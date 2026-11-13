@@ -2,6 +2,150 @@
 //! copy and move. They block, so the app runs them off the UI thread.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+/// The error a copy or move gives when Cancelar stopped it.
+pub const CANCELLED: &str = "Cancelado.";
+
+/// Where one transfer stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    Waiting,
+    Running,
+    Done,
+    Cancelled,
+    Failed,
+}
+
+/// How far one item's copy, move, upload or download has got, shared by the thread doing it
+/// and the window showing it.
+pub struct Progress {
+    /// Bytes through so far, and in all once known (`sized`).
+    pub bytes: AtomicU64,
+    pub total: AtomicU64,
+    pub sized: AtomicBool,
+    stage: AtomicU8,
+    /// Why it failed.
+    error: Mutex<String>,
+    /// When it started running, for its speed.
+    began: Mutex<Option<Instant>>,
+    /// Set by Cancelar: the copy stops within a chunk.
+    cancel: AtomicBool,
+    made: Instant,
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Milliseconds after `made` of the last wake: the window redraws at most ten times a
+    /// second, not once per 64 KB chunk.
+    woke: AtomicU64,
+}
+
+impl Progress {
+    pub fn new(wake: Option<Arc<dyn Fn() + Send + Sync>>) -> Progress {
+        Progress {
+            bytes: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+            sized: AtomicBool::new(false),
+            stage: AtomicU8::new(Stage::Waiting as u8),
+            error: Mutex::new(String::new()),
+            began: Mutex::new(None),
+            cancel: AtomicBool::new(false),
+            made: Instant::now(),
+            wake,
+            woke: AtomicU64::new(0),
+        }
+    }
+
+    fn tick(&self, now: bool) {
+        let at = self.made.elapsed().as_millis() as u64;
+        let last = self.woke.load(Ordering::Relaxed);
+        if (now || at >= last + 100)
+            && self.woke.compare_exchange(last, at, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            && let Some(wake) = &self.wake
+        {
+            wake();
+        }
+    }
+
+    pub fn stage(&self) -> Stage {
+        match self.stage.load(Ordering::Relaxed) {
+            0 => Stage::Waiting,
+            1 => Stage::Running,
+            2 => Stage::Done,
+            3 => Stage::Cancelled,
+            _ => Stage::Failed,
+        }
+    }
+
+    /// Whether it has ended, however.
+    pub fn over(&self) -> bool {
+        !matches!(self.stage(), Stage::Waiting | Stage::Running)
+    }
+
+    pub fn error(&self) -> String {
+        self.error.lock().map(|e| e.clone()).unwrap_or_default()
+    }
+
+    /// Asks it to stop: one still waiting is cancelled at once and won't start; one running
+    /// stops within a chunk.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        let _ = self.stage.compare_exchange(Stage::Waiting as u8, Stage::Cancelled as u8, Ordering::Relaxed, Ordering::Relaxed);
+        self.tick(true);
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Its size, once worked out.
+    pub fn size(&self, bytes: u64) {
+        self.total.store(bytes, Ordering::Relaxed);
+        self.sized.store(true, Ordering::Relaxed);
+        self.tick(false);
+    }
+
+    /// Starts it running, unless it was cancelled while waiting.
+    pub fn begin(&self) -> bool {
+        if self.stage.compare_exchange(Stage::Waiting as u8, Stage::Running as u8, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return false;
+        }
+        if let Ok(mut b) = self.began.lock() {
+            *b = Some(Instant::now());
+        }
+        self.tick(true);
+        true
+    }
+
+    /// Seconds since it started running.
+    pub fn running_for(&self) -> Option<f64> {
+        self.began.lock().ok()?.map(|b| b.elapsed().as_secs_f64())
+    }
+
+    /// How it ended: done (its bar full), cancelled, or failed with why.
+    pub fn end(&self, result: Result<(), String>) {
+        let stage = match result {
+            Ok(()) => {
+                self.bytes.store(self.total.load(Ordering::Relaxed), Ordering::Relaxed);
+                Stage::Done
+            }
+            Err(e) if e == CANCELLED || self.cancelled() => Stage::Cancelled,
+            Err(e) => {
+                if let Ok(mut m) = self.error.lock() {
+                    *m = e;
+                }
+                Stage::Failed
+            }
+        };
+        self.stage.store(stage as u8, Ordering::Relaxed);
+        self.tick(true);
+    }
+
+    pub fn add_bytes(&self, n: u64) {
+        self.bytes.fetch_add(n, Ordering::Relaxed);
+        self.tick(false);
+    }
+}
 
 /// Characters Windows doesn't allow in a file name.
 const FORBIDDEN: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
@@ -92,31 +236,91 @@ pub fn to_recycle_bin(paths: &[PathBuf]) -> Result<(), String> {
 }
 
 /// Copies a file or a whole folder into `dir`, under a free name there.
-pub fn copy_into(src: &Path, dir: &Path) -> Result<PathBuf, String> {
+pub fn copy_into(src: &Path, dir: &Path, prog: &Progress) -> Result<PathBuf, String> {
     let name = src.file_name().ok_or("Item sem nome.")?.to_string_lossy().into_owned();
     if src.is_dir() && dir.starts_with(src) {
         return Err(format!("Não dá para copiar a pasta \"{name}\" para dentro dela mesma."));
     }
     let to = unique_in(dir, &name);
-    copy_tree(src, &to).map(|_| to).map_err(|e| format!("Não consegui copiar \"{name}\": {e}"))
+    copy_tree(src, &to, prog).map(|_| to.clone()).map_err(|e| failed(e, &to, &format!("Não consegui copiar \"{name}\"")))
 }
 
-fn copy_tree(src: &Path, to: &Path) -> std::io::Result<()> {
+/// The message for a copy that stopped. A cancelled one takes away the item it was in the
+/// middle of, so what's left in the destination is only whole items.
+fn failed(e: std::io::Error, to: &Path, what: &str) -> String {
+    if e.kind() != std::io::ErrorKind::Interrupted {
+        return format!("{what}: {e}");
+    }
+    let _ = if to.is_dir() { std::fs::remove_dir_all(to) } else { std::fs::remove_file(to) };
+    CANCELLED.into()
+}
+
+fn copy_tree(src: &Path, to: &Path, prog: &Progress) -> std::io::Result<()> {
+    if prog.cancelled() {
+        return Err(std::io::ErrorKind::Interrupted.into());
+    }
     if src.is_dir() {
         std::fs::create_dir(to)?;
         for item in std::fs::read_dir(src)? {
             let item = item?;
-            copy_tree(&item.path(), &to.join(item.file_name()))?;
+            copy_tree(&item.path(), &to.join(item.file_name()), prog)?;
         }
         Ok(())
     } else {
-        std::fs::copy(src, to).map(|_| ())
+        copy_file(src, to, prog)
     }
+}
+
+/// One file, through Windows' own copy (as Explorer does: attributes and dates come along),
+/// reporting each chunk and stopping, with the partial file removed, on Cancelar.
+#[cfg(windows)]
+fn copy_file(src: &Path, to: &Path, prog: &Progress) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{COPY_FILE_FAIL_IF_EXISTS, CopyFileExW, PROGRESS_CANCEL, PROGRESS_CONTINUE};
+    struct Sent<'a> {
+        prog: &'a Progress,
+        bytes: u64,
+    }
+    /// Called by CopyFileExW between chunks, on this thread.
+    unsafe extern "system" fn chunk(_size: i64, done: i64, _: i64, _: i64, _: u32, _: u32, _: HANDLE, _: HANDLE, data: *const core::ffi::c_void) -> u32 {
+        // SAFETY: `data` is the `Sent` below, alive for the whole call.
+        let sent = unsafe { &mut *(data as *mut Sent) };
+        let done = done.max(0) as u64;
+        if done > sent.bytes {
+            sent.prog.add_bytes(done - sent.bytes);
+            sent.bytes = done;
+        }
+        if sent.prog.cancelled() { PROGRESS_CANCEL } else { PROGRESS_CONTINUE }
+    }
+    let wide = |p: &Path| p.as_os_str().encode_wide().chain([0]).collect::<Vec<u16>>();
+    let (from, into) = (wide(src), wide(to));
+    let mut sent = Sent { prog, bytes: 0 };
+    // SAFETY: NUL-terminated paths, and a callback whose data outlives the call.
+    let ok = unsafe { CopyFileExW(from.as_ptr(), into.as_ptr(), Some(chunk), (&raw mut sent).cast(), std::ptr::null_mut(), COPY_FILE_FAIL_IF_EXISTS) };
+    if ok != 0 {
+        Ok(())
+    } else if prog.cancelled() {
+        Err(std::io::ErrorKind::Interrupted.into())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(windows))]
+fn copy_file(src: &Path, to: &Path, prog: &Progress) -> std::io::Result<()> {
+    prog.add_bytes(std::fs::copy(src, to)?);
+    Ok(())
+}
+
+/// The bytes `path` holds, everything inside it included.
+pub fn measure(path: &Path, stop: &dyn Fn() -> bool) -> u64 {
+    totals(&[path.to_path_buf()], stop).bytes
 }
 
 /// Moves a file or folder into `dir`, keeping its name; a rename when both are on one disk,
 /// a copy then delete across disks.
-pub fn move_into(src: &Path, dir: &Path) -> Result<PathBuf, String> {
+pub fn move_into(src: &Path, dir: &Path, prog: &Progress) -> Result<PathBuf, String> {
     let name = src.file_name().ok_or("Item sem nome.")?.to_string_lossy().into_owned();
     if src.parent() == Some(dir) {
         return Ok(src.to_path_buf());
@@ -131,7 +335,7 @@ pub fn move_into(src: &Path, dir: &Path) -> Result<PathBuf, String> {
     if std::fs::rename(src, &to).is_ok() {
         return Ok(to);
     }
-    copy_tree(src, &to).map_err(|e| format!("Não consegui mover \"{name}\": {e}"))?;
+    copy_tree(src, &to, prog).map_err(|e| failed(e, &to, &format!("Não consegui mover \"{name}\"")))?;
     let removed = if src.is_dir() { std::fs::remove_dir_all(src) } else { std::fs::remove_file(src) };
     removed.map(|_| to).map_err(|e| format!("\"{name}\" foi copiado, mas o original não pôde ser apagado: {e}"))
 }
@@ -255,14 +459,22 @@ mod tests {
     fn copies_get_a_free_name_and_folders_copy_whole() {
         let d = scratch("copy");
         std::fs::write(d.join("nota.txt"), "x").unwrap();
-        assert_eq!(copy_into(&d.join("nota.txt"), &d).unwrap(), d.join("nota - Cópia.txt"));
-        assert_eq!(copy_into(&d.join("nota.txt"), &d).unwrap(), d.join("nota - Cópia (2).txt"));
+        let prog = Progress::new(None);
+        assert_eq!(copy_into(&d.join("nota.txt"), &d, &prog).unwrap(), d.join("nota - Cópia.txt"));
+        assert_eq!(copy_into(&d.join("nota.txt"), &d, &prog).unwrap(), d.join("nota - Cópia (2).txt"));
+        assert_eq!(prog.bytes.load(Ordering::Relaxed), 2);
         std::fs::create_dir_all(d.join("pasta/sub")).unwrap();
         std::fs::write(d.join("pasta/sub/a.txt"), "y").unwrap();
         let out = scratch("copy-out");
-        let copied = copy_into(&d.join("pasta"), &out).unwrap();
+        assert_eq!(measure(&d.join("pasta"), &|| false), 1);
+        assert_eq!(measure(&d.join("nota.txt"), &|| false), 1);
+        let copied = copy_into(&d.join("pasta"), &out, &prog).unwrap();
         assert_eq!(std::fs::read_to_string(copied.join("sub/a.txt")).unwrap(), "y");
-        assert!(copy_into(&d.join("pasta"), &d.join("pasta/sub")).is_err());
+        assert!(copy_into(&d.join("pasta"), &d.join("pasta/sub"), &prog).is_err());
+        // Cancelar stops it, and the half-copied item doesn't stay behind.
+        prog.cancel();
+        assert_eq!(copy_into(&d.join("pasta"), &out, &prog).unwrap_err(), CANCELLED);
+        assert!(!out.join("pasta - Cópia").exists());
         let _ = std::fs::remove_dir_all(d);
         let _ = std::fs::remove_dir_all(out);
     }
@@ -275,7 +487,7 @@ mod tests {
         assert!(rename(&d.join("a.txt"), "b.txt").is_err());
         let a = rename(&d.join("a.txt"), "A.txt").unwrap();
         std::fs::create_dir(d.join("dest")).unwrap();
-        let moved = move_into(&a, &d.join("dest")).unwrap();
+        let moved = move_into(&a, &d.join("dest"), &Progress::new(None)).unwrap();
         assert_eq!(std::fs::read_to_string(moved).unwrap(), "1");
         assert!(new_folder(&d, "dest").is_err());
         assert!(new_folder(&d, "Nova pasta").unwrap().is_dir());

@@ -11,6 +11,7 @@ use openexplorer_gdrive::{Details, Drive, DriveFile, Revision};
 use rune::{TextEdit, Tx};
 
 use crate::model::{Entry, Location, Space};
+use crate::transfers::{self, End, Op};
 use crate::{Msg, State, background, open as open_entry, open_drive, ops};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,25 +195,26 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
         return;
     }
     let reload = vec![to.clone(), from.clone()];
-    let n = items.len();
+    let op = if mode == ClipMode::Cut { Op::Move } else { Op::Copy };
     match (&from, &to) {
         (Location::Local(src), Location::Local(dst)) => {
-            let (src, dst) = (src.clone(), dst.clone());
-            local_job(s, reload, move || {
-                for e in &items {
-                    let path = src.join(&e.name);
-                    match mode {
-                        ClipMode::Copy => ops::copy_into(&path, &dst)?,
-                        ClipMode::Cut => ops::move_into(&path, &dst)?,
-                    };
-                }
-                Ok(format!("{}: {}.", if mode == ClipMode::Cut { "Movido" } else { "Copiado" }, count(n)))
-            });
+            let sources = items.iter().map(|e| src.join(&e.name)).collect();
+            local_transfer(s, op, sources, dst.clone(), reload);
         }
         _ => {
             let (Some((email, src)), Some((_, dst))) = (drive_folder(&from), drive_folder(&to)) else { return };
+            let ends = items.iter().map(|e| (End::drive(&from, Some(&e.name)), End::drive(&to, None)));
+            let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, ends);
+            // Drive copies on its side: a file's bar fills when it's done; a folder's size isn't
+            // known.
+            for (p, e) in batch.rows().iter().zip(&items) {
+                if let (false, Some(size)) = (e.is_dir, e.size) {
+                    p.size(size);
+                }
+            }
             drive_job(s, &email, reload, move |d| {
-                for e in &items {
+                batch.run(|i, _| {
+                    let e = &items[i];
                     let file = DriveFile {
                         id: e.id.clone(),
                         name: e.name.clone(),
@@ -224,17 +226,56 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
                         md5: None,
                     };
                     match mode {
-                        ClipMode::Copy if src == dst => d.copy(&file, &dst, &format!("Cópia de {}", e.name)).map(|_| ())?,
-                        ClipMode::Copy => d.copy(&file, &dst, &e.name).map(|_| ())?,
-                        ClipMode::Cut if src == dst => {}
-                        ClipMode::Cut => d.move_to(&e.id, &src, &dst).map(|_| ())?,
+                        ClipMode::Copy if src == dst => d.copy(&file, &dst, &format!("Cópia de {}", e.name)).map(|_| ()),
+                        ClipMode::Copy => d.copy(&file, &dst, &e.name).map(|_| ()),
+                        ClipMode::Cut if src == dst => Ok(()),
+                        ClipMode::Cut => d.move_to(&e.id, &src, &dst).map(|_| ()),
                     }
-                }
-                Ok(format!("{} no Google Drive: {}.", if mode == ClipMode::Cut { "Movido" } else { "Copiado" }, count(n)))
+                })
             });
         }
     }
-    s.status = format!("{} {}…", if mode == ClipMode::Cut { "Movendo" } else { "Copiando" }, count(n));
+}
+
+/// Copies or moves `sources` into the folder `dst` on a background thread, a row each in the
+/// transfer queue: first every size is added up, then each item goes, chunk by chunk.
+pub fn local_transfer(s: &mut State, op: Op, sources: Vec<PathBuf>, dst: PathBuf, reload: Vec<Location>) {
+    let to = End::local(&dst);
+    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, sources.iter().map(|p| (End::local(p), to.clone())));
+    local_job(s, reload, move || {
+        for (p, path) in batch.rows().iter().zip(&sources) {
+            p.size(ops::measure(path, &|| p.cancelled()));
+        }
+        batch.run(|i, p| {
+            let moved = match op {
+                Op::Copy => ops::copy_into(&sources[i], &dst, p),
+                Op::Move => ops::move_into(&sources[i], &dst, p),
+            };
+            moved.map(|_| ())
+        })
+    });
+}
+
+/// Cancelar on a row of the queue.
+pub fn cancel_transfer(row: &ops::Progress) {
+    row.cancel();
+}
+
+/// Cancelar todas: every row not over yet.
+pub fn cancel_all_transfers(s: &mut State) {
+    for t in &s.transfers {
+        t.progress.cancel();
+    }
+}
+
+/// Takes a row off the list, once it's over.
+pub fn remove_transfer(s: &mut State, row: &Arc<ops::Progress>) {
+    s.transfers.retain(|t| !(Arc::ptr_eq(&t.progress, row) && t.progress.over()));
+}
+
+/// Takes every row that's over off the list.
+pub fn clear_transfers(s: &mut State) {
+    s.transfers.retain(|t| !t.progress.over());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -652,6 +693,12 @@ mod tests {
         copy_across(&mut s, 0, 1);
         let done = s.inbox.recv_timeout(std::time::Duration::from_secs(10)).expect("the copy answers");
         assert!(matches!(done, Msg::Done { result: Ok(_), .. }));
+        // Its row in the queue sized the file, filled up and is done.
+        let [t] = s.transfers.as_slice() else { panic!("one transfer: {}", s.transfers.len()) };
+        assert_eq!((t.op, &t.from, &t.to), (Op::Copy, &End::local(&a.join("nota.txt")), &End::local(&b)));
+        let p = &t.progress;
+        assert_eq!(p.stage(), crate::ops::Stage::Done);
+        assert_eq!((p.bytes.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed)), (2, 2));
         assert_eq!(std::fs::read_to_string(b.join("nota.txt")).unwrap(), "oi");
         assert!(a.join("nota.txt").exists(), "a copy leaves the original");
         assert!(matches!(&s.clip, Some(Clip { mode: ClipMode::Cut, .. })), "what Recortar picked up stays");

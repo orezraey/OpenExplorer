@@ -11,6 +11,7 @@ mod layout;
 mod model;
 mod ops;
 mod sysicons;
+mod transfers;
 mod ui;
 
 use std::collections::HashMap;
@@ -94,6 +95,12 @@ struct State {
     inbox: Receiver<Msg>,
     outbox: Sender<Msg>,
     waker: Option<Waker>,
+    /// Copies and moves under way, each with its bar.
+    transfers: Vec<transfers::Transfer>,
+    /// The transfer queue's right-click menu: the row it was opened on, and where.
+    transfer_menu: Option<(Option<Arc<ops::Progress>>, rune::PointerPress)>,
+    /// How many rows were still waiting or running at the last frame.
+    transfers_live: usize,
     /// Windows' own icons, as Explorer shows them.
     icons: sysicons::SysIcons,
     /// The listing version each pane's icons were last asked for.
@@ -131,6 +138,9 @@ fn init() -> State {
         inbox,
         outbox,
         waker: None,
+        transfers: Vec::new(),
+        transfer_menu: None,
+        transfers_live: 0,
         icons: Default::default(),
         icons_for: [u64::MAX; 2],
     }
@@ -175,6 +185,19 @@ fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
         s.icons.show(keys);
     }
     let mut changed = s.icons.settle();
+    // Rows done leave the queue (the status line says how the job went); cancelled and failed
+    // ones stay to be seen. While any runs, its thread wakes the window a few times a second.
+    // A redraw is due while any row moves, and once more when the last one stops.
+    let rows = s.transfers.len();
+    s.transfers.retain(|t| t.progress.stage() != ops::Stage::Done);
+    if let Some((Some(row), _)) = &s.transfer_menu
+        && !s.transfers.iter().any(|t| Arc::ptr_eq(&t.progress, row))
+    {
+        s.transfer_menu = None;
+    }
+    let live = s.transfers.iter().filter(|t| !t.progress.over()).count();
+    changed |= live > 0 || live != s.transfers_live || s.transfers.len() != rows;
+    s.transfers_live = live;
     while let Ok(msg) = s.inbox.try_recv() {
         changed = true;
         match msg {
@@ -716,27 +739,24 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
     s.last_drag = None;
     s.active = p;
     let loc = s.panes[p].loc.clone();
-    let (mut done, mut skipped, mut failed) = (0, 0, 0);
+    let (mut done, mut skipped) = (0, 0);
     match &loc {
         Location::Drive { .. } => {
             s.status = "Enviar arquivos para o Google Drive é o próximo passo; por enquanto o painel só lista.".into();
             return;
         }
         Location::Local(dir) => {
-            for f in files {
-                let Some(name) = f.file_name() else { continue };
-                let to = dir.join(name);
-                if to.exists() || f.parent() == Some(dir.as_path()) {
-                    skipped += 1;
-                } else if f.is_dir() {
-                    // Copying folders comes with the real transfer queue.
-                    skipped += 1;
-                } else if std::fs::copy(f, &to).is_ok() {
-                    done += 1;
-                } else {
-                    failed += 1;
-                }
+            // Files and folders from Explorer copy in the background with a bar; ones already
+            // here are left alone.
+            let fresh: Vec<PathBuf> = files.iter().filter(|f| f.parent() != Some(dir.as_path()) && f.file_name().is_some_and(|n| !dir.join(n).exists())).cloned().collect();
+            let skipped = files.len() - fresh.len();
+            if !fresh.is_empty() {
+                actions::local_transfer(s, transfers::Op::Copy, fresh, dir.clone(), vec![loc.clone()]);
             }
+            if skipped > 0 {
+                s.status = format!("Ignorados (já estão aqui): {skipped}.");
+            }
+            return;
         }
         Location::Mock(segs) => {
             for f in files {
@@ -758,8 +778,7 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
             }
         }
     }
-    let verb = if matches!(loc, Location::Local(_)) { "Copiados" } else { "Enviados (simulado)" };
-    s.status = format!("{verb}: {done} · ignorados (já existem ou pastas): {skipped} · falhas: {failed}");
+    s.status = format!("Enviados (simulado): {done} · ignorados (já existem): {skipped}");
     load(s, p);
 }
 
@@ -788,6 +807,31 @@ fn main() {
                 }
                 switch(s, 0, Location::Local(dir.clone()));
                 switch(s, 1, Location::Local(dir.join("Projetos")));
+            }),
+            // The transfer queue with a row in each state.
+            ("copying", |s| {
+                use transfers::{End, Op};
+                let from = |name: &str| End::local(&PathBuf::from(r"D:\Desenhos").join(name));
+                let drive = Location::drive("voce@gmail.com", Space::MyDrive);
+                let rows = [
+                    (Op::Copy, from("Episódio 05.mkv"), End::local(&PathBuf::from(r"C:\Users\voce\Vídeos"))),
+                    (Op::Copy, from("Episódio 06.mkv"), End::local(&PathBuf::from(r"C:\Users\voce\Vídeos"))),
+                    (Op::Move, End::drive(&drive, Some("Relatório.pdf")), End::drive(&drive, None)),
+                    (Op::Copy, from("Episódio 07.mkv"), End::local(&PathBuf::from(r"E:\"))),
+                ];
+                for (op, a, b) in rows {
+                    std::mem::forget(transfers::queue(&mut s.transfers, None, op, [(a, b)]));
+                }
+                let p = |i: usize| s.transfers[i].progress.clone();
+                p(0).size(2_858_000_000);
+                p(0).begin();
+                p(0).add_bytes(54_760_000);
+                p(1).size(1_240_000_000);
+                p(2).cancel();
+                p(2).end(Err(ops::CANCELLED.into()));
+                p(3).size(900_000_000);
+                p(3).begin();
+                p(3).end(Err("Não há espaço suficiente no disco.".into()));
             }),
             // The shared drives list of an account, without a network.
             ("shared", |s| {

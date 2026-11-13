@@ -11,7 +11,9 @@ use crate::model::{Kind, Location, SortCol, Space, crumbs, format_bytes, format_
 use crate::actions::{self, ClipMode, Dialog};
 use crate::{State, click, connect, disconnect, drag_item, dragged_ids, dropped, go_back, go_forward, go_up, key, load, navigate, open, pane_key, paths_for, row_key, set_sort};
 use crate::icons;
+use crate::ops::Stage;
 use crate::sysicons::{self, IconKey};
+use crate::transfers;
 use crate::layout::{self, clamp_col, clamp_tree};
 
 const ROW_H: f32 = crate::ROW_H;
@@ -22,6 +24,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     // Menus and dialogs draw in a layer above everything.
     let mut layer = Vec::new();
     let menu = context(s, &k, &mut layer);
+    let queue_menu = transfer_context(s, &k, &mut layer);
     dialog(s, &k, &mut layer);
     let body = col()
         .w_full()
@@ -29,9 +32,182 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .fill(k.c.page)
         .child(toolbar(s, &k))
         .child(panes(s, &k))
-        .child(row().key("message").w_full().h(22.0).px(10.0).center_y().child(message))
-        .child(menu);
+        .child(transfers(s, &k))
+        .child(row().key("message").w_full().h(24.0).px(10.0).gap(12.0).center_y().child(message).child(el().grow(1.0)).child(queue_totals(s, &k)))
+        .child(menu)
+        .child(queue_menu);
     rune_kit::root(body, layer)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Transfer queue
+
+/// The queue's columns, as in Air Explorer.
+const QUEUE_COLS: [(&str, f32); 8] = [
+    ("Operação", 92.0),
+    ("Origem", 300.0),
+    ("Destino", 240.0),
+    ("Estado", 124.0),
+    ("Tamanho", 128.0),
+    ("Progresso", 112.0),
+    ("Velocidade", 96.0),
+    ("Estimado", 88.0),
+];
+const QUEUE_H: f32 = 150.0;
+
+fn queue_cell(i: usize) -> El {
+    row().w(QUEUE_COLS[i].1).h_full().px(6.0).gap(5.0).center_y().clip_soft(0.0)
+}
+
+/// Origem or Destino: the disk's (or Drive's) icon and the path.
+fn queue_end(s: &State, k: &Kit, i: usize, end: &transfers::End) -> El {
+    let glyph = match &end.disk {
+        Some(disk) => shell_icon(s, Some(&sysicons::drive_key(disk)), &icons::DISK, 14.0),
+        None => icon(&icons::CLOUD, 14.0),
+    };
+    queue_cell(i).child(glyph).child(text(end.text.clone()).font(k.ty.text_xsmall).color(k.c.text_base).truncate().shrink().min_w(0.0).help_when_truncated(end.text.clone()))
+}
+
+/// The bar with its percentage over it, as in Air Explorer.
+fn queue_bar(k: &Kit, fraction: Option<f32>) -> El {
+    let label = fraction.map(|f| format!("{}%", (f * 100.0).floor())).unwrap_or_else(|| "…".into());
+    let fill = el().key("fill").h_full().fill(k.alpha(k.c.text_accent, 0.35));
+    row()
+        .key("bar")
+        .role("progressbar")
+        .label(label.clone())
+        .w(96.0)
+        .h(15.0)
+        .border(1.0, k.c.border_base)
+        .fill(k.c.bg_base)
+        .clip_soft(0.0)
+        .child(fill.w_frac(fraction.unwrap_or(0.0)))
+        .child(row().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).center().child(text(label).font(k.ty.text_xsmall).color(k.c.text_base)))
+}
+
+fn queue_row(s: &State, k: &Kit, t: &transfers::Transfer) -> El {
+    use std::sync::atomic::Ordering::Relaxed;
+    let p = &t.progress;
+    let muted = |t: String| text(t).font(k.ty.text_xsmall).color(k.c.text_base).truncate().shrink().min_w(0.0);
+    let (state, dot) = match p.stage() {
+        Stage::Waiting if p.cancelled() => ("Cancelando…", k.c.text_faint),
+        Stage::Waiting => ("Aguardando", k.c.text_faint),
+        Stage::Running if p.cancelled() => ("Cancelando…", k.c.warning.fg),
+        Stage::Running => ("Em andamento", k.c.success.fg),
+        Stage::Done => ("Concluído", k.c.text_accent),
+        Stage::Cancelled => ("Cancelado", k.c.warning.fg),
+        Stage::Failed => ("Erro", k.c.danger.fg),
+    };
+    let mut state_cell = queue_cell(3).child(el().size(8.0, 8.0).radius(4.0).fill(dot)).child(muted(state.into()));
+    if p.stage() == Stage::Failed {
+        state_cell = state_cell.help(p.error());
+    }
+    let sized = p.sized.load(Relaxed);
+    let size = if sized { transfers::pair(p.bytes.load(Relaxed), p.total.load(Relaxed)) } else { String::new() };
+    let speed = t.speed().map(|v| format!("{}/s", format_size(v as u64))).unwrap_or_default();
+    let left = t.left().map(transfers::hms).unwrap_or_default();
+    let (op_icon, op) = match t.op {
+        transfers::Op::Copy => (&icons::M_COPY, t.op.label()),
+        transfers::Op::Move => (&icons::M_CUT, t.op.label()),
+    };
+    row()
+        .key(format!("t-{:p}", std::sync::Arc::as_ptr(p)))
+        .role("row")
+        .label(format!("{op} {}", t.from.text))
+        .w_full()
+        .h(22.0)
+        .center_y()
+        .hover(k.alpha(k.c.text_base, 0.045))
+        .on_secondary_press({
+            let row = p.clone();
+            move |s: &mut State, at: rune::PointerPress, _: &mut Tx| s.transfer_menu = Some((Some(row.clone()), at))
+        })
+        .child(queue_cell(0).child(icon(op_icon, 14.0).color(k.c.icon_base)).child(muted(op.into())))
+        .child(queue_end(s, k, 1, &t.from))
+        .child(queue_end(s, k, 2, &t.to))
+        .child(state_cell)
+        .child(queue_cell(4).child(muted(size)))
+        .child(queue_cell(5).child(queue_bar(k, t.fraction())))
+        .child(queue_cell(6).child(muted(speed)))
+        .child(queue_cell(7).child(muted(left)))
+}
+
+/// The transfer queue under the panes: a row per item being copied or moved.
+fn transfers(s: &State, k: &Kit) -> El {
+    let header = row()
+        .key("queue-header")
+        .w_full()
+        .h(22.0)
+        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+        .children(QUEUE_COLS.iter().enumerate().map(|(i, (label, _))| {
+            queue_cell(i).border_sides([0.0, 1.0, 0.0, 0.0], k.c.border_weak).child(text(label.to_string()).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().min_w(0.0))
+        }));
+    // Only the rows in view are built: copying a 5,000-file folder makes 5,000 rows.
+    let kit = k.clone();
+    let rows = col().key("queue-rows").w_full().growth(GrowthSpec::default()).virtual_rows(
+        s.transfers.len(),
+        22.0,
+        |s: &State, i| Cow::Owned(format!("t-{:p}", std::sync::Arc::as_ptr(&s.transfers[i].progress))),
+        move |s: &State, i| queue_row(s, &kit, &s.transfers[i]),
+    );
+    let queue = col()
+        .key("queue")
+        .w_full()
+        .h_full()
+        .fill(k.c.bg_base)
+        .border(1.0, k.c.border_weak)
+        .clip_soft(0.0)
+        .child(header)
+        .child(col().key("queue-scroll").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(rows))
+        .on_secondary_press(|s: &mut State, at: rune::PointerPress, _: &mut Tx| s.transfer_menu = Some((None, at)));
+    row().key("queue-wrap").w_full().h(QUEUE_H).px(6.0).child(queue)
+}
+
+/// The right end of the status line while something is under way: "Total: 0,05 / 2,66 GB",
+/// a bar, and the speed of everything running.
+fn queue_totals(s: &State, k: &Kit) -> El {
+    use std::sync::atomic::Ordering::Relaxed;
+    let live: Vec<&transfers::Transfer> = s.transfers.iter().filter(|t| !t.progress.over()).collect();
+    if live.is_empty() {
+        return el().key("totals");
+    }
+    let done: u64 = live.iter().map(|t| t.progress.bytes.load(Relaxed)).sum();
+    let total: u64 = live.iter().map(|t| t.progress.total.load(Relaxed)).sum();
+    let speed: f64 = live.iter().filter_map(|t| t.speed()).sum();
+    let fraction = if total > 0 { (done as f64 / total as f64).min(1.0) as f32 } else { 0.0 };
+    let small = |t: String| text(t).font(k.ty.text_xsmall).color(k.c.text_muted);
+    row()
+        .key("totals")
+        .gap(8.0)
+        .center_y()
+        .child(small(format!("Total: {}", transfers::pair(done, total))))
+        .child(row().w(80.0).h(10.0).border(1.0, k.c.border_base).child(el().h_full().w_frac(fraction).fill(k.alpha(k.c.text_accent, 0.5))))
+        .child(small(if speed > 0.0 { format!("{}/s", format_size(speed as u64)) } else { String::new() }))
+}
+
+/// The queue's right-click menu: on a row, or on the list as a whole.
+fn transfer_context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
+    let anchor = el().key("queue-menu-anchor").size(0.0, 0.0);
+    let Some((row, at)) = s.transfer_menu.clone() else { return anchor };
+    let item = |label: &str, enabled: bool, f: Box<dyn Fn(&mut State)>| {
+        MenuItem::new(label).disabled(!enabled).on_select_tx(move |s: &mut State, _: &mut Tx| {
+            s.transfer_menu = None;
+            f(s);
+        })
+    };
+    let mut menu = context_menu("queue-menu", anchor, Some(at)).min_width(200.0);
+    if let Some(row) = row {
+        let (over, other) = (row.over(), row.clone());
+        menu = menu
+            .item(item("Cancelar", !over, Box::new(move |_| actions::cancel_transfer(&row))))
+            .item(item("Remover da lista", over, Box::new(move |s| actions::remove_transfer(s, &other))))
+            .separator();
+    }
+    let (any_live, any_over) = (s.transfers.iter().any(|t| !t.progress.over()), s.transfers.iter().any(|t| t.progress.over()));
+    menu.item(item("Cancelar todas", any_live, Box::new(actions::cancel_all_transfers)))
+        .item(item("Limpar finalizadas", any_over, Box::new(actions::clear_transfers)))
+        .on_close(|s: &mut State| s.transfer_menu = None)
+        .build(k, layer)
 }
 
 // ---------------------------------------------------------------------------------------------
