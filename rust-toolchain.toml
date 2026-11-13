@@ -1,0 +1,4 @@
+[toolchain]
+# Same toolchain Rune's dev branch builds with.
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]

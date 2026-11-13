@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/app"]
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+# Rune has no releases: `dev` is its only branch and is never rewritten. Cargo.lock pins the
+# exact commit; `cargo update -p rune` moves to the newest dev.
+rune = { git = "https://github.com/anomalyco/rune", branch = "dev" }
+rune-kit = { git = "https://github.com/anomalyco/rune", branch = "dev" }
+
+# Rune builds against patched winit, wgpu-hal, parley_engine and accesskit_windows. A dependency's
+# [patch] doesn't reach us, so an app repeats Rune's table from the same branch (Rune README,
+# "Depending on Rune"). When Rune adds an entry to its root Cargo.toml's [patch.crates-io], add it here.
+[patch.crates-io]
+winit = { git = "https://github.com/anomalyco/rune", branch = "dev" }
+parley_engine = { git = "https://github.com/anomalyco/rune", branch = "dev" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", branch = "dev" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", branch = "dev" }
+
+[profile.dev.package."*"]
+# Rune's renderer is slow unoptimized; keep our own crate debuggable.
+opt-level = 2
