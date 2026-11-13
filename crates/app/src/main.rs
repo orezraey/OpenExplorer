@@ -1,85 +1,266 @@
-//! Open Explorer prototype: two panes side by side, the local disk on the left and a simulated
-//! Google Drive on the right. It checks what Rune gives a dual-pane file manager on Windows:
-//! virtual lists of 50,000 rows, dragging between panes, dropping files in from Explorer and
-//! dragging files out to Explorer.
+//! Open Explorer: two panes side by side, each showing the local disk, a simulated drive or a
+//! connected Google Drive account.
+//!
+//! Drive calls block, so they run on background threads that send a [`Msg`] back and wake the
+//! window; `poll` applies it.
 
 mod model;
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::SystemTime;
 
-use rune::{Align, AppSpec, Cursor, Cx, DragItem, DragOutcome, El, GrowthSpec, Key, KeyEvent, Mods, ScrollSpec, Tx, col, el, row, text};
+use openexplorer_gdrive::store::{self, StoredAccount};
+use openexplorer_gdrive::{ClientConfig, Drive, DriveFile, oauth};
+use rune::{Align, AppSpec, Cursor, Cx, DragItem, DragOutcome, El, GrowthSpec, Key, KeyEvent, Mods, ScrollSpec, Tx, Waker, col, el, row, text};
 use rune_kit::Kit;
 
 use model::{Entry, Location, MockDrive, Pane, SortCol, format_size, format_time};
 
 const ROW_H: f32 = 26.0;
 
+enum Msg {
+    /// `made` carries an account opened on the background thread, for `poll` to keep.
+    Listed { pane: usize, request: u64, made: Option<(String, Arc<Drive>)>, result: Result<Vec<DriveFile>, String> },
+    LoggedIn { pane: usize, attempt: u64, result: Result<(StoredAccount, Arc<Drive>), String> },
+}
+
 struct State {
     panes: [Pane; 2],
-    drive: MockDrive,
+    mock: MockDrive,
+    accounts: Vec<StoredAccount>,
+    /// Connected accounts by e-mail, made on first use.
+    drives: HashMap<String, Arc<Drive>>,
+    /// The login waiting for the browser, numbered from `logins`. Clicking again starts a new
+    /// one; an older attempt's error is then dropped, its success still kept.
+    login: Option<u64>,
+    logins: u64,
     active: usize,
     /// The pane a drag started in and the files it carried, so a drop back on the same pane
     /// is ignored (the drop can arrive after the drag's end).
     last_drag: Option<(usize, Vec<PathBuf>)>,
     status: String,
     temp: PathBuf,
+    inbox: Receiver<Msg>,
+    outbox: Sender<Msg>,
+    waker: Option<Waker>,
 }
 
 fn init() -> State {
-    let home = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\"));
-    let drive = MockDrive::new();
-    let mut panes = [Pane::new(Location::Local(home)), Pane::new(Location::Cloud(Vec::new()))];
+    let (outbox, inbox) = channel();
+    let mock = MockDrive::new();
+    let mut panes = [Pane::new(Location::home()), Pane::new(Location::Mock(Vec::new()))];
     for p in &mut panes {
-        p.load(&drive);
+        p.load_now(&mock);
     }
     State {
         panes,
-        drive,
+        mock,
+        accounts: store::accounts(),
+        drives: HashMap::new(),
+        login: None,
+        logins: 0,
         active: 0,
         last_drag: None,
         status: "Arraste arquivos entre os painéis, do Explorer para cá ou daqui para o Explorer.".into(),
         temp: std::env::temp_dir().join("OpenExplorer-drag"),
+        inbox,
+        outbox,
+        waker: None,
     }
+}
+
+fn setup(s: &mut State, waker: Waker) {
+    s.waker = Some(waker);
+}
+
+/// Runs `work` on a new thread and hands its message to `poll`.
+fn background(s: &State, work: impl FnOnce() -> Msg + Send + 'static) {
+    let (out, wake) = (s.outbox.clone(), s.waker.clone());
+    std::thread::spawn(move || {
+        let _ = out.send(work());
+        if let Some(w) = wake {
+            w();
+        }
+    });
+}
+
+fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
+    let mut changed = false;
+    while let Ok(msg) = s.inbox.try_recv() {
+        changed = true;
+        match msg {
+            Msg::Listed { pane, request, made, result } => {
+                if let Some((email, drive)) = made
+                    && s.accounts.iter().any(|a| a.email == email)
+                {
+                    s.drives.entry(email).or_insert(drive);
+                }
+                if s.panes[pane].request == request {
+                    s.panes[pane].set_entries(result.map(|files| files.into_iter().map(entry_of).collect()));
+                }
+            }
+            Msg::LoggedIn { pane, attempt, result } => {
+                let current = s.login == Some(attempt);
+                if current {
+                    s.login = None;
+                } else if result.is_err() {
+                    continue;
+                }
+                match result {
+                    Ok((account, drive)) => {
+                        s.status = format!("Conta conectada: {}", account.email);
+                        s.drives.insert(account.email.clone(), drive);
+                        let email = account.email.clone();
+                        match s.accounts.iter_mut().find(|a| a.email == account.email) {
+                            Some(a) => *a = account,
+                            None => s.accounts.push(account),
+                        }
+                        switch(s, pane, Location::Drive { email, path: Vec::new() });
+                    }
+                    Err(e) => s.status = e,
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn entry_of(f: DriveFile) -> Entry {
+    Entry { id: f.id, name: f.name, is_dir: f.is_dir, size: f.size, modified: f.modified }
 }
 
 fn pane_key(p: usize) -> String {
     format!("pane-{p}")
 }
 
-fn row_key(name: &str) -> String {
-    format!("r:{name}")
+fn row_key(id: &str) -> String {
+    format!("r:{id}")
 }
 
 // ---------------------------------------------------------------------------------------------
-// Actions
+// Accounts
 
-fn reload(s: &mut State, p: usize) {
-    let State { panes, drive, .. } = s;
-    panes[p].load(drive);
+/// Opens a stored account: reads the client file and the credential store, so it runs off the
+/// UI thread.
+fn open_drive(email: &str) -> Result<Arc<Drive>, String> {
+    let cfg = ClientConfig::load()?;
+    let token = store::refresh_token(email)?;
+    Ok(Arc::new(Drive::new(cfg, token)))
 }
 
-fn open(s: &mut State, p: usize, name: &str) {
-    let pane = &mut s.panes[p];
-    let Some(e) = pane.entries.iter().find(|e| e.name == name) else { return };
-    if !e.is_dir {
-        s.status = format!("Abrir \"{name}\" ainda não faz parte do protótipo.");
+fn connect(s: &mut State, p: usize, tx: &mut Tx) {
+    let cfg = match ClientConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            s.status = e;
+            return;
+        }
+    };
+    let pending = match oauth::begin(&cfg) {
+        Ok(l) => l,
+        Err(e) => {
+            s.status = e;
+            return;
+        }
+    };
+    if let Err(e) = tx.open_url(&pending.url) {
+        s.status = format!("Não consegui abrir o navegador: {e:?}");
         return;
     }
-    match &mut pane.loc {
-        Location::Local(dir) => dir.push(name),
-        Location::Cloud(segs) => segs.push(name.to_string()),
+    s.logins += 1;
+    let attempt = s.logins;
+    s.login = Some(attempt);
+    s.status = "Faça o login no navegador que abriu. Esperando o Google…".into();
+    background(s, move || {
+        let result = (|| {
+            let tokens = pending.finish(&cfg)?;
+            let drive = Drive::from_login(cfg, &tokens)?;
+            let who = drive.about()?;
+            let account = StoredAccount { email: who.email, name: who.name };
+            store::save(account.clone(), drive.refresh_token())?;
+            Ok((account, Arc::new(drive)))
+        })();
+        Msg::LoggedIn { pane: p, attempt, result }
+    });
+}
+
+fn disconnect(s: &mut State, email: &str) {
+    if let Err(e) = store::remove(email) {
+        s.status = e;
+        return;
     }
-    pane.selected.clear();
-    pane.cursor = None;
-    pane.anchor = None;
-    reload(s, p);
+    s.drives.remove(email);
+    s.accounts.retain(|a| a.email != email);
+    for p in 0..2 {
+        if matches!(&s.panes[p].loc, Location::Drive { email: e, .. } if e == email) {
+            switch(s, p, Location::Mock(Vec::new()));
+        }
+    }
+    s.status = format!("Conta desconectada: {email}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Navigation
+
+/// Lists the pane's current folder: in place for local and simulated folders, in the
+/// background for Drive.
+fn load(s: &mut State, p: usize) {
+    // Every load gets a new number, so a Drive answer for a folder left since is dropped,
+    // whatever the pane shows now.
+    s.panes[p].request += 1;
+    let Location::Drive { email, path } = s.panes[p].loc.clone() else {
+        let State { panes, mock, .. } = s;
+        panes[p].load_now(mock);
+        return;
+    };
+    let cached = s.drives.get(&email).cloned();
+    let pane = &mut s.panes[p];
+    pane.loading = true;
+    pane.error = None;
+    let request = pane.request;
+    let folder = path.last().map_or_else(|| "root".to_string(), |(id, _)| id.clone());
+    background(s, move || {
+        let (drive, made) = match cached {
+            Some(d) => (d, None),
+            None => match open_drive(&email) {
+                Ok(d) => (d.clone(), Some((email, d))),
+                Err(e) => return Msg::Listed { pane: p, request, made: None, result: Err(e) },
+            },
+        };
+        Msg::Listed { pane: p, request, made, result: drive.list(&folder) }
+    });
+}
+
+fn switch(s: &mut State, p: usize, loc: Location) {
+    s.active = p;
+    s.panes[p].go(loc);
+    load(s, p);
+}
+
+fn open(s: &mut State, p: usize, id: &str) {
+    let pane = &mut s.panes[p];
+    let Some(e) = pane.entry(id).cloned() else { return };
+    if !e.is_dir {
+        s.status = format!("Abrir \"{}\" ainda não faz parte do protótipo.", e.name);
+        return;
+    }
+    let mut loc = pane.loc.clone();
+    match &mut loc {
+        Location::Local(dir) => dir.push(&e.name),
+        Location::Mock(segs) => segs.push(e.name.clone()),
+        Location::Drive { path, .. } => path.push((e.id.clone(), e.name.clone())),
+    }
+    switch(s, p, loc);
 }
 
 fn go_up(s: &mut State, p: usize) {
-    let pane = &mut s.panes[p];
-    let from = match &mut pane.loc {
+    let mut loc = s.panes[p].loc.clone();
+    // The folder we come out of, to land on it.
+    let from = match &mut loc {
         Location::Local(dir) => {
             let name = dir.file_name().map(|n| n.to_string_lossy().into_owned());
             if !dir.pop() {
@@ -87,38 +268,44 @@ fn go_up(s: &mut State, p: usize) {
             }
             name
         }
-        Location::Cloud(segs) => segs.pop(),
+        Location::Mock(segs) => segs.pop(),
+        Location::Drive { path, .. } => path.pop().map(|(id, _)| id),
     };
-    reload(s, p);
-    // Land on the folder we came out of.
-    if let Some(name) = from {
+    if from.is_none() {
+        return;
+    }
+    switch(s, p, loc);
+    if let Some(id) = from {
         let pane = &mut s.panes[p];
-        pane.selected = [name.clone()].into();
-        pane.cursor = Some(name.clone());
-        pane.anchor = Some(name);
+        pane.selected = [id.clone()].into();
+        pane.cursor = Some(id.clone());
+        pane.anchor = Some(id);
     }
 }
 
-fn click(s: &mut State, p: usize, name: &str, mods: Mods) {
+// ---------------------------------------------------------------------------------------------
+// Selection and keys
+
+fn click(s: &mut State, p: usize, id: &str, mods: Mods) {
     s.active = p;
     let pane = &mut s.panes[p];
     if mods.cmd {
-        if !pane.selected.remove(name) {
-            pane.selected.insert(name.to_string());
+        if !pane.selected.remove(id) {
+            pane.selected.insert(id.to_string());
         }
-        pane.anchor = Some(name.to_string());
+        pane.anchor = Some(id.to_string());
     } else if mods.shift && pane.anchor.is_some() {
         let a = pane.anchor.as_deref().and_then(|a| pane.index_of(a));
-        let b = pane.index_of(name);
+        let b = pane.index_of(id);
         if let (Some(a), Some(b)) = (a, b) {
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-            pane.selected = pane.entries[lo..=hi].iter().map(|e| e.name.clone()).collect();
+            pane.selected = pane.entries[lo..=hi].iter().map(|e| e.id.clone()).collect();
         }
     } else {
-        pane.selected = [name.to_string()].into();
-        pane.anchor = Some(name.to_string());
+        pane.selected = [id.to_string()].into();
+        pane.anchor = Some(id.to_string());
     }
-    pane.cursor = Some(name.to_string());
+    pane.cursor = Some(id.to_string());
 }
 
 fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
@@ -157,19 +344,19 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         }
         _ if ev.is_command('a') => {
             let pane = &mut s.panes[p];
-            pane.selected = pane.entries.iter().map(|e| e.name.clone()).collect();
+            pane.selected = pane.entries.iter().map(|e| e.id.clone()).collect();
             return true;
         }
         _ if ev.is_command('r') => {
-            reload(s, p);
+            load(s, p);
             return true;
         }
         _ => return false,
     };
     if let Some(i) = to {
-        let name = s.panes[p].entries[i].name.clone();
-        click(s, p, &name, Mods { shift: ev.mods.shift, ..Mods::default() });
-        tx.scroll_into_view_in(pane_key(p), row_key(&name));
+        let id = s.panes[p].entries[i].id.clone();
+        click(s, p, &id, Mods { shift: ev.mods.shift, ..Mods::default() });
+        tx.scroll_into_view_in(pane_key(p), row_key(&id));
     }
     true
 }
@@ -180,41 +367,49 @@ fn set_sort(s: &mut State, p: usize, col: SortCol) {
     pane.sort_entries();
 }
 
-/// What a drag from pane `p` that started on `name` carries: the selection if `name` is in it,
-/// else `name` alone. Drive files become small placeholder files in the temp folder first, as a
-/// real download would.
-fn drag_item(s: &State, p: usize, name: &str) -> Option<DragItem> {
-    let pane = &s.panes[p];
-    let names: Vec<&str> = if pane.selected.contains(name) {
-        pane.entries.iter().filter(|e| pane.selected.contains(&e.name)).map(|e| e.name.as_str()).collect()
+// ---------------------------------------------------------------------------------------------
+// Drag and drop
+
+/// The ids a drag that started on `id` carries: the selection if `id` is in it, else `id`.
+fn dragged_ids(pane: &Pane, id: &str) -> Vec<String> {
+    if pane.selected.contains(id) {
+        pane.entries.iter().filter(|e| pane.selected.contains(&e.id)).map(|e| e.id.clone()).collect()
     } else {
-        vec![name]
-    };
-    let paths = paths_for(s, p, &names);
+        vec![id.to_string()]
+    }
+}
+
+fn drag_item(s: &State, p: usize, id: &str) -> Option<DragItem> {
+    let paths = paths_for(s, p, &dragged_ids(&s.panes[p], id), true);
     if paths.is_empty() {
         return None;
     }
     Some(paths.into_iter().fold(DragItem::new(), DragItem::file).within_app())
 }
 
-fn paths_for(s: &State, p: usize, names: &[&str]) -> Vec<PathBuf> {
+/// Files on disk for the dragged entries. Simulated files become small placeholder files in
+/// the temp folder first, as a download would, when `materialize` is set; without it this only
+/// names the paths. Drive downloads aren't written yet: none.
+fn paths_for(s: &State, p: usize, ids: &[String], materialize: bool) -> Vec<PathBuf> {
     let pane = &s.panes[p];
     match &pane.loc {
-        Location::Local(dir) => names.iter().map(|n| dir.join(n)).collect(),
-        Location::Cloud(segs) => {
+        Location::Local(dir) => ids.iter().filter_map(|id| pane.entry(id)).map(|e| dir.join(&e.name)).collect(),
+        Location::Drive { .. } => Vec::new(),
+        Location::Mock(segs) => {
             let dir = s.temp.join(if segs.is_empty() { "Meu Drive".to_string() } else { segs.join("_") });
-            if std::fs::create_dir_all(&dir).is_err() {
+            if materialize && std::fs::create_dir_all(&dir).is_err() {
                 return Vec::new();
             }
-            names
-                .iter()
-                .filter_map(|n| {
-                    let e = pane.entries.iter().find(|e| e.name == *n)?;
-                    let path = dir.join(n);
-                    let ok = if e.is_dir {
+            ids.iter()
+                .filter_map(|id| {
+                    let e = pane.entry(id)?;
+                    let path = dir.join(&e.name);
+                    let ok = if !materialize {
+                        true
+                    } else if e.is_dir {
                         std::fs::create_dir_all(&path).is_ok()
                     } else {
-                        path.exists() || std::fs::write(&path, format!("Arquivo simulado do Google Drive: {}/{n}\n", pane.title())).is_ok()
+                        path.exists() || std::fs::write(&path, format!("Arquivo simulado: {}/{}\n", pane.title(), e.name)).is_ok()
                     };
                     ok.then_some(path)
                 })
@@ -236,6 +431,10 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
     let loc = s.panes[p].loc.clone();
     let (mut done, mut skipped, mut failed) = (0, 0, 0);
     match &loc {
+        Location::Drive { .. } => {
+            s.status = "Enviar arquivos para o Google Drive é o próximo passo; por enquanto o painel só lista.".into();
+            return;
+        }
         Location::Local(dir) => {
             for f in files {
                 let Some(name) = f.file_name() else { continue };
@@ -252,24 +451,26 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
                 }
             }
         }
-        Location::Cloud(segs) => {
+        Location::Mock(segs) => {
             for f in files {
                 let Some(name) = f.file_name() else { continue };
                 let meta = std::fs::metadata(f).ok();
                 let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
+                let name = name.to_string_lossy().into_owned();
                 let entry = Entry {
-                    name: name.to_string_lossy().into_owned(),
+                    id: name.clone(),
+                    name,
                     is_dir,
                     size: if is_dir { None } else { meta.as_ref().map(|m| m.len()) },
                     modified: Some(SystemTime::now()),
                 };
-                if s.drive.add(segs, entry) { done += 1 } else { skipped += 1 }
+                if s.mock.add(segs, entry) { done += 1 } else { skipped += 1 }
             }
         }
     }
     let verb = if matches!(loc, Location::Local(_)) { "Copiados" } else { "Enviados (simulado)" };
     s.status = format!("{verb}: {done} · ignorados (já existem ou pastas): {skipped} · falhas: {failed}");
-    reload(s, p);
+    load(s, p);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -277,7 +478,7 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
 
 fn view(s: &State, cx: &mut Cx<State>) -> El {
     let k = Kit::neutral(cx.system_dark());
-    let status = text(s.status.clone()).font(k.ty.text_small).color(k.c.text_muted).truncate().shrink().min_w(0.0);
+    let status = text(s.status.clone()).font(k.ty.text_small).color(k.c.text_muted).truncate().shrink().min_w(0.0).help_when_truncated(s.status.clone());
     col()
         .w_full()
         .h_full()
@@ -288,7 +489,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(row().key("status").w_full().px(4.0).child(status))
 }
 
-fn button<F: Fn(&mut State) + 'static>(k: &Kit, key: &str, label: &str, f: F) -> El {
+fn button<F: Fn(&mut State, &mut Tx) + 'static>(k: &Kit, key: &str, label: &str, f: F) -> El {
     row()
         .key(key.to_string())
         .role("button")
@@ -301,28 +502,82 @@ fn button<F: Fn(&mut State) + 'static>(k: &Kit, key: &str, label: &str, f: F) ->
         .hover(k.c.hover)
         .press(k.c.pressed)
         .cursor(Cursor::Pointer)
-        .on_press(f)
+        .on_press_tx(f)
         .child(text(label.to_string()).font(k.ty.text_small).color(k.c.text_base))
+}
+
+/// A source the pane can show: Local, the simulated drive or a connected account.
+fn chip<F: Fn(&mut State, &mut Tx) + 'static>(k: &Kit, key: String, label: &str, on: bool, f: F) -> El {
+    let accent = k.c.text_accent;
+    row()
+        .key(key)
+        .role("tab")
+        .label(label.to_string())
+        .checked(on)
+        .h(24.0)
+        .px(10.0)
+        .center_y()
+        .radius(12.0)
+        .fill(if on { k.alpha(accent, 0.16) } else { k.alpha(k.c.text_base, 0.04) })
+        .hover(if on { k.alpha(accent, 0.22) } else { k.c.hover })
+        .cursor(Cursor::Pointer)
+        .on_press_tx(f)
+        .child(text(label.to_string()).font(if on { k.ty.text_small_medium } else { k.ty.text_small }).color(if on { accent } else { k.c.text_muted }))
+}
+
+fn sources(s: &State, k: &Kit, p: usize) -> El {
+    let loc = &s.panes[p].loc;
+    let mut r = row()
+        .key("sources")
+        .w_full()
+        .h(36.0)
+        .px(8.0)
+        .gap(6.0)
+        .center_y()
+        .child(chip(k, "src-local".into(), "Local", matches!(loc, Location::Local(_)), move |s: &mut State, _| {
+            if !matches!(s.panes[p].loc, Location::Local(_)) {
+                switch(s, p, Location::home());
+            }
+        }))
+        .child(chip(k, "src-mock".into(), "Simulado", matches!(loc, Location::Mock(_)), move |s: &mut State, _| {
+            if !matches!(s.panes[p].loc, Location::Mock(_)) {
+                switch(s, p, Location::Mock(Vec::new()));
+            }
+        }));
+    for a in &s.accounts {
+        let on = matches!(loc, Location::Drive { email, .. } if *email == a.email);
+        let email = a.email.clone();
+        r = r.child(
+            chip(k, format!("src-{}", a.email), &a.email, on, move |s: &mut State, _| {
+                let here = matches!(&s.panes[p].loc, Location::Drive { email: e, .. } if *e == email);
+                if !here {
+                    switch(s, p, Location::Drive { email: email.clone(), path: Vec::new() });
+                }
+            })
+            .help(if a.name.is_empty() { a.email.clone() } else { format!("{} · Google Drive", a.name) }),
+        );
+    }
+    let label = if s.login.is_some() { "Conectando… (clique para recomeçar)" } else { "+ Google Drive" };
+    r.child(button(k, "connect", label, move |s: &mut State, tx: &mut Tx| connect(s, p, tx)).help("Conectar uma conta do Google Drive"))
 }
 
 fn pane(s: &State, k: &Kit, p: usize) -> El {
     let pane = &s.panes[p];
     let active = s.active == p;
-    let (badge, badge_color) = match pane.loc {
-        Location::Local(_) => ("Local", k.c.text_accent),
-        Location::Cloud(_) => ("Google Drive (simulado)", k.c.success.icon),
-    };
-    let toolbar = row()
+    let mut nav = row()
         .key("toolbar")
         .w_full()
-        .h(36.0)
+        .h(32.0)
         .px(8.0)
         .gap(8.0)
         .center_y()
-        .child(text(badge).font(k.ty.text_small_medium).color(badge_color))
-        .child(button(k, "up", "↑ Acima", move |s: &mut State| go_up(s, p)))
-        .child(button(k, "reload", "Atualizar", move |s: &mut State| reload(s, p)))
+        .child(button(k, "up", "↑ Acima", move |s: &mut State, _| go_up(s, p)))
+        .child(button(k, "reload", "Atualizar", move |s: &mut State, _| load(s, p)))
         .child(text(pane.title()).font(k.ty.text_small).color(k.c.text_muted).truncate().shrink().min_w(0.0).grow(1.0).help_when_truncated(pane.title()));
+    if let Location::Drive { email, .. } = &pane.loc {
+        let email = email.clone();
+        nav = nav.child(button(k, "disconnect", "Desconectar", move |s: &mut State, _| disconnect(s, &email)));
+    }
 
     let arrow = |c: SortCol| if pane.sort.0 == c { if pane.sort.1 { " ▲" } else { " ▼" } } else { "" };
     let head = |key: &str, label: &str, c: SortCol| {
@@ -340,7 +595,6 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
         .key("header")
         .w_full()
         .h(28.0)
-        .border(0.0, k.c.border_weak)
         .fill(k.alpha(k.c.text_base, 0.03))
         .child(head("h-name", "Nome", SortCol::Name).w(0.0).grow(1.0).min_w(0.0))
         .child(head("h-size", "Tamanho", SortCol::Size).w(100.0).justify_end())
@@ -354,18 +608,14 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
     let build = move |s: &State, i: usize| -> El {
         let pane = &s.panes[p];
         let e = &pane.entries[i];
-        let is_sel = pane.selected.contains(&e.name);
-        let name = e.name.clone();
-        let mut r = row().key(row_key(&e.name)).role("row").label(e.name.clone()).focus_selected(is_sel).w_full().h(ROW_H).center_y();
+        let is_sel = pane.selected.contains(&e.id);
+        let mut r = row().key(row_key(&e.id)).role("row").label(e.name.clone()).focus_selected(is_sel).w_full().h(ROW_H).center_y();
         r = if is_sel { r.fill(selected) } else { r.hover(hover) };
-        if s.active == p && pane.cursor.as_deref() == Some(e.name.as_str()) {
+        if s.active == p && pane.cursor.as_deref() == Some(e.id.as_str()) {
             r = r.outline(1.0, -1.0, ring);
         }
         let icon = el().size(14.0, if e.is_dir { 11.0 } else { 14.0 }).radius(2.0).fill(if e.is_dir { folder_c } else { file_c });
-        let n_press = name.clone();
-        let n_open = name.clone();
-        let n_drag = name.clone();
-        let n_start = name.clone();
+        let (id_press, id_open, id_drag, id_start) = (e.id.clone(), e.id.clone(), e.id.clone(), e.id.clone());
         r.child(
             row().w(0.0).grow(1.0).min_w(0.0).px(8.0).gap(8.0).center_y().child(icon).child(text(e.name.clone()).font(font).color(text_c).truncate().shrink().min_w(0.0)),
         )
@@ -374,22 +624,21 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
         )
         .child(row().w(140.0).px(8.0).child(text(e.modified.map(format_time).unwrap_or_default()).font(font).color(muted_c).truncate()))
         .on_press_tx(move |s: &mut State, tx: &mut Tx| {
-            click(s, p, &n_press, tx.mods());
+            click(s, p, &id_press, tx.mods());
             tx.focus(pane_key(p), false);
         })
-        .on_double_press(move |s: &mut State| open(s, p, &n_open))
-        .drag_out(move |s: &State| drag_item(s, p, &n_drag))
+        .on_double_press(move |s: &mut State| open(s, p, &id_open))
+        .drag_out(move |s: &State| drag_item(s, p, &id_drag))
         .on_drag_start(move |s: &mut State, _| {
             s.active = p;
             let pane = &mut s.panes[p];
-            if !pane.selected.contains(&n_start) {
-                pane.selected = [n_start.clone()].into();
-                pane.anchor = Some(n_start.clone());
-                pane.cursor = Some(n_start.clone());
+            if !pane.selected.contains(&id_start) {
+                pane.selected = [id_start.clone()].into();
+                pane.anchor = Some(id_start.clone());
+                pane.cursor = Some(id_start.clone());
             }
-            let pane = &s.panes[p];
-            let names: Vec<&str> = pane.entries.iter().filter(|e| pane.selected.contains(&e.name)).map(|e| e.name.as_str()).collect();
-            let paths = paths_for(s, p, &names);
+            // `drag_out` already wrote the files; this only names them.
+            let paths = paths_for(s, p, &dragged_ids(&s.panes[p], &id_start), false);
             s.last_drag = Some((p, paths));
         })
         .on_drag_end(move |s: &mut State, outcome: DragOutcome, _| {
@@ -405,16 +654,22 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
         .key("rows")
         .w_full()
         .growth(GrowthSpec::default())
-        .virtual_rows(n, ROW_H, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].name)), build)
+        .virtual_rows(n, ROW_H, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
         .virtual_rows_version(pane.version);
-    let mut body = col().key("viewport").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(rows);
-    if let Some(err) = &pane.error {
-        body = col().key("error").w_full().grow(1.0).padding(16.0).child(text(err.clone()).font(k.ty.text_small).color(k.c.danger.fg));
-    }
+    let notice = |msg: String, color| col().key("notice").w_full().grow(1.0).padding(16.0).child(text(msg).font(k.ty.text_small).color(color));
+    let body = if let Some(err) = &pane.error {
+        notice(err.clone(), k.c.danger.fg)
+    } else if pane.loading && n == 0 {
+        notice("Carregando…".into(), k.c.text_muted)
+    } else {
+        col().key("viewport").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(rows)
+    };
 
-    let footer = text(format!("{} itens · {} selecionados", thousands(n), thousands(pane.selected.len())))
-        .font(k.ty.text_xsmall)
-        .color(k.c.text_faint);
+    let mut count = format!("{} itens · {} selecionados", thousands(n), thousands(pane.selected.len()));
+    if pane.loading {
+        count.push_str(" · carregando…");
+    }
+    let footer = text(count).font(k.ty.text_xsmall).color(k.c.text_faint);
 
     let border = if pane.drop_over {
         k.c.text_accent
@@ -439,7 +694,8 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
         .on_press(move |s: &mut State| s.active = p)
         .on_drop_files(move |s: &mut State, files: &[PathBuf], _| dropped(s, p, files))
         .on_drop_hover(move |s: &mut State, over, _| s.panes[p].drop_over = over)
-        .child(toolbar)
+        .child(sources(s, k, p))
+        .child(nav)
         .child(header)
         .child(body)
         .child(row().key("footer").w_full().h(24.0).px(10.0).center_y().child(footer))
@@ -448,7 +704,7 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
 fn thousands(n: usize) -> String {
     let d = n.to_string();
     d.chars().enumerate().fold(String::new(), |mut out, (i, ch)| {
-        if i > 0 && (d.len() - i) % 3 == 0 {
+        if i > 0 && (d.len() - i).is_multiple_of(3) {
             out.push('.');
         }
         out.push(ch);
@@ -458,12 +714,19 @@ fn thousands(n: usize) -> String {
 
 fn main() {
     rune::run(AppSpec::<State> {
-        min_size: Some((700.0, 400.0)),
-        scenes: &[("stress", |s| {
-            s.panes[1].loc = Location::Cloud(vec!["Teste 50.000 arquivos".into()]);
-            let State { panes, drive, .. } = s;
-            panes[1].load(drive);
-        })],
+        min_size: Some((760.0, 400.0)),
+        setup: Some(setup),
+        poll: Some(poll),
+        scenes: &[
+            ("stress", |s| switch(s, 1, Location::Mock(vec!["Teste 50.000 arquivos".into()]))),
+            // How a connected account looks, without a network: a fake account and a listing.
+            ("account", |s| {
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.panes[1].go(Location::Drive { email: "voce@gmail.com".into(), path: vec![("x".into(), "Projetos".into())] });
+                s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
+                s.status = "Conta conectada: voce@gmail.com".into();
+            }),
+        ],
         ..AppSpec::new("Open Explorer", (1200.0, 720.0), init, view)
     });
 }

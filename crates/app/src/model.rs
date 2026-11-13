@@ -1,5 +1,5 @@
-//! What the panes show: a folder listing, either on the local disk or in a simulated Google
-//! Drive kept in memory, and the selection and sort of each pane.
+//! What the panes show: a folder listing on the local disk, in a simulated drive kept in memory,
+//! or in a connected Google Drive account, and the selection and sort of each pane.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -8,6 +8,9 @@ use std::time::{Duration, SystemTime};
 
 #[derive(Clone, Debug)]
 pub struct Entry {
+    /// Unique in its folder: the name on disk and in the simulated drive, the file id in Google
+    /// Drive (where two files can share a name).
+    pub id: String,
     pub name: String,
     pub is_dir: bool,
     pub size: Option<u64>,
@@ -18,7 +21,15 @@ pub struct Entry {
 pub enum Location {
     Local(PathBuf),
     /// A folder in the simulated drive, as its path segments from the root.
-    Cloud(Vec<String>),
+    Mock(Vec<String>),
+    /// A folder in a connected account, as the (id, name) of each folder from My Drive down.
+    Drive { email: String, path: Vec<(String, String)> },
+}
+
+impl Location {
+    pub fn home() -> Location {
+        Location::Local(std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\")))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +42,7 @@ pub enum SortCol {
 pub struct Pane {
     pub loc: Location,
     pub entries: Vec<Entry>,
+    /// Entry ids.
     pub selected: HashSet<String>,
     pub anchor: Option<String>,
     pub cursor: Option<String>,
@@ -39,30 +51,70 @@ pub struct Pane {
     pub version: u64,
     pub drop_over: bool,
     pub error: Option<String>,
+    /// A listing is on its way from a background thread.
+    pub loading: bool,
+    /// Numbers each listing request, so an answer for a folder already left is dropped.
+    pub request: u64,
 }
 
 impl Pane {
     pub fn new(loc: Location) -> Pane {
-        Pane { loc, entries: Vec::new(), selected: HashSet::new(), anchor: None, cursor: None, sort: (SortCol::Name, true), version: 0, drop_over: false, error: None }
+        Pane {
+            loc,
+            entries: Vec::new(),
+            selected: HashSet::new(),
+            anchor: None,
+            cursor: None,
+            sort: (SortCol::Name, true),
+            version: 0,
+            drop_over: false,
+            error: None,
+            loading: false,
+            request: 0,
+        }
     }
 
-    pub fn index_of(&self, name: &str) -> Option<usize> {
-        self.entries.iter().position(|e| e.name == name)
+    pub fn index_of(&self, id: &str) -> Option<usize> {
+        self.entries.iter().position(|e| e.id == id)
     }
 
-    pub fn load(&mut self, drive: &MockDrive) {
-        self.error = None;
-        self.entries = match &self.loc {
-            Location::Local(dir) => match read_local(dir) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.error = Some(format!("{}: {e}", dir.display()));
-                    Vec::new()
-                }
-            },
-            Location::Cloud(segs) => drive.list(segs),
+    pub fn entry(&self, id: &str) -> Option<&Entry> {
+        self.entries.iter().find(|e| e.id == id)
+    }
+
+    /// Moves to `loc`, forgetting the selection.
+    pub fn go(&mut self, loc: Location) {
+        self.loc = loc;
+        self.selected.clear();
+        self.cursor = None;
+        self.anchor = None;
+        self.entries.clear();
+        self.version += 1;
+    }
+
+    /// Lists a local or simulated folder in place. Drive folders load in the background instead.
+    pub fn load_now(&mut self, mock: &MockDrive) {
+        let entries = match &self.loc {
+            Location::Local(dir) => read_local(dir).map_err(|e| format!("{}: {e}", dir.display())),
+            Location::Mock(segs) => Ok(mock.list(segs)),
+            Location::Drive { .. } => return,
         };
-        self.selected.retain(|n| self.entries.iter().any(|e| &e.name == n));
+        self.set_entries(entries);
+    }
+
+    pub fn set_entries(&mut self, entries: Result<Vec<Entry>, String>) {
+        self.loading = false;
+        match entries {
+            Ok(v) => {
+                self.error = None;
+                self.entries = v;
+            }
+            Err(e) => {
+                self.error = Some(e);
+                self.entries.clear();
+            }
+        }
+        self.selected.retain(|id| self.entries.iter().any(|e| &e.id == id));
         self.sort_entries();
     }
 
@@ -86,7 +138,11 @@ impl Pane {
     pub fn title(&self) -> String {
         match &self.loc {
             Location::Local(p) => p.display().to_string(),
-            Location::Cloud(segs) => format!("Meu Drive/{}", segs.join("/")),
+            Location::Mock(segs) => format!("Meu Drive/{}", segs.join("/")),
+            Location::Drive { path, .. } => {
+                let names: Vec<&str> = path.iter().map(|(_, n)| n.as_str()).collect();
+                format!("Meu Drive/{}", names.join("/"))
+            }
         }
     }
 }
@@ -97,8 +153,10 @@ fn read_local(dir: &Path) -> std::io::Result<Vec<Entry>> {
         let Ok(item) = item else { continue };
         let meta = item.metadata().ok();
         let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
+        let name = item.file_name().to_string_lossy().into_owned();
         out.push(Entry {
-            name: item.file_name().to_string_lossy().into_owned(),
+            id: name.clone(),
+            name,
             is_dir,
             size: if is_dir { None } else { meta.as_ref().map(|m| m.len()) },
             modified: meta.and_then(|m| m.modified().ok()),
@@ -107,7 +165,7 @@ fn read_local(dir: &Path) -> std::io::Result<Vec<Entry>> {
     Ok(out)
 }
 
-/// A Google Drive stand-in held in memory, so the prototype runs without OAuth.
+/// A Google Drive stand-in held in memory, to try the panes without an account.
 pub struct MockDrive {
     folders: HashMap<String, Vec<Entry>>,
 }
@@ -116,8 +174,8 @@ impl MockDrive {
     pub fn new() -> MockDrive {
         let now = SystemTime::now();
         let ago = |days: u64| now - Duration::from_secs(days * 86_400);
-        let dir = |name: &str, days| Entry { name: name.into(), is_dir: true, size: None, modified: Some(ago(days)) };
-        let file = |name: String, size: u64, days| Entry { name, is_dir: false, size: Some(size), modified: Some(ago(days)) };
+        let dir = |name: &str, days| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: Some(ago(days)) };
+        let file = |name: String, size: u64, days| Entry { id: name.clone(), name, is_dir: false, size: Some(size), modified: Some(ago(days)) };
 
         let mut folders = HashMap::new();
         folders.insert(

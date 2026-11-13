@@ -7,3 +7,4 @@ edition.workspace = true
 rune = { workspace = true }
 rune-kit = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+openexplorer-gdrive = { path = "../gdrive" }
