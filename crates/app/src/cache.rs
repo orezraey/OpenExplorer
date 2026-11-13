@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::model::{Entry, Location, Space};
 
 /// Bumped when [`Entry`]'s shape changes, so old files are ignored instead of misread.
-const FORMAT: u32 = 1;
+/// 2: modified times as signed milliseconds.
+const FORMAT: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Key {
@@ -45,6 +46,9 @@ enum Job {
 pub struct Cache {
     mem: HashMap<Key, Arc<Vec<Entry>>>,
     disk: Option<Sender<Job>>,
+    /// Tests keep the cache in memory, away from the real cache folder.
+    #[cfg(test)]
+    memory_only: bool,
 }
 
 #[derive(Serialize)]
@@ -97,7 +101,16 @@ impl Cache {
         self.mem.get(k)
     }
 
+    #[cfg(test)]
+    pub fn memory_only() -> Cache {
+        Cache { memory_only: true, ..Cache::default() }
+    }
+
     fn disk(&mut self, job: Job) {
+        #[cfg(test)]
+        if self.memory_only {
+            return;
+        }
         let tx = self.disk.get_or_insert_with(|| {
             let (tx, rx) = channel();
             std::thread::spawn(move || rx.into_iter().for_each(run));
@@ -133,6 +146,20 @@ pub fn load_disk(k: &Key) -> Option<Vec<Entry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listings_with_times_before_1970_round_trip_through_the_disk_format() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let at = |ms: i64| if ms >= 0 { UNIX_EPOCH + Duration::from_millis(ms as u64) } else { UNIX_EPOCH - Duration::from_millis(ms.unsigned_abs()) };
+        let entries: Vec<Entry> = [Some(at(1_709_294_400_250)), Some(at(-86_400_000)), None]
+            .into_iter()
+            .enumerate()
+            .map(|(i, modified)| Entry { id: format!("{i}"), name: format!("f{i}"), is_dir: false, size: None, modified, target: None })
+            .collect();
+        let text = serde_json::to_vec(&FileOut { format: FORMAT, entries: &entries }).unwrap();
+        let back: FileIn = serde_json::from_slice(&text).unwrap();
+        assert_eq!(back.entries, entries);
+    }
 
     #[test]
     fn each_drive_folder_has_its_own_key_and_local_folders_none() {

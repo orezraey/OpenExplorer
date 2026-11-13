@@ -100,6 +100,17 @@ fn setup(s: &mut State, waker: Waker) {
     s.waker = Some(waker);
 }
 
+/// Runs `f`, turning a panic into an error that names it (and logging it), so background work
+/// that hits a bug still ends with a message instead of never answering. `doing` says what it
+/// was ("listar", "conectar").
+fn catch_panic<T>(doing: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|p| {
+        let what = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
+        openexplorer_gdrive::log(&format!("pânico ao {doing}: {what}"));
+        Err(format!("Erro interno ao {doing} ({what}). Detalhes no log."))
+    })
+}
+
 /// Runs `work` on a new thread. Each message it emits reaches `poll` at once.
 fn background(s: &State, work: impl FnOnce(&dyn Fn(Msg)) + Send + 'static) {
     let (out, wake) = (s.outbox.clone(), s.waker.clone());
@@ -232,14 +243,14 @@ fn connect(s: &mut State, p: usize, tx: &mut Tx) {
     s.login = Some(attempt);
     s.status = "Faça o login no navegador que abriu. Esperando o Google…".into();
     background(s, move |emit| {
-        let result = (|| {
+        let result = catch_panic("conectar", || {
             let tokens = pending.finish(&cfg)?;
             let drive = Drive::from_login(cfg, &tokens)?;
             let who = drive.about()?;
             let account = StoredAccount { email: who.email, name: who.name };
             store::save(account.clone(), drive.refresh_token())?;
             Ok((account, Arc::new(drive)))
-        })();
+        });
         emit(Msg::LoggedIn { pane: p, attempt, result });
     });
 }
@@ -294,13 +305,15 @@ fn load(s: &mut State, p: usize) {
             emit(listed(None, Part::Cached, Ok(entries)));
             quiet = true;
         }
-        let (drive, mut made) = match opened {
+        let (drive, made) = match opened {
             Some(d) => (d, None),
             None => match open_drive(&email) {
                 Ok(d) => (d.clone(), Some((email, d))),
                 Err(e) => return emit(listed(None, Part::Page { first: !quiet, more: false }, Err(e))),
             },
         };
+        // Handed over with the first message, from whichever path sends it.
+        let made = std::cell::Cell::new(made);
         // Without a cached listing each page shows as soon as it lands, so a big folder fills
         // in instead of staying blank. With one, pages are gathered and replace it in one go,
         // so the list doesn't shrink to the first page and grow back.
@@ -319,7 +332,8 @@ fn load(s: &mut State, p: usize) {
             }
             live.load(Ordering::Relaxed) == request
         };
-        let result = match &space {
+        // A panic here (a bad value from Drive, say) must not leave the pane loading forever.
+        let result = catch_panic("listar", || match &space {
             Space::MyDrive => drive.list(folder.as_deref().unwrap_or("root"), None, &mut page),
             Space::Shared { id, .. } => drive.list(folder.as_deref().unwrap_or(id), Some(id), &mut page),
             // The shared drives show as folders.
@@ -335,7 +349,7 @@ fn load(s: &mut State, p: usize) {
                     })
                     .collect::<Vec<_>>()
             }).map(|entries| emit(listed(made.take(), Part::WHOLE, Ok(entries)))),
-        };
+        });
         if let Err(e) = result {
             // Over a cached or partly shown listing, keep it and only report the error.
             emit(listed(made.take(), Part::Page { first: first && !quiet, more: false }, Err(e)));
@@ -884,4 +898,31 @@ fn main() {
         ],
         ..AppSpec::new("Open Explorer", (1200.0, 720.0), init, view)
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entries(from: usize, n: usize) -> Vec<Entry> {
+        (from..from + n).map(|i| Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None }).collect()
+    }
+
+    #[test]
+    fn a_streamed_listing_keeps_every_page() {
+        let mut s = init();
+        s.cache = cache::Cache::memory_only();
+        s.panes[1].go(Location::Drive { email: "t@t".into(), space: Space::Shared { id: "0AAx".into(), name: "x".into() }, path: vec![("big".into(), "Grande".into())] });
+        s.live[1].store(7, Ordering::Relaxed);
+        let pages = [1000, 1000, 1000, 1000, 1000, 720];
+        let mut from = 0;
+        for (i, n) in pages.iter().enumerate() {
+            let part = Part::Page { first: i == 0, more: i + 1 < pages.len() };
+            s.outbox.send(Msg::Listed { pane: 1, request: 7, made: None, part, result: Ok(entries(from, *n)) }).unwrap();
+            from += n;
+        }
+        poll(&mut s, 0.0, &mut Tx::default());
+        assert_eq!(s.panes[1].entries.len(), 5720);
+        assert!(!s.panes[1].loading);
+    }
 }

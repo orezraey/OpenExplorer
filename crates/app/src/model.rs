@@ -14,6 +14,7 @@ pub struct Entry {
     pub name: String,
     pub is_dir: bool,
     pub size: Option<u64>,
+    #[serde(with = "unix_ms")]
     pub modified: Option<SystemTime>,
     /// For a Drive shortcut to a folder: the folder it opens, instead of `id`.
     pub target: Option<String>,
@@ -277,4 +278,30 @@ pub fn format_size(b: u64) -> String {
 
 pub fn format_time(t: SystemTime) -> String {
     chrono::DateTime::<chrono::Local>::from(t).format("%d/%m/%Y %H:%M").to_string()
+}
+
+/// `Option<SystemTime>` as signed milliseconds since 1970 for the disk cache: serde's own
+/// `SystemTime` format can't hold a time before 1970, and Drive has files dated far earlier.
+mod unix_ms {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(t: &Option<SystemTime>, s: S) -> Result<S::Ok, S::Error> {
+        let ms = t.map(|t| match t.duration_since(UNIX_EPOCH) {
+            Ok(d) => d.as_millis() as i64,
+            Err(e) => -(e.duration().as_millis() as i64),
+        });
+        match ms {
+            Some(ms) => s.serialize_some(&ms),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<SystemTime>, D::Error> {
+        Ok(Option::<i64>::deserialize(d)?.and_then(|ms| {
+            let span = Duration::from_millis(ms.unsigned_abs());
+            if ms >= 0 { UNIX_EPOCH.checked_add(span) } else { UNIX_EPOCH.checked_sub(span) }
+        }))
+    }
 }

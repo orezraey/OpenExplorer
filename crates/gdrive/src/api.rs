@@ -164,22 +164,6 @@ impl Drive {
     /// covers every drive the account reaches (`corpora=allDrives`); the parent filter keeps
     /// it as cheap as a My Drive listing.
     pub fn list(&self, folder_id: &str, shared_drive: Option<&str>, mut each: impl FnMut(Vec<DriveFile>, bool) -> bool) -> Result<()> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Shortcut {
-            target_id: String,
-            target_mime_type: Option<String>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Raw {
-            id: String,
-            name: String,
-            mime_type: String,
-            size: Option<String>,
-            modified_time: Option<String>,
-            shortcut_details: Option<Shortcut>,
-        }
         // Drive ids are [A-Za-z0-9_-]; anything else would break out of the query string.
         let valid = |id: &str| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
         if !valid(folder_id) {
@@ -203,18 +187,88 @@ impl Drive {
             Some(d) => query.extend([("corpora", "drive"), ("driveId", d)]),
             None => query.push(("corpora", "allDrives")),
         }
-        let file = |r: Raw| {
-            let target = r.shortcut_details.filter(|s| s.target_mime_type.as_deref() == Some(FOLDER_MIME)).map(|s| s.target_id);
-            DriveFile {
-                is_dir: r.mime_type == FOLDER_MIME || target.is_some(),
-                target,
-                size: r.size.and_then(|s| s.parse().ok()),
-                modified: r.modified_time.and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok()).map(SystemTime::from),
-                id: r.id,
-                name: r.name,
-                mime: r.mime_type,
-            }
-        };
-        self.pages("/files", &query, "files", "Listagem da pasta", |raw: Vec<Raw>, more| each(raw.into_iter().map(file).collect(), more))
+        self.pages("/files", &query, "files", "Listagem da pasta", |raw: Vec<RawFile>, more| each(raw.into_iter().map(DriveFile::from).collect(), more))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Shortcut {
+    target_id: String,
+    target_mime_type: Option<String>,
+}
+
+/// A file as Drive's `files.list` sends it, with the fields [`Drive::list`] asks for.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawFile {
+    id: String,
+    name: String,
+    mime_type: String,
+    size: Option<String>,
+    modified_time: Option<String>,
+    shortcut_details: Option<Shortcut>,
+}
+
+impl From<RawFile> for DriveFile {
+    fn from(r: RawFile) -> DriveFile {
+        let target = r.shortcut_details.filter(|s| s.target_mime_type.as_deref() == Some(FOLDER_MIME)).map(|s| s.target_id);
+        DriveFile {
+            is_dir: r.mime_type == FOLDER_MIME || target.is_some(),
+            target,
+            size: r.size.and_then(|s| s.parse().ok()),
+            modified: r.modified_time.as_deref().and_then(parse_time),
+            id: r.id,
+            name: r.name,
+            mime: r.mime_type,
+        }
+    }
+}
+
+/// An RFC 3339 time from Drive, or `None` when it's malformed or out of the platform's range.
+/// Drive keeps whatever a client sent, years 0001 and 9999 included, and Windows can't hold a
+/// time before 1601: chrono's `SystemTime::from` panics there, which took down listings.
+fn parse_time(t: &str) -> Option<SystemTime> {
+    let dt = chrono::DateTime::parse_from_rfc3339(t).ok()?;
+    let (secs, nanos) = (dt.timestamp(), dt.timestamp_subsec_nanos());
+    if secs >= 0 {
+        SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs.unsigned_abs(), nanos))
+    } else {
+        SystemTime::UNIX_EPOCH.checked_sub(Duration::new(secs.unsigned_abs(), 0))?.checked_add(Duration::new(0, nanos))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drive_times_out_of_range_are_dropped_instead_of_panicking() {
+        let t = parse_time("2024-03-01T12:00:00.250Z").unwrap();
+        assert_eq!(t.duration_since(SystemTime::UNIX_EPOCH).unwrap(), Duration::new(1_709_294_400, 250_000_000));
+        assert!(parse_time("1969-12-31T23:59:59Z").is_some());
+        // Before 1601 Windows has no SystemTime; elsewhere it may, so only "no panic" is asserted.
+        let _ = parse_time("0001-01-01T00:00:00Z");
+        let _ = parse_time("1600-12-31T23:59:59Z");
+        assert!(parse_time("not a date").is_none());
+        #[cfg(windows)]
+        assert!(parse_time("1600-12-31T23:59:59Z").is_none());
+    }
+
+    #[test]
+    fn a_listed_file_from_year_one_maps_without_panicking() {
+        let raw: RawFile = serde_json::from_str(
+            r#"{"id":"a","name":"velho.txt","mimeType":"text/plain","size":"12","modifiedTime":"0001-01-01T00:00:00.000Z"}"#,
+        )
+        .unwrap();
+        let f = DriveFile::from(raw);
+        assert_eq!((f.name.as_str(), f.size, f.is_dir), ("velho.txt", Some(12), false));
+        let shortcut: RawFile = serde_json::from_str(
+            r#"{"id":"s","name":"Atalho","mimeType":"application/vnd.google-apps.shortcut","shortcutDetails":{"targetId":"t","targetMimeType":"application/vnd.google-apps.folder"}}"#,
+        )
+        .unwrap();
+        let s = DriveFile::from(shortcut);
+        assert!(s.is_dir);
+        assert_eq!(s.target.as_deref(), Some("t"));
     }
 }
