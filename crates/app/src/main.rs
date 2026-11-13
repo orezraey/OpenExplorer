@@ -18,13 +18,13 @@ use openexplorer_gdrive::{ClientConfig, Drive, DriveFile, oauth};
 use rune::{Align, AppSpec, Cursor, Cx, DragItem, DragOutcome, El, GrowthSpec, Key, KeyEvent, Mods, ScrollSpec, Tx, Waker, col, el, row, text};
 use rune_kit::Kit;
 
-use model::{Entry, Location, MockDrive, Pane, SortCol, format_size, format_time};
+use model::{Entry, Location, MockDrive, Pane, SortCol, Space, format_size, format_time};
 
 const ROW_H: f32 = 26.0;
 
 enum Msg {
     /// `made` carries an account opened on the background thread, for `poll` to keep.
-    Listed { pane: usize, request: u64, made: Option<(String, Arc<Drive>)>, result: Result<Vec<DriveFile>, String> },
+    Listed { pane: usize, request: u64, made: Option<(String, Arc<Drive>)>, result: Result<Vec<Entry>, String> },
     LoggedIn { pane: usize, attempt: u64, result: Result<(StoredAccount, Arc<Drive>), String> },
 }
 
@@ -100,7 +100,7 @@ fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
                     s.drives.entry(email).or_insert(drive);
                 }
                 if s.panes[pane].request == request {
-                    s.panes[pane].set_entries(result.map(|files| files.into_iter().map(entry_of).collect()));
+                    s.panes[pane].set_entries(result);
                 }
             }
             Msg::LoggedIn { pane, attempt, result } => {
@@ -119,7 +119,7 @@ fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
                             Some(a) => *a = account,
                             None => s.accounts.push(account),
                         }
-                        switch(s, pane, Location::Drive { email, path: Vec::new() });
+                        switch(s, pane, Location::drive(email, Space::MyDrive));
                     }
                     Err(e) => s.status = e,
                 }
@@ -130,7 +130,7 @@ fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
 }
 
 fn entry_of(f: DriveFile) -> Entry {
-    Entry { id: f.id, name: f.name, is_dir: f.is_dir, size: f.size, modified: f.modified }
+    Entry { id: f.id, name: f.name, is_dir: f.is_dir, size: f.size, modified: f.modified, target: f.target }
 }
 
 fn pane_key(p: usize) -> String {
@@ -212,7 +212,7 @@ fn load(s: &mut State, p: usize) {
     // Every load gets a new number, so a Drive answer for a folder left since is dropped,
     // whatever the pane shows now.
     s.panes[p].request += 1;
-    let Location::Drive { email, path } = s.panes[p].loc.clone() else {
+    let Location::Drive { email, space, path } = s.panes[p].loc.clone() else {
         let State { panes, mock, .. } = s;
         panes[p].load_now(mock);
         return;
@@ -222,7 +222,7 @@ fn load(s: &mut State, p: usize) {
     pane.loading = true;
     pane.error = None;
     let request = pane.request;
-    let folder = path.last().map_or_else(|| "root".to_string(), |(id, _)| id.clone());
+    let folder = path.last().map(|(id, _)| id.clone());
     background(s, move || {
         let (drive, made) = match cached {
             Some(d) => (d, None),
@@ -231,7 +231,25 @@ fn load(s: &mut State, p: usize) {
                 Err(e) => return Msg::Listed { pane: p, request, made: None, result: Err(e) },
             },
         };
-        Msg::Listed { pane: p, request, made, result: drive.list(&folder) }
+        let files = |r: Result<Vec<DriveFile>, String>| r.map(|v| v.into_iter().map(entry_of).collect());
+        let result = match &space {
+            Space::MyDrive => files(drive.list(folder.as_deref().unwrap_or("root"), None)),
+            Space::Shared { id, .. } => files(drive.list(folder.as_deref().unwrap_or(id), Some(id))),
+            // The shared drives show as folders.
+            Space::SharedDrives => drive.shared_drives().map(|list| {
+                list.into_iter()
+                    .map(|d| Entry {
+                        name: if d.hidden { format!("{} (oculto)", d.name) } else { d.name },
+                        id: d.id,
+                        is_dir: true,
+                        size: None,
+                        modified: None,
+                        target: None,
+                    })
+                    .collect()
+            }),
+        };
+        Msg::Listed { pane: p, request, made, result }
     });
 }
 
@@ -252,7 +270,8 @@ fn open(s: &mut State, p: usize, id: &str) {
     match &mut loc {
         Location::Local(dir) => dir.push(&e.name),
         Location::Mock(segs) => segs.push(e.name.clone()),
-        Location::Drive { path, .. } => path.push((e.id.clone(), e.name.clone())),
+        Location::Drive { space: space @ Space::SharedDrives, .. } => *space = Space::Shared { id: e.id.clone(), name: e.name.clone() },
+        Location::Drive { path, .. } => path.push((e.target.clone().unwrap_or_else(|| e.id.clone()), e.name.clone())),
     }
     switch(s, p, loc);
 }
@@ -269,7 +288,16 @@ fn go_up(s: &mut State, p: usize) {
             name
         }
         Location::Mock(segs) => segs.pop(),
-        Location::Drive { path, .. } => path.pop().map(|(id, _)| id),
+        Location::Drive { space, path, .. } => match (path.pop(), &*space) {
+            (Some((id, _)), _) => Some(id),
+            // From the top of a shared drive up to the list of shared drives.
+            (None, Space::Shared { id, .. }) => {
+                let id = id.clone();
+                *space = Space::SharedDrives;
+                Some(id)
+            }
+            (None, _) => None,
+        },
     };
     if from.is_none() {
         return;
@@ -463,6 +491,7 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
                     is_dir,
                     size: if is_dir { None } else { meta.as_ref().map(|m| m.len()) },
                     modified: Some(SystemTime::now()),
+                    target: None,
                 };
                 if s.mock.add(segs, entry) { done += 1 } else { skipped += 1 }
             }
@@ -551,7 +580,7 @@ fn sources(s: &State, k: &Kit, p: usize) -> El {
             chip(k, format!("src-{}", a.email), &a.email, on, move |s: &mut State, _| {
                 let here = matches!(&s.panes[p].loc, Location::Drive { email: e, .. } if *e == email);
                 if !here {
-                    switch(s, p, Location::Drive { email: email.clone(), path: Vec::new() });
+                    switch(s, p, Location::drive(email.clone(), Space::MyDrive));
                 }
             })
             .help(if a.name.is_empty() { a.email.clone() } else { format!("{} · Google Drive", a.name) }),
@@ -564,7 +593,37 @@ fn sources(s: &State, k: &Kit, p: usize) -> El {
 fn pane(s: &State, k: &Kit, p: usize) -> El {
     let pane = &s.panes[p];
     let active = s.active == p;
-    let mut nav = row()
+    // A Drive account's own row: which space it shows, and the way out.
+    let spaces = if let Location::Drive { email, space, path } = &pane.loc {
+        let mine = *space == Space::MyDrive;
+        let at_top = mine && path.is_empty();
+        let (e1, e2, e3) = (email.clone(), email.clone(), email.clone());
+        Some(
+            row()
+                .key("spaces")
+                .w_full()
+                .h(32.0)
+                .px(8.0)
+                .gap(6.0)
+                .center_y()
+                .child(chip(k, "space-my".into(), "Meu Drive", mine, move |s: &mut State, _| {
+                    if !at_top {
+                        switch(s, p, Location::drive(e1.clone(), Space::MyDrive));
+                    }
+                }))
+                .child(chip(k, "space-shared".into(), "Drives compartilhados", !mine, move |s: &mut State, _| {
+                    let here = matches!(&s.panes[p].loc, Location::Drive { space: Space::SharedDrives, .. });
+                    if !here {
+                        switch(s, p, Location::drive(e2.clone(), Space::SharedDrives));
+                    }
+                }))
+                .child(el().grow(1.0))
+                .child(button(k, "disconnect", "Desconectar", move |s: &mut State, _| disconnect(s, &e3))),
+        )
+    } else {
+        None
+    };
+    let nav = row()
         .key("toolbar")
         .w_full()
         .h(32.0)
@@ -574,10 +633,6 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
         .child(button(k, "up", "↑ Acima", move |s: &mut State, _| go_up(s, p)))
         .child(button(k, "reload", "Atualizar", move |s: &mut State, _| load(s, p)))
         .child(text(pane.title()).font(k.ty.text_small).color(k.c.text_muted).truncate().shrink().min_w(0.0).grow(1.0).help_when_truncated(pane.title()));
-    if let Location::Drive { email, .. } = &pane.loc {
-        let email = email.clone();
-        nav = nav.child(button(k, "disconnect", "Desconectar", move |s: &mut State, _| disconnect(s, &email)));
-    }
 
     let arrow = |c: SortCol| if pane.sort.0 == c { if pane.sort.1 { " ▲" } else { " ▼" } } else { "" };
     let head = |key: &str, label: &str, c: SortCol| {
@@ -661,6 +716,8 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
         notice(err.clone(), k.c.danger.fg)
     } else if pane.loading && n == 0 {
         notice("Carregando…".into(), k.c.text_muted)
+    } else if n == 0 && matches!(pane.loc, Location::Drive { space: Space::SharedDrives, .. }) {
+        notice("Esta conta não participa de nenhum drive compartilhado.".into(), k.c.text_muted)
     } else {
         col().key("viewport").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(rows)
     };
@@ -695,6 +752,7 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
         .on_drop_files(move |s: &mut State, files: &[PathBuf], _| dropped(s, p, files))
         .on_drop_hover(move |s: &mut State, over, _| s.panes[p].drop_over = over)
         .child(sources(s, k, p))
+        .children(spaces)
         .child(nav)
         .child(header)
         .child(body)
@@ -722,9 +780,16 @@ fn main() {
             // How a connected account looks, without a network: a fake account and a listing.
             ("account", |s| {
                 s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
-                s.panes[1].go(Location::Drive { email: "voce@gmail.com".into(), path: vec![("x".into(), "Projetos".into())] });
+                s.panes[1].go(Location::Drive { email: "voce@gmail.com".into(), space: Space::MyDrive, path: vec![("x".into(), "Projetos".into())] });
                 s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
                 s.status = "Conta conectada: voce@gmail.com".into();
+            }),
+            // The shared drives list of an account, without a network.
+            ("shared", |s| {
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.panes[1].go(Location::drive("voce@gmail.com", Space::SharedDrives));
+                let d = |id: &str, name: &str| Entry { id: id.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None };
+                s.panes[1].set_entries(Ok(vec![d("0AAa", "Equipe de design"), d("0AAb", "Financeiro"), d("0AAc", "Projetos 2026")]));
             }),
         ],
         ..AppSpec::new("Open Explorer", (1200.0, 720.0), init, view)

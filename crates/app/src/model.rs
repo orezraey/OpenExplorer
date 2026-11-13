@@ -15,6 +15,8 @@ pub struct Entry {
     pub is_dir: bool,
     pub size: Option<u64>,
     pub modified: Option<SystemTime>,
+    /// For a Drive shortcut to a folder: the folder it opens, instead of `id`.
+    pub target: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -22,11 +24,26 @@ pub enum Location {
     Local(PathBuf),
     /// A folder in the simulated drive, as its path segments from the root.
     Mock(Vec<String>),
-    /// A folder in a connected account, as the (id, name) of each folder from My Drive down.
-    Drive { email: String, path: Vec<(String, String)> },
+    /// A folder in a connected account: the (id, name) of each folder from the top of `space`
+    /// down.
+    Drive { email: String, space: Space, path: Vec<(String, String)> },
+}
+
+/// Where a Drive location's folders hang from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Space {
+    MyDrive,
+    /// The list of the account's shared drives; its "folders" are the drives. `path` is empty.
+    SharedDrives,
+    /// Inside one shared drive.
+    Shared { id: String, name: String },
 }
 
 impl Location {
+    pub fn drive(email: impl Into<String>, space: Space) -> Location {
+        Location::Drive { email: email.into(), space, path: Vec::new() }
+    }
+
     pub fn home() -> Location {
         Location::Local(std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\")))
     }
@@ -139,9 +156,14 @@ impl Pane {
         match &self.loc {
             Location::Local(p) => p.display().to_string(),
             Location::Mock(segs) => format!("Meu Drive/{}", segs.join("/")),
-            Location::Drive { path, .. } => {
-                let names: Vec<&str> = path.iter().map(|(_, n)| n.as_str()).collect();
-                format!("Meu Drive/{}", names.join("/"))
+            Location::Drive { space, path, .. } => {
+                let mut parts: Vec<&str> = match space {
+                    Space::MyDrive => vec!["Meu Drive"],
+                    Space::SharedDrives => vec!["Drives compartilhados"],
+                    Space::Shared { name, .. } => vec!["Drives compartilhados", name],
+                };
+                parts.extend(path.iter().map(|(_, n)| n.as_str()));
+                parts.join("/")
             }
         }
     }
@@ -160,6 +182,7 @@ fn read_local(dir: &Path) -> std::io::Result<Vec<Entry>> {
             is_dir,
             size: if is_dir { None } else { meta.as_ref().map(|m| m.len()) },
             modified: meta.and_then(|m| m.modified().ok()),
+            target: None,
         });
     }
     Ok(out)
@@ -174,8 +197,8 @@ impl MockDrive {
     pub fn new() -> MockDrive {
         let now = SystemTime::now();
         let ago = |days: u64| now - Duration::from_secs(days * 86_400);
-        let dir = |name: &str, days| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: Some(ago(days)) };
-        let file = |name: String, size: u64, days| Entry { id: name.clone(), name, is_dir: false, size: Some(size), modified: Some(ago(days)) };
+        let dir = |name: &str, days| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: Some(ago(days)), target: None };
+        let file = |name: String, size: u64, days| Entry { id: name.clone(), name, is_dir: false, size: Some(size), modified: Some(ago(days)), target: None };
 
         let mut folders = HashMap::new();
         folders.insert(

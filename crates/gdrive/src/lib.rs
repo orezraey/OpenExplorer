@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-pub use api::{Account, Drive, DriveFile};
+pub use api::{Account, Drive, DriveFile, SharedDrive};
 
 /// Errors are shown to the user as they are, so they're plain Portuguese sentences.
 pub type Result<T> = std::result::Result<T, String>;

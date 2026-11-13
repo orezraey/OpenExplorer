@@ -27,6 +27,18 @@ pub struct DriveFile {
     pub size: Option<u64>,
     pub modified: Option<SystemTime>,
     pub mime: String,
+    /// For a shortcut to a folder: the folder it opens.
+    pub target: Option<String>,
+}
+
+/// A shared drive (formerly Team Drive): files owned by a group rather than by a person.
+#[derive(Clone, Debug, Deserialize)]
+pub struct SharedDrive {
+    pub id: String,
+    pub name: String,
+    /// Hidden by the user on the Drive website.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 /// One connected account. Cheap to share across threads; it renews its access token as needed.
@@ -95,8 +107,47 @@ impl Drive {
         Ok(Account { name: s("/user/displayName"), email })
     }
 
-    /// Every file and folder directly in `folder_id` (`"root"` is My Drive), trash excluded.
-    pub fn list(&self, folder_id: &str) -> Result<Vec<DriveFile>> {
+    /// Every item of a paged Drive listing (`files`, `drives`, ...): follows `nextPageToken`
+    /// until the last page.
+    fn pages<T: serde::de::DeserializeOwned>(&self, path: &str, query: &[(&str, &str)], items: &str, what: &str) -> Result<Vec<T>> {
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut q = query.to_vec();
+            if let Some(t) = &token {
+                q.push(("pageToken", t.as_str()));
+            }
+            let mut v = self.get(path, &q, what)?;
+            let page: Vec<T> = serde_json::from_value(v.get_mut(items).map(serde_json::Value::take).unwrap_or_default())
+                .map_err(|e| format!("{what}: resposta inesperada: {e}"))?;
+            out.extend(page);
+            match v.get("nextPageToken").and_then(|t| t.as_str()) {
+                Some(t) => token = Some(t.to_string()),
+                None => return Ok(out),
+            }
+        }
+    }
+
+    /// The shared drives the account is a member of, including the ones hidden on the Drive
+    /// website (marked in `hidden`), which would otherwise be out of reach here.
+    pub fn shared_drives(&self) -> Result<Vec<SharedDrive>> {
+        self.pages("/drives", &[("pageSize", "100"), ("fields", "nextPageToken,drives(id,name,hidden)")], "drives", "Lista de drives compartilhados")
+    }
+
+    /// Every file and folder directly in `folder_id`, trash excluded. `"root"` is My Drive; in a
+    /// shared drive pass its id as `shared_drive` (its own id is also its top folder's).
+    ///
+    /// A shortcut to a folder lists as a folder whose [`DriveFile::target`] is the folder to
+    /// open. That folder can sit in a shared drive, so without `shared_drive` the listing
+    /// covers every drive the account reaches (`corpora=allDrives`); the parent filter keeps
+    /// it as cheap as a My Drive listing.
+    pub fn list(&self, folder_id: &str, shared_drive: Option<&str>) -> Result<Vec<DriveFile>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Shortcut {
+            target_id: String,
+            target_mime_type: Option<String>,
+        }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Raw {
@@ -105,45 +156,45 @@ impl Drive {
             mime_type: String,
             size: Option<String>,
             modified_time: Option<String>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Page {
-            #[serde(default)]
-            files: Vec<Raw>,
-            next_page_token: Option<String>,
+            shortcut_details: Option<Shortcut>,
         }
         // Drive ids are [A-Za-z0-9_-]; anything else would break out of the query string.
-        if !folder_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        let valid = |id: &str| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !valid(folder_id) {
             return Err(format!("Id de pasta inválido: {folder_id}"));
         }
-        let q = format!("'{folder_id}' in parents and trashed = false");
-        let mut out = Vec::new();
-        let mut token: Option<String> = None;
-        loop {
-            let mut query = vec![
-                ("q", q.as_str()),
-                ("fields", "nextPageToken,files(id,name,mimeType,size,modifiedTime)"),
-                ("pageSize", "1000"),
-                ("orderBy", "folder,name_natural"),
-            ];
-            if let Some(t) = &token {
-                query.push(("pageToken", t.as_str()));
-            }
-            let v = self.get("/files", &query, "Listagem da pasta")?;
-            let page: Page = serde_json::from_value(v).map_err(|e| format!("Listagem da pasta: resposta inesperada: {e}"))?;
-            out.extend(page.files.into_iter().map(|r| DriveFile {
-                is_dir: r.mime_type == FOLDER_MIME,
-                size: r.size.and_then(|s| s.parse().ok()),
-                modified: r.modified_time.and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok()).map(SystemTime::from),
-                id: r.id,
-                name: r.name,
-                mime: r.mime_type,
-            }));
-            match page.next_page_token {
-                Some(t) => token = Some(t),
-                None => return Ok(out),
-            }
+        if let Some(d) = shared_drive.filter(|d| !valid(d)) {
+            return Err(format!("Id de drive compartilhado inválido: {d}"));
         }
+        let q = format!("'{folder_id}' in parents and trashed = false");
+        let mut query = vec![
+            ("q", q.as_str()),
+            ("fields", "nextPageToken,files(id,name,mimeType,size,modifiedTime,shortcutDetails(targetId,targetMimeType))"),
+            ("pageSize", "1000"),
+            ("orderBy", "folder,name_natural"),
+            // Without these two, Drive answers nothing for a folder in a shared drive.
+            ("supportsAllDrives", "true"),
+            ("includeItemsFromAllDrives", "true"),
+        ];
+        match shared_drive {
+            Some(d) => query.extend([("corpora", "drive"), ("driveId", d)]),
+            None => query.push(("corpora", "allDrives")),
+        }
+        let raw: Vec<Raw> = self.pages("/files", &query, "files", "Listagem da pasta")?;
+        Ok(raw
+            .into_iter()
+            .map(|r| {
+                let target = r.shortcut_details.filter(|s| s.target_mime_type.as_deref() == Some(FOLDER_MIME)).map(|s| s.target_id);
+                DriveFile {
+                    is_dir: r.mime_type == FOLDER_MIME || target.is_some(),
+                    target,
+                    size: r.size.and_then(|s| s.parse().ok()),
+                    modified: r.modified_time.and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok()).map(SystemTime::from),
+                    id: r.id,
+                    name: r.name,
+                    mime: r.mime_type,
+                }
+            })
+            .collect())
     }
 }

@@ -2,7 +2,7 @@
 
 Gerenciador de arquivos de dois painéis para nuvem (começando pelo Google Drive), em Rust com
 [Rune](https://github.com/anomalyco/rune). Cada painel mostra o disco local, um drive
-**simulado** em memória ou uma conta do Google Drive conectada (por enquanto só listagem).
+**simulado** em memória ou uma conta do Google Drive conectada: Meu Drive e Drives compartilhados (por enquanto só listagem).
 
 ## Conectar o Google Drive
 
