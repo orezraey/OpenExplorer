@@ -101,6 +101,11 @@ impl Cache {
         self.mem.get(k)
     }
 
+    /// An account's shared drives, if their list was loaded this session.
+    pub fn shared_drives(&self, email: &str) -> Option<&Arc<Vec<Entry>>> {
+        self.mem.get(&Key { email: email.to_string(), folder: "sd-list".into() })
+    }
+
     #[cfg(test)]
     pub fn memory_only() -> Cache {
         Cache { memory_only: true, ..Cache::default() }
@@ -154,7 +159,7 @@ mod tests {
         let entries: Vec<Entry> = [Some(at(1_709_294_400_250)), Some(at(-86_400_000)), None]
             .into_iter()
             .enumerate()
-            .map(|(i, modified)| Entry { id: format!("{i}"), name: format!("f{i}"), is_dir: false, size: None, modified, target: None })
+            .map(|(i, modified)| Entry { id: format!("{i}"), name: format!("f{i}"), is_dir: false, size: None, modified, target: None, mime: None })
             .collect();
         let text = serde_json::to_vec(&FileOut { format: FORMAT, entries: &entries }).unwrap();
         let back: FileIn = serde_json::from_slice(&text).unwrap();

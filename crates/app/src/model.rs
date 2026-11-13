@@ -18,6 +18,88 @@ pub struct Entry {
     pub modified: Option<SystemTime>,
     /// For a Drive shortcut to a folder: the folder it opens, instead of `id`.
     pub target: Option<String>,
+    /// Drive's MIME type, which names Google's own formats (Docs, Sheets...) that have no
+    /// extension.
+    #[serde(default)]
+    pub mime: Option<String>,
+}
+
+/// What a file is, for its icon and the Tipo column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Folder,
+    FolderLink,
+    Image,
+    Video,
+    Audio,
+    Pdf,
+    Doc,
+    Sheet,
+    Slides,
+    Archive,
+    Code,
+    Text,
+    App,
+    Torrent,
+    Other,
+}
+
+impl Entry {
+    fn ext(&self) -> Option<String> {
+        let (stem, ext) = self.name.rsplit_once('.')?;
+        (!stem.is_empty() && !ext.is_empty() && ext.len() <= 8 && !ext.contains(' ')).then(|| ext.to_ascii_lowercase())
+    }
+
+    pub fn kind(&self) -> Kind {
+        if self.is_dir {
+            return if self.target.is_some() { Kind::FolderLink } else { Kind::Folder };
+        }
+        match self.mime.as_deref() {
+            Some("application/vnd.google-apps.document") => return Kind::Doc,
+            Some("application/vnd.google-apps.spreadsheet") => return Kind::Sheet,
+            Some("application/vnd.google-apps.presentation") => return Kind::Slides,
+            _ => {}
+        }
+        match self.ext().as_deref() {
+            Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "heic" | "heif" | "svg" | "tif" | "tiff" | "raw" | "ico" | "avif") => Kind::Image,
+            Some("mp4" | "mkv" | "avi" | "mov" | "wmv" | "webm" | "m4v" | "flv" | "mpg" | "mpeg" | "m2ts") => Kind::Video,
+            Some("mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "opus" | "wma") => Kind::Audio,
+            Some("pdf") => Kind::Pdf,
+            Some("doc" | "docx" | "odt" | "rtf") => Kind::Doc,
+            Some("xls" | "xlsx" | "xlsm" | "ods" | "csv") => Kind::Sheet,
+            Some("ppt" | "pptx" | "odp" | "key") => Kind::Slides,
+            Some("zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "zst" | "iso") => Kind::Archive,
+            Some("rs" | "js" | "ts" | "tsx" | "jsx" | "py" | "java" | "c" | "cpp" | "h" | "cs" | "go" | "html" | "css" | "json" | "toml" | "yaml" | "yml" | "xml" | "sh" | "ps1" | "bat" | "sql" | "ipynb") => Kind::Code,
+            Some("txt" | "md" | "log" | "ini" | "cfg" | "srt") => Kind::Text,
+            Some("exe" | "msi" | "apk" | "dmg" | "appimage" | "deb" | "rpm" | "lnk") => Kind::App,
+            Some("torrent") => Kind::Torrent,
+            _ => Kind::Other,
+        }
+    }
+
+    /// The Tipo column: "Pasta de arquivos", "Arquivo JPG", "Documento Google"...
+    pub fn kind_label(&self) -> String {
+        if self.is_dir {
+            return if self.target.is_some() { "Atalho de pasta".into() } else { "Pasta de arquivos".into() };
+        }
+        let google = match self.mime.as_deref() {
+            Some("application/vnd.google-apps.document") => Some("Documento Google"),
+            Some("application/vnd.google-apps.spreadsheet") => Some("Planilha Google"),
+            Some("application/vnd.google-apps.presentation") => Some("Apresentação Google"),
+            Some("application/vnd.google-apps.form") => Some("Formulário Google"),
+            Some("application/vnd.google-apps.drawing") => Some("Desenho Google"),
+            Some("application/vnd.google-apps.shortcut") => Some("Atalho"),
+            Some(m) if m.starts_with("application/vnd.google-apps.") => Some("Arquivo Google"),
+            _ => None,
+        };
+        if let Some(g) = google {
+            return g.into();
+        }
+        match self.ext() {
+            Some(ext) => format!("Arquivo {}", ext.to_ascii_uppercase()),
+            None => "Arquivo".into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -55,6 +137,7 @@ pub enum SortCol {
     Name,
     Size,
     Modified,
+    Kind,
 }
 
 pub struct Pane {
@@ -71,6 +154,11 @@ pub struct Pane {
     pub error: Option<String>,
     /// A listing is on its way from a background thread.
     pub loading: bool,
+    /// Where Voltar and Avançar go.
+    pub back: Vec<Location>,
+    pub forward: Vec<Location>,
+    /// Free space on the local disk shown, read with each listing.
+    pub free: Option<u64>,
 }
 
 impl Pane {
@@ -86,6 +174,9 @@ impl Pane {
             drop_over: false,
             error: None,
             loading: false,
+            back: Vec::new(),
+            forward: Vec::new(),
+            free: None,
         }
     }
 
@@ -109,6 +200,10 @@ impl Pane {
 
     /// Lists a local or simulated folder in place. Drive folders load in the background instead.
     pub fn load_now(&mut self, mock: &MockDrive) {
+        self.free = match &self.loc {
+            Location::Local(dir) => free_space(dir),
+            _ => None,
+        };
         let entries = match &self.loc {
             Location::Local(dir) => read_local(dir).map_err(|e| format!("{}: {e}", dir.display())),
             Location::Mock(segs) => Ok(mock.list(segs)),
@@ -147,18 +242,29 @@ impl Pane {
 
     pub fn sort_entries(&mut self) {
         let (col, asc) = self.sort;
-        self.entries.sort_by(|a, b| {
-            // Folders always come first, as in Explorer.
+        // Folders always come first, as in Explorer; ties fall back to the name.
+        let order = |a: &Entry, b: &Entry, by: Ordering| {
             b.is_dir.cmp(&a.is_dir).then_with(|| {
-                let o = match col {
-                    SortCol::Name => rune_kit::natural_cmp(&a.name, &b.name),
-                    SortCol::Size => a.size.cmp(&b.size),
-                    SortCol::Modified => a.modified.cmp(&b.modified),
-                };
-                let o = if o == Ordering::Equal { rune_kit::natural_cmp(&a.name, &b.name) } else { o };
+                let o = if by == Ordering::Equal { rune_kit::natural_cmp(&a.name, &b.name) } else { by };
                 if asc { o } else { o.reverse() }
             })
-        });
+        };
+        if col == SortCol::Kind {
+            // The label is built once per entry rather than twice per comparison.
+            let mut keyed: Vec<(String, Entry)> = std::mem::take(&mut self.entries).into_iter().map(|e| (e.kind_label(), e)).collect();
+            keyed.sort_by(|(ka, a), (kb, b)| order(a, b, ka.cmp(kb)));
+            self.entries = keyed.into_iter().map(|(_, e)| e).collect();
+        } else {
+            self.entries.sort_by(|a, b| {
+                let by = match col {
+                    SortCol::Name => Ordering::Equal,
+                    SortCol::Size => a.size.cmp(&b.size),
+                    SortCol::Modified => a.modified.cmp(&b.modified),
+                    SortCol::Kind => unreachable!(),
+                };
+                order(a, b, by)
+            });
+        }
         self.version += 1;
     }
 
@@ -193,6 +299,7 @@ fn read_local(dir: &Path) -> std::io::Result<Vec<Entry>> {
             size: if is_dir { None } else { meta.as_ref().map(|m| m.len()) },
             modified: meta.and_then(|m| m.modified().ok()),
             target: None,
+            mime: None,
         });
     }
     Ok(out)
@@ -207,8 +314,8 @@ impl MockDrive {
     pub fn new() -> MockDrive {
         let now = SystemTime::now();
         let ago = |days: u64| now - Duration::from_secs(days * 86_400);
-        let dir = |name: &str, days| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: Some(ago(days)), target: None };
-        let file = |name: String, size: u64, days| Entry { id: name.clone(), name, is_dir: false, size: Some(size), modified: Some(ago(days)), target: None };
+        let dir = |name: &str, days| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: Some(ago(days)), target: None, mime: None };
+        let file = |name: String, size: u64, days| Entry { id: name.clone(), name, is_dir: false, size: Some(size), modified: Some(ago(days)), target: None, mime: None };
 
         let mut folders = HashMap::new();
         folders.insert(
@@ -303,5 +410,206 @@ mod unix_ms {
             let span = Duration::from_millis(ms.unsigned_abs());
             if ms >= 0 { UNIX_EPOCH.checked_add(span) } else { UNIX_EPOCH.checked_sub(span) }
         }))
+    }
+}
+
+/// One step of a location's path, and where clicking it goes.
+pub struct Crumb {
+    pub label: String,
+    pub to: Location,
+}
+
+/// The clickable path of a location: `C:\ › Users › Ana`, `ana@gmail.com › Meu Drive › Fotos`.
+pub fn crumbs(loc: &Location) -> Vec<Crumb> {
+    match loc {
+        Location::Local(dir) => {
+            let mut at = PathBuf::new();
+            dir.components()
+                .filter_map(|c| {
+                    match c {
+                        std::path::Component::Prefix(_) => {
+                            at.push(c.as_os_str());
+                            at.push(std::path::MAIN_SEPARATOR_STR);
+                            return Some(Crumb { label: at.display().to_string(), to: Location::Local(at.clone()) });
+                        }
+                        std::path::Component::RootDir => {
+                            if at.as_os_str().is_empty() {
+                                at.push("/");
+                                return Some(Crumb { label: "/".into(), to: Location::Local(at.clone()) });
+                            }
+                            return None;
+                        }
+                        _ => at.push(c.as_os_str()),
+                    }
+                    Some(Crumb { label: c.as_os_str().to_string_lossy().into_owned(), to: Location::Local(at.clone()) })
+                })
+                .collect()
+        }
+        Location::Mock(segs) => std::iter::once(Crumb { label: "Drive simulado".into(), to: Location::Mock(Vec::new()) })
+            .chain((0..segs.len()).map(|i| Crumb { label: segs[i].clone(), to: Location::Mock(segs[..=i].to_vec()) }))
+            .collect(),
+        Location::Drive { email, space, path } => {
+            let mut out = vec![Crumb { label: email.clone(), to: Location::drive(email.clone(), Space::MyDrive) }];
+            match space {
+                Space::MyDrive => out.push(Crumb { label: "Meu Drive".into(), to: Location::drive(email.clone(), Space::MyDrive) }),
+                Space::SharedDrives => out.push(Crumb { label: "Drives compartilhados".into(), to: Location::drive(email.clone(), Space::SharedDrives) }),
+                Space::Shared { name, .. } => {
+                    out.push(Crumb { label: "Drives compartilhados".into(), to: Location::drive(email.clone(), Space::SharedDrives) });
+                    out.push(Crumb { label: name.clone(), to: Location::drive(email.clone(), space.clone()) });
+                }
+            }
+            for i in 0..path.len() {
+                out.push(Crumb { label: path[i].1.clone(), to: Location::Drive { email: email.clone(), space: space.clone(), path: path[..=i].to_vec() } });
+            }
+            out
+        }
+    }
+}
+
+/// What kind of drive a letter is, as Windows reports it without touching the media.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriveKind {
+    Fixed,
+    Removable,
+    Network,
+    Optical,
+    Other,
+}
+
+impl DriveKind {
+    pub fn label(self, letter: &str) -> String {
+        match self {
+            DriveKind::Fixed => format!("Disco local ({letter})"),
+            DriveKind::Removable => format!("Unidade removível ({letter})"),
+            DriveKind::Network => format!("Unidade de rede ({letter})"),
+            DriveKind::Optical => format!("Unidade de DVD ({letter})"),
+            DriveKind::Other => format!("Unidade ({letter})"),
+        }
+    }
+}
+
+/// The kind of drive `dir` is on. Answers from Windows' own records, so it doesn't wait on a
+/// slow network share or an empty DVD drive.
+pub fn drive_kind(dir: &Path) -> DriveKind {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let Some(std::path::Component::Prefix(prefix)) = dir.components().next() else { return DriveKind::Other };
+        let mut root = prefix.as_os_str().to_os_string();
+        root.push("\\");
+        let wide: Vec<u16> = root.encode_wide().chain([0]).collect();
+        // SAFETY: a NUL-terminated path.
+        // The DRIVE_* values of GetDriveTypeW: 2 removable, 3 fixed, 4 remote, 5 CD-ROM, 6 RAM disk.
+        match unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(wide.as_ptr()) } {
+            2 => DriveKind::Removable,
+            3 | 6 => DriveKind::Fixed,
+            4 => DriveKind::Network,
+            5 => DriveKind::Optical,
+            _ => DriveKind::Other,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        DriveKind::Fixed
+    }
+}
+
+/// The disks Windows shows in "Este computador", by letter, with their kind.
+pub fn local_drives() -> Vec<(PathBuf, DriveKind)> {
+    #[cfg(windows)]
+    {
+        // A bit per letter that has a drive, without touching the drives themselves (an empty
+        // DVD drive would make `exists` wait).
+        let mask = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
+        (0..26u8)
+            .filter(|i| mask & (1 << i) != 0)
+            .map(|i| PathBuf::from(format!("{}:\\", (b'A' + i) as char)))
+            .map(|d| {
+                let kind = drive_kind(&d);
+                (d, kind)
+            })
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        vec![(PathBuf::from("/"), DriveKind::Fixed)]
+    }
+}
+
+/// Free bytes on the disk holding `dir`. Only asked of fixed disks: on a network share the
+/// call can block the window for as long as the server takes to answer.
+pub fn free_space(dir: &Path) -> Option<u64> {
+    if drive_kind(dir) != DriveKind::Fixed {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+        let mut free = 0u64;
+        // SAFETY: a NUL-terminated path and a valid out pointer; the other outs may be null.
+        let ok = unsafe { windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
+        (ok != 0).then_some(free)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(name: &str) -> Entry {
+        Entry { id: name.into(), name: name.into(), is_dir: false, size: None, modified: None, target: None, mime: None }
+    }
+
+    #[test]
+    fn kinds_come_from_the_extension_or_google_mime() {
+        assert_eq!(file("photo_2025.JPG").kind(), Kind::Image);
+        assert_eq!(file("photo_2025.JPG").kind_label(), "Arquivo JPG");
+        assert_eq!(file("Life.Is.Beautiful.mkv").kind(), Kind::Video);
+        assert_eq!(file("Assinantes Plex").kind_label(), "Arquivo");
+        assert_eq!(file(".bashrc").kind_label(), "Arquivo");
+        let doc = Entry { mime: Some("application/vnd.google-apps.spreadsheet".into()), ..file("Planilha sem título") };
+        assert_eq!((doc.kind(), doc.kind_label().as_str()), (Kind::Sheet, "Planilha Google"));
+        let dir = Entry { is_dir: true, ..file("Fotos") };
+        assert_eq!(dir.kind_label(), "Pasta de arquivos");
+    }
+
+    #[test]
+    fn sorting_by_kind_keeps_folders_first_then_groups_types() {
+        let mut p = Pane::new(Location::Mock(Vec::new()));
+        p.set_entries(Ok(["b.png", "a.pdf", "c.png", "z.pdf"].map(file).into_iter().chain([Entry { is_dir: true, ..file("Fotos") }]).collect()));
+        p.sort = (SortCol::Kind, true);
+        p.sort_entries();
+        let names: Vec<&str> = p.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Fotos", "a.pdf", "z.pdf", "b.png", "c.png"]);
+        p.sort = (SortCol::Kind, false);
+        p.sort_entries();
+        let names: Vec<&str> = p.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Fotos", "c.png", "b.png", "z.pdf", "a.pdf"]);
+    }
+
+    #[test]
+    fn crumbs_lead_back_to_each_step() {
+        let c = crumbs(&Location::Drive {
+            email: "a@b".into(),
+            space: Space::Shared { id: "0A".into(), name: "Equipe".into() },
+            path: vec![("f1".into(), "Fotos".into()), ("f2".into(), "2026".into())],
+        });
+        let labels: Vec<&str> = c.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, ["a@b", "Drives compartilhados", "Equipe", "Fotos", "2026"]);
+        assert!(matches!(&c[3].to, Location::Drive { path, .. } if path.len() == 1));
+        #[cfg(windows)]
+        {
+            let c = crumbs(&Location::Local(PathBuf::from(r"C:\Users\Ana")));
+            let labels: Vec<&str> = c.iter().map(|c| c.label.as_str()).collect();
+            assert_eq!(labels, [r"C:\", "Users", "Ana"]);
+            assert_eq!(c[1].to, Location::Local(PathBuf::from(r"C:\Users")));
+        }
     }
 }

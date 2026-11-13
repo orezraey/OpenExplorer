@@ -5,9 +5,10 @@
 //! window; `poll` applies it.
 
 mod cache;
+mod icons;
 mod model;
+mod ui;
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,12 +18,11 @@ use std::time::SystemTime;
 
 use openexplorer_gdrive::store::{self, StoredAccount};
 use openexplorer_gdrive::{ClientConfig, Drive, DriveFile, oauth};
-use rune::{Align, AppSpec, Cursor, Cx, DragItem, DragOutcome, El, GrowthSpec, Key, KeyEvent, Mods, ScrollSpec, Tx, Waker, col, el, row, text};
-use rune_kit::Kit;
+use rune::{AppSpec, DragItem, Key, KeyEvent, Mods, Tx, Waker};
 
-use model::{Entry, Location, MockDrive, Pane, SortCol, Space, format_size, format_time};
+use model::{Entry, Location, MockDrive, Pane, SortCol, Space};
 
-const ROW_H: f32 = 26.0;
+const ROW_H: f32 = 22.0;
 
 enum Msg {
     /// Part of a folder listing. `made` carries an account opened on the background thread,
@@ -47,6 +47,8 @@ impl Part {
 
 struct State {
     panes: [Pane; 2],
+    /// The disks "Este computador" lists, read at start.
+    local_drives: Vec<(PathBuf, model::DriveKind)>,
     /// Each pane's current listing request, bumped by every load: `poll` drops answers for an
     /// older one, and the listing thread stops fetching pages once the pane has moved on.
     live: [Arc<AtomicU64>; 2],
@@ -79,6 +81,7 @@ fn init() -> State {
     }
     State {
         panes,
+        local_drives: model::local_drives(),
         live: Default::default(),
         cache: Default::default(),
         mock,
@@ -186,7 +189,7 @@ fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
                             Some(a) => *a = account,
                             None => s.accounts.push(account),
                         }
-                        switch(s, pane, Location::drive(email, Space::MyDrive));
+                        navigate(s, pane, Location::drive(email, Space::MyDrive));
                     }
                     Err(e) => s.status = e,
                 }
@@ -197,7 +200,7 @@ fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
 }
 
 fn entry_of(f: DriveFile) -> Entry {
-    Entry { id: f.id, name: f.name, is_dir: f.is_dir, size: f.size, modified: f.modified, target: f.target }
+    Entry { id: f.id, name: f.name, is_dir: f.is_dir, size: f.size, modified: f.modified, target: f.target, mime: Some(f.mime) }
 }
 
 fn pane_key(p: usize) -> String {
@@ -264,6 +267,9 @@ fn disconnect(s: &mut State, email: &str) {
     s.cache.forget(email);
     s.accounts.retain(|a| a.email != email);
     for p in 0..2 {
+        let gone = |l: &Location| matches!(l, Location::Drive { email: e, .. } if e == email);
+        s.panes[p].back.retain(|l| !gone(l));
+        s.panes[p].forward.retain(|l| !gone(l));
         if matches!(&s.panes[p].loc, Location::Drive { email: e, .. } if e == email) {
             switch(s, p, Location::Mock(Vec::new()));
         }
@@ -346,6 +352,7 @@ fn load(s: &mut State, p: usize) {
                         size: None,
                         modified: None,
                         target: None,
+                        mime: None,
                     })
                     .collect::<Vec<_>>()
             }).map(|entries| emit(listed(made.take(), Part::WHOLE, Ok(entries)))),
@@ -363,6 +370,35 @@ fn switch(s: &mut State, p: usize, loc: Location) {
     load(s, p);
 }
 
+/// Goes to `loc` as a step the reader can take back with Voltar.
+fn navigate(s: &mut State, p: usize, loc: Location) {
+    let pane = &mut s.panes[p];
+    if pane.loc == loc {
+        s.active = p;
+        return;
+    }
+    let from = std::mem::replace(&mut pane.loc, loc.clone());
+    pane.back.push(from);
+    pane.forward.clear();
+    switch(s, p, loc);
+}
+
+fn go_back(s: &mut State, p: usize) {
+    let pane = &mut s.panes[p];
+    if let Some(loc) = pane.back.pop() {
+        pane.forward.push(pane.loc.clone());
+        switch(s, p, loc);
+    }
+}
+
+fn go_forward(s: &mut State, p: usize) {
+    let pane = &mut s.panes[p];
+    if let Some(loc) = pane.forward.pop() {
+        pane.back.push(pane.loc.clone());
+        switch(s, p, loc);
+    }
+}
+
 fn open(s: &mut State, p: usize, id: &str) {
     let pane = &mut s.panes[p];
     let Some(e) = pane.entry(id).cloned() else { return };
@@ -377,7 +413,7 @@ fn open(s: &mut State, p: usize, id: &str) {
         Location::Drive { space: space @ Space::SharedDrives, .. } => *space = Space::Shared { id: e.id.clone(), name: e.name.clone() },
         Location::Drive { path, .. } => path.push((e.target.clone().unwrap_or_else(|| e.id.clone()), e.name.clone())),
     }
-    switch(s, p, loc);
+    navigate(s, p, loc);
 }
 
 fn go_up(s: &mut State, p: usize) {
@@ -406,7 +442,7 @@ fn go_up(s: &mut State, p: usize) {
     if from.is_none() {
         return;
     }
-    switch(s, p, loc);
+    navigate(s, p, loc);
     if let Some(id) = from {
         let pane = &mut s.panes[p];
         pane.selected = [id.clone()].into();
@@ -453,6 +489,14 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         })
     };
     let to = match &ev.key {
+        Key::Left if ev.mods.alt => {
+            go_back(s, p);
+            return true;
+        }
+        Key::Right if ev.mods.alt => {
+            go_forward(s, p);
+            return true;
+        }
         Key::Up => step(-1),
         Key::Down => step(1),
         Key::PageUp => step(-20),
@@ -596,6 +640,7 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
                     size: if is_dir { None } else { meta.as_ref().map(|m| m.len()) },
                     modified: Some(SystemTime::now()),
                     target: None,
+                    mime: None,
                 };
                 if s.mock.add(segs, entry) { done += 1 } else { skipped += 1 }
             }
@@ -606,277 +651,9 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
     load(s, p);
 }
 
-// ---------------------------------------------------------------------------------------------
-// View
-
-fn view(s: &State, cx: &mut Cx<State>) -> El {
-    let k = Kit::neutral(cx.system_dark());
-    let status = text(s.status.clone()).font(k.ty.text_small).color(k.c.text_muted).truncate().shrink().min_w(0.0).help_when_truncated(s.status.clone());
-    col()
-        .w_full()
-        .h_full()
-        .fill(k.c.page)
-        .padding(10.0)
-        .gap(8.0)
-        .child(row().key("panes").w_full().grow(1.0).min_h(0.0).gap(8.0).child(pane(s, &k, 0)).child(pane(s, &k, 1)))
-        .child(row().key("status").w_full().px(4.0).child(status))
-}
-
-fn button<F: Fn(&mut State, &mut Tx) + 'static>(k: &Kit, key: &str, label: &str, f: F) -> El {
-    row()
-        .key(key.to_string())
-        .role("button")
-        .label(label.to_string())
-        .h(24.0)
-        .px(8.0)
-        .center_y()
-        .radius(k.radius.sm)
-        .border(1.0, k.c.border_weak)
-        .hover(k.c.hover)
-        .press(k.c.pressed)
-        .cursor(Cursor::Pointer)
-        .on_press_tx(f)
-        .child(text(label.to_string()).font(k.ty.text_small).color(k.c.text_base))
-}
-
-/// A source the pane can show: Local, the simulated drive or a connected account.
-fn chip<F: Fn(&mut State, &mut Tx) + 'static>(k: &Kit, key: String, label: &str, on: bool, f: F) -> El {
-    let accent = k.c.text_accent;
-    row()
-        .key(key)
-        .role("tab")
-        .label(label.to_string())
-        .checked(on)
-        .h(24.0)
-        .px(10.0)
-        .center_y()
-        .radius(12.0)
-        .fill(if on { k.alpha(accent, 0.16) } else { k.alpha(k.c.text_base, 0.04) })
-        .hover(if on { k.alpha(accent, 0.22) } else { k.c.hover })
-        .cursor(Cursor::Pointer)
-        .on_press_tx(f)
-        .child(text(label.to_string()).font(if on { k.ty.text_small_medium } else { k.ty.text_small }).color(if on { accent } else { k.c.text_muted }))
-}
-
-fn sources(s: &State, k: &Kit, p: usize) -> El {
-    let loc = &s.panes[p].loc;
-    let mut r = row()
-        .key("sources")
-        .w_full()
-        .h(36.0)
-        .px(8.0)
-        .gap(6.0)
-        .center_y()
-        .child(chip(k, "src-local".into(), "Local", matches!(loc, Location::Local(_)), move |s: &mut State, _| {
-            if !matches!(s.panes[p].loc, Location::Local(_)) {
-                switch(s, p, Location::home());
-            }
-        }))
-        .child(chip(k, "src-mock".into(), "Simulado", matches!(loc, Location::Mock(_)), move |s: &mut State, _| {
-            if !matches!(s.panes[p].loc, Location::Mock(_)) {
-                switch(s, p, Location::Mock(Vec::new()));
-            }
-        }));
-    for a in &s.accounts {
-        let on = matches!(loc, Location::Drive { email, .. } if *email == a.email);
-        let email = a.email.clone();
-        r = r.child(
-            chip(k, format!("src-{}", a.email), &a.email, on, move |s: &mut State, _| {
-                let here = matches!(&s.panes[p].loc, Location::Drive { email: e, .. } if *e == email);
-                if !here {
-                    switch(s, p, Location::drive(email.clone(), Space::MyDrive));
-                }
-            })
-            .help(if a.name.is_empty() { a.email.clone() } else { format!("{} · Google Drive", a.name) }),
-        );
-    }
-    let label = if s.login.is_some() { "Conectando… (clique para recomeçar)" } else { "+ Google Drive" };
-    r.child(button(k, "connect", label, move |s: &mut State, tx: &mut Tx| connect(s, p, tx)).help("Conectar uma conta do Google Drive"))
-}
-
-fn pane(s: &State, k: &Kit, p: usize) -> El {
-    let pane = &s.panes[p];
-    let active = s.active == p;
-    // A Drive account's own row: which space it shows, and the way out.
-    let spaces = if let Location::Drive { email, space, path } = &pane.loc {
-        let mine = *space == Space::MyDrive;
-        let at_top = mine && path.is_empty();
-        let (e1, e2, e3) = (email.clone(), email.clone(), email.clone());
-        Some(
-            row()
-                .key("spaces")
-                .w_full()
-                .h(32.0)
-                .px(8.0)
-                .gap(6.0)
-                .center_y()
-                .child(chip(k, "space-my".into(), "Meu Drive", mine, move |s: &mut State, _| {
-                    if !at_top {
-                        switch(s, p, Location::drive(e1.clone(), Space::MyDrive));
-                    }
-                }))
-                .child(chip(k, "space-shared".into(), "Drives compartilhados", !mine, move |s: &mut State, _| {
-                    let here = matches!(&s.panes[p].loc, Location::Drive { space: Space::SharedDrives, .. });
-                    if !here {
-                        switch(s, p, Location::drive(e2.clone(), Space::SharedDrives));
-                    }
-                }))
-                .child(el().grow(1.0))
-                .child(button(k, "disconnect", "Desconectar", move |s: &mut State, _| disconnect(s, &e3))),
-        )
-    } else {
-        None
-    };
-    let nav = row()
-        .key("toolbar")
-        .w_full()
-        .h(32.0)
-        .px(8.0)
-        .gap(8.0)
-        .center_y()
-        .child(button(k, "up", "↑ Acima", move |s: &mut State, _| go_up(s, p)))
-        .child(button(k, "reload", "Atualizar", move |s: &mut State, _| load(s, p)))
-        .child(text(pane.title()).font(k.ty.text_small).color(k.c.text_muted).truncate().shrink().min_w(0.0).grow(1.0).help_when_truncated(pane.title()));
-
-    let arrow = |c: SortCol| if pane.sort.0 == c { if pane.sort.1 { " ▲" } else { " ▼" } } else { "" };
-    let head = |key: &str, label: &str, c: SortCol| {
-        row()
-            .key(key.to_string())
-            .h_full()
-            .px(8.0)
-            .center_y()
-            .hover(k.c.hover)
-            .cursor(Cursor::Pointer)
-            .on_press(move |s: &mut State| set_sort(s, p, c))
-            .child(text(format!("{label}{}", arrow(c))).font(k.ty.text_small_medium).color(k.c.text_muted).truncate().shrink().min_w(0.0))
-    };
-    let header = row()
-        .key("header")
-        .w_full()
-        .h(28.0)
-        .fill(k.alpha(k.c.text_base, 0.03))
-        .child(head("h-name", "Nome", SortCol::Name).w(0.0).grow(1.0).min_w(0.0))
-        .child(head("h-size", "Tamanho", SortCol::Size).w(100.0).justify_end())
-        .child(head("h-mod", "Modificado", SortCol::Modified).w(140.0));
-
-    let selected = k.alpha(k.c.text_accent, if k.dark { 0.24 } else { 0.2 });
-    let hover = k.alpha(k.c.text_base, 0.05);
-    let ring = k.c.border_focus;
-    let (text_c, muted_c, folder_c, file_c) = (k.c.text_base, k.c.text_muted, rune::oklch(0.82, 0.15, 75.0), k.c.icon_faint);
-    let (font, mono) = (k.ty.text_small, k.ty.mono);
-    let build = move |s: &State, i: usize| -> El {
-        let pane = &s.panes[p];
-        let e = &pane.entries[i];
-        let is_sel = pane.selected.contains(&e.id);
-        let mut r = row().key(row_key(&e.id)).role("row").label(e.name.clone()).focus_selected(is_sel).w_full().h(ROW_H).center_y();
-        r = if is_sel { r.fill(selected) } else { r.hover(hover) };
-        if s.active == p && pane.cursor.as_deref() == Some(e.id.as_str()) {
-            r = r.outline(1.0, -1.0, ring);
-        }
-        let icon = el().size(14.0, if e.is_dir { 11.0 } else { 14.0 }).radius(2.0).fill(if e.is_dir { folder_c } else { file_c });
-        let (id_press, id_open, id_drag, id_start) = (e.id.clone(), e.id.clone(), e.id.clone(), e.id.clone());
-        r.child(
-            row().w(0.0).grow(1.0).min_w(0.0).px(8.0).gap(8.0).center_y().child(icon).child(text(e.name.clone()).font(font).color(text_c).truncate().shrink().min_w(0.0)),
-        )
-        .child(
-            row().w(100.0).px(8.0).justify_end().child(text(e.size.map(format_size).unwrap_or_default()).font(mono).color(muted_c).align(Align::End)),
-        )
-        .child(row().w(140.0).px(8.0).child(text(e.modified.map(format_time).unwrap_or_default()).font(font).color(muted_c).truncate()))
-        .on_press_tx(move |s: &mut State, tx: &mut Tx| {
-            click(s, p, &id_press, tx.mods());
-            tx.focus(pane_key(p), false);
-        })
-        .on_double_press(move |s: &mut State| open(s, p, &id_open))
-        .drag_out(move |s: &State| drag_item(s, p, &id_drag))
-        .on_drag_start(move |s: &mut State, _| {
-            s.active = p;
-            let pane = &mut s.panes[p];
-            if !pane.selected.contains(&id_start) {
-                pane.selected = [id_start.clone()].into();
-                pane.anchor = Some(id_start.clone());
-                pane.cursor = Some(id_start.clone());
-            }
-            // `drag_out` already wrote the files; this only names them.
-            let paths = paths_for(s, p, &dragged_ids(&s.panes[p], &id_start), false);
-            s.last_drag = Some((p, paths));
-        })
-        .on_drag_end(move |s: &mut State, outcome: DragOutcome, _| {
-            s.status = match outcome {
-                DragOutcome::Cancelled => "Arrastar cancelado.".into(),
-                o => format!("Arrastar terminou: {o:?}"),
-            };
-        })
-    };
-
-    let n = pane.entries.len();
-    let rows = col()
-        .key("rows")
-        .w_full()
-        .growth(GrowthSpec::default())
-        .virtual_rows(n, ROW_H, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
-        .virtual_rows_version(pane.version);
-    let notice = |msg: String, color| col().key("notice").w_full().grow(1.0).padding(16.0).child(text(msg).font(k.ty.text_small).color(color));
-    let body = if let Some(err) = &pane.error {
-        notice(err.clone(), k.c.danger.fg)
-    } else if pane.loading && n == 0 {
-        notice("Carregando…".into(), k.c.text_muted)
-    } else if n == 0 && matches!(pane.loc, Location::Drive { space: Space::SharedDrives, .. }) {
-        notice("Esta conta não participa de nenhum drive compartilhado.".into(), k.c.text_muted)
-    } else {
-        col().key("viewport").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(rows)
-    };
-
-    let mut count = format!("{} itens · {} selecionados", thousands(n), thousands(pane.selected.len()));
-    if pane.loading {
-        count.push_str(" · carregando…");
-    }
-    let footer = text(count).font(k.ty.text_xsmall).color(k.c.text_faint);
-
-    let border = if pane.drop_over {
-        k.c.text_accent
-    } else if active {
-        k.c.border_focus
-    } else {
-        k.c.border_weak
-    };
-    col()
-        .key(pane_key(p))
-        .focusable(true)
-        .label(format!("Painel {}", p + 1))
-        .w(0.0)
-        .grow(1.0)
-        .h_full()
-        .min_w(0.0)
-        .radius(k.radius.md)
-        .fill(if pane.drop_over { k.alpha(k.c.text_accent, 0.08) } else { k.c.bg_base })
-        .border(if pane.drop_over { 2.0 } else { 1.0 }, border)
-        .clip_rounded(k.radius.md)
-        .on_key(move |s: &mut State, ev: &KeyEvent, tx: &mut Tx| key(s, p, ev, tx))
-        .on_press(move |s: &mut State| s.active = p)
-        .on_drop_files(move |s: &mut State, files: &[PathBuf], _| dropped(s, p, files))
-        .on_drop_hover(move |s: &mut State, over, _| s.panes[p].drop_over = over)
-        .child(sources(s, k, p))
-        .children(spaces)
-        .child(nav)
-        .child(header)
-        .child(body)
-        .child(row().key("footer").w_full().h(24.0).px(10.0).center_y().child(footer))
-}
-
-fn thousands(n: usize) -> String {
-    let d = n.to_string();
-    d.chars().enumerate().fold(String::new(), |mut out, (i, ch)| {
-        if i > 0 && (d.len() - i).is_multiple_of(3) {
-            out.push('.');
-        }
-        out.push(ch);
-        out
-    })
-}
-
 fn main() {
     rune::run(AppSpec::<State> {
-        min_size: Some((760.0, 400.0)),
+        min_size: Some((900.0, 420.0)),
         setup: Some(setup),
         poll: Some(poll),
         scenes: &[
@@ -892,11 +669,11 @@ fn main() {
             ("shared", |s| {
                 s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::SharedDrives));
-                let d = |id: &str, name: &str| Entry { id: id.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None };
+                let d = |id: &str, name: &str| Entry { id: id.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None };
                 s.panes[1].set_entries(Ok(vec![d("0AAa", "Equipe de design"), d("0AAb", "Financeiro"), d("0AAc", "Projetos 2026")]));
             }),
         ],
-        ..AppSpec::new("Open Explorer", (1200.0, 720.0), init, view)
+        ..AppSpec::new("Open Explorer", (1280.0, 760.0), init, ui::view)
     });
 }
 
@@ -905,7 +682,7 @@ mod tests {
     use super::*;
 
     fn entries(from: usize, n: usize) -> Vec<Entry> {
-        (from..from + n).map(|i| Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None }).collect()
+        (from..from + n).map(|i| Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None }).collect()
     }
 
     #[test]
