@@ -10,6 +10,7 @@ mod icons;
 mod layout;
 mod model;
 mod ops;
+mod sysicons;
 mod ui;
 
 use std::collections::HashMap;
@@ -37,6 +38,8 @@ enum Msg {
     Done { reload: Vec<Location>, made: Option<(String, Arc<Drive>)>, result: Result<String, String> },
     /// Something Propriedades number `id` was waiting for.
     Prop { id: u64, update: actions::PropUpdate },
+    /// Windows' icon for a file type, a folder or a drive.
+    Icon { key: sysicons::IconKey, rgba: Option<sysicons::Rgba> },
 }
 
 /// Which part of a listing a [`Msg::Listed`] is.
@@ -91,6 +94,10 @@ struct State {
     inbox: Receiver<Msg>,
     outbox: Sender<Msg>,
     waker: Option<Waker>,
+    /// Windows' own icons, as Explorer shows them.
+    icons: sysicons::SysIcons,
+    /// The listing version each pane's icons were last asked for.
+    icons_for: [u64; 2],
 }
 
 fn init() -> State {
@@ -124,10 +131,14 @@ fn init() -> State {
         inbox,
         outbox,
         waker: None,
+        icons: Default::default(),
+        icons_for: [u64::MAX; 2],
     }
 }
 
 fn setup(s: &mut State, waker: Waker) {
+    let fixed = s.local_drives.iter().map(|(p, _)| sysicons::drive_key(p)).chain(sysicons::home_key());
+    s.icons.start(rune::ImageCache::new(waker.clone()), s.outbox.clone(), waker.clone(), fixed);
     s.waker = Some(waker);
 }
 
@@ -156,7 +167,14 @@ fn background(s: &State, work: impl FnOnce(&dyn Fn(Msg)) + Send + 'static) {
 }
 
 fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
-    let mut changed = false;
+    // Each listing's file types get their icons asked for once.
+    let versions = s.panes.each_ref().map(|p| p.version);
+    if s.icons_for != versions {
+        s.icons_for = versions;
+        let keys = s.panes.iter().flat_map(|p| sysicons::keys_of(&p.entries, &p.loc)).collect();
+        s.icons.show(keys);
+    }
+    let mut changed = s.icons.settle();
     while let Ok(msg) = s.inbox.try_recv() {
         changed = true;
         match msg {
@@ -218,6 +236,7 @@ fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
                 }
             }
             Msg::Prop { id, update } => actions::props_update(s, id, update),
+            Msg::Icon { key, rgba } => s.icons.arrived(key, rgba),
             Msg::LoggedIn { pane, attempt, result } => {
                 let current = s.login == Some(attempt);
                 if current {
@@ -245,7 +264,7 @@ fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
 }
 
 fn entry_of(f: DriveFile) -> Entry {
-    Entry { id: f.id, name: f.name, is_dir: f.is_dir, size: f.size, modified: f.modified, target: f.target, mime: Some(f.mime) }
+    Entry { id: f.id, name: f.name, is_dir: f.is_dir, size: f.size, modified: f.modified, target: f.target, mime: Some(f.mime), md5: f.md5 }
 }
 
 fn pane_key(p: usize) -> String {
@@ -399,6 +418,7 @@ fn load(s: &mut State, p: usize) {
                         modified: None,
                         target: None,
                         mime: None,
+                        md5: None,
                     })
                     .collect::<Vec<_>>()
             }).map(|entries| emit(listed(made.take(), Part::WHOLE, Ok(entries)))),
@@ -732,6 +752,7 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
                     modified: Some(SystemTime::now()),
                     target: None,
                     mime: None,
+                    md5: None,
                 };
                 if s.mock.add(segs, entry) { done += 1 } else { skipped += 1 }
             }
@@ -772,7 +793,7 @@ fn main() {
             ("shared", |s| {
                 s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::SharedDrives));
-                let d = |id: &str, name: &str| Entry { id: id.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None };
+                let d = |id: &str, name: &str| Entry { id: id.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None };
                 s.panes[1].set_entries(Ok(vec![d("0AAa", "Equipe de design"), d("0AAb", "Financeiro"), d("0AAc", "Projetos 2026")]));
             }),
         ],
@@ -785,7 +806,7 @@ mod tests {
     use super::*;
 
     fn entries(from: usize, n: usize) -> Vec<Entry> {
-        (from..from + n).map(|i| Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None }).collect()
+        (from..from + n).map(|i| Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None }).collect()
     }
 
     #[test]

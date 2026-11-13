@@ -11,10 +11,10 @@ use crate::model::{Kind, Location, SortCol, Space, crumbs, format_bytes, format_
 use crate::actions::{self, ClipMode, Dialog};
 use crate::{State, click, connect, disconnect, drag_item, dragged_ids, dropped, go_back, go_forward, go_up, key, load, navigate, open, pane_key, paths_for, row_key, set_sort};
 use crate::icons;
+use crate::sysicons::{self, IconKey};
 use crate::layout::{self, clamp_col, clamp_tree};
 
 const ROW_H: f32 = crate::ROW_H;
-const PANES_GAP: f32 = 6.0;
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let k = Kit::neutral(cx.system_dark());
@@ -109,7 +109,7 @@ fn dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
             let mut list = col().key("items").w_full().gap(4.0);
             for e in items.iter().take(6) {
                 list = list.child(
-                    row().gap(6.0).center_y().child(icon(kind_icon(e.kind()), 16.0)).child(text(e.name.clone()).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0)),
+                    row().gap(6.0).center_y().child(entry_icon(s, &s.panes[*pane].loc, e, 16.0)).child(text(e.name.clone()).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0)),
                 );
             }
             if items.len() > 6 {
@@ -282,10 +282,11 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
     let muted = |t: &str| text(t.to_string()).font(k.ty.text_small).color(k.c.text_muted);
 
     // Header: the item's icon and its name, which renames on OK.
+    let loc = &s.panes[p.pane].loc;
     let (glyph, title) = match p.single() {
-        Some(e) => (kind_icon(e.kind()), e.name.clone()),
-        None if p.items.iter().all(|e| e.is_dir) => (&icons::FOLDER, format!("{} itens", ui_count(p.items.len()))),
-        None => (&icons::FILE, format!("{} itens", ui_count(p.items.len()))),
+        Some(e) => (entry_icon(s, loc, e, 40.0), e.name.clone()),
+        None if p.items.iter().all(|e| e.is_dir) => (shell_icon(s, Some(&IconKey::Folder), &icons::FOLDER, 40.0), format!("{} itens", ui_count(p.items.len()))),
+        None => (icon(&icons::FILE, 40.0), format!("{} itens", ui_count(p.items.len()))),
     };
     let editable_name = p.renamable(s);
     let name: El = if editable_name {
@@ -311,7 +312,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
         .w_full()
         .gap(14.0)
         .center_y()
-        .child(icon(glyph, 40.0))
+        .child(glyph)
         .child(name_box.child(name));
 
     let mut tabs = row().key("prop-tabs").w_full().border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak).child(prop_tab(k, "Geral", PropTab::General, p.tab == PropTab::General)).child(prop_tab(
@@ -366,17 +367,22 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
                     body = body.child(prop_text(k, "Aberto por você", format_long(v)));
                 }
                 if !e.is_dir {
-                    let hash: El = match (&p.local, &p.md5, details) {
-                        (_, Some(Ok(h)), _) => text(h.clone()).font(k.ty.mono).color(k.c.text_base).selectable(true),
-                        (_, Some(Err(err)), _) => text(err.clone()).font(k.ty.text_small).color(k.c.danger.fg),
-                        (Some(_), None, _) if p.md5_running => muted("Calculando…"),
-                        (Some(_), None, _) => Button::new("Calcular").variant(ButtonVariant::Neutral).on_press(actions::props_md5).build(k).key("md5"),
-                        (None, _, Some(d)) => match &d.md5 {
-                            Some(h) => text(h.clone()).font(k.ty.mono).color(k.c.text_base).selectable(true),
-                            None => muted("— (formato do Google, sem arquivo binário)"),
+                    let mono = |h: &String| text(h.clone()).font(k.ty.mono).color(k.c.text_base).selectable(true);
+                    // Drive keeps each file's MD5 and sends it with the listing: nothing to work
+                    // out. A local file's is read from disk on request.
+                    let drive_md5 = e.md5.as_ref().or_else(|| details.and_then(|d| d.md5.as_ref()));
+                    let google_format = e.mime.as_deref().is_some_and(|m| m.starts_with("application/vnd.google-apps."));
+                    let hash: El = match (&p.local, &p.md5) {
+                        (_, Some(Ok(h))) => mono(h),
+                        (_, Some(Err(err))) => text(err.clone()).font(k.ty.text_small).color(k.c.danger.fg),
+                        (Some(_), None) if p.md5_running => muted("Calculando…"),
+                        (Some(_), None) => Button::new("Calcular").variant(ButtonVariant::Neutral).on_press(actions::props_md5).build(k).key("md5"),
+                        (None, None) => match drive_md5 {
+                            Some(h) => mono(h),
+                            None if google_format => muted("— (formato do Google, sem arquivo binário)"),
+                            None if details.is_none() && p.details.is_none() && matches!(s.panes[p.pane].loc, Location::Drive { .. }) => muted("Carregando…"),
+                            None => muted("—"),
                         },
-                        (None, _, None) if p.details.is_some() => muted("—"),
-                        (None, _, None) => muted("Carregando…"),
                     };
                     body = body.child(prop_row(k, "Hash (MD5)", hash));
                 }
@@ -427,7 +433,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
                     // Several items: their names.
                     let mut names = col().w_full().gap(4.0);
                     for e in p.items.iter().take(20) {
-                        names = names.child(row().gap(6.0).center_y().child(icon(kind_icon(e.kind()), 16.0)).child(text(e.name.clone()).font(k.ty.text_small).color(k.c.text_base).truncate().min_w(0.0)));
+                        names = names.child(row().gap(6.0).center_y().child(entry_icon(s, loc, e, 16.0)).child(text(e.name.clone()).font(k.ty.text_small).color(k.c.text_base).truncate().min_w(0.0)));
                     }
                     if p.items.len() > 20 {
                         names = names.child(muted(&format!("e mais {}", ui_count(p.items.len() - 20))));
@@ -476,6 +482,25 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
         .child(Button::new("Cancelar").variant(ButtonVariant::Neutral).on_press(actions::close_properties).build(k));
     let content = col().key("content").w_full().px(16.0).pb(16.0).child(tabs).child(body).child(buttons);
     Modal::new("props", format!("Propriedades: {title}")).open(true).child(content).width(520.0).fit().on_close(actions::close_properties).build(k, layer);
+}
+
+/// Windows' icon for `key` once it has loaded, else the app's own `fallback`.
+fn shell_icon(s: &State, key: Option<&IconKey>, fallback: &'static Icon, size: f32) -> El {
+    match key.and_then(|k| s.icons.get(k)).filter(|i| i.is_ready() && i.error().is_none()) {
+        Some(image) => el().size(size, size).pixels(image.pixels()),
+        None => icon(fallback, size),
+    }
+}
+
+/// The icon Explorer would show for `e`: its type's program's (VLC's for a video VLC opens).
+/// A Drive shortcut to a folder keeps the app's linked-folder icon.
+fn entry_icon(s: &State, loc: &Location, e: &crate::model::Entry, size: f32) -> El {
+    let kind = e.kind();
+    let fallback = kind_icon(kind);
+    if kind == Kind::FolderLink {
+        return icon(fallback, size);
+    }
+    shell_icon(s, sysicons::key_for(e, loc).as_ref(), fallback, size)
 }
 
 fn kind_icon(kind: Kind) -> &'static Icon {
@@ -619,9 +644,31 @@ fn panes(s: &State, k: &Kit) -> El {
         .grow(1.0)
         .min_h(0.0)
         .padding(6.0)
-        .gap(PANES_GAP)
         .child(pane(s, k, 0))
+        .child(gutter(s, k))
         .child(pane(s, k, 1))
+}
+
+/// The strip between the panes, as in Air Explorer: the window's own background, empty but
+/// for two small triangles near the top that copy the selection of one pane into the folder
+/// the other shows. A triangle is blue while its pane has something selected, grey otherwise.
+fn gutter(s: &State, k: &Kit) -> El {
+    let arrow = |key: &str, glyph: &'static Icon, help: &str, from: usize, to: usize| {
+        let ready = !s.panes[from].selected.is_empty();
+        let ink = if ready { k.alpha(k.c.text_accent, 0.7) } else { k.alpha(k.c.icon_faint, 0.6) };
+        let b = el().key(key.to_string()).role("button").label(help.to_string()).help(help.to_string()).size(28.0, 28.0).center().radius(k.radius.sm);
+        let b = if ready { b.hover(k.c.hover).press(k.c.pressed).cursor(Cursor::Pointer) } else { b };
+        b.on_press(move |s: &mut State| actions::copy_across(s, from, to)).child(icon(glyph, 16.0).color(ink))
+    };
+    col()
+        .key("gutter")
+        .w(40.0)
+        .h_full()
+        .items_center()
+        .pt(96.0)
+        .gap(6.0)
+        .child(arrow("copy-right", &icons::COPY_RIGHT, "Copiar a seleção do painel esquerdo para o direito", 0, 1))
+        .child(arrow("copy-left", &icons::COPY_LEFT, "Copiar a seleção do painel direito para o esquerdo", 1, 0))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -632,7 +679,8 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
     let border = if pane.drop_over {
         k.c.text_accent
     } else if s.active == p {
-        k.c.border_focus
+        // Just a hint of the accent: the active pane shouldn't shout.
+        k.alpha(k.c.border_focus, 0.3)
     } else {
         k.c.border_weak
     };
@@ -771,7 +819,7 @@ fn node_of(loc: &Location) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn node(k: &Kit, p: usize, id: String, depth: usize, glyph: &'static Icon, label: &str, current: &str, to: Location) -> El {
+fn node(k: &Kit, p: usize, id: String, depth: usize, glyph: El, label: &str, current: &str, to: Location) -> El {
     let on = id == current;
     row()
         .key(format!("node-{id}"))
@@ -788,7 +836,7 @@ fn node(k: &Kit, p: usize, id: String, depth: usize, glyph: &'static Icon, label
         .hover(if on { k.alpha(k.c.text_accent, 0.24) } else { k.alpha(k.c.text_base, 0.05) })
         .cursor(Cursor::Pointer)
         .on_press(move |s: &mut State| navigate(s, p, to.clone()))
-        .child(icon(glyph, 16.0))
+        .child(glyph)
         .child(text(label.to_string()).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0).help_when_truncated(label.to_string()))
 }
 
@@ -799,10 +847,10 @@ fn heading(k: &Kit, label: &str) -> El {
 fn tree(s: &State, k: &Kit, p: usize) -> El {
     let current = node_of(&s.panes[p].loc);
     let mut t = col().key("tree").w_full().pb(8.0);
-    t = t.child(heading(k, "Este computador")).child(node(k, p, "home".into(), 0, &icons::HOME, "Pasta pessoal", &current, Location::home()));
+    t = t.child(heading(k, "Este computador")).child(node(k, p, "home".into(), 0, shell_icon(s, sysicons::home_key().as_ref(), &icons::HOME, 16.0), "Pasta pessoal", &current, Location::home()));
     for (d, kind) in &s.local_drives {
         let letter = d.display().to_string().trim_end_matches('\\').to_string();
-        t = t.child(node(k, p, format!("disk:{letter}"), 0, &icons::DISK, &kind.label(&letter), &current, Location::Local(d.clone())));
+        t = t.child(node(k, p, format!("disk:{letter}"), 0, shell_icon(s, Some(&sysicons::drive_key(d)), &icons::DISK, 16.0), &kind.label(&letter), &current, Location::Local(d.clone())));
     }
     if !s.accounts.is_empty() {
         t = t.child(heading(k, "Google Drive"));
@@ -810,18 +858,18 @@ fn tree(s: &State, k: &Kit, p: usize) -> El {
     for a in &s.accounts {
         let e = &a.email;
         t = t
-            .child(node(k, p, format!("acc:{e}"), 0, &icons::CLOUD, e, &current, Location::drive(e.clone(), Space::MyDrive)))
-            .child(node(k, p, format!("acc:{e}:my"), 1, &icons::FOLDER, "Meu Drive", &current, Location::drive(e.clone(), Space::MyDrive)))
-            .child(node(k, p, format!("acc:{e}:sd"), 1, &icons::SHARED, "Drives compartilhados", &current, Location::drive(e.clone(), Space::SharedDrives)));
+            .child(node(k, p, format!("acc:{e}"), 0, icon(&icons::CLOUD, 16.0), e, &current, Location::drive(e.clone(), Space::MyDrive)))
+            .child(node(k, p, format!("acc:{e}:my"), 1, shell_icon(s, Some(&IconKey::Folder), &icons::FOLDER, 16.0), "Meu Drive", &current, Location::drive(e.clone(), Space::MyDrive)))
+            .child(node(k, p, format!("acc:{e}:sd"), 1, icon(&icons::SHARED, 16.0), "Drives compartilhados", &current, Location::drive(e.clone(), Space::SharedDrives)));
         // The shared drives, once their list has been loaded.
         if let Some(drives) = s.cache.shared_drives(e) {
             for d in drives.iter() {
                 let space = Space::Shared { id: d.id.clone(), name: d.name.clone() };
-                t = t.child(node(k, p, format!("acc:{e}:sd:{}", d.id), 2, &icons::SHARED, &d.name, &current, Location::drive(e.clone(), space)));
+                t = t.child(node(k, p, format!("acc:{e}:sd:{}", d.id), 2, icon(&icons::SHARED, 16.0), &d.name, &current, Location::drive(e.clone(), space)));
             }
         }
     }
-    t = t.child(heading(k, "Testes")).child(node(k, p, "mock".into(), 0, &icons::LAB, "Drive simulado", &current, Location::Mock(Vec::new())));
+    t = t.child(heading(k, "Testes")).child(node(k, p, "mock".into(), 0, icon(&icons::LAB, 16.0), "Drive simulado", &current, Location::Mock(Vec::new())));
     col()
         .key("tree-scroll")
         .w(s.layout.tree[p])
@@ -913,7 +961,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
             cell(0)
                 .px(6.0)
                 .gap(6.0)
-                .child(icon(kind_icon(e.kind()), 16.0))
+                .child(entry_icon(s, &pane.loc, e, 16.0))
                 .child(match &s.renaming {
                     Some((rp, item)) if *rp == p && item.id == e.id => rename_field(s, rename_look),
                     _ => text(e.name.clone()).font(font).color(text_c).truncate().shrink().min_w(0.0),

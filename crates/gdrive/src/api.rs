@@ -29,6 +29,8 @@ pub struct DriveFile {
     pub mime: String,
     /// For a shortcut to a folder: the folder it opens.
     pub target: Option<String>,
+    /// Drive's MD5 of the content, sent with the listing; Google's own formats have none.
+    pub md5: Option<String>,
 }
 
 /// A shared drive (formerly Team Drive): files owned by a group rather than by a person.
@@ -200,7 +202,7 @@ impl Drive {
         let q = format!("'{folder_id}' in parents and trashed = false");
         let mut query = vec![
             ("q", q.as_str()),
-            ("fields", "nextPageToken,files(id,name,mimeType,size,modifiedTime,shortcutDetails(targetId,targetMimeType))"),
+            ("fields", "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails(targetId,targetMimeType))"),
             // No orderBy: sorting a big folder on Google's side slows every page down, and the
             // app sorts locally.
             ("pageSize", "1000"),
@@ -312,7 +314,7 @@ impl Drive {
 
     /// A call that answers with one file record.
     fn file_call(&self, method: &str, path: &str, query: &[(&str, &str)], body: &serde_json::Value, what: &str) -> Result<DriveFile> {
-        let mut q = vec![("supportsAllDrives", "true"), ("fields", "id,name,mimeType,size,modifiedTime,shortcutDetails(targetId,targetMimeType)")];
+        let mut q = vec![("supportsAllDrives", "true"), ("fields", "id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails(targetId,targetMimeType)")];
         q.extend_from_slice(query);
         let v = self.call(method, path, &q, Some(body), what)?;
         let raw: RawFile = serde_json::from_value(v).map_err(|e| format!("{what}: resposta inesperada: {e}"))?;
@@ -372,6 +374,7 @@ struct RawFile {
     mime_type: String,
     size: Option<String>,
     modified_time: Option<String>,
+    md5_checksum: Option<String>,
     shortcut_details: Option<Shortcut>,
 }
 
@@ -386,6 +389,7 @@ impl From<RawFile> for DriveFile {
             id: r.id,
             name: r.name,
             mime: r.mime_type,
+            md5: r.md5_checksum,
         }
     }
 }

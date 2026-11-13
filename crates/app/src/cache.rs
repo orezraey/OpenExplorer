@@ -159,7 +159,7 @@ mod tests {
         let entries: Vec<Entry> = [Some(at(1_709_294_400_250)), Some(at(-86_400_000)), None]
             .into_iter()
             .enumerate()
-            .map(|(i, modified)| Entry { id: format!("{i}"), name: format!("f{i}"), is_dir: false, size: None, modified, target: None, mime: None })
+            .map(|(i, modified)| Entry { id: format!("{i}"), name: format!("f{i}"), is_dir: false, size: None, modified, target: None, mime: None, md5: None })
             .collect();
         let text = serde_json::to_vec(&FileOut { format: FORMAT, entries: &entries }).unwrap();
         let back: FileIn = serde_json::from_slice(&text).unwrap();

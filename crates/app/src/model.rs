@@ -22,6 +22,9 @@ pub struct Entry {
     /// extension.
     #[serde(default)]
     pub mime: Option<String>,
+    /// Drive's MD5 of the file, from the listing, so Propriedades shows it at once.
+    #[serde(default)]
+    pub md5: Option<String>,
 }
 
 /// What a file is, for its icon and the Tipo column.
@@ -45,7 +48,8 @@ pub enum Kind {
 }
 
 impl Entry {
-    fn ext(&self) -> Option<String> {
+    /// The lowercased extension, if the name has a plausible one.
+    pub fn ext(&self) -> Option<String> {
         let (stem, ext) = self.name.rsplit_once('.')?;
         (!stem.is_empty() && !ext.is_empty() && ext.len() <= 8 && !ext.contains(' ')).then(|| ext.to_ascii_lowercase())
     }
@@ -300,6 +304,7 @@ fn read_local(dir: &Path) -> std::io::Result<Vec<Entry>> {
             modified: meta.and_then(|m| m.modified().ok()),
             target: None,
             mime: None,
+            md5: None,
         });
     }
     Ok(out)
@@ -314,8 +319,8 @@ impl MockDrive {
     pub fn new() -> MockDrive {
         let now = SystemTime::now();
         let ago = |days: u64| now - Duration::from_secs(days * 86_400);
-        let dir = |name: &str, days| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: Some(ago(days)), target: None, mime: None };
-        let file = |name: String, size: u64, days| Entry { id: name.clone(), name, is_dir: false, size: Some(size), modified: Some(ago(days)), target: None, mime: None };
+        let dir = |name: &str, days| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: Some(ago(days)), target: None, mime: None, md5: None };
+        let file = |name: String, size: u64, days| Entry { id: name.clone(), name, is_dir: false, size: Some(size), modified: Some(ago(days)), target: None, mime: None, md5: None };
 
         let mut folders = HashMap::new();
         folders.insert(
@@ -605,7 +610,7 @@ mod tests {
     use super::*;
 
     fn file(name: &str) -> Entry {
-        Entry { id: name.into(), name: name.into(), is_dir: false, size: None, modified: None, target: None, mime: None }
+        Entry { id: name.into(), name: name.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None }
     }
 
     #[test]

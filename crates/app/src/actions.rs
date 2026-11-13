@@ -137,22 +137,54 @@ pub fn pick_up(s: &mut State, p: usize, mode: ClipMode) {
     s.clip = Some(Clip { mode, from: loc, items });
 }
 
-/// Whether Colar can paste the clip into pane `p` as it is: same disk or same Drive account.
-pub fn can_paste(s: &State, p: usize) -> bool {
-    let Some(clip) = &s.clip else { return false };
-    let to = &s.panes[p].loc;
-    match (&clip.from, to) {
+/// Whether items of `from` can be copied or moved into `to` as it is: same disk or same Drive
+/// account.
+fn fits(from: &Location, to: &Location) -> bool {
+    match (from, to) {
         (Location::Local(_), Location::Local(_)) => true,
         (Location::Drive { email: a, .. }, Location::Drive { email: b, .. }) => a == b && drive_folder(to).is_some(),
         _ => false,
     }
 }
 
+/// Whether Colar can paste the clip into pane `p`.
+pub fn can_paste(s: &State, p: usize) -> bool {
+    s.clip.as_ref().is_some_and(|c| fits(&c.from, &s.panes[p].loc))
+}
+
+/// The arrows between the panes: copies pane `from`'s selection into the folder pane `to`
+/// shows, as Copiar there and Colar here would, without touching what Copiar picked up.
+pub fn copy_across(s: &mut State, from: usize, to: usize) {
+    let items = selected(s, from);
+    if items.is_empty() {
+        s.status = "Selecione no outro painel o que copiar.".into();
+        return;
+    }
+    let loc = s.panes[from].loc.clone();
+    if !editable(&loc) {
+        return match loc {
+            Location::Mock(_) => not_here(s),
+            _ => s.status = "Não dá para copiar daqui.".into(),
+        };
+    }
+    transfer(s, ClipMode::Copy, loc, items, to);
+}
+
 pub fn paste(s: &mut State, p: usize) {
     let Some(clip) = &s.clip else { return };
+    let (mode, from, items) = (clip.mode, clip.from.clone(), clip.items.clone());
+    // A cut is used once; a copy can be pasted again.
+    if mode == ClipMode::Cut && fits(&from, &s.panes[p].loc) {
+        s.clip = None;
+    }
+    transfer(s, mode, from, items, p);
+}
+
+/// Copies or moves `items` of `from` into the folder pane `p` shows, or says why it can't.
+fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p: usize) {
     let to = s.panes[p].loc.clone();
-    if !can_paste(s, p) {
-        s.status = match (&clip.from, &to) {
+    if !fits(&from, &to) {
+        s.status = match (&from, &to) {
             (Location::Local(_), Location::Drive { .. }) | (Location::Drive { .. }, Location::Local(_)) => {
                 "Copiar entre o computador e o Google Drive (envio e download) é o próximo passo; por enquanto, cole na mesma origem.".into()
             }
@@ -160,11 +192,6 @@ pub fn paste(s: &mut State, p: usize) {
             _ => "Não dá para colar aqui.".into(),
         };
         return;
-    }
-    let (mode, from, items) = (clip.mode, clip.from.clone(), clip.items.clone());
-    // A cut is used once; a copy can be pasted again.
-    if mode == ClipMode::Cut {
-        s.clip = None;
     }
     let reload = vec![to.clone(), from.clone()];
     let n = items.len();
@@ -194,6 +221,7 @@ pub fn paste(s: &mut State, p: usize) {
                         modified: e.modified,
                         mime: e.mime.clone().unwrap_or_default(),
                         target: None,
+                        md5: None,
                     };
                     match mode {
                         ClipMode::Copy if src == dst => d.copy(&file, &dst, &format!("Cópia de {}", e.name)).map(|_| ())?,
@@ -600,5 +628,33 @@ mod tests {
         assert!(editable(&drive(Space::MyDrive, &[])));
         assert!(!editable(&drive(Space::SharedDrives, &[])));
         assert!(!editable(&Location::Mock(vec![])));
+    }
+
+    #[test]
+    fn arrows_copy_the_selection_across_and_keep_the_clip() {
+        let root = std::env::temp_dir().join(format!("openexplorer-across-{}", std::process::id()));
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("nota.txt"), "oi").unwrap();
+        let mut s = crate::init();
+        s.panes[0] = crate::model::Pane::new(Location::Local(a.clone()));
+        s.panes[1] = crate::model::Pane::new(Location::Local(b.clone()));
+        for p in &mut s.panes {
+            p.load_now(&s.mock);
+        }
+        s.clip = Some(Clip { mode: ClipMode::Cut, from: Location::Local(b.clone()), items: Vec::new() });
+
+        copy_across(&mut s, 1, 0);
+        assert!(s.status.contains("Selecione"), "nothing selected on the right: {}", s.status);
+
+        s.panes[0].selected.insert("nota.txt".into());
+        copy_across(&mut s, 0, 1);
+        let done = s.inbox.recv_timeout(std::time::Duration::from_secs(10)).expect("the copy answers");
+        assert!(matches!(done, Msg::Done { result: Ok(_), .. }));
+        assert_eq!(std::fs::read_to_string(b.join("nota.txt")).unwrap(), "oi");
+        assert!(a.join("nota.txt").exists(), "a copy leaves the original");
+        assert!(matches!(&s.clip, Some(Clip { mode: ClipMode::Cut, .. })), "what Recortar picked up stays");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

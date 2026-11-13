@@ -9,6 +9,10 @@ macro_rules! icon {
     };
 }
 
+// The copy arrows between the panes, in `currentColor`.
+icon!(COPY_RIGHT, "copy-right", r##"<path d="M4.5 1.5L11.5 8L4.5 14.5Z" fill="currentColor"/>"##);
+icon!(COPY_LEFT, "copy-left", r##"<path d="M11.5 1.5L4.5 8L11.5 14.5Z" fill="currentColor"/>"##);
+
 // Places and folders.
 icon!(FOLDER, "folder", r##"<path d="M1 3.5C1 2.95 1.45 2.5 2 2.5H6L7.5 4H14C14.55 4 15 4.45 15 5V12.5C15 13.05 14.55 13.5 14 13.5H2C1.45 13.5 1 13.05 1 12.5Z" fill="#E8A93A"/><path d="M1 5.5H15V12.5C15 13.05 14.55 13.5 14 13.5H2C1.45 13.5 1 13.05 1 12.5Z" fill="#F6C451"/>"##);
 icon!(FOLDER_LINK, "folder-link", r##"<path d="M1 3.5C1 2.95 1.45 2.5 2 2.5H6L7.5 4H14C14.55 4 15 4.45 15 5V12.5C15 13.05 14.55 13.5 14 13.5H2C1.45 13.5 1 13.05 1 12.5Z" fill="#E8A93A"/><path d="M1 5.5H15V12.5C15 13.05 14.55 13.5 14 13.5H2C1.45 13.5 1 13.05 1 12.5Z" fill="#F6C451"/><rect x="2" y="8" width="5.5" height="5" rx="1" fill="#FFFFFF"/><path d="M3.3 11.8L5.8 9.3M4.3 9.2H5.9V10.8" stroke="#2F6FDE" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"##);
