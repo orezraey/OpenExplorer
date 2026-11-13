@@ -1,4 +1,5 @@
-//! The window's adjustable sizes: how wide each pane's location tree and list columns are.
+//! The window's adjustable sizes: how wide each pane's location tree and list columns are, and
+//! how tall the transfer queue is and how wide its columns.
 //! Kept in `layout.json` under the config folder so they survive a restart.
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,16 @@ pub const COLS: [f32; 4] = [240.0, 86.0, 128.0, 130.0];
 pub const COL_MIN: [f32; 4] = [100.0, 60.0, 80.0, 60.0];
 pub const COL_MAX: f32 = 1200.0;
 
+/// The transfer queue's height, dragged from its top edge.
+pub const QUEUE_H: f32 = 170.0;
+pub const QUEUE_H_MIN: f32 = 80.0;
+pub const QUEUE_H_MAX: f32 = 700.0;
+
+/// The queue's columns: Operação, Origem, Destino, Estado, Tamanho, Progresso, Velocidade,
+/// Estimado.
+pub const QUEUE_COLS: [f32; 8] = [92.0, 300.0, 240.0, 124.0, 128.0, 112.0, 96.0, 88.0];
+pub const QUEUE_COL_MIN: f32 = 50.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Layout {
@@ -20,12 +31,23 @@ pub struct Layout {
     /// Per pane, the widths of Nome, Tamanho, Data and Tipo. (`cols`, from an earlier
     /// version that had three, is ignored.)
     pub columns: [[f32; 4]; 2],
+    pub queue_h: f32,
+    pub queue_cols: [f32; 8],
 }
 
 impl Default for Layout {
     fn default() -> Layout {
-        Layout { tree: [TREE_W; 2], columns: [COLS; 2] }
+        Layout { tree: [TREE_W; 2], columns: [COLS; 2], queue_h: QUEUE_H, queue_cols: QUEUE_COLS }
     }
+}
+
+pub fn clamp_queue_h(h: f32) -> f32 {
+    if h.is_finite() { h.clamp(QUEUE_H_MIN, QUEUE_H_MAX) } else { QUEUE_H }
+}
+
+/// Queue column `i`'s width kept between [`QUEUE_COL_MIN`] and [`COL_MAX`].
+pub fn clamp_queue_col(i: usize, w: f32) -> f32 {
+    if w.is_finite() { w.clamp(QUEUE_COL_MIN, COL_MAX) } else { QUEUE_COLS[i] }
 }
 
 /// Column `i`'s width kept between its minimum and [`COL_MAX`].
@@ -44,7 +66,12 @@ fn file() -> std::path::PathBuf {
 impl Layout {
     pub fn load() -> Layout {
         let l: Layout = std::fs::read(file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        Layout { tree: l.tree.map(clamp_tree), columns: l.columns.map(|c| [0, 1, 2, 3].map(|i| clamp_col(i, c[i]))) }
+        Layout {
+            tree: l.tree.map(clamp_tree),
+            columns: l.columns.map(|c| [0, 1, 2, 3].map(|i| clamp_col(i, c[i]))),
+            queue_h: clamp_queue_h(l.queue_h),
+            queue_cols: std::array::from_fn(|i| clamp_queue_col(i, l.queue_cols[i])),
+        }
     }
 
     /// Saved when a drag ends, not on every move.
@@ -67,13 +94,16 @@ mod tests {
         assert_eq!(clamp_tree(f32::NAN), TREE_W);
         assert_eq!(clamp_col(1, 10.0), COL_MIN[1]);
         assert_eq!(clamp_col(3, 2000.0), COL_MAX);
+        assert_eq!(clamp_queue_h(10.0), QUEUE_H_MIN);
+        assert_eq!(clamp_queue_h(f32::INFINITY), QUEUE_H);
+        assert_eq!(clamp_queue_col(1, 5.0), QUEUE_COL_MIN);
     }
 
     #[test]
     fn a_saved_layout_from_an_older_version_still_loads() {
         // The pane split it held is gone; the tree widths stay.
         let l: Layout = serde_json::from_str(r#"{"split":0.62,"tree":[150.0,300.0],"cols":[[61.0,138.0,124.0],[86.0,132.0,124.0]]}"#).unwrap();
-        assert_eq!(l, Layout { tree: [150.0, 300.0], columns: [COLS; 2] });
+        assert_eq!(l, Layout { tree: [150.0, 300.0], ..Layout::default() });
         let l: Layout = serde_json::from_str("{}").unwrap();
         assert_eq!(l, Layout::default());
     }

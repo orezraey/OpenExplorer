@@ -43,29 +43,19 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
 // Transfer queue
 
 /// The queue's columns, as in Air Explorer.
-const QUEUE_COLS: [(&str, f32); 8] = [
-    ("Operação", 92.0),
-    ("Origem", 300.0),
-    ("Destino", 240.0),
-    ("Estado", 124.0),
-    ("Tamanho", 128.0),
-    ("Progresso", 112.0),
-    ("Velocidade", 96.0),
-    ("Estimado", 88.0),
-];
-const QUEUE_H: f32 = 150.0;
+const QUEUE_LABELS: [&str; 8] = ["Operação", "Origem", "Destino", "Estado", "Tamanho", "Progresso", "Velocidade", "Estimado"];
 
-fn queue_cell(i: usize) -> El {
-    row().w(QUEUE_COLS[i].1).h_full().px(6.0).gap(5.0).center_y().clip_soft(0.0)
+fn queue_cell(w: f32) -> El {
+    row().w(w).h_full().px(6.0).gap(5.0).center_y().clip_soft(0.0)
 }
 
 /// Origem or Destino: the disk's (or Drive's) icon and the path.
-fn queue_end(s: &State, k: &Kit, i: usize, end: &transfers::End) -> El {
+fn queue_end(s: &State, k: &Kit, w: f32, end: &transfers::End) -> El {
     let glyph = match &end.disk {
         Some(disk) => shell_icon(s, Some(&sysicons::drive_key(disk)), &icons::DISK, 14.0),
         None => icon(&icons::CLOUD, 14.0),
     };
-    queue_cell(i).child(glyph).child(text(end.text.clone()).font(k.ty.text_xsmall).color(k.c.text_base).truncate().shrink().min_w(0.0).help_when_truncated(end.text.clone()))
+    queue_cell(w).child(glyph).child(text(end.text.clone()).font(k.ty.text_xsmall).color(k.c.text_base).truncate().shrink().min_w(0.0).help_when_truncated(end.text.clone()))
 }
 
 /// The bar with its percentage over it, as in Air Explorer.
@@ -76,7 +66,9 @@ fn queue_bar(k: &Kit, fraction: Option<f32>) -> El {
         .key("bar")
         .role("progressbar")
         .label(label.clone())
-        .w(96.0)
+        .w(0.0)
+        .grow(1.0)
+        .max_w(120.0)
         .h(15.0)
         .border(1.0, k.c.border_base)
         .fill(k.c.bg_base)
@@ -88,6 +80,7 @@ fn queue_bar(k: &Kit, fraction: Option<f32>) -> El {
 fn queue_row(s: &State, k: &Kit, t: &transfers::Transfer) -> El {
     use std::sync::atomic::Ordering::Relaxed;
     let p = &t.progress;
+    let w = s.layout.queue_cols;
     let muted = |t: String| text(t).font(k.ty.text_xsmall).color(k.c.text_base).truncate().shrink().min_w(0.0);
     let (state, dot) = match p.stage() {
         Stage::Waiting if p.cancelled() => ("Cancelando…", k.c.text_faint),
@@ -98,7 +91,7 @@ fn queue_row(s: &State, k: &Kit, t: &transfers::Transfer) -> El {
         Stage::Cancelled => ("Cancelado", k.c.warning.fg),
         Stage::Failed => ("Erro", k.c.danger.fg),
     };
-    let mut state_cell = queue_cell(3).child(el().size(8.0, 8.0).radius(4.0).fill(dot)).child(muted(state.into()));
+    let mut state_cell = queue_cell(w[3]).child(el().size(8.0, 8.0).radius(4.0).fill(dot)).child(muted(state.into()));
     if p.stage() == Stage::Failed {
         state_cell = state_cell.help(p.error());
     }
@@ -122,26 +115,40 @@ fn queue_row(s: &State, k: &Kit, t: &transfers::Transfer) -> El {
             let row = p.clone();
             move |s: &mut State, at: rune::PointerPress, _: &mut Tx| s.transfer_menu = Some((Some(row.clone()), at))
         })
-        .child(queue_cell(0).child(icon(op_icon, 14.0).color(k.c.icon_base)).child(muted(op.into())))
-        .child(queue_end(s, k, 1, &t.from))
-        .child(queue_end(s, k, 2, &t.to))
+        .child(queue_cell(w[0]).child(icon(op_icon, 14.0).color(k.c.icon_base)).child(muted(op.into())))
+        .child(queue_end(s, k, w[1], &t.from))
+        .child(queue_end(s, k, w[2], &t.to))
         .child(state_cell)
-        .child(queue_cell(4).child(muted(size)))
-        .child(queue_cell(5).child(queue_bar(k, t.fraction())))
-        .child(queue_cell(6).child(muted(speed)))
-        .child(queue_cell(7).child(muted(left)))
+        .child(queue_cell(w[4]).child(muted(size)))
+        .child(queue_cell(w[5]).child(queue_bar(k, t.fraction())))
+        .child(queue_cell(w[6]).child(muted(speed)))
+        .child(queue_cell(w[7]).child(muted(left)))
 }
 
-/// The transfer queue under the panes: a row per item being copied or moved.
+/// The transfer queue under the panes: a row per item being copied or moved. It shows only
+/// while there's a row; its top edge drags to change its height, and its columns resize as the
+/// file list's do.
 fn transfers(s: &State, k: &Kit) -> El {
+    if s.transfers.is_empty() {
+        return el().key("queue-wrap");
+    }
+    let w = s.layout.queue_cols;
+    let total: f32 = w.iter().sum();
+    let grips = (0..8).map(|i| {
+        let edge = w[..=i].iter().sum();
+        grip(k, &format!("queue-grip-{i}"), edge, 22.0, move |s| &mut s.layout.queue_cols[i], layout::QUEUE_COLS[i], move |v| layout::clamp_queue_col(i, v))
+    });
     let header = row()
         .key("queue-header")
         .w_full()
         .h(22.0)
+        .fill(k.c.bg_base)
+        .sticky_top(0.0)
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
-        .children(QUEUE_COLS.iter().enumerate().map(|(i, (label, _))| {
-            queue_cell(i).border_sides([0.0, 1.0, 0.0, 0.0], k.c.border_weak).child(text(label.to_string()).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().min_w(0.0))
-        }));
+        .children(QUEUE_LABELS.iter().enumerate().map(|(i, label)| {
+            queue_cell(w[i]).border_sides([0.0, 1.0, 0.0, 0.0], k.c.border_weak).child(text(label.to_string()).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().min_w(0.0))
+        }))
+        .children(grips);
     // Only the rows in view are built: copying a 5,000-file folder makes 5,000 rows.
     let kit = k.clone();
     let rows = col().key("queue-rows").w_full().growth(GrowthSpec::default()).virtual_rows(
@@ -150,17 +157,23 @@ fn transfers(s: &State, k: &Kit) -> El {
         |s: &State, i| Cow::Owned(format!("t-{:p}", std::sync::Arc::as_ptr(&s.transfers[i].progress))),
         move |s: &State, i| queue_row(s, &kit, &s.transfers[i]),
     );
+    // One viewport scrolls both ways, as the file list's: sideways when the columns are wider
+    // than the window, with the header stuck to the top.
+    let table = col().key("queue-table").w_full().min_w(total).child(header).child(rows);
     let queue = col()
         .key("queue")
         .w_full()
-        .h_full()
+        .grow(1.0)
+        .min_h(0.0)
         .fill(k.c.bg_base)
         .border(1.0, k.c.border_weak)
         .clip_soft(0.0)
-        .child(header)
-        .child(col().key("queue-scroll").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(rows))
-        .on_secondary_press(|s: &mut State, at: rune::PointerPress, _: &mut Tx| s.transfer_menu = Some((None, at)));
-    row().key("queue-wrap").w_full().h(QUEUE_H).px(6.0).child(queue)
+        .on_secondary_press(|s: &mut State, at: rune::PointerPress, _: &mut Tx| s.transfer_menu = Some((None, at)))
+        .child(col().key("queue-viewport").w_full().h_full().scroll_xy().child(table).scroll_bar(k));
+    // The strip above the queue drags up and down to change its height. On a window too
+    // short for it, the queue gives way rather than the panes.
+    let edge = splitter(k, "queue-edge", 6.0, Split::Up, |s: &mut State| &mut s.layout.queue_h, layout::QUEUE_H, layout::clamp_queue_h);
+    col().key("queue-wrap").w_full().h(s.layout.queue_h + 6.0).shrink().min_h(layout::QUEUE_H_MIN).px(6.0).child(edge).child(queue)
 }
 
 /// The right end of the status line while something is under way: "Total: 0,05 / 2,66 GB",
@@ -764,7 +777,9 @@ fn toolbar(s: &State, k: &Kit) -> El {
 /// to the start plus the travel (through `clamp`), a cancelled drag puts it back, and a double
 /// click sets `default`. Returns whether the layout changed and should be saved: on a double
 /// click, and on release when the size ended up different.
-fn resize(d: &mut Drag, size: &mut f32, default: f32, clamp: impl Fn(f32) -> f32) -> bool {
+/// `step` is how far the pointer moved along the size: `d.dx` for a width, `-d.dy` for a
+/// height grown upwards.
+fn resize(d: &mut Drag, step: f32, size: &mut f32, default: f32, clamp: impl Fn(f32) -> f32) -> bool {
     match d.phase {
         Phase::Down if d.clicks >= 2 => {
             // The release of this click resizes from the default, so it doesn't undo it.
@@ -781,32 +796,45 @@ fn resize(d: &mut Drag, size: &mut f32, default: f32, clamp: impl Fn(f32) -> f32
             false
         }
         Phase::Move => {
-            *size = clamp(d.data + d.dx);
+            *size = clamp(d.data + step);
             false
         }
         Phase::Up => {
-            *size = clamp(d.data + d.dx);
+            *size = clamp(d.data + step);
             *size != d.data
         }
     }
 }
 
-/// A vertical bar to drag sideways (between a pane's tree and its list), `width` wide, showing
-/// a line on hover and while dragged. `size` picks the width it changes in the layout.
-fn splitter(k: &Kit, key: &str, width: f32, size: impl Fn(&mut State) -> &mut f32 + 'static, default: f32, clamp: fn(f32) -> f32) -> El {
+/// Which way a [`splitter`] drags.
+#[derive(Clone, Copy)]
+enum Split {
+    /// A vertical bar dragged sideways (between a pane's tree and its list): a width.
+    Right,
+    /// A horizontal strip dragged up (over the transfer queue): a height that grows upwards.
+    Up,
+}
+
+/// A bar `thick` across to drag, showing a line on hover and while dragged. `size` picks the
+/// width or height it changes in the layout; a double click puts it back to `default`.
+fn splitter(k: &Kit, key: &str, thick: f32, way: Split, size: impl Fn(&mut State) -> &mut f32 + 'static, default: f32, clamp: fn(f32) -> f32) -> El {
     let line = k.c.border_focus;
-    row()
-        .key(key.to_string())
+    let bar = match way {
+        Split::Right => row().w(thick).h_full().cursor(Cursor::ResizeColumn),
+        Split::Up => row().w_full().h(thick).cursor(Cursor::ResizeRow),
+    };
+    bar.key(key.to_string())
         .role("separator")
         .label("Arraste para redimensionar; clique duas vezes para voltar ao padrão")
-        .w(width)
-        .h_full()
         .justify_center()
-        .cursor(Cursor::ResizeColumn)
         .hover(k.alpha(line, 0.18))
         .press(k.alpha(line, 0.32))
         .on_drag(move |s: &mut State, d: &mut Drag, _tx: &mut Tx| {
-            if resize(d, size(s), default, clamp) {
+            let step = match way {
+                Split::Right => d.dx,
+                Split::Up => -d.dy,
+            };
+            if resize(d, step, size(s), default, clamp) {
                 s.layout.save();
             }
         })
@@ -818,7 +846,7 @@ fn panes(s: &State, k: &Kit) -> El {
         .key("panes")
         .w_full()
         .grow(1.0)
-        .min_h(0.0)
+        .min_h(160.0)
         .padding(6.0)
         .child(pane(s, k, 0))
         .child(gutter(s, k))
@@ -885,7 +913,7 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
                 .min_h(0.0)
                 .child(tree(s, k, p))
                 .child(
-                    splitter(k, "tree-split", 5.0, move |s: &mut State| &mut s.layout.tree[p], layout::TREE_W, clamp_tree)
+                    splitter(k, "tree-split", 5.0, Split::Right, move |s: &mut State| &mut s.layout.tree[p], layout::TREE_W, clamp_tree)
                     .child(el().w(1.0).h_full().fill(k.c.border_weak)),
                 )
                 .child(list(s, k, p)),
@@ -1062,17 +1090,23 @@ fn tree(s: &State, k: &Kit, p: usize) -> El {
 /// The grip on a column's right edge, as in Windows Explorer: it moves with the pointer,
 /// resizing that column and carrying the columns after it along. A double click puts the column
 /// back to its default width.
-fn col_grip(k: &Kit, p: usize, i: usize, width: f32) -> El {
-    el().key(format!("grip-{i}"))
+fn col_grip(k: &Kit, p: usize, i: usize, edge: f32) -> El {
+    grip(k, &format!("grip-{i}"), edge, 24.0, move |s| &mut s.layout.columns[p][i], layout::COLS[i], move |w| clamp_col(i, w))
+}
+
+/// A column grip at `edge` over a header `height` tall, changing the width `size` picks.
+fn grip(k: &Kit, key: &str, edge: f32, height: f32, size: impl Fn(&mut State) -> &mut f32 + 'static, default: f32, clamp: impl Fn(f32) -> f32 + 'static) -> El {
+    el().key(key.to_string())
         .role("separator")
         .label("Arraste para mudar a largura da coluna; clique duas vezes para voltar ao padrão")
-        .absolute(width - 4.0, 0.0)
+        .absolute(edge - 4.0, 0.0)
         .w(8.0)
-        .h(24.0)
+        .h(height)
         .cursor(Cursor::ResizeColumn)
         .hover(k.alpha(k.c.border_focus, 0.35))
         .on_drag(move |s: &mut State, d: &mut Drag, _tx: &mut Tx| {
-            if resize(d, &mut s.layout.columns[p][i], layout::COLS[i], |w| clamp_col(i, w)) {
+            let step = d.dx;
+            if resize(d, step, size(s), default, &clamp) {
                 s.layout.save();
             }
         })

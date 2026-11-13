@@ -190,9 +190,13 @@ fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
     // A redraw is due while any row moves, and once more when the last one stops.
     let rows = s.transfers.len();
     s.transfers.retain(|t| t.progress.stage() != ops::Stage::Done);
-    if let Some((Some(row), _)) = &s.transfer_menu
-        && !s.transfers.iter().any(|t| Arc::ptr_eq(&t.progress, row))
-    {
+    // The queue's menu goes with its row, and with the queue when that empties and hides.
+    let gone = match &s.transfer_menu {
+        Some((Some(row), _)) => !s.transfers.iter().any(|t| Arc::ptr_eq(&t.progress, row)),
+        Some((None, _)) => s.transfers.is_empty(),
+        None => false,
+    };
+    if gone {
         s.transfer_menu = None;
     }
     let live = s.transfers.iter().filter(|t| !t.progress.over()).count();
