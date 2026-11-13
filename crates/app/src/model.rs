@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Entry {
     /// Unique in its folder: the name on disk and in the simulated drive, the file id in Google
     /// Drive (where two files can share a name).
@@ -70,8 +70,6 @@ pub struct Pane {
     pub error: Option<String>,
     /// A listing is on its way from a background thread.
     pub loading: bool,
-    /// Numbers each listing request, so an answer for a folder already left is dropped.
-    pub request: u64,
 }
 
 impl Pane {
@@ -87,7 +85,6 @@ impl Pane {
             drop_over: false,
             error: None,
             loading: false,
-            request: 0,
         }
     }
 
@@ -131,7 +128,19 @@ impl Pane {
                 self.entries.clear();
             }
         }
-        self.selected.retain(|id| self.entries.iter().any(|e| &e.id == id));
+        self.prune_selection();
+        self.sort_entries();
+    }
+
+    /// Forgets selected ids the listing doesn't have (anymore).
+    pub fn prune_selection(&mut self) {
+        let ids: HashSet<&str> = self.entries.iter().map(|e| e.id.as_str()).collect();
+        self.selected.retain(|id| ids.contains(id.as_str()));
+    }
+
+    /// Adds a later page of a listing that's still arriving.
+    pub fn append_entries(&mut self, more: Vec<Entry>) {
+        self.entries.extend(more);
         self.sort_entries();
     }
 

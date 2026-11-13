@@ -2282,6 +2282,8 @@ dependencies = [
  "openexplorer-gdrive",
  "rune",
  "rune-kit",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

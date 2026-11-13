@@ -75,6 +75,26 @@ pub fn config_dir() -> PathBuf {
     base.join("OpenExplorer")
 }
 
+/// `%LOCALAPPDATA%\OpenExplorer`: files tied to this machine (cache, log), kept out of a roaming
+/// profile. [`config_dir`] where there's no such folder.
+pub fn local_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("OpenExplorer")).unwrap_or_else(config_dir)
+}
+
+/// Appends a timestamped line to `openexplorer.log` in [`local_dir`]: request timings, to tell a
+/// slow network from a slow app. Starts over past 1 MB. Never fails the caller.
+pub fn log(line: &str) {
+    use std::io::Write;
+    let path = local_dir().join("openexplorer.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 1 << 20) {
+        let _ = std::fs::remove_file(&path);
+    }
+    let _ = std::fs::create_dir_all(local_dir());
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{} {line}", chrono::Local::now().format("%H:%M:%S%.3f"));
+    }
+}
+
 pub fn client_file() -> PathBuf {
     config_dir().join("google-client.json")
 }

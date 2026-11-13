@@ -4,12 +4,14 @@
 //! Drive calls block, so they run on background threads that send a [`Msg`] back and wake the
 //! window; `poll` applies it.
 
+mod cache;
 mod model;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::SystemTime;
 
@@ -23,13 +25,32 @@ use model::{Entry, Location, MockDrive, Pane, SortCol, Space, format_size, forma
 const ROW_H: f32 = 26.0;
 
 enum Msg {
-    /// `made` carries an account opened on the background thread, for `poll` to keep.
-    Listed { pane: usize, request: u64, made: Option<(String, Arc<Drive>)>, result: Result<Vec<Entry>, String> },
+    /// Part of a folder listing. `made` carries an account opened on the background thread,
+    /// for `poll` to keep.
+    Listed { pane: usize, request: u64, made: Option<(String, Arc<Drive>)>, part: Part, result: Result<Vec<Entry>, String> },
     LoggedIn { pane: usize, attempt: u64, result: Result<(StoredAccount, Arc<Drive>), String> },
+}
+
+/// Which part of a listing a [`Msg::Listed`] is.
+#[derive(Clone, Copy, PartialEq)]
+enum Part {
+    /// A listing saved by an earlier run, shown while the fresh one loads.
+    Cached,
+    /// Fresh entries. `first` replaces what the pane shows, later pages add to it; `more` says
+    /// another page is on its way.
+    Page { first: bool, more: bool },
+}
+
+impl Part {
+    const WHOLE: Part = Part::Page { first: true, more: false };
 }
 
 struct State {
     panes: [Pane; 2],
+    /// Each pane's current listing request, bumped by every load: `poll` drops answers for an
+    /// older one, and the listing thread stops fetching pages once the pane has moved on.
+    live: [Arc<AtomicU64>; 2],
+    cache: cache::Cache,
     mock: MockDrive,
     accounts: Vec<StoredAccount>,
     /// Connected accounts by e-mail, made on first use.
@@ -58,6 +79,8 @@ fn init() -> State {
     }
     State {
         panes,
+        live: Default::default(),
+        cache: Default::default(),
         mock,
         accounts: store::accounts(),
         drives: HashMap::new(),
@@ -77,14 +100,16 @@ fn setup(s: &mut State, waker: Waker) {
     s.waker = Some(waker);
 }
 
-/// Runs `work` on a new thread and hands its message to `poll`.
-fn background(s: &State, work: impl FnOnce() -> Msg + Send + 'static) {
+/// Runs `work` on a new thread. Each message it emits reaches `poll` at once.
+fn background(s: &State, work: impl FnOnce(&dyn Fn(Msg)) + Send + 'static) {
     let (out, wake) = (s.outbox.clone(), s.waker.clone());
     std::thread::spawn(move || {
-        let _ = out.send(work());
-        if let Some(w) = wake {
-            w();
-        }
+        work(&|msg| {
+            let _ = out.send(msg);
+            if let Some(w) = &wake {
+                w();
+            }
+        })
     });
 }
 
@@ -93,14 +118,45 @@ fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
     while let Ok(msg) = s.inbox.try_recv() {
         changed = true;
         match msg {
-            Msg::Listed { pane, request, made, result } => {
+            Msg::Listed { pane, request, made, part, result } => {
                 if let Some((email, drive)) = made
                     && s.accounts.iter().any(|a| a.email == email)
                 {
                     s.drives.entry(email).or_insert(drive);
                 }
-                if s.panes[pane].request == request {
-                    s.panes[pane].set_entries(result);
+                if s.live[pane].load(Ordering::Relaxed) != request {
+                    continue;
+                }
+                let (first, more) = match part {
+                    Part::Cached => (true, true),
+                    Part::Page { first, more } => (first, more),
+                };
+                let ok = result.is_ok();
+                let p = &mut s.panes[pane];
+                // The selection (the folder just left, say) may be on a page still to come.
+                let selected = p.selected.clone();
+                match result {
+                    r if first => p.set_entries(r),
+                    Ok(page) => p.append_entries(page),
+                    // A later page, or the refresh of a cached listing, failed: keep what the pane
+                    // shows and say so.
+                    Err(e) => s.status = format!("Não consegui terminar a listagem, mostrando o que chegou: {e}"),
+                }
+                let p = &mut s.panes[pane];
+                p.loading = ok && more;
+                if p.loading {
+                    p.selected = selected;
+                } else {
+                    p.prune_selection();
+                }
+                // A complete fresh listing replaces the cached one.
+                if ok
+                    && !more
+                    && part != Part::Cached
+                    && let Some(k) = cache::key(&s.panes[pane].loc)
+                {
+                    let entries = s.panes[pane].entries.clone();
+                    s.cache.put(k, entries);
                 }
             }
             Msg::LoggedIn { pane, attempt, result } => {
@@ -175,7 +231,7 @@ fn connect(s: &mut State, p: usize, tx: &mut Tx) {
     let attempt = s.logins;
     s.login = Some(attempt);
     s.status = "Faça o login no navegador que abriu. Esperando o Google…".into();
-    background(s, move || {
+    background(s, move |emit| {
         let result = (|| {
             let tokens = pending.finish(&cfg)?;
             let drive = Drive::from_login(cfg, &tokens)?;
@@ -184,7 +240,7 @@ fn connect(s: &mut State, p: usize, tx: &mut Tx) {
             store::save(account.clone(), drive.refresh_token())?;
             Ok((account, Arc::new(drive)))
         })();
-        Msg::LoggedIn { pane: p, attempt, result }
+        emit(Msg::LoggedIn { pane: p, attempt, result });
     });
 }
 
@@ -194,6 +250,7 @@ fn disconnect(s: &mut State, email: &str) {
         return;
     }
     s.drives.remove(email);
+    s.cache.forget(email);
     s.accounts.retain(|a| a.email != email);
     for p in 0..2 {
         if matches!(&s.panes[p].loc, Location::Drive { email: e, .. } if e == email) {
@@ -211,30 +268,60 @@ fn disconnect(s: &mut State, email: &str) {
 fn load(s: &mut State, p: usize) {
     // Every load gets a new number, so a Drive answer for a folder left since is dropped,
     // whatever the pane shows now.
-    s.panes[p].request += 1;
+    let request = s.live[p].fetch_add(1, Ordering::Relaxed) + 1;
     let Location::Drive { email, space, path } = s.panes[p].loc.clone() else {
         let State { panes, mock, .. } = s;
         panes[p].load_now(mock);
         return;
     };
-    let cached = s.drives.get(&email).cloned();
+    let opened = s.drives.get(&email).cloned();
+    let key = cache::key(&s.panes[p].loc);
+    // A folder seen this session shows at once; the fresh listing then replaces it whole.
+    let in_memory = key.as_ref().and_then(|k| s.cache.get(k)).map(|e| e.to_vec());
     let pane = &mut s.panes[p];
+    let mut quiet = in_memory.is_some();
+    if let Some(entries) = in_memory {
+        pane.set_entries(Ok(entries));
+    }
     pane.loading = true;
     pane.error = None;
-    let request = pane.request;
+    let live = s.live[p].clone();
     let folder = path.last().map(|(id, _)| id.clone());
-    background(s, move || {
-        let (drive, made) = match cached {
+    background(s, move |emit| {
+        let listed = |made, part, result| Msg::Listed { pane: p, request, made, part, result };
+        // Else one from an earlier run, read here off the UI thread.
+        if !quiet && let Some(entries) = key.as_ref().and_then(cache::load_disk) {
+            emit(listed(None, Part::Cached, Ok(entries)));
+            quiet = true;
+        }
+        let (drive, mut made) = match opened {
             Some(d) => (d, None),
             None => match open_drive(&email) {
                 Ok(d) => (d.clone(), Some((email, d))),
-                Err(e) => return Msg::Listed { pane: p, request, made: None, result: Err(e) },
+                Err(e) => return emit(listed(None, Part::Page { first: !quiet, more: false }, Err(e))),
             },
         };
-        let files = |r: Result<Vec<DriveFile>, String>| r.map(|v| v.into_iter().map(entry_of).collect());
+        // Without a cached listing each page shows as soon as it lands, so a big folder fills
+        // in instead of staying blank. With one, pages are gathered and replace it in one go,
+        // so the list doesn't shrink to the first page and grow back.
+        let mut first = true;
+        let mut gathered = Vec::new();
+        let mut page = |files: Vec<DriveFile>, more: bool| {
+            let entries = files.into_iter().map(entry_of);
+            if quiet {
+                gathered.extend(entries);
+                if !more {
+                    emit(listed(made.take(), Part::WHOLE, Ok(std::mem::take(&mut gathered))));
+                }
+            } else {
+                emit(listed(made.take(), Part::Page { first, more }, Ok(entries.collect())));
+                first = false;
+            }
+            live.load(Ordering::Relaxed) == request
+        };
         let result = match &space {
-            Space::MyDrive => files(drive.list(folder.as_deref().unwrap_or("root"), None)),
-            Space::Shared { id, .. } => files(drive.list(folder.as_deref().unwrap_or(id), Some(id))),
+            Space::MyDrive => drive.list(folder.as_deref().unwrap_or("root"), None, &mut page),
+            Space::Shared { id, .. } => drive.list(folder.as_deref().unwrap_or(id), Some(id), &mut page),
             // The shared drives show as folders.
             Space::SharedDrives => drive.shared_drives().map(|list| {
                 list.into_iter()
@@ -246,10 +333,13 @@ fn load(s: &mut State, p: usize) {
                         modified: None,
                         target: None,
                     })
-                    .collect()
-            }),
+                    .collect::<Vec<_>>()
+            }).map(|entries| emit(listed(made.take(), Part::WHOLE, Ok(entries)))),
         };
-        Msg::Listed { pane: p, request, made, result }
+        if let Err(e) = result {
+            // Over a cached or partly shown listing, keep it and only report the error.
+            emit(listed(made.take(), Part::Page { first: first && !quiet, more: false }, Err(e)));
+        }
     });
 }
 

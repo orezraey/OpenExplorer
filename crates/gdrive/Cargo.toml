@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 base64 = "0.22"
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 getrandom = "0.3"
 # Refresh tokens live in the OS credential store: Credential Manager on Windows.
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
