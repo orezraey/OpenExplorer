@@ -79,18 +79,39 @@ impl Drive {
         Ok(fresh.access_token)
     }
 
-    /// A GET with the access token. A 401 means Google dropped the token before its expiry
-    /// (revoked access, clock skew): renew it and try once more. Each call's time goes to
-    /// [`crate::log`].
-    fn get(&self, path: &str, query: &[(&str, &str)], what: &str) -> Result<serde_json::Value> {
+    /// A call with the access token: GET when `body` is `None`, else `method` with a JSON body.
+    /// A 401 means Google dropped the token before its expiry (revoked access, clock skew):
+    /// renew it and try once more. Each call's time goes to [`crate::log`].
+    fn call(&self, method: &str, path: &str, query: &[(&str, &str)], body: Option<&serde_json::Value>, what: &str) -> Result<serde_json::Value> {
         for retry in [false, true] {
             let started = Instant::now();
-            let mut req = self.agent.get(format!("{API}{path}")).header("Authorization", format!("Bearer {}", self.token()?));
-            for (k, v) in query {
-                req = req.query(*k, *v);
-            }
-            let resp = req.call().map_err(|e| {
-                crate::log(&format!("GET {path} falhou em {} ms: {e}", started.elapsed().as_millis()));
+            let url = format!("{API}{path}");
+            let auth = format!("Bearer {}", self.token()?);
+            let sent = match (method, body) {
+                ("GET", _) | (_, None) => {
+                    let mut req = self.agent.get(&url).header("Authorization", &auth);
+                    for (k, v) in query {
+                        req = req.query(*k, *v);
+                    }
+                    req.call()
+                }
+                ("POST", Some(b)) => {
+                    let mut req = self.agent.post(&url).header("Authorization", &auth);
+                    for (k, v) in query {
+                        req = req.query(*k, *v);
+                    }
+                    req.send_json(b)
+                }
+                (_, Some(b)) => {
+                    let mut req = self.agent.patch(&url).header("Authorization", &auth);
+                    for (k, v) in query {
+                        req = req.query(*k, *v);
+                    }
+                    req.send_json(b)
+                }
+            };
+            let resp = sent.map_err(|e| {
+                crate::log(&format!("{method} {path} falhou em {} ms: {e}", started.elapsed().as_millis()));
                 format!("{what}: sem conexão com o Google: {e}")
             })?;
             let status = resp.status().as_u16();
@@ -99,10 +120,14 @@ impl Drive {
                 continue;
             }
             let out = json(resp, what);
-            crate::log(&format!("GET {path} {status} em {} ms", started.elapsed().as_millis()));
+            crate::log(&format!("{method} {path} {status} em {} ms", started.elapsed().as_millis()));
             return out;
         }
         unreachable!("the second attempt always returns")
+    }
+
+    fn get(&self, path: &str, query: &[(&str, &str)], what: &str) -> Result<serde_json::Value> {
+        self.call("GET", path, query, None, what)
     }
 
     pub fn about(&self) -> Result<Account> {
@@ -189,6 +214,85 @@ impl Drive {
         }
         self.pages("/files", &query, "files", "Listagem da pasta", |raw: Vec<RawFile>, more| each(raw.into_iter().map(DriveFile::from).collect(), more))
     }
+
+    /// A new folder named `name` in folder `parent` (`"root"` is My Drive).
+    pub fn create_folder(&self, name: &str, parent: &str) -> Result<DriveFile> {
+        let body = serde_json::json!({ "name": name, "mimeType": FOLDER_MIME, "parents": [parent] });
+        self.file_call("POST", "/files", &[], &body, "Criar pasta")
+    }
+
+    pub fn rename(&self, id: &str, name: &str) -> Result<DriveFile> {
+        self.file_call("PATCH", &format!("/files/{}", checked(id)?), &[], &serde_json::json!({ "name": name }), "Renomear")
+    }
+
+    /// Moves a file or folder to the Drive trash, from where it can be restored for 30 days.
+    pub fn trash(&self, id: &str) -> Result<DriveFile> {
+        self.file_call("PATCH", &format!("/files/{}", checked(id)?), &[], &serde_json::json!({ "trashed": true }), "Mover para a lixeira")
+    }
+
+    /// Moves `id` out of folder `from` into folder `to`.
+    pub fn move_to(&self, id: &str, from: &str, to: &str) -> Result<DriveFile> {
+        let path = format!("/files/{}", checked(id)?);
+        self.file_call("PATCH", &path, &[("addParents", checked(to)?), ("removeParents", checked(from)?)], &serde_json::json!({}), "Mover")
+    }
+
+    /// A copy of file or folder `src` in folder `to`, named `name`. Drive copies files only, so
+    /// a folder is copied as a new folder with copies of everything in it.
+    pub fn copy(&self, src: &DriveFile, to: &str, name: &str) -> Result<DriveFile> {
+        if !src.is_dir {
+            let body = serde_json::json!({ "name": name, "parents": [to] });
+            return self.file_call("POST", &format!("/files/{}/copy", checked(&src.id)?), &[], &body, "Copiar");
+        }
+        let folder = self.create_folder(name, to)?;
+        let mut children = Vec::new();
+        self.list(&src.id, None, |page, _| {
+            children.extend(page);
+            true
+        })?;
+        for c in children {
+            // Shortcuts are copied as shortcuts, not followed into their target.
+            let c = DriveFile { is_dir: c.mime == FOLDER_MIME, ..c };
+            self.copy(&c, &folder.id, &c.name.clone())?;
+        }
+        Ok(folder)
+    }
+
+    /// One file's details, for Propriedades.
+    pub fn details(&self, id: &str) -> Result<Details> {
+        let fields = "id,name,mimeType,size,modifiedTime,createdTime,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName)";
+        let v = self.get(&format!("/files/{}", checked(id)?), &[("fields", fields), ("supportsAllDrives", "true")], "Propriedades")?;
+        let s = |p: &str| v.pointer(p).and_then(|x| x.as_str()).map(str::to_string);
+        Ok(Details {
+            created: s("/createdTime").as_deref().and_then(parse_time),
+            link: s("/webViewLink"),
+            owner: s("/owners/0/displayName").or_else(|| s("/owners/0/emailAddress")),
+            modified_by: s("/lastModifyingUser/displayName"),
+        })
+    }
+
+    /// A call that answers with one file record.
+    fn file_call(&self, method: &str, path: &str, query: &[(&str, &str)], body: &serde_json::Value, what: &str) -> Result<DriveFile> {
+        let mut q = vec![("supportsAllDrives", "true"), ("fields", "id,name,mimeType,size,modifiedTime,shortcutDetails(targetId,targetMimeType)")];
+        q.extend_from_slice(query);
+        let v = self.call(method, path, &q, Some(body), what)?;
+        let raw: RawFile = serde_json::from_value(v).map_err(|e| format!("{what}: resposta inesperada: {e}"))?;
+        Ok(raw.into())
+    }
+}
+
+/// What Propriedades shows of a Drive file beyond its listing.
+#[derive(Clone, Debug, Default)]
+pub struct Details {
+    pub created: Option<SystemTime>,
+    pub link: Option<String>,
+    pub owner: Option<String>,
+    pub modified_by: Option<String>,
+}
+
+/// A Drive id, refused if it holds anything but `[A-Za-z0-9_-]`, so it can't reach into the
+/// request path or query.
+fn checked(id: &str) -> Result<&str> {
+    if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') { Ok(id) } else { Err(format!("Id inválido: {id}")) }
 }
 
 #[derive(Deserialize)]

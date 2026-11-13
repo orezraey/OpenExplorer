@@ -5,9 +5,10 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 
 use rune::{Align, Color, Cursor, Cx, Drag, DragOutcome, El, GrowthSpec, Icon, KeyEvent, Phase, ScrollSpec, Tx, col, el, icon, row, text};
-use rune_kit::{Kit, ScrollBar};
+use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, ScrollBar, context_menu};
 
 use crate::model::{Kind, Location, SortCol, Space, crumbs, format_size, format_time};
+use crate::actions::{self, ClipMode, Dialog};
 use crate::{State, click, connect, disconnect, drag_item, dragged_ids, dropped, go_back, go_forward, go_up, key, load, navigate, open, pane_key, paths_for, row_key, set_sort};
 use crate::icons;
 use crate::layout::{self, clamp_col, clamp_tree};
@@ -18,13 +19,291 @@ const PANES_GAP: f32 = 6.0;
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let k = Kit::neutral(cx.system_dark());
     let message = text(s.status.clone()).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0).help_when_truncated(s.status.clone());
-    col()
+    // Menus and dialogs draw in a layer above everything.
+    let mut layer = Vec::new();
+    let menu = context(s, &k, &mut layer);
+    dialog(s, &k, &mut layer);
+    let body = col()
         .w_full()
         .h_full()
         .fill(k.c.page)
         .child(toolbar(s, &k))
         .child(panes(s, &k))
         .child(row().key("message").w_full().h(22.0).px(10.0).center_y().child(message))
+        .child(menu);
+    rune_kit::root(body, layer)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Context menu
+
+/// The right-click menu of the pane it was opened in: on the selection, or on the folder
+/// when opened over empty space.
+fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
+    let anchor = el().key("menu-anchor").size(0.0, 0.0);
+    let Some((p, at)) = s.menu else { return anchor };
+    let n = s.panes[p].selected.len();
+    let editable = actions::editable(&s.panes[p].loc);
+    let item = |label: &str, glyph: &'static Icon, keys: &str, enabled: bool, f: fn(&mut State, usize, &mut Tx)| {
+        MenuItem::new(label).icon(glyph).shortcut(keys).disabled(!enabled).on_select_tx(move |s: &mut State, tx: &mut Tx| {
+            s.menu = None;
+            f(s, p, tx);
+        })
+    };
+    let mut menu = context_menu("menu", anchor, Some(at)).min_width(220.0);
+    if n > 0 {
+        menu = menu
+            .item(item("Abrir", &icons::M_OPEN, "Enter", n == 1, actions::open))
+            .separator()
+            .item(item("Recortar", &icons::M_CUT, "Ctrl+X", editable, |s, p, _| actions::pick_up(s, p, ClipMode::Cut)))
+            .item(item("Copiar", &icons::M_COPY, "Ctrl+C", editable, |s, p, _| actions::pick_up(s, p, ClipMode::Copy)));
+    }
+    menu = menu.item(item("Colar", &icons::M_PASTE, "Ctrl+V", actions::can_paste(s, p), |s, p, _| actions::paste(s, p)));
+    if n > 0 {
+        menu = menu
+            .separator()
+            .item(item("Excluir", &icons::M_DELETE, "Del", editable, |s, p, _| actions::ask_delete(s, p)).danger(true))
+            .item(item("Renomear", &icons::M_RENAME, "F2", editable && n == 1, actions::ask_rename));
+    }
+    menu = menu.separator().item(item("Nova pasta", &icons::M_NEW_FOLDER, "Ctrl+Shift+N", editable, actions::ask_new_folder));
+    if n > 0 {
+        menu = menu.separator().item(item("Propriedades", &icons::M_PROPERTIES, "Alt+Enter", true, |s, p, _| actions::properties(s, p)));
+    }
+    menu.on_close(|s: &mut State| s.menu = None).build(k, layer)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Dialogs
+
+fn close(s: &mut State) {
+    s.dialog = None;
+}
+
+/// Buttons along a dialog's bottom right: the cancel, then the action.
+fn actions_row(k: &Kit, cancel: &str, act: Button) -> El {
+    row()
+        .key("actions")
+        .w_full()
+        .pt(16.0)
+        .gap(8.0)
+        .justify_end()
+        .child(Button::new(cancel).variant(ButtonVariant::Neutral).on_press(close).build(k))
+        .child(act.build(k))
+}
+
+fn dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
+    let Some(d) = &s.dialog else { return };
+    let pad = |e: El| col().key("content").w_full().px(16.0).pb(16.0).child(e);
+    match d {
+        Dialog::Delete { pane, items } => {
+            let local = matches!(s.panes[*pane].loc, Location::Local(_));
+            let title = match items.as_slice() {
+                [one] => format!("Excluir \"{}\"?", one.name),
+                many => format!("Excluir {} itens?", ui_count(many.len())),
+            };
+            let where_to = if local {
+                "Os itens vão para a Lixeira do Windows, de onde podem ser restaurados."
+            } else {
+                "Os itens vão para a lixeira do Google Drive, onde ficam 30 dias antes de serem apagados de vez."
+            };
+            let mut list = col().key("items").w_full().gap(4.0);
+            for e in items.iter().take(6) {
+                list = list.child(
+                    row().gap(6.0).center_y().child(icon(kind_icon(e.kind()), 16.0)).child(text(e.name.clone()).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0)),
+                );
+            }
+            if items.len() > 6 {
+                list = list.child(text(format!("e mais {}", ui_count(items.len() - 6))).font(k.ty.text_small).color(k.c.text_muted));
+            }
+            // The explanation goes in the body, where it wraps; the dialog's own description
+            // line doesn't, and would run under the close button.
+            let note = text(where_to).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
+            let body = col().w_full().gap(12.0).child(note).child(list).child(actions_row(k, "Cancelar", Button::new("Excluir").variant(ButtonVariant::Danger).on_press(actions::delete)));
+            Modal::new("delete", title).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
+        }
+        Dialog::NewFolder { error, .. } => {
+            // Rune's own field, so it can take the dialog's first focus (`autofocus`); Enter
+            // confirms.
+            let field = rune::text_input(&s.name_edit, k.ty.ui_compact)
+                .single_line()
+                .key("name-input")
+                .label("Nome")
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .color(k.c.text_base)
+                .caret(k.c.text_base, k.selection())
+                .on_edit(|s: &mut State| &mut s.name_edit)
+                .on_submit(|s: &mut State, _: &mut Tx| actions::submit_name(s))
+                .autofocus();
+            let input = row()
+                .key("name")
+                .w_full()
+                .h(32.0)
+                .px(10.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .fill(k.c.bg_base)
+                .border(1.0, if error.is_some() { k.c.danger.fg } else { k.c.border_base })
+                .child(field);
+            let mut body = col().w_full().gap(6.0).child(input);
+            if let Some(e) = error {
+                body = body.child(text(e.clone()).font(k.ty.text_small).color(k.c.danger.fg));
+            }
+            let act = Button::new("Criar").variant(ButtonVariant::Submit).on_press(actions::submit_name);
+            let body = body.child(actions_row(k, "Cancelar", act));
+            Modal::new("name", "Nova pasta").open(true).child(pad(body)).width(420.0).fit().on_close(close).build(k, layer);
+        }
+        Dialog::Properties { pane, items, details, local } => {
+            let rows = properties_rows(s, *pane, items, details.as_ref(), local.as_ref());
+            let mut grid = col().key("props").w_full().gap(8.0);
+            for (label, value) in rows {
+                grid = grid.child(
+                    row()
+                        .w_full()
+                        .gap(12.0)
+                        .items_start()
+                        .child(text(label).font(k.ty.text_small).color(k.c.text_muted).w(110.0))
+                        .child(text(value).font(k.ty.text_small).color(k.c.text_base).selectable(true).wrap_anywhere().w(0.0).shrink().min_w(0.0).grow(1.0)),
+                );
+            }
+            let link = match details {
+                Some(Ok(d)) => d.link.clone(),
+                _ => None,
+            };
+            let mut buttons = row().key("actions").w_full().pt(16.0).gap(8.0).justify_end();
+            if let Some(url) = link {
+                buttons = buttons.child(
+                    Button::new("Abrir no Google Drive")
+                        .variant(ButtonVariant::Neutral)
+                        .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                            if let Err(e) = tx.open_url(&url) {
+                                s.status = format!("Não consegui abrir o navegador: {e:?}");
+                            }
+                        })
+                        .build(k),
+                );
+            }
+            buttons = buttons.child(Button::new("Fechar").variant(ButtonVariant::Submit).on_press(close).build(k));
+            let title = match items.as_slice() {
+                [one] => one.name.clone(),
+                many => format!("{} itens", ui_count(many.len())),
+            };
+            Modal::new("props", format!("Propriedades de {title}")).open(true).child(pad(col().w_full().child(grid).child(buttons))).width(480.0).fit().on_close(close).build(k, layer);
+        }
+    }
+}
+
+/// The colours and font of the in-place rename field, copied out of the kit so the row builder
+/// can hold them.
+#[derive(Clone, Copy)]
+struct RenameLook {
+    font: rune::TextStyle,
+    ink: Color,
+    fill: Color,
+    edge: Color,
+    selection: Color,
+}
+
+/// The name field of an item renamed in place. It's a light modal: focus stays in it, a click
+/// anywhere else renames (as leaving the field does in Explorer), Enter renames, Esc cancels.
+fn rename_field(s: &State, look: RenameLook) -> El {
+    let field = rune::text_input(&s.name_edit, look.font)
+        .single_line()
+        .key("rename-input")
+        .label("Novo nome")
+        .grow(1.0)
+        .shrink()
+        .min_w(0.0)
+        .color(look.ink)
+        .caret(look.ink, look.selection)
+        .on_edit(|s: &mut State| &mut s.name_edit)
+        .on_submit(|s: &mut State, _: &mut Tx| actions::commit_rename(s))
+        // A field's own key hook runs before Esc dismisses the modal around it.
+        .on_input_key(|s: &mut State, ev: &KeyEvent, _: &mut Tx| {
+            if ev.key == rune::Key::Escape {
+                actions::cancel_rename(s);
+                true
+            } else {
+                false
+            }
+        })
+        .autofocus();
+    row()
+        .key("rename")
+        .grow(1.0)
+        .shrink()
+        .min_w(0.0)
+        .h(20.0)
+        .px(3.0)
+        .center_y()
+        .fill(look.fill)
+        .border(1.0, look.edge)
+        .child(field)
+        // A click outside dismisses the modal: that renames. (Esc never gets here: the field
+        // cancels first.)
+        .modal(true, actions::commit_rename)
+}
+
+fn ui_count(n: usize) -> String {
+    thousands(n)
+}
+
+/// The label and value rows of Propriedades.
+fn properties_rows(
+    s: &State,
+    p: usize,
+    items: &[crate::model::Entry],
+    details: Option<&Result<openexplorer_gdrive::Details, String>>,
+    local: Option<&(Option<std::time::SystemTime>, PathBuf)>,
+) -> Vec<(String, String)> {
+    let pane = &s.panes[p];
+    let place = pane.title();
+    let when = |t: Option<std::time::SystemTime>| t.map(format_time).unwrap_or_else(|| "—".into());
+    let bytes = |b: u64| if b < 1024 { format_size(b) } else { format!("{} ({} bytes)", format_size(b), thousands(b as usize)) };
+    let mut rows = Vec::new();
+    match items {
+        [e] => {
+            rows.push(("Nome".into(), e.name.clone()));
+            rows.push(("Tipo".into(), e.kind_label()));
+            match &pane.loc {
+                Location::Local(dir) => {
+                    let (created, path) = local.cloned().unwrap_or_else(|| (None, dir.join(&e.name)));
+                    rows.push(("Local".into(), path.display().to_string()));
+                    rows.push(("Tamanho".into(), e.size.map(bytes).unwrap_or_else(|| "—".into())));
+                    rows.push(("Modificado".into(), when(e.modified)));
+                    rows.push(("Criado".into(), when(created)));
+                }
+                _ => {
+                    rows.push(("Local".into(), place));
+                    rows.push(("Tamanho".into(), e.size.map(bytes).unwrap_or_else(|| "—".into())));
+                    rows.push(("Modificado".into(), when(e.modified)));
+                    match details {
+                        Some(Ok(d)) => {
+                            rows.push(("Criado".into(), when(d.created)));
+                            rows.push(("Proprietário".into(), d.owner.clone().unwrap_or_else(|| "—".into())));
+                            rows.push(("Modificado por".into(), d.modified_by.clone().unwrap_or_else(|| "—".into())));
+                        }
+                        Some(Err(err)) => rows.push(("Detalhes".into(), err.clone())),
+                        None if matches!(pane.loc, Location::Drive { .. }) => rows.push(("Detalhes".into(), "carregando…".into())),
+                        None => {}
+                    }
+                    if let Location::Drive { .. } = pane.loc {
+                        rows.push(("ID".into(), e.id.clone()));
+                    }
+                }
+            }
+        }
+        many => {
+            let dirs = many.iter().filter(|e| e.is_dir).count();
+            let files = many.len() - dirs;
+            rows.push(("Itens".into(), format!("{} pastas, {} arquivos", thousands(dirs), thousands(files))));
+            rows.push(("Local".into(), place));
+            let total: u64 = many.iter().filter_map(|e| e.size).sum();
+            rows.push(("Tamanho dos arquivos".into(), bytes(total)));
+        }
+    }
+    rows
 }
 
 fn kind_icon(kind: Kind) -> &'static Icon {
@@ -445,6 +724,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let ring = k.c.border_focus;
     let (text_c, muted_c) = (k.c.text_base, k.c.text_muted);
     let font = k.ty.text_small;
+    let rename_look = RenameLook { font, ink: text_c, fill: k.c.bg_base, edge: k.c.border_focus, selection: k.selection() };
     let build = move |s: &State, i: usize| -> El {
         let pane = &s.panes[p];
         let e = &pane.entries[i];
@@ -462,7 +742,10 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                 .px(6.0)
                 .gap(6.0)
                 .child(icon(kind_icon(e.kind()), 16.0))
-                .child(text(e.name.clone()).font(font).color(text_c).truncate().shrink().min_w(0.0)),
+                .child(match &s.renaming {
+                    Some((rp, item)) if *rp == p && item.id == e.id => rename_field(s, rename_look),
+                    _ => text(e.name.clone()).font(font).color(text_c).truncate().shrink().min_w(0.0),
+                }),
         )
         .child(cell(1).justify_end().child(muted(e.size.map(format_size).unwrap_or_default()).align(Align::End)))
         .child(cell(2).child(muted(e.modified.map(format_time).unwrap_or_default())))
@@ -470,6 +753,21 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .on_press_tx(move |s: &mut State, tx: &mut Tx| {
             click(s, p, &id_press, tx.mods());
             tx.focus(pane_key(p), false);
+        })
+        .on_secondary_press({
+            let id = e.id.clone();
+            // As in Explorer: a right click on an unselected row selects just that row first.
+            move |s: &mut State, at: rune::PointerPress, tx: &mut Tx| {
+                s.active = p;
+                let pane = &mut s.panes[p];
+                if !pane.selected.contains(&id) {
+                    pane.selected = [id.clone()].into();
+                    pane.anchor = Some(id.clone());
+                }
+                pane.cursor = Some(id.clone());
+                tx.focus(pane_key(p), false);
+                s.menu = Some((p, at));
+            }
         })
         .on_double_press(move |s: &mut State| open(s, p, &id_open))
         .drag_out(move |s: &State| drag_item(s, p, &id_drag))
@@ -499,7 +797,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .w_full()
         .growth(GrowthSpec::default())
         .virtual_rows(n, ROW_H, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
-        .virtual_rows_version((pane.version, w.map(f32::to_bits)));
+        .virtual_rows_version((pane.version, w.map(f32::to_bits), s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))));
     let notice = |msg: String, color| col().key("notice").w_full().grow(1.0).padding(16.0).child(text(msg).font(k.ty.text_small).color(color));
     let body = if let Some(err) = &pane.error {
         notice(err.clone(), k.c.danger.fg)
@@ -516,7 +814,20 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     // header and rows together, and up and down with the header stuck to the top. Its
     // vertical bar sits on the pane's right edge, wherever the columns end.
     let table = col().key("table").w_full().min_w(total).child(header).child(body);
-    let viewport = col().key("viewport").w_full().h_full().scroll_xy().child(table).scroll_bar(k);
+    // A right click on empty space opens the folder's menu (Colar, Nova pasta).
+    let viewport = col()
+        .key("viewport")
+        .w_full()
+        .h_full()
+        .scroll_xy()
+        .on_secondary_press(move |s: &mut State, at: rune::PointerPress, tx: &mut Tx| {
+            s.active = p;
+            s.panes[p].selected.clear();
+            tx.focus(pane_key(p), false);
+            s.menu = Some((p, at));
+        })
+        .child(table)
+        .scroll_bar(k);
     col().key("list").w(0.0).grow(1.0).h_full().min_w(0.0).child(viewport)
 }
 

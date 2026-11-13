@@ -10,6 +10,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 openexplorer-gdrive = { path = "../gdrive" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Deleting local files sends them to the Recycle Bin.
+trash = "5"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

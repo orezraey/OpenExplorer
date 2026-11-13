@@ -4,10 +4,12 @@
 //! Drive calls block, so they run on background threads that send a [`Msg`] back and wake the
 //! window; `poll` applies it.
 
+mod actions;
 mod cache;
 mod icons;
 mod layout;
 mod model;
+mod ops;
 mod ui;
 
 use std::collections::HashMap;
@@ -30,6 +32,11 @@ enum Msg {
     /// for `poll` to keep.
     Listed { pane: usize, request: u64, made: Option<(String, Arc<Drive>)>, part: Part, result: Result<Vec<Entry>, String> },
     LoggedIn { pane: usize, attempt: u64, result: Result<(StoredAccount, Arc<Drive>), String> },
+    /// A file operation finished: reload the panes showing `reload`, and say how it went.
+    /// `made` is an account the operation had to open, for `poll` to keep.
+    Done { reload: Vec<Location>, made: Option<(String, Arc<Drive>)>, result: Result<String, String> },
+    /// Drive's details of item `id`, for an open Propriedades.
+    Details { id: String, result: Result<openexplorer_gdrive::Details, String> },
 }
 
 /// Which part of a listing a [`Msg::Listed`] is.
@@ -48,6 +55,15 @@ impl Part {
 
 struct State {
     panes: [Pane; 2],
+    /// The context menu: the pane it was opened in and where.
+    menu: Option<(usize, rune::PointerPress)>,
+    dialog: Option<actions::Dialog>,
+    /// The name typed in Renomear or Nova pasta.
+    name_edit: rune::TextEdit,
+    /// The item being renamed in place, and its pane.
+    renaming: Option<(usize, Entry)>,
+    /// What Copiar or Recortar picked up.
+    clip: Option<actions::Clip>,
     /// Each pane's tree width, which its splitter changes.
     layout: layout::Layout,
     /// The disks "Este computador" lists, read at start.
@@ -84,6 +100,11 @@ fn init() -> State {
     }
     State {
         panes,
+        menu: None,
+        dialog: None,
+        name_edit: rune::TextEdit::new(""),
+        renaming: None,
+        clip: None,
         local_drives: model::local_drives(),
         layout: layout::Layout::load(),
         live: Default::default(),
@@ -167,6 +188,7 @@ fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
                 } else {
                     p.prune_selection();
                 }
+                drop_stale_rename(s, pane);
                 // A complete fresh listing replaces the cached one.
                 if ok
                     && !more
@@ -175,6 +197,29 @@ fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
                 {
                     let entries = s.panes[pane].entries.clone();
                     s.cache.put(k, entries);
+                }
+            }
+            Msg::Done { reload, made, result } => {
+                if let Some((email, drive)) = made
+                    && s.accounts.iter().any(|a| a.email == email)
+                {
+                    s.drives.entry(email).or_insert(drive);
+                }
+                match result {
+                    Ok(msg) | Err(msg) => s.status = msg,
+                }
+                for p in 0..2 {
+                    if reload.contains(&s.panes[p].loc) {
+                        load(s, p);
+                    }
+                }
+            }
+            Msg::Details { id, result } => {
+                if let Some(actions::Dialog::Properties { items, details, .. }) = &mut s.dialog
+                    && items.len() == 1
+                    && items[0].id == id
+                {
+                    *details = Some(result);
                 }
             }
             Msg::LoggedIn { pane, attempt, result } => {
@@ -293,6 +338,7 @@ fn load(s: &mut State, p: usize) {
     let Location::Drive { email, space, path } = s.panes[p].loc.clone() else {
         let State { panes, mock, .. } = s;
         panes[p].load_now(mock);
+        drop_stale_rename(s, p);
         return;
     };
     let opened = s.drives.get(&email).cloned();
@@ -370,8 +416,23 @@ fn load(s: &mut State, p: usize) {
 
 fn switch(s: &mut State, p: usize, loc: Location) {
     s.active = p;
+    if s.renaming.as_ref().is_some_and(|(rp, _)| *rp == p) {
+        s.renaming = None;
+    }
     s.panes[p].go(loc);
     load(s, p);
+}
+
+/// Ends a rename whose item a reload took out of pane `p` (deleted or moved by another
+/// operation): its field is gone, and the pane's keys would otherwise stay with it.
+fn drop_stale_rename(s: &mut State, p: usize) {
+    if let Some((rp, item)) = &s.renaming
+        && *rp == p
+        && s.panes[p].entry(&item.id).is_none()
+        && !s.panes[p].loading
+    {
+        s.renaming = None;
+    }
 }
 
 /// Goes to `loc` as a step the reader can take back with Voltar.
@@ -481,6 +542,10 @@ fn click(s: &mut State, p: usize, id: &str, mods: Mods) {
 }
 
 fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    // Keys belong to the name field while renaming.
+    if s.renaming.is_some() {
+        return false;
+    }
     let n = s.panes[p].entries.len();
     let at = s.panes[p].cursor.as_deref().and_then(|c| s.panes[p].index_of(c));
     let step = |d: isize| -> Option<usize> {
@@ -493,6 +558,34 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         })
     };
     let to = match &ev.key {
+        _ if ev.is_command('c') => {
+            actions::pick_up(s, p, actions::ClipMode::Copy);
+            return true;
+        }
+        _ if ev.is_command('x') => {
+            actions::pick_up(s, p, actions::ClipMode::Cut);
+            return true;
+        }
+        _ if ev.is_command('v') => {
+            actions::paste(s, p);
+            return true;
+        }
+        _ if ev.is_command('n') && ev.mods.shift => {
+            actions::ask_new_folder(s, p, tx);
+            return true;
+        }
+        Key::Delete => {
+            actions::ask_delete(s, p);
+            return true;
+        }
+        Key::Function(2) => {
+            actions::ask_rename(s, p, tx);
+            return true;
+        }
+        Key::Enter if ev.mods.alt => {
+            actions::properties(s, p);
+            return true;
+        }
         Key::Left if ev.mods.alt => {
             go_back(s, p);
             return true;
@@ -508,9 +601,7 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         Key::Home => step(-(n as isize)),
         Key::End => step(n as isize),
         Key::Enter => {
-            if let Some(c) = s.panes[p].cursor.clone() {
-                open(s, p, &c);
-            }
+            actions::open(s, p, tx);
             return true;
         }
         Key::Backspace => {
@@ -668,6 +759,18 @@ fn main() {
                 s.panes[1].go(Location::Drive { email: "voce@gmail.com".into(), space: Space::MyDrive, path: vec![("x".into(), "Projetos".into())] });
                 s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
                 s.status = "Conta conectada: voce@gmail.com".into();
+            }),
+            // A scratch folder of sample files in %TEMP%, for trying file operations headless
+            // without touching real files.
+            ("ops", |s| {
+                let dir = std::env::temp_dir().join("openexplorer-ops-scene");
+                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::create_dir_all(dir.join("Projetos"));
+                for (name, body) in [("Relatório.pdf", "pdf"), ("foto.jpg", "jpg"), ("notas.txt", "txt")] {
+                    let _ = std::fs::write(dir.join(name), body);
+                }
+                switch(s, 0, Location::Local(dir.clone()));
+                switch(s, 1, Location::Local(dir.join("Projetos")));
             }),
             // The shared drives list of an account, without a network.
             ("shared", |s| {
