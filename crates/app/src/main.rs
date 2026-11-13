@@ -90,7 +90,14 @@ struct State {
     /// The pane a drag started in and the files it carried, so a drop back on the same pane
     /// is ignored (the drop can arrive after the drag's end).
     last_drag: Option<(usize, Vec<PathBuf>)>,
+    /// What the last action said ("Copiado: 3 itens.", an error...), shown for a few seconds
+    /// in a notice at the bottom right.
     status: String,
+    /// The message the notice was last started for, and when it goes (app clock, seconds).
+    status_seen: String,
+    status_until: f64,
+    /// The app clock at the last frame.
+    now: f64,
     temp: PathBuf,
     inbox: Receiver<Msg>,
     outbox: Sender<Msg>,
@@ -133,7 +140,10 @@ fn init() -> State {
         logins: 0,
         active: 0,
         last_drag: None,
-        status: "Arraste arquivos entre os painéis, do Explorer para cá ou daqui para o Explorer.".into(),
+        status: String::new(),
+        status_seen: String::new(),
+        status_until: 0.0,
+        now: 0.0,
         temp: std::env::temp_dir().join("OpenExplorer-drag"),
         inbox,
         outbox,
@@ -176,7 +186,34 @@ fn background(s: &State, work: impl FnOnce(&dyn Fn(Msg)) + Send + 'static) {
     });
 }
 
-fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
+/// Starts the notice for a new message, and takes it away when its time is up; a wake is
+/// set for then, as nothing else may draw a frame. The same message said again later shows
+/// again, as the expired one is cleared.
+fn notice(s: &mut State, now: f64) -> bool {
+    s.now = now;
+    if s.status != s.status_seen {
+        s.status_seen = s.status.clone();
+        s.status_until = now + NOTICE_SECS;
+        if let Some(wake) = s.waker.clone() {
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs_f64(NOTICE_SECS + 0.1));
+                wake();
+            });
+        }
+        return true;
+    }
+    if !s.status.is_empty() && now >= s.status_until {
+        s.status.clear();
+        s.status_seen.clear();
+        return true;
+    }
+    false
+}
+
+/// Seconds a message stays on screen.
+const NOTICE_SECS: f64 = 5.0;
+
+fn poll(s: &mut State, now: f64, _tx: &mut Tx) -> bool {
     // Each listing's file types get their icons asked for once.
     let versions = s.panes.each_ref().map(|p| p.version);
     if s.icons_for != versions {
@@ -185,6 +222,7 @@ fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
         s.icons.show(keys);
     }
     let mut changed = s.icons.settle();
+    changed |= notice(s, now);
     // Rows done leave the queue (the status line says how the job went); cancelled and failed
     // ones stay to be seen. While any runs, its thread wakes the window a few times a second.
     // A redraw is due while any row moves, and once more when the last one stops.

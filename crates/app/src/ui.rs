@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 
 use rune::{Align, Color, Cursor, Cx, Drag, DragOutcome, El, GrowthSpec, Icon, KeyEvent, Phase, ScrollSpec, Tx, col, el, icon, row, text};
-use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, ScrollBar, context_menu};
+use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, ScrollBar, Toast, ToastRegion, context_menu};
 
 use crate::model::{Kind, Location, SortCol, Space, crumbs, format_bytes, format_long, format_size, format_time};
 use crate::actions::{self, ClipMode, Dialog};
@@ -20,12 +20,16 @@ const ROW_H: f32 = crate::ROW_H;
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let k = Kit::neutral(cx.system_dark());
-    let message = text(s.status.clone()).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0).help_when_truncated(s.status.clone());
     // Menus and dialogs draw in a layer above everything.
     let mut layer = Vec::new();
     let menu = context(s, &k, &mut layer);
     let queue_menu = transfer_context(s, &k, &mut layer);
     dialog(s, &k, &mut layer);
+    // What the last action said, for a few seconds at the bottom right.
+    if !s.status.is_empty() && s.now < s.status_until {
+        let close = |s: &mut State| s.status_until = 0.0;
+        layer.push(ToastRegion::new().toast(Toast::new("notice", s.status.clone()).on_close(close).build(&k)).build(&k));
+    }
     let body = col()
         .w_full()
         .h_full()
@@ -33,7 +37,6 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(toolbar(s, &k))
         .child(panes(s, &k))
         .child(transfers(s, &k))
-        .child(row().key("message").w_full().h(24.0).px(10.0).gap(12.0).center_y().child(message).child(el().grow(1.0)).child(queue_totals(s, &k)))
         .child(menu)
         .child(queue_menu);
     rune_kit::root(body, layer)
@@ -169,15 +172,16 @@ fn transfers(s: &State, k: &Kit) -> El {
         .border(1.0, k.c.border_weak)
         .clip_soft(0.0)
         .on_secondary_press(|s: &mut State, at: rune::PointerPress, _: &mut Tx| s.transfer_menu = Some((None, at)))
-        .child(col().key("queue-viewport").w_full().h_full().scroll_xy().child(table).scroll_bar(k));
+        .child(col().key("queue-viewport").w_full().grow(1.0).min_h(0.0).scroll_xy().child(table).scroll_bar(k))
+        .child(row().key("queue-foot").w_full().h(22.0).px(8.0).justify_end().center_y().border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_weak).child(queue_totals(s, k)));
     // The strip above the queue drags up and down to change its height. On a window too
     // short for it, the queue gives way rather than the panes.
     let edge = splitter(k, "queue-edge", 6.0, Split::Up, |s: &mut State| &mut s.layout.queue_h, layout::QUEUE_H, layout::clamp_queue_h);
     col().key("queue-wrap").w_full().h(s.layout.queue_h + 6.0).shrink().min_h(layout::QUEUE_H_MIN).px(6.0).child(edge).child(queue)
 }
 
-/// The right end of the status line while something is under way: "Total: 0,05 / 2,66 GB",
-/// a bar, and the speed of everything running.
+/// The queue's foot while something is under way: "Total: 0,05 / 2,66 GB", a bar, and the
+/// speed of everything running.
 fn queue_totals(s: &State, k: &Kit) -> El {
     use std::sync::atomic::Ordering::Relaxed;
     let live: Vec<&transfers::Transfer> = s.transfers.iter().filter(|t| !t.progress.over()).collect();
