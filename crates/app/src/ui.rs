@@ -4,21 +4,16 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
 
-use rune::{Align, Color, Cursor, Cx, DragOutcome, El, GrowthSpec, Icon, KeyEvent, ScrollSpec, Tx, col, el, icon, row, text};
-use rune_kit::Kit;
+use rune::{Align, Color, Cursor, Cx, Drag, DragOutcome, El, GrowthSpec, Icon, KeyEvent, Phase, ScrollSpec, Tx, col, el, icon, row, text};
+use rune_kit::{Kit, ScrollBar};
 
 use crate::model::{Kind, Location, SortCol, Space, crumbs, format_size, format_time};
 use crate::{State, click, connect, disconnect, drag_item, dragged_ids, dropped, go_back, go_forward, go_up, key, load, navigate, open, pane_key, paths_for, row_key, set_sort};
 use crate::icons;
+use crate::layout::{self, clamp_col, clamp_tree};
 
 const ROW_H: f32 = crate::ROW_H;
-const TREE_W: f32 = 190.0;
-/// Column widths. Tipo gives way when the pane is narrow, Tamanho and Data keep theirs; Nome keeps at least
-/// `MIN_NAME`, so names never shrink to an ellipsis first.
-const W_SIZE: f32 = 86.0;
-const W_DATE: f32 = 132.0;
-const W_KIND: f32 = 124.0;
-const MIN_NAME: f32 = 150.0;
+const PANES_GAP: f32 = 6.0;
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let k = Kit::neutral(cx.system_dark());
@@ -28,7 +23,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .h_full()
         .fill(k.c.page)
         .child(toolbar(s, &k))
-        .child(row().key("panes").w_full().grow(1.0).min_h(0.0).padding(6.0).gap(6.0).child(pane(s, &k, 0)).child(pane(s, &k, 1)))
+        .child(panes(s, &k))
         .child(row().key("message").w_full().h(22.0).px(10.0).center_y().child(message))
 }
 
@@ -111,6 +106,74 @@ fn toolbar(s: &State, k: &Kit) -> El {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Splitters
+
+/// The drag that resizes something to `size`: Down keeps the starting size, each move sets it
+/// to the start plus the travel (through `clamp`), a cancelled drag puts it back, and a double
+/// click sets `default`. Returns whether the layout changed and should be saved: on a double
+/// click, and on release when the size ended up different.
+fn resize(d: &mut Drag, size: &mut f32, default: f32, clamp: impl Fn(f32) -> f32) -> bool {
+    match d.phase {
+        Phase::Down if d.clicks >= 2 => {
+            // The release of this click resizes from the default, so it doesn't undo it.
+            *size = default;
+            d.data = default;
+            true
+        }
+        Phase::Down => {
+            d.data = *size;
+            false
+        }
+        _ if d.cancelled() => {
+            *size = d.data;
+            false
+        }
+        Phase::Move => {
+            *size = clamp(d.data + d.dx);
+            false
+        }
+        Phase::Up => {
+            *size = clamp(d.data + d.dx);
+            *size != d.data
+        }
+    }
+}
+
+/// A vertical bar to drag sideways (between a pane's tree and its list), `width` wide, showing
+/// a line on hover and while dragged. `size` picks the width it changes in the layout.
+fn splitter(k: &Kit, key: &str, width: f32, size: impl Fn(&mut State) -> &mut f32 + 'static, default: f32, clamp: fn(f32) -> f32) -> El {
+    let line = k.c.border_focus;
+    row()
+        .key(key.to_string())
+        .role("separator")
+        .label("Arraste para redimensionar; clique duas vezes para voltar ao padrão")
+        .w(width)
+        .h_full()
+        .justify_center()
+        .cursor(Cursor::ResizeColumn)
+        .hover(k.alpha(line, 0.18))
+        .press(k.alpha(line, 0.32))
+        .on_drag(move |s: &mut State, d: &mut Drag, _tx: &mut Tx| {
+            if resize(d, size(s), default, clamp) {
+                s.layout.save();
+            }
+        })
+}
+
+/// The two panes, side by side in equal halves.
+fn panes(s: &State, k: &Kit) -> El {
+    row()
+        .key("panes")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .padding(6.0)
+        .gap(PANES_GAP)
+        .child(pane(s, k, 0))
+        .child(pane(s, k, 1))
+}
+
+// ---------------------------------------------------------------------------------------------
 // Pane
 
 fn pane(s: &State, k: &Kit, p: usize) -> El {
@@ -146,7 +209,10 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
                 .grow(1.0)
                 .min_h(0.0)
                 .child(tree(s, k, p))
-                .child(el().w(1.0).h_full().fill(k.c.border_weak))
+                .child(
+                    splitter(k, "tree-split", 5.0, move |s: &mut State| &mut s.layout.tree[p], layout::TREE_W, clamp_tree)
+                    .child(el().w(1.0).h_full().fill(k.c.border_weak)),
+                )
                 .child(list(s, k, p)),
         )
         .child(statusbar(s, k, p))
@@ -307,7 +373,7 @@ fn tree(s: &State, k: &Kit, p: usize) -> El {
     t = t.child(heading(k, "Testes")).child(node(k, p, "mock".into(), 0, &icons::LAB, "Drive simulado", &current, Location::Mock(Vec::new())));
     col()
         .key("tree-scroll")
-        .w(TREE_W)
+        .w(s.layout.tree[p])
         .h_full()
         
         .fill(k.alpha(k.c.text_base, if k.dark { 0.02 } else { 0.015 }))
@@ -318,33 +384,61 @@ fn tree(s: &State, k: &Kit, p: usize) -> El {
 // ---------------------------------------------------------------------------------------------
 // File list
 
+/// The grip on a column's right edge, as in Windows Explorer: it moves with the pointer,
+/// resizing that column and carrying the columns after it along. A double click puts the column
+/// back to its default width.
+fn col_grip(k: &Kit, p: usize, i: usize, width: f32) -> El {
+    el().key(format!("grip-{i}"))
+        .role("separator")
+        .label("Arraste para mudar a largura da coluna; clique duas vezes para voltar ao padrão")
+        .absolute(width - 4.0, 0.0)
+        .w(8.0)
+        .h(24.0)
+        .cursor(Cursor::ResizeColumn)
+        .hover(k.alpha(k.c.border_focus, 0.35))
+        .on_drag(move |s: &mut State, d: &mut Drag, _tx: &mut Tx| {
+            if resize(d, &mut s.layout.columns[p][i], layout::COLS[i], |w| clamp_col(i, w)) {
+                s.layout.save();
+            }
+        })
+}
+
 fn list(s: &State, k: &Kit, p: usize) -> El {
     let pane = &s.panes[p];
+    let w = s.layout.columns[p];
+    let total: f32 = w.iter().sum();
     let arrow = |c: SortCol| if pane.sort.0 == c { if pane.sort.1 { "  ▲" } else { "  ▼" } } else { "" };
-    let head = |key: &str, label: &str, c: SortCol, end: bool| {
+    let head = |i: usize, key: &str, label: &str, c: SortCol, end: bool| {
         let mut h = row()
             .key(key.to_string())
+            .w(w[i])
             .h_full()
             .px(8.0)
             .center_y()
             .hover(k.c.hover)
             .cursor(Cursor::Pointer)
             .on_press(move |s: &mut State| set_sort(s, p, c))
-            .child(text(format!("{label}{}", arrow(c))).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0));
+            .child(text(format!("{label}{}", arrow(c))).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0))
+            .border_sides([0.0, 1.0, 0.0, 0.0], k.c.border_weak);
         if end {
             h = h.justify_end();
         }
-        h.border_sides([0.0, 1.0, 0.0, 0.0], k.c.border_weak)
+        h
     };
+    // The grips sit over the header, one at each column's right edge.
+    let grips = (0..4).map(|i| col_grip(k, p, i, w[..=i].iter().sum()));
     let header = row()
         .key("header")
         .w_full()
         .h(24.0)
+        .fill(k.c.bg_base)
+        .sticky_top(0.0)
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
-        .child(head("h-name", "Nome", SortCol::Name, false).w(0.0).grow(1.0).min_w(MIN_NAME))
-        .child(head("h-size", "Tamanho", SortCol::Size, true).w(W_SIZE))
-        .child(head("h-mod", "Data", SortCol::Modified, false).w(W_DATE))
-        .child(head("h-kind", "Tipo", SortCol::Kind, false).w(W_KIND).shrink());
+        .child(head(0, "h-name", "Nome", SortCol::Name, false))
+        .child(head(1, "h-size", "Tamanho", SortCol::Size, true))
+        .child(head(2, "h-mod", "Data", SortCol::Modified, false))
+        .child(head(3, "h-kind", "Tipo", SortCol::Kind, false))
+        .children(grips);
 
     let selected = k.alpha(k.c.text_accent, if k.dark { 0.26 } else { 0.18 });
     let hover = k.alpha(k.c.text_base, 0.045);
@@ -361,25 +455,18 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
             r = r.outline(1.0, -1.0, ring);
         }
         let (id_press, id_open, id_drag, id_start) = (e.id.clone(), e.id.clone(), e.id.clone(), e.id.clone());
-        let cell = |w: f32, gives: bool| {
-            let c = row().w(w).h_full().px(8.0).center_y().clip_soft(0.0);
-            if gives { c.shrink() } else { c }
-        };
+        let cell = |i: usize| row().w(w[i]).h_full().px(8.0).center_y().clip_soft(0.0);
+        let muted = |t: String| text(t).font(font).color(muted_c).truncate().shrink().min_w(0.0);
         r.child(
-            row()
-                .w(0.0)
-                .grow(1.0)
-                .min_w(MIN_NAME)
-                .h_full()
+            cell(0)
                 .px(6.0)
                 .gap(6.0)
-                .center_y()
                 .child(icon(kind_icon(e.kind()), 16.0))
                 .child(text(e.name.clone()).font(font).color(text_c).truncate().shrink().min_w(0.0)),
         )
-        .child(cell(W_SIZE, false).justify_end().child(text(e.size.map(format_size).unwrap_or_default()).font(font).color(muted_c).align(Align::End)))
-        .child(cell(W_DATE, false).child(text(e.modified.map(format_time).unwrap_or_default()).font(font).color(muted_c).truncate().shrink().min_w(0.0)))
-        .child(cell(W_KIND, true).child(text(e.kind_label()).font(font).color(muted_c).truncate().shrink().min_w(0.0)))
+        .child(cell(1).justify_end().child(muted(e.size.map(format_size).unwrap_or_default()).align(Align::End)))
+        .child(cell(2).child(muted(e.modified.map(format_time).unwrap_or_default())))
+        .child(cell(3).child(muted(e.kind_label())))
         .on_press_tx(move |s: &mut State, tx: &mut Tx| {
             click(s, p, &id_press, tx.mods());
             tx.focus(pane_key(p), false);
@@ -412,7 +499,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .w_full()
         .growth(GrowthSpec::default())
         .virtual_rows(n, ROW_H, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
-        .virtual_rows_version(pane.version);
+        .virtual_rows_version((pane.version, w.map(f32::to_bits)));
     let notice = |msg: String, color| col().key("notice").w_full().grow(1.0).padding(16.0).child(text(msg).font(k.ty.text_small).color(color));
     let body = if let Some(err) = &pane.error {
         notice(err.clone(), k.c.danger.fg)
@@ -423,9 +510,14 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     } else if n == 0 {
         notice("Esta pasta está vazia.".into(), k.c.text_faint)
     } else {
-        col().key("viewport").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(rows)
+        rows
     };
-    col().key("list").w(0.0).grow(1.0).h_full().min_w(0.0).child(header).child(body)
+    // One viewport scrolls both ways: sideways when the columns are wider than the pane,
+    // header and rows together, and up and down with the header stuck to the top. Its
+    // vertical bar sits on the pane's right edge, wherever the columns end.
+    let table = col().key("table").w_full().min_w(total).child(header).child(body);
+    let viewport = col().key("viewport").w_full().h_full().scroll_xy().child(table).scroll_bar(k);
+    col().key("list").w(0.0).grow(1.0).h_full().min_w(0.0).child(viewport)
 }
 
 // ---------------------------------------------------------------------------------------------

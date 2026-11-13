@@ -6,6 +6,7 @@
 
 mod cache;
 mod icons;
+mod layout;
 mod model;
 mod ui;
 
@@ -47,6 +48,8 @@ impl Part {
 
 struct State {
     panes: [Pane; 2],
+    /// Each pane's tree width, which its splitter changes.
+    layout: layout::Layout,
     /// The disks "Este computador" lists, read at start.
     local_drives: Vec<(PathBuf, model::DriveKind)>,
     /// Each pane's current listing request, bumped by every load: `poll` drops answers for an
@@ -82,6 +85,7 @@ fn init() -> State {
     State {
         panes,
         local_drives: model::local_drives(),
+        layout: layout::Layout::load(),
         live: Default::default(),
         cache: Default::default(),
         mock,
