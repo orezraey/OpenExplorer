@@ -3,8 +3,11 @@
 //! background and ends in a [`Msg::Done`] that reloads the folders it touched.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
-use openexplorer_gdrive::{Details, Drive, DriveFile};
+use openexplorer_gdrive::{Details, Drive, DriveFile, Revision};
 use rune::{TextEdit, Tx};
 
 use crate::model::{Entry, Location, Space};
@@ -28,8 +31,7 @@ pub enum Dialog {
     Delete { pane: usize, items: Vec<Entry> },
     /// The name being typed is `State::name_edit`.
     NewFolder { pane: usize, error: Option<String> },
-    /// `local` is one local item's (created, full path), read as the dialog opens.
-    Properties { pane: usize, items: Vec<Entry>, details: Option<Result<Details, String>>, local: Option<(Option<std::time::SystemTime>, PathBuf)> },
+    Properties(Box<Props>),
 }
 
 pub fn selected(s: &State, p: usize) -> Vec<Entry> {
@@ -323,7 +325,7 @@ pub fn submit_name(s: &mut State) {
 }
 
 /// Renames `item` to `name`, or with no item creates folder `name`, in pane `pane`'s folder.
-fn apply_name(s: &mut State, pane: usize, item: Option<Entry>, name: String) {
+pub fn apply_name(s: &mut State, pane: usize, item: Option<Entry>, name: String) {
     if item.as_ref().is_some_and(|i| i.name == name) {
         return;
     }
@@ -351,32 +353,209 @@ fn apply_name(s: &mut State, pane: usize, item: Option<Entry>, name: String) {
 // ---------------------------------------------------------------------------------------------
 // Properties
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PropTab {
+    General,
+    Details,
+    Versions,
+}
+
+/// One local item's facts, read as Propriedades opens.
+pub struct LocalInfo {
+    pub path: PathBuf,
+    pub created: Option<SystemTime>,
+    pub accessed: Option<SystemTime>,
+    pub attributes: Vec<&'static str>,
+}
+
+/// What a background task found for the open Propriedades.
+pub enum PropUpdate {
+    Details(Result<Details, String>),
+    Totals(ops::Totals),
+    Md5(Result<String, String>),
+    Revisions(Result<Vec<Revision>, String>),
+}
+
+/// The open Propriedades: what it shows and what's still being worked out.
+pub struct Props {
+    pub pane: usize,
+    pub items: Vec<Entry>,
+    pub tab: PropTab,
+    /// Numbers this dialog, so answers meant for one closed since are dropped.
+    pub id: u64,
+    /// Cleared when the dialog closes, so a folder walk or a hash stops early.
+    pub alive: Arc<AtomicBool>,
+    pub local: Option<LocalInfo>,
+    /// Folder contents adding up, for local folders and several items.
+    pub totals: Option<ops::Totals>,
+    pub md5: Option<Result<String, String>>,
+    pub md5_running: bool,
+    /// The Tipo row: the items' shared type, or "Vários tipos".
+    pub kind: String,
+    /// The listed sizes added up (files only, folders' contents not included).
+    pub listed_bytes: u64,
+    pub details: Option<Result<Details, String>>,
+    pub revisions: Option<Result<Vec<Revision>, String>>,
+    pub revisions_asked: bool,
+}
+
+impl Props {
+    pub fn single(&self) -> Option<&Entry> {
+        match self.items.as_slice() {
+            [e] => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Whether the name field renames: one item, somewhere names can change.
+    pub fn renamable(&self, s: &State) -> bool {
+        self.single().is_some() && editable(&s.panes[self.pane].loc)
+    }
+
+    /// The Histórico de versões tab is for one Drive file (folders have no versions).
+    pub fn has_versions(&self, s: &State) -> bool {
+        matches!(s.panes[self.pane].loc, Location::Drive { .. }) && self.single().is_some_and(|e| !e.is_dir)
+    }
+}
+
+fn props_mut(s: &mut State) -> Option<&mut Props> {
+    match &mut s.dialog {
+        Some(Dialog::Properties(p)) => Some(p),
+        _ => None,
+    }
+}
+
+/// Runs `work` for the open Propriedades; its answer lands only if that dialog is still open.
+/// `work` gives what the task found; a panic in it ends that same task with the error (the hash
+/// row stops saying "Calculando…"), through `failed`.
+fn props_job(s: &State, id: u64, failed: fn(String) -> PropUpdate, work: impl FnOnce() -> PropUpdate + Send + 'static) {
+    background(s, move |emit| emit(Msg::Prop { id, update: crate::catch_panic("ler as propriedades", || Ok(work())).unwrap_or_else(failed) }));
+}
+
 pub fn properties(s: &mut State, p: usize) {
     let items = selected(s, p);
     if items.is_empty() {
         return;
     }
-    // One Drive item gets its owner, creation date and link from Drive.
-    if let ([item], Location::Drive { email, .. }) = (items.as_slice(), &s.panes[p].loc)
-        && !matches!(s.panes[p].loc, Location::Drive { space: Space::SharedDrives, .. })
-    {
-        let (id, cached, email) = (item.id.clone(), s.drives.get(email).cloned(), email.clone());
-        background(s, move |emit| {
-            let result = cached.map_or_else(|| open_drive(&email), Ok).and_then(|d| d.details(&id));
-            emit(Msg::Details { id, result });
-        });
+    close_properties(s);
+    s.props_seq += 1;
+    let id = s.props_seq;
+    let alive = Arc::new(AtomicBool::new(true));
+    let loc = s.panes[p].loc.clone();
+    let mut local = None;
+    if let Location::Local(dir) = &loc {
+        // One item: its dates and attributes now (one metadata call). Folders and several
+        // items: their contents add up in the background.
+        if let [e] = items.as_slice() {
+            let path = dir.join(&e.name);
+            let meta = std::fs::symlink_metadata(&path).ok();
+            local = Some(LocalInfo {
+                created: meta.as_ref().and_then(|m| m.created().ok()),
+                accessed: meta.as_ref().and_then(|m| m.accessed().ok()),
+                attributes: meta.as_ref().map(ops::attributes).unwrap_or_default(),
+                path,
+            });
+        }
+        if items.len() > 1 || items.iter().any(|e| e.is_dir) {
+            let paths: Vec<PathBuf> = items.iter().map(|e| dir.join(&e.name)).collect();
+            let alive = alive.clone();
+            props_job(s, id, |_| PropUpdate::Totals(ops::Totals::default()), move || PropUpdate::Totals(ops::totals(&paths, &|| !alive.load(Ordering::Relaxed))));
+        }
     }
-    let local = match (items.as_slice(), &s.panes[p].loc) {
-        ([e], Location::Local(dir)) => Some(local_details(dir, e)),
-        _ => None,
-    };
-    s.dialog = Some(Dialog::Properties { pane: p, items, details: None, local });
+    // One Drive item: its owner, dates, description and checksum from Drive.
+    if let ([item], Some((email, _))) = (items.as_slice(), drive_folder(&loc)) {
+        let (item_id, cached) = (item.id.clone(), s.drives.get(&email).cloned());
+        props_job(s, id, |e| PropUpdate::Details(Err(e)), move || PropUpdate::Details(cached.map_or_else(|| open_drive(&email), Ok).and_then(|d| d.details(&item_id))));
+    }
+    if let [item] = items.as_slice() {
+        let mut edit = TextEdit::new(item.name.clone());
+        edit.set_selection(0, stem_len(&item.name, item.is_dir));
+        s.name_edit = edit;
+    }
+    let first = items[0].kind_label();
+    let kind = if items.iter().all(|e| e.kind_label() == first) { first } else { "Vários tipos".into() };
+    let listed_bytes = items.iter().filter_map(|e| e.size).sum();
+    s.dialog = Some(Dialog::Properties(Box::new(Props {
+        pane: p,
+        kind,
+        listed_bytes,
+        items,
+        tab: PropTab::General,
+        id,
+        alive,
+        local,
+        totals: None,
+        md5: None,
+        md5_running: false,
+        details: None,
+        revisions: None,
+        revisions_asked: false,
+    })));
 }
 
-/// Local details for Propriedades: (created, full path).
-fn local_details(dir: &std::path::Path, e: &Entry) -> (Option<std::time::SystemTime>, PathBuf) {
-    let path = dir.join(&e.name);
-    (std::fs::metadata(&path).and_then(|m| m.created()).ok(), path)
+/// An answer for Propriedades number `id`.
+pub fn props_update(s: &mut State, id: u64, update: PropUpdate) {
+    let Some(p) = props_mut(s).filter(|p| p.id == id) else { return };
+    match update {
+        PropUpdate::Details(d) => p.details = Some(d),
+        PropUpdate::Totals(t) => p.totals = Some(t),
+        PropUpdate::Md5(m) => {
+            p.md5 = Some(m);
+            p.md5_running = false;
+        }
+        PropUpdate::Revisions(r) => p.revisions = Some(r),
+    }
+}
+
+pub fn props_tab(s: &mut State, tab: PropTab) {
+    let Some(p) = props_mut(s) else { return };
+    p.tab = tab;
+    // Versions load the first time their tab opens.
+    if tab != PropTab::Versions || p.revisions_asked {
+        return;
+    }
+    p.revisions_asked = true;
+    let (id, pane) = (p.id, p.pane);
+    let Some(item_id) = p.single().map(|e| e.id.clone()) else { return };
+    let Location::Drive { email, .. } = &s.panes[pane].loc else { return };
+    let (cached, email) = (s.drives.get(email).cloned(), email.clone());
+    props_job(s, id, |e| PropUpdate::Revisions(Err(e)), move || PropUpdate::Revisions(cached.map_or_else(|| open_drive(&email), Ok).and_then(|d| d.revisions(&item_id))));
+}
+
+/// Works out a local file's MD5 on request: reading a large file takes a while.
+pub fn props_md5(s: &mut State) {
+    let Some(p) = props_mut(s) else { return };
+    let Some(path) = p.local.as_ref().map(|l| l.path.clone()) else { return };
+    p.md5_running = true;
+    let (id, alive) = (p.id, p.alive.clone());
+    props_job(s, id, |e| PropUpdate::Md5(Err(e)), move || PropUpdate::Md5(ops::md5_file(&path, &|| !alive.load(Ordering::Relaxed))));
+}
+
+/// OK: renames when the name was changed, then closes.
+pub fn props_ok(s: &mut State) {
+    let Some(Dialog::Properties(p)) = &s.dialog else { return };
+    let rename = p.renamable(s).then(|| (p.pane, p.single().cloned())).and_then(|(pane, e)| e.map(|e| (pane, e)));
+    let name = s.name_edit.text.trim().to_string();
+    if let Some((pane, item)) = rename
+        && name != item.name
+    {
+        if let Some(why) = name_problem(&s.panes[pane].loc, &name) {
+            s.status = why;
+            return;
+        }
+        close_properties(s);
+        apply_name(s, pane, Some(item), name);
+        return;
+    }
+    close_properties(s);
+}
+
+/// Closes Propriedades and stops what it still had running.
+pub fn close_properties(s: &mut State) {
+    if let Some(Dialog::Properties(p)) = &s.dialog {
+        p.alive.store(false, Ordering::Relaxed);
+        s.dialog = None;
+    }
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use rune::{Align, Color, Cursor, Cx, Drag, DragOutcome, El, GrowthSpec, Icon, KeyEvent, Phase, ScrollSpec, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, ScrollBar, context_menu};
 
-use crate::model::{Kind, Location, SortCol, Space, crumbs, format_size, format_time};
+use crate::model::{Kind, Location, SortCol, Space, crumbs, format_bytes, format_long, format_size, format_time};
 use crate::actions::{self, ClipMode, Dialog};
 use crate::{State, click, connect, disconnect, drag_item, dragged_ids, dropped, go_back, go_forward, go_up, key, load, navigate, open, pane_key, paths_for, row_key, set_sort};
 use crate::icons;
@@ -154,43 +154,7 @@ fn dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
             let body = body.child(actions_row(k, "Cancelar", act));
             Modal::new("name", "Nova pasta").open(true).child(pad(body)).width(420.0).fit().on_close(close).build(k, layer);
         }
-        Dialog::Properties { pane, items, details, local } => {
-            let rows = properties_rows(s, *pane, items, details.as_ref(), local.as_ref());
-            let mut grid = col().key("props").w_full().gap(8.0);
-            for (label, value) in rows {
-                grid = grid.child(
-                    row()
-                        .w_full()
-                        .gap(12.0)
-                        .items_start()
-                        .child(text(label).font(k.ty.text_small).color(k.c.text_muted).w(110.0))
-                        .child(text(value).font(k.ty.text_small).color(k.c.text_base).selectable(true).wrap_anywhere().w(0.0).shrink().min_w(0.0).grow(1.0)),
-                );
-            }
-            let link = match details {
-                Some(Ok(d)) => d.link.clone(),
-                _ => None,
-            };
-            let mut buttons = row().key("actions").w_full().pt(16.0).gap(8.0).justify_end();
-            if let Some(url) = link {
-                buttons = buttons.child(
-                    Button::new("Abrir no Google Drive")
-                        .variant(ButtonVariant::Neutral)
-                        .on_press_tx(move |s: &mut State, tx: &mut Tx| {
-                            if let Err(e) = tx.open_url(&url) {
-                                s.status = format!("Não consegui abrir o navegador: {e:?}");
-                            }
-                        })
-                        .build(k),
-                );
-            }
-            buttons = buttons.child(Button::new("Fechar").variant(ButtonVariant::Submit).on_press(close).build(k));
-            let title = match items.as_slice() {
-                [one] => one.name.clone(),
-                many => format!("{} itens", ui_count(many.len())),
-            };
-            Modal::new("props", format!("Propriedades de {title}")).open(true).child(pad(col().w_full().child(grid).child(buttons))).width(480.0).fit().on_close(close).build(k, layer);
-        }
+        Dialog::Properties(p) => props_dialog(s, k, p, layer),
     }
 }
 
@@ -249,61 +213,269 @@ fn ui_count(n: usize) -> String {
     thousands(n)
 }
 
-/// The label and value rows of Propriedades.
-fn properties_rows(
-    s: &State,
-    p: usize,
-    items: &[crate::model::Entry],
-    details: Option<&Result<openexplorer_gdrive::Details, String>>,
-    local: Option<&(Option<std::time::SystemTime>, PathBuf)>,
-) -> Vec<(String, String)> {
-    let pane = &s.panes[p];
-    let place = pane.title();
-    let when = |t: Option<std::time::SystemTime>| t.map(format_time).unwrap_or_else(|| "—".into());
-    let bytes = |b: u64| if b < 1024 { format_size(b) } else { format!("{} ({} bytes)", format_size(b), thousands(b as usize)) };
-    let mut rows = Vec::new();
-    match items {
-        [e] => {
-            rows.push(("Nome".into(), e.name.clone()));
-            rows.push(("Tipo".into(), e.kind_label()));
-            match &pane.loc {
-                Location::Local(dir) => {
-                    let (created, path) = local.cloned().unwrap_or_else(|| (None, dir.join(&e.name)));
-                    rows.push(("Local".into(), path.display().to_string()));
-                    rows.push(("Tamanho".into(), e.size.map(bytes).unwrap_or_else(|| "—".into())));
-                    rows.push(("Modificado".into(), when(e.modified)));
-                    rows.push(("Criado".into(), when(created)));
+// ---------------------------------------------------------------------------------------------
+// Properties
+
+/// A label and its value, the value selectable so it can be copied.
+fn prop_row(k: &Kit, label: &str, value: El) -> El {
+    row()
+        .w_full()
+        .gap(12.0)
+        .items_start()
+        .child(text(label.to_string()).font(k.ty.text_small).color(k.c.text_muted).w(120.0))
+        .child(row().w(0.0).grow(1.0).min_w(0.0).child(value))
+}
+
+fn prop_text(k: &Kit, label: &str, value: impl Into<String>) -> El {
+    prop_row(k, label, text(value.into()).font(k.ty.text_small).color(k.c.text_base).selectable(true).wrap_anywhere().w_full().min_w(0.0))
+}
+
+fn prop_sep(k: &Kit) -> El {
+    el().w_full().h(1.0).my(5.0).fill(k.c.border_weak)
+}
+
+/// The Propriedades tabs, Geral first.
+fn prop_tab(k: &Kit, label: &str, tab: actions::PropTab, on: bool) -> El {
+    row()
+        .key(format!("tab-{label}"))
+        .role("tab")
+        .label(label.to_string())
+        .checked(on)
+        .h(30.0)
+        .px(12.0)
+        .center_y()
+        .cursor(Cursor::Pointer)
+        .hover(k.c.hover)
+        .border_sides([0.0, 0.0, if on { 2.0 } else { 0.0 }, 0.0], k.c.text_accent)
+        .on_press(move |s: &mut State| actions::props_tab(s, tab))
+        .child(text(label.to_string()).font(if on { k.ty.text_small_medium } else { k.ty.text_small }).color(if on { k.c.text_base } else { k.c.text_muted }))
+}
+
+/// Where an item is, in words: the folder's full path on disk, or its place in Drive.
+fn place_of(s: &State, p: &actions::Props) -> String {
+    let pane = &s.panes[p.pane];
+    match (&pane.loc, p.single()) {
+        (Location::Local(dir), Some(e)) => dir.join(&e.name).display().to_string(),
+        (Location::Local(dir), None) => dir.display().to_string(),
+        (loc, single) => {
+            let mut parts: Vec<String> = crumbs(loc).into_iter().skip(1).map(|c| c.label).collect();
+            if let Some(e) = single {
+                parts.push(e.name.clone());
+            }
+            parts.join("/")
+        }
+    }
+}
+
+fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
+    use actions::PropTab;
+    let loc = &s.panes[p.pane].loc;
+    let drive = match loc {
+        Location::Drive { email, .. } => Some(email.clone()),
+        _ => None,
+    };
+    let details = match &p.details {
+        Some(Ok(d)) => Some(d),
+        _ => None,
+    };
+    let when = |t: Option<std::time::SystemTime>| t.map(format_long).unwrap_or_else(|| "—".into());
+    let muted = |t: &str| text(t.to_string()).font(k.ty.text_small).color(k.c.text_muted);
+
+    // Header: the item's icon and its name, which renames on OK.
+    let (glyph, title) = match p.single() {
+        Some(e) => (kind_icon(e.kind()), e.name.clone()),
+        None if p.items.iter().all(|e| e.is_dir) => (&icons::FOLDER, format!("{} itens", ui_count(p.items.len()))),
+        None => (&icons::FILE, format!("{} itens", ui_count(p.items.len()))),
+    };
+    let editable_name = p.renamable(s);
+    let name: El = if editable_name {
+        rune::text_input(&s.name_edit, k.ty.text_small)
+            .single_line()
+            .key("prop-name")
+            .label("Nome")
+            .w_full()
+            .min_w(0.0)
+            .color(k.c.text_base)
+            .caret(k.c.text_base, k.selection())
+            .on_edit(|s: &mut State| &mut s.name_edit)
+            .on_submit(|s: &mut State, _: &mut Tx| actions::props_ok(s))
+    } else {
+        text(title.clone()).font(k.ty.text_small_medium).color(k.c.text_base).selectable(true).truncate().min_w(0.0)
+    };
+    // An editable name sits in a field; one that can't change (several items, a shared drive)
+    // is plain text, so it doesn't look like it takes typing.
+    let name_box = row().w(0.0).grow(1.0).min_w(0.0).h(30.0).center_y();
+    let name_box = if editable_name { name_box.px(8.0).radius(k.radius.sm).fill(k.c.bg_base).border(1.0, k.c.border_base) } else { name_box };
+    let header = row()
+        .key("prop-head")
+        .w_full()
+        .gap(14.0)
+        .center_y()
+        .child(icon(glyph, 40.0))
+        .child(name_box.child(name));
+
+    let mut tabs = row().key("prop-tabs").w_full().border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak).child(prop_tab(k, "Geral", PropTab::General, p.tab == PropTab::General)).child(prop_tab(
+        k,
+        "Detalhes",
+        PropTab::Details,
+        p.tab == PropTab::Details,
+    ));
+    if p.has_versions(s) {
+        tabs = tabs.child(prop_tab(k, "Histórico de versões", PropTab::Versions, p.tab == PropTab::Versions));
+    }
+
+    // A floor on the height, so switching tabs doesn't make the dialog jump.
+    let mut body = col().key("prop-body").w_full().min_h(380.0).pt(14.0).gap(7.0);
+    match p.tab {
+        PropTab::General => {
+            body = body.child(header).child(prop_sep(k));
+            // What it is and where it lives.
+            body = body.child(prop_text(k, "Tipo", p.kind.clone()));
+            if let Some(desc) = details.and_then(|d| d.description.clone()) {
+                body = body.child(prop_text(k, "Descrição", desc));
+            }
+            body = body.child(prop_text(k, "Local", if drive.is_some() { "Google Drive" } else { "Este computador" }));
+            if let Some(email) = &drive {
+                body = body.child(prop_text(k, "Conta", email.clone()));
+            }
+            body = body.child(prop_sep(k));
+            // Where and how big.
+            body = body.child(prop_text(k, "Caminho", place_of(s, p)));
+            let size = match (p.single(), &p.totals) {
+                (_, Some(t)) => format_bytes(t.bytes),
+                (Some(e), None) if !e.is_dir => e.size.map(format_bytes).unwrap_or_else(|| "—".into()),
+                (_, None) if matches!(loc, Location::Local(_)) => "Calculando…".into(),
+                (None, None) => format_bytes(p.listed_bytes),
+                _ => "—".into(),
+            };
+            body = body.child(prop_text(k, "Tamanho", size));
+            if let Some(t) = &p.totals
+                && (p.items.len() > 1 || p.items.iter().any(|e| e.is_dir))
+            {
+                let plural = |n: u64, one: &str, many: &str| format!("{} {}", thousands(n as usize), if n == 1 { one } else { many });
+                body = body.child(prop_text(k, "Contém", format!("{}, {}", plural(t.files, "arquivo", "arquivos"), plural(t.dirs, "pasta", "pastas"))));
+            }
+            if let Some(e) = p.single() {
+                body = body.child(prop_sep(k));
+                // When, and the content's fingerprint.
+                let created = p.local.as_ref().and_then(|l| l.created).or_else(|| details.and_then(|d| d.created));
+                body = body.child(prop_text(k, "Criado", when(created))).child(prop_text(k, "Modificado", when(e.modified)));
+                if let Some(l) = &p.local {
+                    body = body.child(prop_text(k, "Acessado", when(l.accessed)));
+                } else if let Some(v) = details.and_then(|d| d.viewed) {
+                    body = body.child(prop_text(k, "Aberto por você", format_long(v)));
                 }
-                _ => {
-                    rows.push(("Local".into(), place));
-                    rows.push(("Tamanho".into(), e.size.map(bytes).unwrap_or_else(|| "—".into())));
-                    rows.push(("Modificado".into(), when(e.modified)));
-                    match details {
-                        Some(Ok(d)) => {
-                            rows.push(("Criado".into(), when(d.created)));
-                            rows.push(("Proprietário".into(), d.owner.clone().unwrap_or_else(|| "—".into())));
-                            rows.push(("Modificado por".into(), d.modified_by.clone().unwrap_or_else(|| "—".into())));
-                        }
-                        Some(Err(err)) => rows.push(("Detalhes".into(), err.clone())),
-                        None if matches!(pane.loc, Location::Drive { .. }) => rows.push(("Detalhes".into(), "carregando…".into())),
-                        None => {}
-                    }
-                    if let Location::Drive { .. } = pane.loc {
-                        rows.push(("ID".into(), e.id.clone()));
-                    }
+                if !e.is_dir {
+                    let hash: El = match (&p.local, &p.md5, details) {
+                        (_, Some(Ok(h)), _) => text(h.clone()).font(k.ty.mono).color(k.c.text_base).selectable(true),
+                        (_, Some(Err(err)), _) => text(err.clone()).font(k.ty.text_small).color(k.c.danger.fg),
+                        (Some(_), None, _) if p.md5_running => muted("Calculando…"),
+                        (Some(_), None, _) => Button::new("Calcular").variant(ButtonVariant::Neutral).on_press(actions::props_md5).build(k).key("md5"),
+                        (None, _, Some(d)) => match &d.md5 {
+                            Some(h) => text(h.clone()).font(k.ty.mono).color(k.c.text_base).selectable(true),
+                            None => muted("— (formato do Google, sem arquivo binário)"),
+                        },
+                        (None, _, None) if p.details.is_some() => muted("—"),
+                        (None, _, None) => muted("Carregando…"),
+                    };
+                    body = body.child(prop_row(k, "Hash (MD5)", hash));
                 }
             }
         }
-        many => {
-            let dirs = many.iter().filter(|e| e.is_dir).count();
-            let files = many.len() - dirs;
-            rows.push(("Itens".into(), format!("{} pastas, {} arquivos", thousands(dirs), thousands(files))));
-            rows.push(("Local".into(), place));
-            let total: u64 = many.iter().filter_map(|e| e.size).sum();
-            rows.push(("Tamanho dos arquivos".into(), bytes(total)));
+        PropTab::Details => {
+            match (p.single(), &p.local, drive.is_some()) {
+                (Some(e), Some(l), _) => {
+                    let attrs = if l.attributes.is_empty() { "Nenhum".to_string() } else { l.attributes.join(", ") };
+                    body = body.child(prop_text(k, "Atributos", attrs));
+                    let ext = e.name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty() && !e.is_dir).map(|(_, x)| format!(".{x}")).unwrap_or_else(|| "—".into());
+                    body = body.child(prop_text(k, "Extensão", ext)).child(prop_text(k, "Caminho completo", l.path.display().to_string()));
+                }
+                (Some(e), None, true) => {
+                    body = body.child(prop_text(k, "ID", e.id.clone()));
+                    match &p.details {
+                        Some(Ok(d)) => {
+                            let or_dash = |v: &Option<String>| v.clone().unwrap_or_else(|| "—".into());
+                            body = body
+                                .child(prop_text(k, "Tipo MIME", or_dash(&d.mime)))
+                                .child(prop_text(k, "Proprietário", or_dash(&d.owner)))
+                                .child(prop_text(k, "Modificado por", or_dash(&d.modified_by)))
+                                .child(prop_text(k, "Compartilhado", if d.shared { "Sim" } else { "Não" }));
+                            if let Some(by) = &d.shared_by {
+                                body = body.child(prop_text(k, "Compartilhado por", by.clone()));
+                            }
+                            body = body.child(prop_text(k, "Com estrela", if d.starred { "Sim" } else { "Não" }));
+                            if let Some(url) = d.link.clone() {
+                                body = body.child(prop_sep(k)).child(
+                                    row().w_full().justify_end().child(
+                                        Button::new("Abrir no Google Drive")
+                                            .variant(ButtonVariant::Neutral)
+                                            .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                                                if let Err(e) = tx.open_url(&url) {
+                                                    s.status = format!("Não consegui abrir o navegador: {e:?}");
+                                                }
+                                            })
+                                            .build(k),
+                                    ),
+                                );
+                            }
+                        }
+                        Some(Err(err)) => body = body.child(prop_text(k, "Detalhes", err.clone())),
+                        None => body = body.child(prop_row(k, "Detalhes", muted("Carregando…"))),
+                    }
+                }
+                _ => {
+                    // Several items: their names.
+                    let mut names = col().w_full().gap(4.0);
+                    for e in p.items.iter().take(20) {
+                        names = names.child(row().gap(6.0).center_y().child(icon(kind_icon(e.kind()), 16.0)).child(text(e.name.clone()).font(k.ty.text_small).color(k.c.text_base).truncate().min_w(0.0)));
+                    }
+                    if p.items.len() > 20 {
+                        names = names.child(muted(&format!("e mais {}", ui_count(p.items.len() - 20))));
+                    }
+                    body = body.child(prop_row(k, "Itens", names));
+                }
+            }
         }
+        PropTab::Versions => match &p.revisions {
+            None => body = body.child(muted("Carregando…")),
+            Some(Err(err)) => body = body.child(text(err.clone()).font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full()),
+            Some(Ok(list)) if list.is_empty() => body = body.child(muted("Nenhuma versão guardada.")),
+            Some(Ok(list)) => {
+                let head = |t: &str, w: f32| text(t.to_string()).font(k.ty.text_xsmall).color(k.c.text_muted).w(w);
+                body = body.child(row().w_full().pb(6.0).border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak).child(head("Data", 150.0)).child(head("Tamanho", 90.0)).child(head("Por", 150.0)));
+                let mut rows = col().w_full();
+                // Newest first, as the Drive website lists them.
+                for r in list.iter().rev() {
+                    let date = r.modified.map(format_time).unwrap_or_else(|| "—".into());
+                    let mut by = r.by.clone().unwrap_or_else(|| "—".into());
+                    if r.keep_forever {
+                        by.push_str(" · mantida para sempre");
+                    }
+                    rows = rows.child(
+                        row()
+                            .w_full()
+                            .h(26.0)
+                            .center_y()
+                            .child(text(date).font(k.ty.text_small).color(k.c.text_base).w(150.0))
+                            .child(text(r.size.map(format_size).unwrap_or_else(|| "—".into())).font(k.ty.text_small).color(k.c.text_muted).w(90.0))
+                            .child(text(by).font(k.ty.text_small).color(k.c.text_muted).truncate().w(0.0).grow(1.0).min_w(0.0)),
+                    );
+                }
+                body = body.child(col().key("versions").w_full().max_h(260.0).scroll(ScrollSpec { stick_bottom: false }).child(rows));
+            }
+        },
     }
-    rows
+
+    let buttons = row()
+        .key("actions")
+        .w_full()
+        .pt(18.0)
+        .gap(8.0)
+        .justify_end()
+        .child(Button::new("OK").variant(ButtonVariant::Submit).on_press(actions::props_ok).build(k))
+        .child(Button::new("Cancelar").variant(ButtonVariant::Neutral).on_press(actions::close_properties).build(k));
+    let content = col().key("content").w_full().px(16.0).pb(16.0).child(tabs).child(body).child(buttons);
+    Modal::new("props", format!("Propriedades: {title}")).open(true).child(content).width(520.0).fit().on_close(actions::close_properties).build(k, layer);
 }
 
 fn kind_icon(kind: Kind) -> &'static Icon {

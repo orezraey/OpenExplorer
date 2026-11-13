@@ -259,15 +259,55 @@ impl Drive {
 
     /// One file's details, for Propriedades.
     pub fn details(&self, id: &str) -> Result<Details> {
-        let fields = "id,name,mimeType,size,modifiedTime,createdTime,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName)";
+        let fields = "id,description,mimeType,md5Checksum,createdTime,viewedByMeTime,webViewLink,shared,starred,                      owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),sharingUser(displayName)";
         let v = self.get(&format!("/files/{}", checked(id)?), &[("fields", fields), ("supportsAllDrives", "true")], "Propriedades")?;
-        let s = |p: &str| v.pointer(p).and_then(|x| x.as_str()).map(str::to_string);
+        let s = |p: &str| v.pointer(p).and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(str::to_string);
+        let person = |p: &str| s(&format!("{p}/displayName")).or_else(|| s(&format!("{p}/emailAddress")));
         Ok(Details {
             created: s("/createdTime").as_deref().and_then(parse_time),
+            viewed: s("/viewedByMeTime").as_deref().and_then(parse_time),
             link: s("/webViewLink"),
-            owner: s("/owners/0/displayName").or_else(|| s("/owners/0/emailAddress")),
-            modified_by: s("/lastModifyingUser/displayName"),
+            owner: person("/owners/0"),
+            modified_by: person("/lastModifyingUser"),
+            shared_by: person("/sharingUser"),
+            description: s("/description"),
+            md5: s("/md5Checksum"),
+            mime: s("/mimeType"),
+            shared: v.get("shared").and_then(|x| x.as_bool()).unwrap_or(false),
+            starred: v.get("starred").and_then(|x| x.as_bool()).unwrap_or(false),
         })
+    }
+
+    /// The stored versions of a file, oldest first. Google Docs, Sheets and Slides list their
+    /// revisions without sizes; folders have none.
+    pub fn revisions(&self, id: &str) -> Result<Vec<Revision>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Raw {
+            id: String,
+            modified_time: Option<String>,
+            size: Option<String>,
+            keep_forever: Option<bool>,
+            original_filename: Option<String>,
+            last_modifying_user: Option<serde_json::Value>,
+        }
+        let path = format!("/files/{}/revisions", checked(id)?);
+        let fields = "nextPageToken,revisions(id,modifiedTime,size,keepForever,originalFilename,lastModifyingUser(displayName,emailAddress))";
+        let mut out = Vec::new();
+        self.pages(&path, &[("pageSize", "200"), ("fields", fields)], "revisions", "Histórico de versões", |page: Vec<Raw>, _| {
+            out.extend(page.into_iter().map(|r| Revision {
+                modified: r.modified_time.as_deref().and_then(parse_time),
+                size: r.size.and_then(|s| s.parse().ok()),
+                keep_forever: r.keep_forever.unwrap_or(false),
+                name: r.original_filename,
+                by: r.last_modifying_user.and_then(|u| {
+                    u.get("displayName").or_else(|| u.get("emailAddress")).and_then(|x| x.as_str()).map(str::to_string)
+                }),
+                id: r.id,
+            }));
+            true
+        })?;
+        Ok(out)
     }
 
     /// A call that answers with one file record.
@@ -284,9 +324,30 @@ impl Drive {
 #[derive(Clone, Debug, Default)]
 pub struct Details {
     pub created: Option<SystemTime>,
+    /// When this account last opened it.
+    pub viewed: Option<SystemTime>,
     pub link: Option<String>,
     pub owner: Option<String>,
     pub modified_by: Option<String>,
+    pub shared_by: Option<String>,
+    pub description: Option<String>,
+    /// Drive's checksum of the content; Google Docs and folders have none.
+    pub md5: Option<String>,
+    pub mime: Option<String>,
+    pub shared: bool,
+    pub starred: bool,
+}
+
+/// One stored version of a Drive file.
+#[derive(Clone, Debug)]
+pub struct Revision {
+    pub id: String,
+    pub modified: Option<SystemTime>,
+    pub size: Option<u64>,
+    pub by: Option<String>,
+    /// Kept for good rather than dropped after 30 days or 100 versions.
+    pub keep_forever: bool,
+    pub name: Option<String>,
 }
 
 /// A Drive id, refused if it holds anything but `[A-Za-z0-9_-]`, so it can't reach into the

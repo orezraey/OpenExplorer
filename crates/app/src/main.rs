@@ -35,8 +35,8 @@ enum Msg {
     /// A file operation finished: reload the panes showing `reload`, and say how it went.
     /// `made` is an account the operation had to open, for `poll` to keep.
     Done { reload: Vec<Location>, made: Option<(String, Arc<Drive>)>, result: Result<String, String> },
-    /// Drive's details of item `id`, for an open Propriedades.
-    Details { id: String, result: Result<openexplorer_gdrive::Details, String> },
+    /// Something Propriedades number `id` was waiting for.
+    Prop { id: u64, update: actions::PropUpdate },
 }
 
 /// Which part of a listing a [`Msg::Listed`] is.
@@ -62,6 +62,8 @@ struct State {
     name_edit: rune::TextEdit,
     /// The item being renamed in place, and its pane.
     renaming: Option<(usize, Entry)>,
+    /// Counts Propriedades dialogs, to tell their background answers apart.
+    props_seq: u64,
     /// What Copiar or Recortar picked up.
     clip: Option<actions::Clip>,
     /// Each pane's tree width, which its splitter changes.
@@ -104,6 +106,7 @@ fn init() -> State {
         dialog: None,
         name_edit: rune::TextEdit::new(""),
         renaming: None,
+        props_seq: 0,
         clip: None,
         local_drives: model::local_drives(),
         layout: layout::Layout::load(),
@@ -214,14 +217,7 @@ fn poll(s: &mut State, _now: f64, _tx: &mut Tx) -> bool {
                     }
                 }
             }
-            Msg::Details { id, result } => {
-                if let Some(actions::Dialog::Properties { items, details, .. }) = &mut s.dialog
-                    && items.len() == 1
-                    && items[0].id == id
-                {
-                    *details = Some(result);
-                }
-            }
+            Msg::Prop { id, update } => actions::props_update(s, id, update),
             Msg::LoggedIn { pane, attempt, result } => {
                 let current = s.login == Some(attempt);
                 if current {

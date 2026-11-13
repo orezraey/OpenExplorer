@@ -383,6 +383,47 @@ pub fn format_size(b: u64) -> String {
     format!("{v:.1} {}", UNITS[u]).replace('.', ",")
 }
 
+/// A date in full, as Windows' Properties shows it: "sexta-feira, 10 de fevereiro de 2023 20:19:35".
+pub fn format_long(t: SystemTime) -> String {
+    use chrono::{Datelike, Timelike};
+    const DAYS: [&str; 7] = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"];
+    const MONTHS: [&str; 12] = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"];
+    let d = chrono::DateTime::<chrono::Local>::from(t);
+    format!(
+        "{}, {} de {} de {} {:02}:{:02}:{:02}",
+        DAYS[d.weekday().num_days_from_monday() as usize],
+        d.day(),
+        MONTHS[d.month0() as usize],
+        d.year(),
+        d.hour(),
+        d.minute(),
+        d.second()
+    )
+}
+
+/// A size as "1,45 GB (1.553.451.055 bytes)", or just "512 bytes".
+pub fn format_bytes(b: u64) -> String {
+    let digits = b.to_string();
+    let grouped = digits.chars().enumerate().fold(String::new(), |mut out, (i, ch)| {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push('.');
+        }
+        out.push(ch);
+        out
+    });
+    if b < 1024 {
+        return format!("{grouped} bytes");
+    }
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    let (mut v, mut u) = (b as f64 / 1024.0, 0);
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    // Two decimals here, where the exact count follows; the list's one decimal is enough there.
+    format!("{} ({grouped} bytes)", format!("{v:.2} {}", UNITS[u]).replace('.', ","))
+}
+
 pub fn format_time(t: SystemTime) -> String {
     chrono::DateTime::<chrono::Local>::from(t).format("%d/%m/%Y %H:%M").to_string()
 }
@@ -592,6 +633,15 @@ mod tests {
         p.sort_entries();
         let names: Vec<&str> = p.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["Fotos", "c.png", "b.png", "z.pdf", "a.pdf"]);
+    }
+
+    #[test]
+    fn long_dates_and_byte_counts_read_as_in_windows() {
+        use chrono::TimeZone;
+        let t: SystemTime = chrono::Local.with_ymd_and_hms(2023, 2, 10, 20, 19, 35).unwrap().into();
+        assert_eq!(format_long(t), "sexta-feira, 10 de fevereiro de 2023 20:19:35");
+        assert_eq!(format_bytes(1_553_451_055), "1,45 GB (1.553.451.055 bytes)");
+        assert_eq!(format_bytes(512), "512 bytes");
     }
 
     #[test]

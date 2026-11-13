@@ -136,6 +136,87 @@ pub fn move_into(src: &Path, dir: &Path) -> Result<PathBuf, String> {
     removed.map(|_| to).map_err(|e| format!("\"{name}\" foi copiado, mas o original não pôde ser apagado: {e}"))
 }
 
+/// What a set of files and folders adds up to: bytes and how many files and folders, counting
+/// everything inside the folders.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Totals {
+    pub bytes: u64,
+    pub files: u64,
+    pub dirs: u64,
+}
+
+/// Walks `paths` (and every folder inside them) adding up sizes. Folders it can't read are
+/// skipped; `stop` is checked between entries, to give up when the dialog closes.
+pub fn totals(paths: &[PathBuf], stop: &dyn Fn() -> bool) -> Totals {
+    let mut t = Totals::default();
+    let mut todo: Vec<PathBuf> = paths.to_vec();
+    while let Some(p) = todo.pop() {
+        if stop() {
+            break;
+        }
+        // symlink_metadata: a link to a folder counts as itself, not what it points to, so a
+        // link loop can't make this walk forever.
+        let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
+        // A single item doesn't count itself ("Contém" is what's inside it); among several,
+        // each one counts, as in Explorer.
+        let counts = !paths.contains(&p) || paths.len() > 1;
+        if meta.is_dir() {
+            if counts {
+                t.dirs += 1;
+            }
+            if let Ok(items) = std::fs::read_dir(&p) {
+                todo.extend(items.flatten().map(|i| i.path()));
+            }
+        } else {
+            if counts {
+                t.files += 1;
+            }
+            t.bytes += meta.len();
+        }
+    }
+    t
+}
+
+/// The MD5 of a file's content, in lowercase hex, read in 1 MB chunks.
+pub fn md5_file(path: &Path, stop: &dyn Fn() -> bool) -> Result<String, String> {
+    use md5::{Digest, Md5};
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| format!("Não consegui ler o arquivo: {e}"))?;
+    let mut hash = Md5::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        if stop() {
+            return Err("Cancelado.".into());
+        }
+        let n = f.read(&mut buf).map_err(|e| format!("Não consegui ler o arquivo: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+    }
+    Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// The Windows attributes set in `meta`: Somente leitura, Oculto, Sistema, Arquivo...
+pub fn attributes(meta: &std::fs::Metadata) -> Vec<&'static str> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let a = meta.file_attributes();
+        // FILE_ATTRIBUTE_* bits.
+        [(0x1, "Somente leitura"), (0x2, "Oculto"), (0x4, "Sistema"), (0x20, "Arquivo"), (0x800, "Compactado"), (0x4000, "Criptografado")]
+            .into_iter()
+            .filter(|(bit, _)| a & bit != 0)
+            .map(|(_, name)| name)
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = meta;
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +226,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn totals_count_what_is_inside_folders_and_md5_matches() {
+        let d = scratch("totals");
+        std::fs::create_dir_all(d.join("a/b")).unwrap();
+        std::fs::write(d.join("a/um.txt"), "12345").unwrap();
+        std::fs::write(d.join("a/b/dois.txt"), "abc").unwrap();
+        let t = totals(&[d.join("a")], &|| false);
+        assert_eq!(t, Totals { bytes: 8, files: 2, dirs: 1 });
+        std::fs::write(d.join("solto.txt"), "xy").unwrap();
+        assert_eq!(totals(&[d.join("a"), d.join("solto.txt")], &|| false), Totals { bytes: 10, files: 3, dirs: 2 });
+        // The MD5 of "abc".
+        assert_eq!(md5_file(&d.join("a/b/dois.txt"), &|| false).unwrap(), "900150983cd24fb0d6963f7d28e17f72");
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]
