@@ -25,6 +25,9 @@ pub struct Entry {
     /// Drive's MD5 of the file, from the listing, so Propriedades shows it at once.
     #[serde(default)]
     pub md5: Option<String>,
+    /// Starred in Google Drive, for the menu to offer Adicionar or Remover estrela.
+    #[serde(default)]
+    pub starred: bool,
 }
 
 /// What a file is, for its icon and the Tipo column.
@@ -124,6 +127,40 @@ pub enum Space {
     SharedDrives,
     /// Inside one shared drive.
     Shared { id: String, name: String },
+    /// Drive's lists of files gathered by a property, not a place: Compartilhados comigo, Com
+    /// estrela, Recentes and Lixeira. With an empty `path` the location is the list itself; a
+    /// folder opened from it lists as any folder (in Lixeira, a trashed folder's contents).
+    SharedWithMe,
+    Starred,
+    Recent,
+    Trash,
+}
+
+impl Space {
+    /// The Drive list a view shows, `None` for the spaces made of folders.
+    pub fn view(&self) -> Option<openexplorer_gdrive::View> {
+        use openexplorer_gdrive::View;
+        match self {
+            Space::SharedWithMe => Some(View::SharedWithMe),
+            Space::Starred => Some(View::Starred),
+            Space::Recent => Some(View::Recent),
+            Space::Trash => Some(View::Trash),
+            Space::MyDrive | Space::SharedDrives | Space::Shared { .. } => None,
+        }
+    }
+
+    /// Its name in the tree and the path bar.
+    pub fn label(&self) -> &str {
+        match self {
+            Space::MyDrive => "Meu Drive",
+            Space::SharedDrives => "Drives compartilhados",
+            Space::Shared { name, .. } => name,
+            Space::SharedWithMe => "Compartilhados comigo",
+            Space::Starred => "Com estrela",
+            Space::Recent => "Recentes",
+            Space::Trash => "Lixeira",
+        }
+    }
 }
 
 impl Location {
@@ -278,9 +315,8 @@ impl Pane {
             Location::Mock(segs) => format!("Meu Drive/{}", segs.join("/")),
             Location::Drive { space, path, .. } => {
                 let mut parts: Vec<&str> = match space {
-                    Space::MyDrive => vec!["Meu Drive"],
-                    Space::SharedDrives => vec!["Drives compartilhados"],
                     Space::Shared { name, .. } => vec!["Drives compartilhados", name],
+                    other => vec![other.label()],
                 };
                 parts.extend(path.iter().map(|(_, n)| n.as_str()));
                 parts.join("/")
@@ -305,6 +341,7 @@ fn read_local(dir: &Path) -> std::io::Result<Vec<Entry>> {
             target: None,
             mime: None,
             md5: None,
+            starred: false,
         });
     }
     Ok(out)
@@ -319,8 +356,8 @@ impl MockDrive {
     pub fn new() -> MockDrive {
         let now = SystemTime::now();
         let ago = |days: u64| now - Duration::from_secs(days * 86_400);
-        let dir = |name: &str, days| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: Some(ago(days)), target: None, mime: None, md5: None };
-        let file = |name: String, size: u64, days| Entry { id: name.clone(), name, is_dir: false, size: Some(size), modified: Some(ago(days)), target: None, mime: None, md5: None };
+        let dir = |name: &str, days| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: Some(ago(days)), target: None, mime: None, md5: None, starred: false };
+        let file = |name: String, size: u64, days| Entry { id: name.clone(), name, is_dir: false, size: Some(size), modified: Some(ago(days)), target: None, mime: None, md5: None, starred: false };
 
         let mut folders = HashMap::new();
         folders.insert(
@@ -496,14 +533,10 @@ pub fn crumbs(loc: &Location) -> Vec<Crumb> {
             .collect(),
         Location::Drive { email, space, path } => {
             let mut out = vec![Crumb { label: email.clone(), to: Location::drive(email.clone(), Space::MyDrive) }];
-            match space {
-                Space::MyDrive => out.push(Crumb { label: "Meu Drive".into(), to: Location::drive(email.clone(), Space::MyDrive) }),
-                Space::SharedDrives => out.push(Crumb { label: "Drives compartilhados".into(), to: Location::drive(email.clone(), Space::SharedDrives) }),
-                Space::Shared { name, .. } => {
-                    out.push(Crumb { label: "Drives compartilhados".into(), to: Location::drive(email.clone(), Space::SharedDrives) });
-                    out.push(Crumb { label: name.clone(), to: Location::drive(email.clone(), space.clone()) });
-                }
+            if let Space::Shared { .. } = space {
+                out.push(Crumb { label: "Drives compartilhados".into(), to: Location::drive(email.clone(), Space::SharedDrives) });
             }
+            out.push(Crumb { label: space.label().to_string(), to: Location::drive(email.clone(), space.clone()) });
             for i in 0..path.len() {
                 out.push(Crumb { label: path[i].1.clone(), to: Location::Drive { email: email.clone(), space: space.clone(), path: path[..=i].to_vec() } });
             }
@@ -610,7 +643,7 @@ mod tests {
     use super::*;
 
     fn file(name: &str) -> Entry {
-        Entry { id: name.into(), name: name.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None }
+        Entry { id: name.into(), name: name.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false }
     }
 
     #[test]
@@ -659,6 +692,13 @@ mod tests {
         let labels: Vec<&str> = c.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(labels, ["a@b", "Drives compartilhados", "Equipe", "Fotos", "2026"]);
         assert!(matches!(&c[3].to, Location::Drive { path, .. } if path.len() == 1));
+        // A folder opened from Com estrela leads back to the list it came from.
+        let c = crumbs(&Location::Drive { email: "a@b".into(), space: Space::Starred, path: vec![("f1".into(), "Fotos".into())] });
+        let labels: Vec<&str> = c.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, ["a@b", "Com estrela", "Fotos"]);
+        assert_eq!(c[1].to, Location::drive("a@b", Space::Starred));
+        let p = Pane::new(Location::Drive { email: "a@b".into(), space: Space::Trash, path: vec![("f1".into(), "Velha".into())] });
+        assert_eq!(p.title(), "Lixeira/Velha");
         #[cfg(windows)]
         {
             let c = crumbs(&Location::Local(PathBuf::from(r"C:\Users\Ana")));

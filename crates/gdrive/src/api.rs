@@ -12,7 +12,72 @@ use crate::{ClientConfig, Result, agent, json};
 const API: &str = "https://www.googleapis.com/drive/v3";
 pub const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 /// The fields of a file Drive answers with after a change or an upload.
-pub(crate) const FILE_FIELDS: &str = "id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails(targetId,targetMimeType)";
+pub(crate) const FILE_FIELDS: &str = "id,name,mimeType,size,modifiedTime,md5Checksum,starred,shortcutDetails(targetId,targetMimeType)";
+/// What a listing asks of each file: [`FILE_FIELDS`] and the next page.
+const LIST_FIELDS: &str = "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,starred,shortcutDetails(targetId,targetMimeType))";
+/// What the trash listing asks of each file, to keep only what this account can restore.
+const TRASH_FIELDS: &str =
+    "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,starred,shortcutDetails(targetId,targetMimeType),explicitlyTrashed,ownedByMe,driveId,capabilities(canUntrash))";
+/// How many files Recentes shows: Drive's own Recent view also stops after a while.
+pub const RECENT_LIMIT: usize = 200;
+
+/// Google Drive's lists that aren't folders: files gathered by a property rather than by
+/// where they sit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    /// Compartilhados comigo: shared with this account by someone else.
+    SharedWithMe,
+    /// Com estrela.
+    Starred,
+    /// Recentes: the files this account opened last, newest first.
+    Recent,
+    /// Lixeira: what this account trashed in My Drive, and what it can restore in shared drives.
+    Trash,
+}
+
+impl View {
+    /// The `files.list` parameters of the view, besides paging and fields.
+    pub(crate) fn query(self) -> Vec<(&'static str, &'static str)> {
+        let mut q = vec![("supportsAllDrives", "true"), ("includeItemsFromAllDrives", "true")];
+        match self {
+            View::SharedWithMe => q.extend([("q", "sharedWithMe = true and trashed = false"), ("corpora", "user"), ("pageSize", "1000")]),
+            // Starred files can sit in shared drives, which `corpora=user` leaves out.
+            View::Starred => q.extend([("q", "starred = true and trashed = false"), ("corpora", "allDrives"), ("pageSize", "1000")]),
+            // Folders have no "opened" time worth showing; Drive's Recent lists files only.
+            View::Recent => q.extend([
+                ("q", "trashed = false and mimeType != 'application/vnd.google-apps.folder'"),
+                ("corpora", "user"),
+                ("orderBy", "viewedByMeTime desc"),
+                ("pageSize", "200"),
+            ]),
+            // `explicitlyTrashed` can't be asked for in `q`; `in_trash_view` filters on it.
+            View::Trash => q.extend([("q", "trashed = true"), ("corpora", "allDrives"), ("pageSize", "1000")]),
+        }
+        q
+    }
+
+    fn what(self) -> &'static str {
+        match self {
+            View::SharedWithMe => "Compartilhados comigo",
+            View::Starred => "Com estrela",
+            View::Recent => "Recentes",
+            View::Trash => "Lixeira",
+        }
+    }
+}
+
+/// Whether a trashed file shows in Lixeira, as on the Drive website: only what was trashed
+/// itself (not the contents of a trashed folder, which open with it), and only what this
+/// account can restore: its own files in My Drive, and in a shared drive what its role allows.
+fn in_trash_view(r: &RawFile) -> bool {
+    if !r.explicitly_trashed.unwrap_or(false) {
+        return false;
+    }
+    match r.drive_id {
+        Some(_) => r.capabilities.as_ref().is_some_and(|c| c.can_untrash.unwrap_or(false)),
+        None => r.owned_by_me.unwrap_or(false),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Account {
@@ -31,6 +96,7 @@ pub struct DriveFile {
     pub mime: String,
     /// For a shortcut to a folder: the folder it opens.
     pub target: Option<String>,
+    pub starred: bool,
     /// Drive's MD5 of the content, sent with the listing; Google's own formats have none.
     pub md5: Option<String>,
 }
@@ -57,7 +123,7 @@ pub struct Drive {
     pub(crate) upload_url: String,
     /// For downloads: no overall time limit either, but a stalled read gives up.
     pub(crate) downloads: ureq::Agent,
-    /// Where downloads come from: the Drive API (a local stand-in in tests).
+    /// Where Drive calls and downloads go: Google's API (a local stand-in in tests).
     pub(crate) api_url: String,
 }
 
@@ -125,9 +191,16 @@ impl Drive {
         let mut limited = 0u32;
         loop {
             let started = Instant::now();
-            let url = format!("{API}{path}");
+            let url = format!("{}{path}", self.api_url);
             let auth = format!("Bearer {}", self.token()?);
             let sent = match (method, body) {
+                ("DELETE", _) => {
+                    let mut req = self.agent.delete(&url).header("Authorization", &auth);
+                    for (k, v) in query {
+                        req = req.query(*k, *v);
+                    }
+                    req.call()
+                }
                 ("GET", _) | (_, None) => {
                     let mut req = self.agent.get(&url).header("Authorization", &auth);
                     for (k, v) in query {
@@ -173,7 +246,8 @@ impl Drive {
                 crate::log(&format!("{method} {path} {status} em {} ms", started.elapsed().as_millis()));
                 return Err(format!("{what}: HTTP {status}: {}", crate::google_reason(&text)));
             }
-            let out = json(resp, what);
+            // A delete answers 204 with no body at all.
+            let out = if method == "DELETE" && (200..300).contains(&status) { Ok(serde_json::Value::Null) } else { json(resp, what) };
             crate::log(&format!("{method} {path} {status} em {} ms", started.elapsed().as_millis()));
             return out;
         }
@@ -253,7 +327,7 @@ impl Drive {
         let q = format!("'{folder_id}' in parents and trashed = false");
         let mut query = vec![
             ("q", q.as_str()),
-            ("fields", "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails(targetId,targetMimeType))"),
+            ("fields", LIST_FIELDS),
             // No orderBy: sorting a big folder on Google's side slows every page down, and the
             // app sorts locally.
             ("pageSize", "1000"),
@@ -266,6 +340,62 @@ impl Drive {
             None => query.push(("corpora", "allDrives")),
         }
         self.pages("/files", &query, "files", "Listagem da pasta", |raw: Vec<RawFile>, more| each(raw.into_iter().map(DriveFile::from).collect(), more))
+    }
+
+    /// The files of a [`View`], handed to `each` a page at a time like [`Drive::list`].
+    /// Recentes stops after [`RECENT_LIMIT`] files.
+    pub fn view(&self, view: View, mut each: impl FnMut(Vec<DriveFile>, bool) -> bool) -> Result<()> {
+        let mut query = view.query();
+        query.push(("fields", if view == View::Trash { TRASH_FIELDS } else { LIST_FIELDS }));
+        let mut seen = 0;
+        self.pages("/files", &query, "files", view.what(), |raw: Vec<RawFile>, more| {
+            let files: Vec<DriveFile> = raw.into_iter().filter(|r| view != View::Trash || in_trash_view(r)).map(DriveFile::from).collect();
+            if view != View::Recent {
+                return each(files, more);
+            }
+            let room = RECENT_LIMIT - seen;
+            let full = files.len() >= room;
+            seen += files.len().min(room);
+            // The last page shown says so, or the pane would wait for one that never comes.
+            each(files.into_iter().take(room).collect(), more && !full) && !full
+        })
+    }
+
+    /// The contents of a trashed folder, which went to the trash with it and come back when
+    /// it's restored. No `trashed` filter: Drive marks them trashed only some time after the
+    /// folder, and everything in a trashed folder is in the trash anyway.
+    pub fn list_trashed(&self, folder_id: &str, mut each: impl FnMut(Vec<DriveFile>, bool) -> bool) -> Result<()> {
+        let q = format!("'{}' in parents", checked(folder_id)?);
+        let query = [
+            ("q", q.as_str()),
+            ("fields", LIST_FIELDS),
+            ("pageSize", "1000"),
+            ("supportsAllDrives", "true"),
+            ("includeItemsFromAllDrives", "true"),
+            ("corpora", "allDrives"),
+        ];
+        self.pages("/files", &query, "files", "Listagem da pasta na lixeira", |raw: Vec<RawFile>, more| each(raw.into_iter().map(DriveFile::from).collect(), more))
+    }
+
+    /// Takes a file or folder out of the trash, back where it was.
+    pub fn restore(&self, id: &str) -> Result<DriveFile> {
+        self.file_call("PATCH", &format!("/files/{}", checked(id)?), &[], &serde_json::json!({ "trashed": false }), "Restaurar")
+    }
+
+    /// Deletes a file or folder for good, skipping the trash: it can't be undone.
+    pub fn delete_forever(&self, id: &str) -> Result<()> {
+        self.call("DELETE", &format!("/files/{}", checked(id)?), &[("supportsAllDrives", "true")], None, "Excluir permanentemente").map(|_| ())
+    }
+
+    /// Deletes for good everything in this account's My Drive trash; shared drives keep theirs.
+    pub fn empty_trash(&self) -> Result<()> {
+        self.call("DELETE", "/files/trash", &[], None, "Esvaziar lixeira").map(|_| ())
+    }
+
+    /// Adds or removes the star.
+    pub fn set_starred(&self, id: &str, starred: bool) -> Result<DriveFile> {
+        let what = if starred { "Adicionar estrela" } else { "Remover estrela" };
+        self.file_call("PATCH", &format!("/files/{}", checked(id)?), &[], &serde_json::json!({ "starred": starred }), what)
     }
 
     /// A new folder named `name` in folder `parent` (`"root"` is My Drive).
@@ -427,6 +557,18 @@ pub(crate) struct RawFile {
     modified_time: Option<String>,
     md5_checksum: Option<String>,
     shortcut_details: Option<Shortcut>,
+    starred: Option<bool>,
+    /// The trash listing's fields, see `in_trash_view`.
+    explicitly_trashed: Option<bool>,
+    owned_by_me: Option<bool>,
+    drive_id: Option<String>,
+    capabilities: Option<Capabilities>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Capabilities {
+    can_untrash: Option<bool>,
 }
 
 impl From<RawFile> for DriveFile {
@@ -441,6 +583,7 @@ impl From<RawFile> for DriveFile {
             name: r.name,
             mime: r.mime_type,
             md5: r.md5_checksum,
+            starred: r.starred.unwrap_or(false),
         }
     }
 }
@@ -473,6 +616,137 @@ mod tests {
         assert!(parse_time("not a date").is_none());
         #[cfg(windows)]
         assert!(parse_time("1600-12-31T23:59:59Z").is_none());
+    }
+
+    fn param<'a>(q: &'a [(&str, &str)], k: &str) -> Option<&'a str> {
+        q.iter().find(|(n, _)| *n == k).map(|(_, v)| *v)
+    }
+
+    #[test]
+    fn each_view_asks_drive_for_its_own_files() {
+        let q = View::SharedWithMe.query();
+        assert_eq!(param(&q, "q"), Some("sharedWithMe = true and trashed = false"));
+        assert_eq!(param(&q, "corpora"), Some("user"));
+        let q = View::Starred.query();
+        assert_eq!(param(&q, "q"), Some("starred = true and trashed = false"));
+        assert_eq!(param(&q, "corpora"), Some("allDrives"));
+        let q = View::Recent.query();
+        assert_eq!(param(&q, "orderBy"), Some("viewedByMeTime desc"));
+        assert_eq!(param(&q, "q"), Some("trashed = false and mimeType != 'application/vnd.google-apps.folder'"));
+        let q = View::Trash.query();
+        assert_eq!(param(&q, "q"), Some("trashed = true"));
+        for v in [View::SharedWithMe, View::Starred, View::Recent, View::Trash] {
+            let q = v.query();
+            assert_eq!((param(&q, "supportsAllDrives"), param(&q, "includeItemsFromAllDrives")), (Some("true"), Some("true")), "{v:?}");
+            assert!(param(&q, "pageSize").is_some(), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn the_trash_shows_what_was_trashed_itself_and_can_come_back() {
+        let raw = |json: &str| serde_json::from_str::<RawFile>(&format!(r#"{{"id":"a","name":"n","mimeType":"text/plain",{json}}}"#)).unwrap();
+        // Trashed by its owner, this account.
+        assert!(in_trash_view(&raw(r#""explicitlyTrashed":true,"ownedByMe":true"#)));
+        // Inside a trashed folder: it shows inside that folder, not on its own.
+        assert!(!in_trash_view(&raw(r#""explicitlyTrashed":false,"ownedByMe":true"#)));
+        // Someone else's file they trashed, still shared with this account.
+        assert!(!in_trash_view(&raw(r#""explicitlyTrashed":true,"ownedByMe":false"#)));
+        // In a shared drive: as the account's role allows.
+        assert!(in_trash_view(&raw(r#""explicitlyTrashed":true,"driveId":"0A","capabilities":{"canUntrash":true}"#)));
+        assert!(!in_trash_view(&raw(r#""explicitlyTrashed":true,"driveId":"0A","capabilities":{"canUntrash":false}"#)));
+        assert!(!in_trash_view(&raw(r#""explicitlyTrashed":true,"driveId":"0A""#)));
+        let starred = DriveFile::from(raw(r#""starred":true"#));
+        assert!(starred.starred);
+        assert!(!DriveFile::from(raw(r#""size":"1""#)).starred);
+    }
+
+    /// A stand-in for the Drive API that answers each request in turn with the next of
+    /// `answers` (status line, body), and hands back the first line of every request it got.
+    fn stand_in(answers: Vec<(&'static str, &'static str)>) -> (Drive, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let seen = std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            for (status, body) in answers {
+                let mut s = BufReader::new(server.accept().unwrap().0);
+                let mut line = String::new();
+                s.read_line(&mut line).unwrap();
+                let mut len = 0;
+                loop {
+                    let mut h = String::new();
+                    s.read_line(&mut h).unwrap();
+                    if h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = h.split_once(':')
+                        && k.eq_ignore_ascii_case("content-length")
+                    {
+                        len = v.trim().parse().unwrap();
+                    }
+                }
+                let mut sent = vec![0; len];
+                s.read_exact(&mut sent).unwrap();
+                // The body as compact JSON, however it was sent.
+                let got = serde_json::from_slice::<serde_json::Value>(&sent).map(|v| v.to_string()).unwrap_or_default();
+                lines.push(format!("{} {got}", line.trim_end()).trim_end().to_string());
+                let out = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                s.get_mut().write_all(out.as_bytes()).unwrap();
+            }
+            lines
+        });
+        (Drive { api_url: base, ..Drive::for_tests(String::new()) }, seen)
+    }
+
+    #[test]
+    fn trash_actions_send_the_calls_drive_documents() {
+        let file = r#"{"id":"f1","name":"a.txt","mimeType":"text/plain"}"#;
+        let (d, seen) = stand_in(vec![("200 OK", file), ("204 No Content", ""), ("204 No Content", ""), ("200 OK", file), ("403 Forbidden", r#"{"error":{"code":403,"message":"The user does not have sufficient permissions for this file."}}"#)]);
+        d.restore("f1").unwrap();
+        d.delete_forever("f1").unwrap();
+        d.empty_trash().unwrap();
+        d.set_starred("f1", true).unwrap();
+        let err = d.delete_forever("f2").unwrap_err();
+        assert!(err.contains("sufficient permissions"), "{err}");
+        let seen = seen.join().unwrap();
+        assert!(seen[0].starts_with("PATCH /files/f1?supportsAllDrives=true") && seen[0].ends_with(r#"{"trashed":false}"#), "{}", seen[0]);
+        assert!(seen[1].starts_with("DELETE /files/f1?supportsAllDrives=true "), "{}", seen[1]);
+        // Esvaziar lixeira is the one call on the whole trash, with nothing that could aim it
+        // at anything else.
+        assert_eq!(seen[2], "DELETE /files/trash HTTP/1.1");
+        assert!(seen[3].ends_with(r#"{"starred":true}"#), "{}", seen[3]);
+        assert!(d.delete_forever("../trash").is_err(), "ids can't reach other paths");
+    }
+
+    #[test]
+    fn the_trash_view_keeps_only_what_can_be_restored_and_recent_stops_at_its_limit() {
+        let page = r#"{"files":[
+            {"id":"mine","name":"meu.txt","mimeType":"text/plain","explicitlyTrashed":true,"ownedByMe":true},
+            {"id":"inside","name":"dentro.txt","mimeType":"text/plain","explicitlyTrashed":false,"ownedByMe":true},
+            {"id":"theirs","name":"deles.txt","mimeType":"text/plain","explicitlyTrashed":true,"ownedByMe":false}]}"#;
+        let (d, seen) = stand_in(vec![("200 OK", page)]);
+        let mut got = Vec::new();
+        d.view(View::Trash, |files, more| {
+            got.extend(files.into_iter().map(|f| f.id));
+            assert!(!more);
+            true
+        })
+        .unwrap();
+        assert_eq!(got, ["mine"]);
+        let line = &seen.join().unwrap()[0];
+        assert!(line.contains("q=trashed+%3D+true") || line.contains("q=trashed%20%3D%20true"), "{line}");
+
+        let many: String = (0..150).map(|i| format!(r#"{{"id":"r{i}","name":"r{i}","mimeType":"text/plain"}}"#)).collect::<Vec<_>>().join(",");
+        let first: &'static str = format!(r#"{{"nextPageToken":"p2","files":[{many}]}}"#).leak();
+        let (d, seen) = stand_in(vec![("200 OK", first), ("200 OK", first)]);
+        let mut pages = Vec::new();
+        d.view(View::Recent, |files, more| {
+            pages.push((files.len(), more));
+            true
+        })
+        .unwrap();
+        assert_eq!(pages, [(150, true), (RECENT_LIMIT - 150, false)]);
+        assert_eq!(seen.join().unwrap().len(), 2);
     }
 
     #[test]

@@ -382,6 +382,7 @@ mod tests {
             mime: mime.into(),
             target: None,
             md5: None,
+            starred: false,
         }
     }
 

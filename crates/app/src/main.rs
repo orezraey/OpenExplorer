@@ -354,7 +354,7 @@ fn poll(s: &mut State, now: f64, _tx: &mut Tx) -> bool {
 }
 
 fn entry_of(f: DriveFile) -> Entry {
-    Entry { id: f.id, name: f.name, is_dir: f.is_dir, size: f.size, modified: f.modified, target: f.target, mime: Some(f.mime), md5: f.md5 }
+    Entry { id: f.id, name: f.name, is_dir: f.is_dir, size: f.size, modified: f.modified, target: f.target, mime: Some(f.mime), md5: f.md5, starred: f.starred }
 }
 
 fn pane_key(p: usize) -> String {
@@ -494,11 +494,19 @@ fn load(s: &mut State, p: usize) {
             live.load(Ordering::Relaxed) == request
         };
         // A panic here (a bad value from Drive, say) must not leave the pane loading forever.
-        let result = catch_panic("listar", || match &space {
-            Space::MyDrive => drive.list(folder.as_deref().unwrap_or("root"), None, &mut page),
-            Space::Shared { id, .. } => drive.list(folder.as_deref().unwrap_or(id), Some(id), &mut page),
+        let result = catch_panic("listar", || match (&space, folder.as_deref()) {
+            (Space::MyDrive, f) => drive.list(f.unwrap_or("root"), None, &mut page),
+            (Space::Shared { id, .. }, f) => drive.list(f.unwrap_or(id), Some(id), &mut page),
+            (Space::Trash, Some(f)) => drive.list_trashed(f, &mut page),
+            // A folder opened from Compartilhados comigo, Com estrela or Recentes lists as any
+            // folder, in whichever drive it sits.
+            (Space::SharedWithMe | Space::Starred | Space::Recent, Some(f)) => drive.list(f, None, &mut page),
+            (Space::SharedWithMe | Space::Starred | Space::Recent | Space::Trash, None) => match space.view() {
+                Some(v) => drive.view(v, &mut page),
+                None => Ok(()),
+            },
             // The shared drives show as folders.
-            Space::SharedDrives => drive.shared_drives().map(|list| {
+            (Space::SharedDrives, _) => drive.shared_drives().map(|list| {
                 list.into_iter()
                     .map(|d| Entry {
                         name: if d.hidden { format!("{} (oculto)", d.name) } else { d.name },
@@ -509,6 +517,7 @@ fn load(s: &mut State, p: usize) {
                         target: None,
                         mime: None,
                         md5: None,
+                        starred: false,
                     })
                     .collect::<Vec<_>>()
             }).map(|entries| emit(listed(made.take(), Part::WHOLE, Ok(entries)))),
@@ -923,6 +932,7 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
                     target: None,
                     mime: None,
                     md5: None,
+                    starred: false,
                 };
                 if s.mock.add(segs, entry) { done += 1 } else { skipped += 1 }
             }
@@ -952,6 +962,7 @@ fn clash_scene(s: &mut State, all: bool) {
         target: None,
         mime: Some(mime.into()),
         md5: None,
+        starred: false,
     };
     let existing = vec![e("a", "Relatório.pdf", "application/pdf"), e("b", "foto.jpg", "image/jpeg"), e("c", "Projetos", openexplorer_gdrive::api::FOLDER_MIME)];
     s.panes[1].set_entries(Ok(existing.clone()));
@@ -959,6 +970,28 @@ fn clash_scene(s: &mut State, all: bool) {
     let up = actions::Upload { email: "voce@gmail.com".into(), parent: "x".into(), to: to.clone(), sources, remove: false, reload: vec![to] };
     let chosen = if all { Vec::new() } else { vec![uploads::Clash::KeepBoth] };
     s.dialog = Some(actions::Dialog::Clash(Box::new(actions::ClashAsk { up, existing, clashes: vec![0, 1, 2], chosen, all })));
+}
+
+/// A few Drive items for the scenes of Drive's views.
+fn view_sample() -> Vec<Entry> {
+    let ago = |days: u64| Some(SystemTime::now() - std::time::Duration::from_secs(days * 86_400));
+    let e = |id: &str, name: &str, is_dir: bool, size: Option<u64>, days, mime: Option<&str>| Entry {
+        id: id.into(),
+        name: name.into(),
+        is_dir,
+        size,
+        modified: ago(days),
+        target: None,
+        mime: mime.map(str::to_string),
+        md5: None,
+        starred: false,
+    };
+    vec![
+        e("f1", "Projetos antigos", true, None, 40, None),
+        e("f2", "Relatório 2025.pdf", false, Some(1_204_330), 12, None),
+        e("f3", "Orçamento", false, None, 3, Some("application/vnd.google-apps.spreadsheet")),
+        e("f4", "foto_praia.jpg", false, Some(3_480_112), 90, None),
+    ]
 }
 
 fn main() {
@@ -1026,11 +1059,42 @@ fn main() {
                     p(4).item_done();
                 }
             }),
+            // Lixeira of an account with its menu open on an item, without a network.
+            ("trash", |s| {
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.panes[1].go(Location::drive("voce@gmail.com", Space::Trash));
+                s.panes[1].set_entries(Ok(view_sample()));
+                s.panes[1].selected = ["f2".to_string()].into();
+                s.menu = Some((1, rune::PointerPress { x: 900.0, y: 200.0 }));
+            }),
+            // Excluir permanentemente asking to confirm.
+            ("purge", |s| {
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.panes[1].go(Location::drive("voce@gmail.com", Space::Trash));
+                s.panes[1].set_entries(Ok(view_sample()));
+                s.panes[1].selected = ["f2".to_string(), "f3".to_string()].into();
+                actions::ask_delete(s, 1);
+            }),
+            // Esvaziar lixeira asking to confirm.
+            ("empty-trash", |s| {
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.panes[1].go(Location::drive("voce@gmail.com", Space::Trash));
+                s.panes[1].set_entries(Ok(view_sample()));
+                actions::ask_empty_trash(s, 1);
+            }),
+            // Com estrela with the menu on a starred file, and the views in the tree.
+            ("starred", |s| {
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.panes[1].go(Location::drive("voce@gmail.com", Space::Starred));
+                s.panes[1].set_entries(Ok(view_sample().into_iter().map(|e| Entry { starred: true, ..e }).collect()));
+                s.panes[1].selected = ["f3".to_string()].into();
+                s.menu = Some((1, rune::PointerPress { x: 900.0, y: 200.0 }));
+            }),
             // The shared drives list of an account, without a network.
             ("shared", |s| {
                 s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::SharedDrives));
-                let d = |id: &str, name: &str| Entry { id: id.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None };
+                let d = |id: &str, name: &str| Entry { id: id.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
                 s.panes[1].set_entries(Ok(vec![d("0AAa", "Equipe de design"), d("0AAb", "Financeiro"), d("0AAc", "Projetos 2026")]));
             }),
         ],
@@ -1043,7 +1107,7 @@ mod tests {
     use super::*;
 
     fn entries(from: usize, n: usize) -> Vec<Entry> {
-        (from..from + n).map(|i| Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None }).collect()
+        (from..from + n).map(|i| Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false }).collect()
     }
 
     /// Dropping items whose names the Drive folder already has asks first, one by one once

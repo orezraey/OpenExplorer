@@ -305,19 +305,41 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         })
     };
     let mut menu = context_menu("menu", anchor, Some(at)).min_width(220.0);
+    // Lixeira: what can come back, or go for good.
+    if actions::in_trash(&s.panes[p].loc) {
+        // Wide enough for "Excluir permanentemente" and its key.
+        menu = menu.min_width(270.0);
+        if n > 0 {
+            menu = menu
+                .item(item("Abrir", &icons::M_OPEN, "Enter", n == 1, actions::open))
+                .separator()
+                .item(item("Restaurar", &icons::M_RESTORE, "", true, |s, p, _| actions::restore(s, p)))
+                .item(item("Excluir permanentemente", &icons::M_DELETE, "Del", true, |s, p, _| actions::ask_purge(s, p)).danger(true))
+                .separator()
+                .item(item("Propriedades", &icons::M_PROPERTIES, "Alt+Enter", true, |s, p, _| actions::properties(s, p)))
+                .separator();
+        }
+        menu = menu.item(item("Esvaziar lixeira", &icons::M_EMPTY_TRASH, "", true, |s, p, _| actions::ask_empty_trash(s, p)).danger(true));
+        return menu.on_close(|s: &mut State| s.menu = None).build(k, layer);
+    }
+    let changeable = actions::items_editable(&s.panes[p].loc);
     if n > 0 {
         menu = menu
             .item(item("Abrir", &icons::M_OPEN, "Enter", n == 1, actions::open))
             .separator()
             .item(item("Recortar", &icons::M_CUT, "Ctrl+X", editable, |s, p, _| actions::pick_up(s, p, ClipMode::Cut)))
-            .item(item("Copiar", &icons::M_COPY, "Ctrl+C", editable, |s, p, _| actions::pick_up(s, p, ClipMode::Copy)));
+            .item(item("Copiar", &icons::M_COPY, "Ctrl+C", changeable, |s, p, _| actions::pick_up(s, p, ClipMode::Copy)));
     }
     menu = menu.item(item("Colar", &icons::M_PASTE, "Ctrl+V", actions::can_paste(s, p), |s, p, _| actions::paste(s, p)));
     if n > 0 {
         menu = menu
             .separator()
-            .item(item("Excluir", &icons::M_DELETE, "Del", editable, |s, p, _| actions::ask_delete(s, p)).danger(true))
-            .item(item("Renomear", &icons::M_RENAME, "F2", editable && n == 1, actions::ask_rename));
+            .item(item("Excluir", &icons::M_DELETE, "Del", changeable, |s, p, _| actions::ask_delete(s, p)).danger(true))
+            .item(item("Renomear", &icons::M_RENAME, "F2", changeable && n == 1, actions::ask_rename));
+        if changeable && matches!(s.panes[p].loc, Location::Drive { .. }) {
+            let label = if actions::stars_to_add(s, p) { "Adicionar estrela" } else { "Remover estrela" };
+            menu = menu.item(item(label, &icons::M_STAR, "", true, |s, p, _| actions::star(s, p)));
+        }
     }
     menu = menu.separator().item(item("Nova pasta", &icons::M_NEW_FOLDER, "Ctrl+Shift+N", editable, actions::ask_new_folder));
     if n > 0 {
@@ -360,20 +382,36 @@ fn dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
             } else {
                 "Os itens vão para a lixeira do Google Drive, onde ficam 30 dias antes de serem apagados de vez."
             };
-            let mut list = col().key("items").w_full().gap(4.0);
-            for e in items.iter().take(6) {
-                list = list.child(
-                    row().gap(6.0).center_y().child(entry_icon(s, &s.panes[*pane].loc, e, 16.0)).child(text(e.name.clone()).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0)),
-                );
-            }
-            if items.len() > 6 {
-                list = list.child(text(format!("e mais {}", ui_count(items.len() - 6))).font(k.ty.text_small).color(k.c.text_muted));
-            }
             // The explanation goes in the body, where it wraps; the dialog's own description
             // line doesn't, and would run under the close button.
             let note = text(where_to).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
-            let body = col().w_full().gap(12.0).child(note).child(list).child(actions_row(k, "Cancelar", Button::new("Excluir").variant(ButtonVariant::Danger).on_press(actions::delete)));
+            let body = col().w_full().gap(12.0).child(note).child(item_list(s, k, *pane, items)).child(actions_row(k, "Cancelar", Button::new("Excluir").variant(ButtonVariant::Danger).on_press(actions::delete)));
             Modal::new("delete", title).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
+        }
+        Dialog::Purge { pane, items } => {
+            let title = match items.as_slice() {
+                [one] => format!("Excluir \"{}\" permanentemente?", one.name),
+                many => format!("Excluir {} itens permanentemente?", ui_count(many.len())),
+            };
+            let note = "Os itens serão apagados para sempre do Google Drive. Isso não pode ser desfeito.";
+            let body = col()
+                .w_full()
+                .gap(12.0)
+                .child(text(note).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
+                .child(item_list(s, k, *pane, items))
+                .child(actions_row(k, "Cancelar", Button::new("Excluir permanentemente").variant(ButtonVariant::Danger).on_press(actions::purge)));
+            Modal::new("purge", title).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
+        }
+        Dialog::EmptyTrash { email } => {
+            let note = format!(
+                "Todos os itens da lixeira do Meu Drive de {email} serão apagados para sempre. Isso não pode ser desfeito. Itens na lixeira de drives compartilhados continuam lá."
+            );
+            let body = col()
+                .w_full()
+                .gap(12.0)
+                .child(text(note).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
+                .child(actions_row(k, "Cancelar", Button::new("Esvaziar lixeira").variant(ButtonVariant::Danger).on_press(actions::empty_trash)));
+            Modal::new("empty-trash", "Esvaziar lixeira?").open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
         }
         Dialog::NewFolder { error, .. } => {
             // Rune's own field, so it can take the dialog's first focus (`autofocus`); Enter
@@ -467,6 +505,20 @@ fn clash_dialog(s: &State, k: &Kit, ask: &actions::ClashAsk, layer: &mut Vec<El>
         .child(choice("Substituir", crate::uploads::Clash::Replace, ButtonVariant::Submit));
     let body = col().key("content").w_full().px(16.0).pb(16.0).child(body.child(buttons));
     Modal::new("clash", title).open(true).child(body).width(520.0).fit().on_close(|s: &mut State| actions::answer_clash(s, None)).build(k, layer);
+}
+
+/// The first few items a dialog acts on, with "e mais N" for the rest.
+fn item_list(s: &State, k: &Kit, pane: usize, items: &[crate::model::Entry]) -> El {
+    let mut list = col().key("items").w_full().gap(4.0);
+    for e in items.iter().take(6) {
+        list = list.child(
+            row().gap(6.0).center_y().child(entry_icon(s, &s.panes[pane].loc, e, 16.0)).child(text(e.name.clone()).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0)),
+        );
+    }
+    if items.len() > 6 {
+        list = list.child(text(format!("e mais {}", ui_count(items.len() - 6))).font(k.ty.text_small).color(k.c.text_muted));
+    }
+    list
 }
 
 /// The colours and font of the in-place rename field, copied out of the kit so the row builder
@@ -1141,6 +1193,10 @@ fn node_of(loc: &Location) -> String {
             Space::MyDrive => format!("acc:{email}:my"),
             Space::SharedDrives => format!("acc:{email}:sd"),
             Space::Shared { id, .. } => format!("acc:{email}:sd:{id}"),
+            Space::SharedWithMe => format!("acc:{email}:shared-with-me"),
+            Space::Starred => format!("acc:{email}:starred"),
+            Space::Recent => format!("acc:{email}:recent"),
+            Space::Trash => format!("acc:{email}:trash"),
         },
     }
 }
@@ -1194,6 +1250,11 @@ fn tree(s: &State, k: &Kit, p: usize) -> El {
                 let space = Space::Shared { id: d.id.clone(), name: d.name.clone() };
                 t = t.child(node(k, p, format!("acc:{e}:sd:{}", d.id), 2, icon(&icons::SHARED, 16.0), &d.name, &current, Location::drive(e.clone(), space)));
             }
+        }
+        // Drive's own lists, as on the Drive website.
+        for (space, glyph) in [(Space::SharedWithMe, &icons::SHARED_WITH_ME), (Space::Starred, &icons::STAR), (Space::Recent, &icons::RECENT), (Space::Trash, &icons::TRASH)] {
+            let to = Location::drive(e.clone(), space.clone());
+            t = t.child(node(k, p, node_of(&to), 1, icon(glyph, 16.0), space.label(), &current, to));
         }
     }
     t = t.child(heading(k, "Testes")).child(node(k, p, "mock".into(), 0, icon(&icons::LAB, 16.0), "Drive simulado", &current, Location::Mock(Vec::new())));
@@ -1359,6 +1420,17 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         notice("Carregando…".into(), k.c.text_muted)
     } else if n == 0 && matches!(pane.loc, Location::Drive { space: Space::SharedDrives, .. }) {
         notice("Esta conta não participa de nenhum drive compartilhado.".into(), k.c.text_muted)
+    } else if let (0, Location::Drive { space, path, .. }) = (n, &pane.loc)
+        && path.is_empty()
+        && space.view().is_some()
+    {
+        let msg = match space {
+            Space::SharedWithMe => "Ninguém compartilhou arquivos com esta conta.",
+            Space::Starred => "Nenhum item com estrela. Use Adicionar estrela no menu de um arquivo.",
+            Space::Recent => "Nenhum arquivo aberto recentemente.",
+            _ => "A lixeira está vazia.",
+        };
+        notice(msg.into(), k.c.text_faint)
     } else if n == 0 {
         notice("Esta pasta está vazia.".into(), k.c.text_faint)
     } else {

@@ -31,6 +31,17 @@ pub fn key(loc: &Location) -> Option<Key> {
         Space::MyDrive => format!("my/{}", folder.unwrap_or("root")),
         Space::SharedDrives => "sd-list".to_string(),
         Space::Shared { id, .. } => format!("sd/{id}/{}", folder.unwrap_or(id)),
+        // A trashed folder lists its trashed contents, not what a folder in My Drive shows.
+        Space::Trash => folder.map_or_else(|| "view/trash".to_string(), |f| format!("trash/{f}")),
+        // A folder opened from a view lists as it does anywhere else.
+        Space::SharedWithMe | Space::Starred | Space::Recent => match folder {
+            Some(f) => format!("my/{f}"),
+            None => format!("view/{}", match space {
+                Space::SharedWithMe => "shared-with-me",
+                Space::Starred => "starred",
+                _ => "recent",
+            }),
+        },
     };
     Some(Key { email: email.clone(), folder })
 }
@@ -159,7 +170,7 @@ mod tests {
         let entries: Vec<Entry> = [Some(at(1_709_294_400_250)), Some(at(-86_400_000)), None]
             .into_iter()
             .enumerate()
-            .map(|(i, modified)| Entry { id: format!("{i}"), name: format!("f{i}"), is_dir: false, size: None, modified, target: None, mime: None, md5: None })
+            .map(|(i, modified)| Entry { id: format!("{i}"), name: format!("f{i}"), is_dir: false, size: None, modified, target: None, mime: None, md5: None, starred: false })
             .collect();
         let text = serde_json::to_vec(&FileOut { format: FORMAT, entries: &entries }).unwrap();
         let back: FileIn = serde_json::from_slice(&text).unwrap();
@@ -178,5 +189,12 @@ mod tests {
         assert_eq!(k(&Location::Drive { email: "a@b".into(), space: shared, path: vec![("f2".into(), "Docs".into())] }).as_deref(), Some("sd/0AAx/f2"));
         assert_ne!(key(&my(vec![])), key(&Location::Drive { email: "c@d".into(), space: Space::MyDrive, path: vec![] }));
         assert!(key(&Location::Mock(vec![])).is_none());
+        let view = |space: Space, path: Vec<(String, String)>| k(&Location::Drive { email: "a@b".into(), space, path });
+        assert_eq!(view(Space::Starred, vec![]).as_deref(), Some("view/starred"));
+        assert_eq!(view(Space::SharedWithMe, vec![]).as_deref(), Some("view/shared-with-me"));
+        assert_eq!(view(Space::Recent, vec![]).as_deref(), Some("view/recent"));
+        assert_eq!(view(Space::Trash, vec![]).as_deref(), Some("view/trash"));
+        assert_eq!(view(Space::Starred, vec![("f1".into(), "Fotos".into())]).as_deref(), Some("my/f1"));
+        assert_eq!(view(Space::Trash, vec![("f1".into(), "Fotos".into())]).as_deref(), Some("trash/f1"));
     }
 }
