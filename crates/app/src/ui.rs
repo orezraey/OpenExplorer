@@ -341,6 +341,13 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             menu = menu.item(item(label, &icons::M_STAR, "", true, |s, p, _| actions::star(s, p)));
         }
     }
+    // Sharing, for one Drive item.
+    if n == 1 && editable && matches!(s.panes[p].loc, Location::Drive { .. }) {
+        menu = menu
+            .separator()
+            .item(item("Copiar link", &icons::M_LINK, "", true, crate::sharing::copy_link))
+            .item(item("Compartilhar…", &icons::M_SHARE, "", true, crate::sharing::ask_share));
+    }
     menu = menu.separator().item(item("Nova pasta", &icons::M_NEW_FOLDER, "Ctrl+Shift+N", editable, actions::ask_new_folder));
     if n > 0 {
         menu = menu.separator().item(item("Propriedades", &icons::M_PROPERTIES, "Alt+Enter", true, |s, p, _| actions::properties(s, p)));
@@ -449,6 +456,8 @@ fn dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
         Dialog::Properties(p) => props_dialog(s, k, p, layer),
         Dialog::Options => options_dialog(s, k, layer),
         Dialog::Clash(ask) => clash_dialog(s, k, ask, layer),
+        Dialog::Share(sh) => crate::sharing::share_dialog(s, k, sh, layer),
+        Dialog::MakePublic(m) => crate::sharing::public_dialog(k, m, layer),
     }
 }
 
@@ -769,6 +778,12 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
                                 .child(prop_text(k, "Proprietário", or_dash(&d.owner)))
                                 .child(prop_text(k, "Modificado por", or_dash(&d.modified_by)))
                                 .child(prop_text(k, "Compartilhado", if d.shared { "Sim" } else { "Não" }));
+                            let me = drive.as_deref().unwrap_or_default();
+                            body = body.child(match &p.sharing {
+                                Some(Ok(sh)) => prop_text(k, "Compartilhamento", sh.summary(me)),
+                                Some(Err(err)) => prop_row(k, "Compartilhamento", muted(err)),
+                                None => prop_row(k, "Compartilhamento", muted("Carregando…")),
+                            });
                             if let Some(by) = &d.shared_by {
                                 body = body.child(prop_text(k, "Compartilhado por", by.clone()));
                             }
@@ -1476,15 +1491,70 @@ fn statusbar(s: &State, k: &Kit, p: usize) -> El {
         left.push_str("   ·   carregando…");
     }
     let right = pane.free.map(|b| format!("{} livres", format_size(b))).unwrap_or_default();
-    row()
+    // A Drive account's storage, beside My Drive's folders (a shared drive's files count
+    // against its organisation, not the account).
+    let quota = match &pane.loc {
+        Location::Drive { email, space: Space::MyDrive, .. } => s.quotas.get(email).copied().flatten(),
+        _ => None,
+    };
+    let right = quota.map(|q| quota_label(&q)).unwrap_or(right);
+    let meter = quota.and_then(|q| q.limit.filter(|l| *l > 0).map(|l| (q.usage as f64 / l as f64).min(1.0) as f32)).map(|used| {
+        let fill = if used >= 0.9 { k.c.danger.fg } else { k.c.text_accent };
+        row()
+            .key("quota-meter")
+            .w(64.0)
+            .h(6.0)
+            .mr(8.0)
+            .radius(3.0)
+            .fill(k.c.border_weak)
+            .clip_soft(3.0)
+            .child(el().w(64.0 * used).h_full().radius(3.0).fill(fill))
+    });
+    let help = quota.map(quota_help).unwrap_or_default();
+    let mut bar = row()
         .key("statusbar")
         .w_full()
         .h(24.0)
         .px(10.0)
         .center_y()
         .border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_weak)
-        .child(text(left).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0).grow(1.0))
-        .child(text(right).font(k.ty.text_xsmall).color(k.c.text_muted))
+        .child(text(left).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0).grow(1.0));
+    if let Some(m) = meter {
+        bar = bar.child(m);
+    }
+    let right = text(right).font(k.ty.text_xsmall).color(k.c.text_muted);
+    bar.child(if help.is_empty() { right } else { right.key("quota").help(help) })
+}
+
+/// The status bar's word on an account's storage: "12,3 GB livres de 15 GB", or what it uses
+/// when there's no limit.
+pub fn quota_label(q: &openexplorer_gdrive::Quota) -> String {
+    match (q.limit, q.free()) {
+        (Some(limit), Some(free)) => format!("{} livres de {}", format_size(free), whole_size(limit)),
+        _ => format!("{} usados · Ilimitado", format_size(q.usage)),
+    }
+}
+
+/// The quota's breakdown, on hover.
+fn quota_help(q: openexplorer_gdrive::Quota) -> String {
+    let mut out = format!("Usado: {}", format_size(q.usage));
+    if let Some(l) = q.limit {
+        out.push_str(&format!(" de {}", whole_size(l)));
+    }
+    out.push_str(&format!("
+No Drive: {} (lixeira: {})", format_size(q.in_drive), format_size(q.in_trash)));
+    out.push_str(&format!("
+Gmail e Fotos: {}", format_size(q.usage.saturating_sub(q.in_drive))));
+    out
+}
+
+/// A plan's size without a needless ",0": "15 GB", "2 TB", but "1,5 TB".
+fn whole_size(b: u64) -> String {
+    let s = format_size(b);
+    match s.split_once(' ') {
+        Some((n, unit)) if n.ends_with(",0") => format!("{} {unit}", &n[..n.len() - 2]),
+        _ => s,
+    }
 }
 
 pub fn thousands(n: usize) -> String {

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
-use openexplorer_gdrive::{Details, Drive, DriveFile, Revision};
+use openexplorer_gdrive::{Details, Drive, DriveFile, Revision, Sharing};
 use rune::{TextEdit, Tx};
 
 use crate::model::{Entry, Location, Space};
@@ -42,6 +42,10 @@ pub enum Dialog {
     Options,
     /// Names an upload would repeat in its Drive folder: Substituir, Pular or Manter os dois.
     Clash(Box<ClashAsk>),
+    /// Compartilhar: who has access to a Drive item.
+    Share(Box<crate::sharing::Share>),
+    /// Copiar link on a private item: open it to anyone with the link first?
+    MakePublic(Box<crate::sharing::MakePublic>),
 }
 
 pub fn selected(s: &State, p: usize) -> Vec<Entry> {
@@ -52,7 +56,7 @@ pub fn selected(s: &State, p: usize) -> Vec<Entry> {
 /// The folder a Drive location shows, to write into: (account, folder id). `None` for the
 /// shared drives list and Drive's views (Com estrela...), which aren't folders, and anywhere in
 /// Lixeira.
-fn drive_folder(loc: &Location) -> Option<(String, String)> {
+pub(crate) fn drive_folder(loc: &Location) -> Option<(String, String)> {
     let Location::Drive { email, space, path } = loc else { return None };
     let id = match (path.last(), space) {
         (_, Space::Trash) => return None,
@@ -836,6 +840,7 @@ pub enum PropUpdate {
     Totals(ops::Totals),
     Md5(Result<String, String>),
     Revisions(Result<Vec<Revision>, String>),
+    Sharing(Result<Sharing, String>),
 }
 
 /// The open Propriedades: what it shows and what's still being worked out.
@@ -859,6 +864,8 @@ pub struct Props {
     pub details: Option<Result<Details, String>>,
     pub revisions: Option<Result<Vec<Revision>, String>>,
     pub revisions_asked: bool,
+    /// Who a Drive item is shared with.
+    pub sharing: Option<Result<Sharing, String>>,
 }
 
 impl Props {
@@ -927,7 +934,11 @@ pub fn properties(s: &mut State, p: usize) {
     // One Drive item: its owner, dates, description and checksum from Drive.
     if let ([item], Some(email)) = (items.as_slice(), account(&loc).map(str::to_string)) {
         let (item_id, cached) = (item.id.clone(), s.drives.get(&email).cloned());
+        let (sharing_id, sharing_drive, sharing_email) = (item_id.clone(), cached.clone(), email.clone());
         props_job(s, id, |e| PropUpdate::Details(Err(e)), move || PropUpdate::Details(cached.map_or_else(|| open_drive(&email), Ok).and_then(|d| d.details(&item_id))));
+        props_job(s, id, |e| PropUpdate::Sharing(Err(e)), move || {
+            PropUpdate::Sharing(sharing_drive.map_or_else(|| open_drive(&sharing_email), Ok).and_then(|d| d.sharing(&sharing_id)))
+        });
     }
     if let [item] = items.as_slice() {
         let mut edit = TextEdit::new(item.name.clone());
@@ -952,6 +963,7 @@ pub fn properties(s: &mut State, p: usize) {
         details: None,
         revisions: None,
         revisions_asked: false,
+        sharing: None,
     })));
 }
 
@@ -966,6 +978,7 @@ pub fn props_update(s: &mut State, id: u64, update: PropUpdate) {
             p.md5_running = false;
         }
         PropUpdate::Revisions(r) => p.revisions = Some(r),
+        PropUpdate::Sharing(r) => p.sharing = Some(r),
     }
 }
 

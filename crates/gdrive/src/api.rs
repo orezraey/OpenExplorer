@@ -185,8 +185,9 @@ impl Drive {
     /// A 401 means Google dropped the token before its expiry (revoked access, clock skew):
     /// renew it and try once more. A 429 or a 403 for Drive's rate limit means the request was
     /// turned away undone (making hundreds of folders hits it): wait and send it again, up to
-    /// five times. Each call's time goes to [`crate::log`].
-    fn call(&self, method: &str, path: &str, query: &[(&str, &str)], body: Option<&serde_json::Value>, what: &str) -> Result<serde_json::Value> {
+    /// five times. DELETE takes no body and answers none (204): that gives `Null`. Each call's
+    /// time goes to [`crate::log`].
+    pub(crate) fn call(&self, method: &str, path: &str, query: &[(&str, &str)], body: Option<&serde_json::Value>, what: &str) -> Result<serde_json::Value> {
         let mut renewed = false;
         let mut limited = 0u32;
         loop {
@@ -247,7 +248,7 @@ impl Drive {
                 return Err(format!("{what}: HTTP {status}: {}", crate::google_reason(&text)));
             }
             // A delete answers 204 with no body at all.
-            let out = if method == "DELETE" && (200..300).contains(&status) { Ok(serde_json::Value::Null) } else { json(resp, what) };
+            let out = if status == 204 || (method == "DELETE" && (200..300).contains(&status)) { Ok(serde_json::Value::Null) } else { json(resp, what) };
             crate::log(&format!("{method} {path} {status} em {} ms", started.elapsed().as_millis()));
             return out;
         }

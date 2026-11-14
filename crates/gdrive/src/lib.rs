@@ -6,6 +6,8 @@
 pub mod api;
 pub mod download;
 pub mod oauth;
+pub mod quota;
+pub mod share;
 pub mod store;
 pub mod upload;
 
@@ -15,6 +17,8 @@ use std::time::Duration;
 use serde::Deserialize;
 
 pub use api::{Account, Details, Drive, DriveFile, Revision, SharedDrive, View};
+pub use quota::Quota;
+pub use share::{Access, Permission, Role, Sharing};
 
 /// Errors are shown to the user as they are, so they're plain Portuguese sentences.
 pub type Result<T> = std::result::Result<T, String>;

@@ -12,6 +12,7 @@ mod layout;
 mod model;
 mod ops;
 mod settings;
+mod sharing;
 mod sysicons;
 mod transfers;
 mod uploads;
@@ -26,7 +27,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::SystemTime;
 
 use openexplorer_gdrive::store::{self, StoredAccount};
-use openexplorer_gdrive::{ClientConfig, Drive, DriveFile, oauth};
+use openexplorer_gdrive::{ClientConfig, Drive, DriveFile, Quota, oauth};
 use rune::{AppSpec, DragItem, Key, KeyEvent, Mods, Tx, Waker};
 
 use model::{Entry, Location, MockDrive, Pane, SortCol, Space};
@@ -47,6 +48,12 @@ enum Msg {
     Icon { key: sysicons::IconKey, rgba: Option<sysicons::Rgba> },
     /// What the Drive folder an upload goes into holds, to check its names against.
     Clashes { up: actions::Upload, made: Option<(String, Arc<Drive>)>, result: Result<Vec<Entry>, String> },
+    /// An account's storage, for the status bar.
+    Quota { email: String, made: Option<(String, Arc<Drive>)>, result: Result<Quota, String> },
+    /// Something the Compartilhar dialog for Drive item `item` was waiting for.
+    Share { item: String, update: sharing::Update },
+    /// What Copiar link found out about an item's access.
+    Link(sharing::LinkAnswer),
 }
 
 /// Which part of a listing a [`Msg::Listed`] is.
@@ -70,7 +77,7 @@ struct State {
     dialog: Option<actions::Dialog>,
     /// Uploads whose clash dialog waits for the one open (or another dialog) to close.
     clash_waiting: std::collections::VecDeque<actions::ClashAsk>,
-    /// The name typed in Renomear or Nova pasta.
+    /// The name typed in Renomear or Nova pasta, or the e-mail typed in Compartilhar.
     name_edit: rune::TextEdit,
     /// The item being renamed in place, and its pane.
     renaming: Option<(usize, Entry)>,
@@ -90,6 +97,9 @@ struct State {
     accounts: Vec<StoredAccount>,
     /// Connected accounts by e-mail, made on first use.
     drives: HashMap<String, Arc<Drive>>,
+    /// Each account's storage, asked for when its pane first opens and again after changes
+    /// there: `None` while the first answer is on its way, or when it failed.
+    quotas: HashMap<String, Option<Quota>>,
     /// The login waiting for the browser, numbered from `logins`. Clicking again starts a new
     /// one; an older attempt's error is then dropped, its success still kept.
     login: Option<u64>,
@@ -147,6 +157,7 @@ fn init() -> State {
         mock,
         accounts: store::accounts(),
         drives: HashMap::new(),
+        quotas: HashMap::new(),
         login: None,
         logins: 0,
         active: 0,
@@ -225,7 +236,7 @@ fn notice(s: &mut State, now: f64) -> bool {
 /// Seconds a message stays on screen.
 const NOTICE_SECS: f64 = 5.0;
 
-fn poll(s: &mut State, now: f64, _tx: &mut Tx) -> bool {
+fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     // Each listing's file types get their icons asked for once.
     let versions = s.panes.each_ref().map(|p| p.version);
     if s.icons_for != versions {
@@ -311,7 +322,27 @@ fn poll(s: &mut State, now: f64, _tx: &mut Tx) -> bool {
                         load(s, p);
                     }
                 }
+                // An upload, a copy or a delete there changes what the account uses.
+                let mut touched: Vec<&String> = reload.iter().filter_map(|l| if let Location::Drive { email, .. } = l { Some(email) } else { None }).collect();
+                touched.dedup();
+                for email in touched {
+                    ask_quota(s, email);
+                }
             }
+            Msg::Quota { email, made, result } => {
+                keep_drive(s, made);
+                if s.accounts.iter().any(|a| a.email == email) {
+                    match result {
+                        Ok(q) => {
+                            s.quotas.insert(email, Some(q));
+                        }
+                        // Only the status bar misses it: logged, not shown.
+                        Err(e) => openexplorer_gdrive::log(&format!("cota de {email}: {e}")),
+                    }
+                }
+            }
+            Msg::Share { item, update } => sharing::update(s, &item, update),
+            Msg::Link(answer) => sharing::link_answer(s, answer, tx),
             Msg::Prop { id, update } => actions::props_update(s, id, update),
             Msg::Icon { key, rgba } => s.icons.arrived(key, rgba),
             Msg::Clashes { up, made, result } => {
@@ -351,6 +382,15 @@ fn poll(s: &mut State, now: f64, _tx: &mut Tx) -> bool {
         changed = true;
     }
     changed
+}
+
+/// Keeps an account a background job had to open, if it's still connected.
+fn keep_drive(s: &mut State, made: Option<(String, Arc<Drive>)>) {
+    if let Some((email, drive)) = made
+        && s.accounts.iter().any(|a| a.email == email)
+    {
+        s.drives.entry(email).or_insert(drive);
+    }
 }
 
 fn entry_of(f: DriveFile) -> Entry {
@@ -418,6 +458,7 @@ fn disconnect(s: &mut State, email: &str) {
         return;
     }
     s.drives.remove(email);
+    s.quotas.remove(email);
     s.cache.forget(email);
     s.accounts.retain(|a| a.email != email);
     for p in 0..2 {
@@ -429,6 +470,27 @@ fn disconnect(s: &mut State, email: &str) {
         }
     }
     s.status = format!("Conta desconectada: {email}");
+}
+
+/// Asks Drive how much of `email`'s storage is used, on a background thread; the status bar
+/// keeps showing the last answer meanwhile.
+fn ask_quota(s: &mut State, email: &str) {
+    if !s.accounts.iter().any(|a| a.email == email) {
+        return;
+    }
+    s.quotas.entry(email.to_string()).or_insert(None);
+    let (cached, email) = (s.drives.get(email).cloned(), email.to_string());
+    background(s, move |emit| {
+        let (drive, made) = match cached {
+            Some(d) => (d, None),
+            None => match open_drive(&email) {
+                Ok(d) => (d.clone(), Some((email.clone(), d))),
+                Err(e) => return emit(Msg::Quota { email, made: None, result: Err(e) }),
+            },
+        };
+        let result = catch_panic("ler a cota", || drive.quota());
+        emit(Msg::Quota { email, made, result });
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -446,6 +508,10 @@ fn load(s: &mut State, p: usize) {
         drop_stale_rename(s, p);
         return;
     };
+    // The account's storage, the first time one of its folders opens.
+    if !s.quotas.contains_key(&email) {
+        ask_quota(s, &email);
+    }
     let opened = s.drives.get(&email).cloned();
     let key = cache::key(&s.panes[p].loc);
     // A folder seen this session shows at once; the fresh listing then replaces it whole.
@@ -1089,6 +1155,46 @@ fn main() {
                 s.panes[1].set_entries(Ok(view_sample().into_iter().map(|e| Entry { starred: true, ..e }).collect()));
                 s.panes[1].selected = ["f3".to_string()].into();
                 s.menu = Some((1, rune::PointerPress { x: 900.0, y: 200.0 }));
+            }),
+            // An account's storage in its status bar, without a network.
+            ("quota", |s| {
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.quotas.insert("voce@gmail.com".into(), Some(Quota { limit: Some(16_106_127_360), usage: 2_898_000_000, in_drive: 2_100_000_000, in_trash: 12_000_000 }));
+                s.panes[1].go(Location::drive("voce@gmail.com", Space::MyDrive));
+                s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
+            }),
+            // Compartilhar on a file shared with a few people and the link, without a network.
+            ("share", |s| {
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.quotas.insert("voce@gmail.com".into(), Some(Quota { limit: None, usage: 734_003_200, in_drive: 600_000_000, in_trash: 0 }));
+                s.panes[1].go(Location::drive("voce@gmail.com", Space::MyDrive));
+                s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
+                let item = s.panes[1].entries.iter().find(|e| !e.is_dir).cloned().unwrap_or_else(|| s.panes[1].entries[0].clone());
+                let file = serde_json::json!({"webViewLink": "https://drive.google.com/file/d/x/view", "capabilities": {"canShare": true}});
+                let perms = serde_json::json!({"permissions": [
+                    {"id": "1", "type": "user", "role": "owner", "emailAddress": "voce@gmail.com", "displayName": "Você"},
+                    {"id": "2", "type": "user", "role": "writer", "emailAddress": "ana@exemplo.com", "displayName": "Ana Souza"},
+                    {"id": "3", "type": "user", "role": "commenter", "emailAddress": "bruno@exemplo.com"},
+                    {"id": "4", "type": "group", "role": "reader", "emailAddress": "equipe@exemplo.com", "displayName": "Equipe"},
+                    {"id": "anyoneWithLink", "type": "anyone", "role": "reader"}
+                ]});
+                s.name_edit = rune::TextEdit::new("carla@exemplo.com");
+                s.dialog = Some(actions::Dialog::Share(Box::new(sharing::Share {
+                    email: "voce@gmail.com".into(),
+                    item,
+                    sharing: Some(openexplorer_gdrive::Sharing::parse(&file, &perms)),
+                    busy: false,
+                    error: Some("Compartilhar: HTTP 403: Sharing is restricted to members of this organization.".into()),
+                    role: openexplorer_gdrive::Role::Writer,
+                    notify: true,
+                })));
+            }),
+            // The question Copiar link asks on a private item.
+            ("make-public", |s| {
+                let item = MockDrive::new().list(&["Documentos".into()]).into_iter().find(|e| !e.is_dir);
+                if let Some(item) = item {
+                    s.dialog = Some(actions::Dialog::MakePublic(Box::new(sharing::MakePublic { email: "voce@gmail.com".into(), item, link: None })));
+                }
             }),
             // The shared drives list of an account, without a network.
             ("shared", |s| {
