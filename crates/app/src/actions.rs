@@ -30,6 +30,10 @@ pub struct Clip {
 /// The dialog open over the window, if any.
 pub enum Dialog {
     Delete { pane: usize, items: Vec<Entry> },
+    /// Excluir permanentemente, from Lixeira.
+    Purge { pane: usize, items: Vec<Entry> },
+    /// Esvaziar lixeira of an account.
+    EmptyTrash { email: String },
     /// The name being typed is `State::name_edit`.
     NewFolder { pane: usize, error: Option<String> },
     Properties(Box<Props>),
@@ -42,21 +46,31 @@ pub fn selected(s: &State, p: usize) -> Vec<Entry> {
     pane.entries.iter().filter(|e| pane.selected.contains(&e.id)).cloned().collect()
 }
 
-/// The folder a Drive location shows: (account, folder id). `None` for the shared drives
-/// list, which isn't a folder.
+/// The folder a Drive location shows, to write into: (account, folder id). `None` for the
+/// shared drives list and Drive's views (Com estrela...), which aren't folders, and anywhere in
+/// Lixeira.
 fn drive_folder(loc: &Location) -> Option<(String, String)> {
     let Location::Drive { email, space, path } = loc else { return None };
     let id = match (path.last(), space) {
+        (_, Space::Trash) => return None,
         (Some((id, _)), _) => id.clone(),
         (None, Space::MyDrive) => "root".into(),
         (None, Space::Shared { id, .. }) => id.clone(),
-        (None, Space::SharedDrives) => return None,
+        (None, _) => return None,
     };
     Some((email.clone(), id))
 }
 
-/// Whether items in `loc` can be changed (renamed, deleted, cut): not in the shared drives list,
-/// whose items are the drives themselves, and not in the simulated drive.
+/// The account of a Drive location.
+fn account(loc: &Location) -> Option<&str> {
+    match loc {
+        Location::Drive { email, .. } => Some(email),
+        _ => None,
+    }
+}
+
+/// Whether `loc` is a folder items can be put in (Colar, Nova pasta) and taken out of
+/// (Recortar): not the shared drives list, Drive's views or Lixeira, nor the simulated drive.
 pub fn editable(loc: &Location) -> bool {
     match loc {
         Location::Local(_) => true,
@@ -65,8 +79,45 @@ pub fn editable(loc: &Location) -> bool {
     }
 }
 
-fn not_here(s: &mut State) {
-    s.status = "O drive simulado só serve para testar a interface; abra o disco local ou o Google Drive.".into();
+/// Whether the items `loc` lists can be renamed, copied, starred or sent to the trash: also in
+/// Compartilhados comigo, Com estrela and Recentes, which list real files; not the shared drives
+/// themselves, nor what's already in Lixeira.
+pub fn items_editable(loc: &Location) -> bool {
+    match loc {
+        Location::Drive { space: Space::SharedDrives | Space::Trash, .. } => false,
+        Location::Drive { .. } => true,
+        _ => editable(loc),
+    }
+}
+
+/// Lixeira itself, where Restaurar and Excluir permanentemente apply (not a trashed folder's
+/// contents, which come back with it).
+pub fn in_trash(loc: &Location) -> bool {
+    matches!(loc, Location::Drive { space: Space::Trash, path, .. } if path.is_empty())
+}
+
+/// Why `loc` doesn't take what was asked (pasting, a new folder, cutting).
+fn why_not(loc: &Location) -> String {
+    match loc {
+        Location::Drive { space: Space::SharedDrives, .. } => "Drives compartilhados lista os drives: abra um deles para trabalhar nas pastas.".into(),
+        Location::Drive { space: Space::Trash, path, .. } if path.is_empty() => "A Lixeira não recebe itens: use Restaurar ou Excluir permanentemente.".into(),
+        Location::Drive { space: Space::Trash, .. } => "Esta pasta está na lixeira: restaure-a para mexer no que tem dentro.".into(),
+        Location::Drive { space, path, .. } if path.is_empty() => {
+            format!("{} é uma lista do Google Drive, não uma pasta: abra uma pasta para colar, criar pastas ou recortar.", space.label())
+        }
+        Location::Mock(_) => "O drive simulado só serve para testar a interface; abra o disco local ou o Google Drive.".into(),
+        _ => "Não dá para fazer isso aqui.".into(),
+    }
+}
+
+fn not_here(s: &mut State, p: usize) {
+    s.status = why_not(&s.panes[p].loc);
+}
+
+/// Every location the panes show in `email`'s Drive, to reload after a change whose effects
+/// reach past one folder: a restored file goes back to its folder, a star shows in Com estrela.
+fn account_panes(s: &State, email: &str) -> Vec<Location> {
+    s.panes.iter().map(|p| p.loc.clone()).filter(|l| account(l) == Some(email)).collect()
 }
 
 /// Runs `work` on a background thread with the account's [`Drive`], then reloads `reload`.
@@ -120,7 +171,7 @@ pub fn open(s: &mut State, p: usize, tx: &mut Tx) {
                 s.status = format!("Não consegui abrir o navegador: {e:?}");
             }
         }
-        Location::Mock(_) => not_here(s),
+        Location::Mock(_) => not_here(s, p),
     }
 }
 
@@ -133,8 +184,10 @@ pub fn pick_up(s: &mut State, p: usize, mode: ClipMode) {
         return;
     }
     let loc = s.panes[p].loc.clone();
-    if !editable(&loc) || (mode == ClipMode::Cut && matches!(loc, Location::Mock(_))) {
-        return not_here(s);
+    // A cut needs the folder the items leave; a copy only the items.
+    let ok = if mode == ClipMode::Cut { editable(&loc) } else { items_editable(&loc) };
+    if !ok {
+        return not_here(s, p);
     }
     s.status = format!("{} {} — use Colar (Ctrl+V) na pasta de destino.", if mode == ClipMode::Cut { "Recortado:" } else { "Copiado:" }, count(items.len()));
     s.clip = Some(Clip { mode, from: loc, items });
@@ -165,9 +218,9 @@ pub fn copy_across(s: &mut State, from: usize, to: usize) {
         return;
     }
     let loc = s.panes[from].loc.clone();
-    if !editable(&loc) {
+    if !items_editable(&loc) {
         return match loc {
-            Location::Mock(_) => not_here(s),
+            Location::Mock(_) => not_here(s, from),
             _ => s.status = "Não dá para copiar daqui.".into(),
         };
     }
@@ -187,6 +240,9 @@ pub fn paste(s: &mut State, p: usize) {
 /// Copies or moves `items` of `from` into the folder pane `p` shows, or says why it can't.
 fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p: usize) {
     let to = s.panes[p].loc.clone();
+    if matches!(to, Location::Drive { .. }) && drive_folder(&to).is_none() {
+        return not_here(s, p);
+    }
     if !fits(&from, &to) {
         s.status = match (&from, &to) {
             (Location::Drive { .. }, Location::Local(_)) => "Baixar do Google Drive para o computador é o próximo passo; por enquanto, cole na mesma origem.".into(),
@@ -208,7 +264,9 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
             upload(s, sources, &to, mode == ClipMode::Cut, reload);
         }
         _ => {
-            let (Some((email, src)), Some((_, dst))) = (drive_folder(&from), drive_folder(&to)) else { return };
+            // Copied out of a view (Com estrela...), the items have no one folder they come from.
+            let src = drive_folder(&from).map(|(_, id)| id).unwrap_or_default();
+            let (Some(email), Some((_, dst))) = (account(&from).map(str::to_string), drive_folder(&to)) else { return };
             let ends = items.iter().map(|e| (End::drive(&from, Some(&e.name)), End::drive(&to, None)));
             let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, ends);
             // Drive copies on its side: a file's bar fills when it's done; a folder's size isn't
@@ -230,11 +288,13 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
                         mime: e.mime.clone().unwrap_or_default(),
                         target: None,
                         md5: None,
+                        starred: e.starred,
                     };
                     match mode {
                         ClipMode::Copy if src == dst => d.copy(&file, &dst, &format!("Cópia de {}", e.name)).map(|_| ()),
                         ClipMode::Copy => d.copy(&file, &dst, &e.name).map(|_| ()),
                         ClipMode::Cut if src == dst => Ok(()),
+                        ClipMode::Cut if src.is_empty() => Err("Recortar precisa da pasta de origem.".into()),
                         ClipMode::Cut => d.move_to(&e.id, &src, &dst).map(|_| ()),
                     }
                 })
@@ -306,8 +366,13 @@ pub fn ask_delete(s: &mut State, p: usize) {
     if items.is_empty() {
         return;
     }
-    if !editable(&s.panes[p].loc) {
-        return not_here(s);
+    // In Lixeira, Del deletes for good, after asking.
+    if in_trash(&s.panes[p].loc) {
+        s.dialog = Some(Dialog::Purge { pane: p, items });
+        return;
+    }
+    if !items_editable(&s.panes[p].loc) {
+        return not_here(s, p);
     }
     s.dialog = Some(Dialog::Delete { pane: p, items });
 }
@@ -321,18 +386,96 @@ pub fn delete(s: &mut State) {
             let paths: Vec<PathBuf> = items.iter().map(|e| dir.join(&e.name)).collect();
             local_job(s, vec![loc.clone()], move || ops::to_recycle_bin(&paths).map(|_| format!("Movido para a Lixeira: {}.", count(n))));
         }
-        Location::Drive { .. } => {
-            let Some((email, _)) = drive_folder(&loc) else { return };
-            drive_job(s, &email, vec![loc.clone()], move |d| {
+        Location::Drive { email, .. } => {
+            // Lixeira, if a pane shows it, gets the items too.
+            drive_job(s, email, account_panes(s, email), move |d| {
                 for e in &items {
                     d.trash(&e.id)?;
                 }
                 Ok(format!("Movido para a lixeira do Google Drive: {}.", count(n)))
             });
         }
-        Location::Mock(_) => return not_here(s),
+        Location::Mock(_) => return not_here(s, pane),
     }
     s.status = format!("Excluindo {}…", count(n));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Lixeira and stars
+
+/// Restaurar: the selected items in Lixeira go back where they were.
+pub fn restore(s: &mut State, p: usize) {
+    let items = selected(s, p);
+    let loc = s.panes[p].loc.clone();
+    let (false, true, Some(email)) = (items.is_empty(), in_trash(&loc), account(&loc)) else { return };
+    let n = items.len();
+    drive_job(s, email, account_panes(s, email), move |d| {
+        for e in &items {
+            d.restore(&e.id)?;
+        }
+        Ok(format!("Restaurado: {}.", count(n)))
+    });
+    s.status = format!("Restaurando {}…", count(n));
+}
+
+/// Excluir permanentemente: asks first, as it can't be undone.
+pub fn ask_purge(s: &mut State, p: usize) {
+    let items = selected(s, p);
+    if !items.is_empty() && in_trash(&s.panes[p].loc) {
+        s.dialog = Some(Dialog::Purge { pane: p, items });
+    }
+}
+
+/// The confirmed Excluir permanentemente.
+pub fn purge(s: &mut State) {
+    let Some(Dialog::Purge { pane, items }) = s.dialog.take() else { return };
+    let loc = s.panes[pane].loc.clone();
+    let Some(email) = account(&loc) else { return };
+    let n = items.len();
+    drive_job(s, email, account_panes(s, email), move |d| {
+        for (i, e) in items.iter().enumerate() {
+            // Say how far it got: what went before an error is gone for good.
+            d.delete_forever(&e.id).map_err(|err| if i == 0 { err } else { format!("{err} (já excluídos para sempre: {})", count(i)) })?;
+        }
+        Ok(format!("Excluído permanentemente: {}.", count(n)))
+    });
+    s.status = format!("Excluindo permanentemente {}…", count(n));
+}
+
+/// Esvaziar lixeira: asks first, as it can't be undone.
+pub fn ask_empty_trash(s: &mut State, p: usize) {
+    let loc = &s.panes[p].loc;
+    if let (true, Some(email)) = (in_trash(loc), account(loc)) {
+        s.dialog = Some(Dialog::EmptyTrash { email: email.to_string() });
+    }
+}
+
+/// The confirmed Esvaziar lixeira: Drive deletes for good everything in the account's My Drive
+/// trash.
+pub fn empty_trash(s: &mut State) {
+    let Some(Dialog::EmptyTrash { email }) = s.dialog.take() else { return };
+    drive_job(s, &email, account_panes(s, &email), |d| d.empty_trash().map(|_| "Lixeira esvaziada.".into()));
+    s.status = "Esvaziando a lixeira…".into();
+}
+
+/// Whether the star item adds stars: unless every selected item has one already.
+pub fn stars_to_add(s: &State, p: usize) -> bool {
+    !selected(s, p).iter().all(|e| e.starred)
+}
+
+/// Adicionar estrela or Remover estrela on the selection, as [`stars_to_add`] says.
+pub fn star(s: &mut State, p: usize) {
+    let items = selected(s, p);
+    let loc = s.panes[p].loc.clone();
+    let (false, true, Some(email)) = (items.is_empty(), items_editable(&loc), account(&loc)) else { return };
+    let on = stars_to_add(s, p);
+    let n = items.len();
+    drive_job(s, email, account_panes(s, email), move |d| {
+        for e in &items {
+            d.set_starred(&e.id, on)?;
+        }
+        Ok(format!("{}: {}.", if on { "Estrela adicionada" } else { "Estrela removida" }, count(n)))
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -343,8 +486,8 @@ pub fn delete(s: &mut State) {
 pub fn ask_rename(s: &mut State, p: usize, tx: &mut Tx) {
     let items = selected(s, p);
     let [item] = items.as_slice() else { return };
-    if !editable(&s.panes[p].loc) {
-        return not_here(s);
+    if !items_editable(&s.panes[p].loc) {
+        return not_here(s, p);
     }
     let mut edit = TextEdit::new(item.name.clone());
     edit.set_selection(0, stem_len(&item.name, item.is_dir));
@@ -392,7 +535,7 @@ pub fn cancel_rename(s: &mut State) {
 
 pub fn ask_new_folder(s: &mut State, p: usize, _: &mut Tx) {
     if !editable(&s.panes[p].loc) {
-        return not_here(s);
+        return not_here(s, p);
     }
     let mut edit = TextEdit::new("Nova pasta");
     edit.set_selection(0, "Nova pasta".len());
@@ -428,14 +571,14 @@ pub fn apply_name(s: &mut State, pane: usize, item: Option<Entry>, name: String)
             let dir = dir.clone();
             local_job(s, vec![loc.clone()], move || ops::new_folder(&dir, &name).map(|_| format!("Pasta \"{name}\" criada.")));
         }
-        (Location::Drive { .. }, item) => {
-            let Some((email, folder)) = drive_folder(&loc) else { return };
-            drive_job(s, &email, vec![loc.clone()], move |d| match item {
-                Some(item) => d.rename(&item.id, &name).map(|_| format!("Renomeado para \"{name}\".")),
-                None => d.create_folder(&name, &folder).map(|_| format!("Pasta \"{name}\" criada.")),
-            });
+        (Location::Drive { email, .. }, Some(item)) => {
+            drive_job(s, email, account_panes(s, email), move |d| d.rename(&item.id, &name).map(|_| format!("Renomeado para \"{name}\".")));
         }
-        (Location::Mock(_), _) => not_here(s),
+        (Location::Drive { .. }, None) => {
+            let Some((email, folder)) = drive_folder(&loc) else { return not_here(s, pane) };
+            drive_job(s, &email, vec![loc.clone()], move |d| d.create_folder(&name, &folder).map(|_| format!("Pasta \"{name}\" criada.")));
+        }
+        (Location::Mock(_), _) => not_here(s, pane),
     }
 }
 
@@ -498,7 +641,7 @@ impl Props {
 
     /// Whether the name field renames: one item, somewhere names can change.
     pub fn renamable(&self, s: &State) -> bool {
-        self.single().is_some() && editable(&s.panes[self.pane].loc)
+        self.single().is_some() && items_editable(&s.panes[self.pane].loc)
     }
 
     /// The Histórico de versões tab is for one Drive file (folders have no versions).
@@ -552,7 +695,7 @@ pub fn properties(s: &mut State, p: usize) {
         }
     }
     // One Drive item: its owner, dates, description and checksum from Drive.
-    if let ([item], Some((email, _))) = (items.as_slice(), drive_folder(&loc)) {
+    if let ([item], Some(email)) = (items.as_slice(), account(&loc).map(str::to_string)) {
         let (item_id, cached) = (item.id.clone(), s.drives.get(&email).cloned());
         props_job(s, id, |e| PropUpdate::Details(Err(e)), move || PropUpdate::Details(cached.map_or_else(|| open_drive(&email), Ok).and_then(|d| d.details(&item_id))));
     }
@@ -662,6 +805,67 @@ mod tests {
         let shared = Space::Shared { id: "0AA".into(), name: "Equipe".into() };
         assert_eq!(drive_folder(&drive(shared.clone(), &[])), Some(("a@b".into(), "0AA".into())));
         assert_eq!(drive_folder(&drive(Space::SharedDrives, &[])), None);
+        // Drive's views aren't folders, but a folder opened from one is; nothing in Lixeira is.
+        for view in [Space::SharedWithMe, Space::Starred, Space::Recent, Space::Trash] {
+            assert_eq!(drive_folder(&drive(view, &[])), None);
+        }
+        assert_eq!(drive_folder(&drive(Space::Starred, &["f1"])), Some(("a@b".into(), "f1".into())));
+        assert_eq!(drive_folder(&drive(Space::Trash, &["f1"])), None);
+    }
+
+    #[test]
+    fn views_take_no_paste_or_new_folder_and_say_why() {
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        s.panes[1].go(drive(Space::Starred, &[]));
+        ask_new_folder(&mut s, 1, &mut Tx::default());
+        assert!(s.dialog.is_none());
+        assert!(s.status.starts_with("Com estrela é uma lista do Google Drive"), "{}", s.status);
+        s.clip = Some(Clip { mode: ClipMode::Copy, from: drive(Space::MyDrive, &[]), items: vec![] });
+        s.status.clear();
+        paste(&mut s, 1);
+        assert!(s.status.starts_with("Com estrela é uma lista"), "{}", s.status);
+        assert!(s.transfers.is_empty());
+        s.panes[1].go(drive(Space::Trash, &[]));
+        paste(&mut s, 1);
+        assert!(s.status.contains("Restaurar"), "{}", s.status);
+        // Items in a view can still be copied, starred, renamed and trashed; in Lixeira not.
+        assert!(items_editable(&drive(Space::Recent, &[])) && !editable(&drive(Space::Recent, &[])));
+        assert!(!items_editable(&drive(Space::Trash, &[])));
+        assert!(in_trash(&drive(Space::Trash, &[])) && !in_trash(&drive(Space::Trash, &["f1"])));
+    }
+
+    #[test]
+    fn lixeira_asks_before_deleting_for_good() {
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        s.panes[1].go(drive(Space::Trash, &[]));
+        let e = |id: &str| Entry { id: id.into(), name: id.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        s.panes[1].set_entries(Ok(vec![e("a"), e("b")]));
+        s.panes[1].selected = ["a".to_string()].into();
+        // Del in Lixeira opens Excluir permanentemente, not the move to the trash.
+        ask_delete(&mut s, 1);
+        assert!(matches!(&s.dialog, Some(Dialog::Purge { pane: 1, items }) if items.len() == 1));
+        s.dialog = None;
+        ask_empty_trash(&mut s, 1);
+        assert!(matches!(&s.dialog, Some(Dialog::EmptyTrash { email }) if email == "a@b"));
+        // Elsewhere neither applies.
+        s.dialog = None;
+        s.panes[1].go(drive(Space::MyDrive, &[]));
+        ask_empty_trash(&mut s, 1);
+        assert!(s.dialog.is_none());
+    }
+
+    #[test]
+    fn the_star_item_adds_unless_all_have_one() {
+        let mut s = crate::init();
+        s.panes[1].go(drive(Space::MyDrive, &[]));
+        let e = |id: &str, starred| Entry { id: id.into(), name: id.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred };
+        s.panes[1].set_entries(Ok(vec![e("a", true), e("b", false)]));
+        s.panes[1].selected = ["a".to_string()].into();
+        assert!(!stars_to_add(&s, 1));
+        s.panes[1].selected.insert("b".into());
+        assert!(stars_to_add(&s, 1));
     }
 
     #[test]
