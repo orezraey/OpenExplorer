@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::Mutex;
 
 use openexplorer_gdrive::api::FOLDER_MIME;
 use openexplorer_gdrive::{Drive, DriveFile};
@@ -23,6 +23,7 @@ use openexplorer_gdrive::{Drive, DriveFile};
 use crate::model::Entry;
 use crate::ops::{self, CANCELLED, Progress, Stage};
 use crate::transfers::Batch;
+use crate::work::Queue;
 
 /// What to do with a file whose name is already in the Drive folder it goes into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,52 +185,6 @@ struct Row {
     error: Mutex<Option<String>>,
 }
 
-/// The shared list of work, and how many workers are busy (more work may still come from them).
-struct Queue {
-    state: Mutex<(VecDeque<Work>, usize)>,
-    ready: Condvar,
-}
-
-impl Queue {
-    /// The next piece of work, waiting while busy workers may still add some; `None` when all
-    /// is done.
-    fn next(&self) -> Option<Work> {
-        let mut s = self.state.lock().unwrap();
-        loop {
-            if let Some(w) = s.0.pop_front() {
-                s.1 += 1;
-                return Some(w);
-            }
-            if s.1 == 0 {
-                return None;
-            }
-            s = self.ready.wait(s).unwrap();
-        }
-    }
-
-    fn add(&self, work: impl IntoIterator<Item = Work>) {
-        self.state.lock().unwrap().0.extend(work);
-        self.ready.notify_all();
-    }
-
-    fn finished_one(&self) {
-        if let Ok(mut s) = self.state.lock() {
-            s.1 -= 1;
-        }
-        self.ready.notify_all();
-    }
-}
-
-/// Marks a worker's piece of work finished however it ends, a panic included, so the other
-/// workers don't wait forever for work it would have added.
-struct Finished<'a>(&'a Queue);
-
-impl Drop for Finished<'_> {
-    fn drop(&mut self) {
-        self.0.finished_one();
-    }
-}
-
 /// Uploads each of `items` (a row of `batch` each) into the Drive folder `parent`, with
 /// `at_once` folders made and files sent at the same time. With `remove`, a row whose files all
 /// arrived then goes to the Recycle Bin (Recortar and Colar). An item to skip ends its row
@@ -250,12 +205,11 @@ pub fn run(d: &Drive, batch: &Batch, items: &[Item], parent: &str, remove: bool,
             None => rows[row].end(Ok(())),
         }
     }
-    let queue = Queue { state: Mutex::new((first, 0)), ready: Condvar::new() };
+    let queue = Queue::new(first);
     std::thread::scope(|scope| {
         for _ in 0..at_once.max(1) {
             scope.spawn(|| {
-                while let Some(work) = queue.next() {
-                    let _finished = Finished(&queue);
+                while let Some((work, _finished)) = queue.next() {
                     let row = work.row();
                     let (p, st) = (&rows[row], &state[row]);
                     if p.cancelled() || st.error.lock().map(|e| e.is_some()).unwrap_or(true) {
@@ -375,44 +329,6 @@ fn send(d: &Drive, path: &Path, name: &str, parent: &str, replace: Option<&str>,
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn file(row: usize) -> Work {
-        Work::File { row, path: PathBuf::new(), name: String::new(), parent: String::new(), replace: None }
-    }
-
-    fn folder(row: usize) -> Work {
-        Work::Folder { row, dir: PathBuf::new(), name: String::new(), parent: String::new(), into: None, clash: Clash::KeepBoth }
-    }
-
-    /// Workers keep going while a busy one may still add work, and all stop once nothing is
-    /// queued or running: every piece, nested ones included, is taken exactly once.
-    #[test]
-    fn the_work_queue_ends_only_when_all_work_is_done() {
-        let queue = Queue { state: Mutex::new((VecDeque::from([folder(0)]), 0)), ready: Condvar::new() };
-        let taken = AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            for _ in 0..4 {
-                scope.spawn(|| {
-                    while let Some(work) = queue.next() {
-                        let _finished = Finished(&queue);
-                        taken.fetch_add(1, Ordering::Relaxed);
-                        // The root folder (row 0) adds three folders and five files; each of
-                        // those folders (row 1) adds five files. A pause first, so the other
-                        // workers find the list empty while this one is still busy.
-                        if let Work::Folder { row, .. } = work {
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                            if row == 0 {
-                                queue.add((0..3).map(|_| folder(1)));
-                            }
-                            queue.add((0..5).map(|_| file(1)));
-                        }
-                    }
-                });
-            }
-        });
-        // The root, its 3 folders, and 5 files from each of the 4 folders.
-        assert_eq!(taken.load(Ordering::Relaxed), 1 + 3 + 4 * 5);
-    }
 
     fn there(name: &str, id: &str, kind: Kind) -> Existing {
         Existing { name: name.into(), id: id.into(), kind }
