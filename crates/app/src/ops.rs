@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// The error a copy or move gives when Cancelar stopped it.
-pub const CANCELLED: &str = "Cancelado.";
+/// The error a copy, move or upload gives when Cancelar stopped it.
+pub const CANCELLED: &str = openexplorer_gdrive::CANCELLED;
 
 /// Where one transfer stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +139,13 @@ impl Progress {
         };
         self.stage.store(stage as u8, Ordering::Relaxed);
         self.tick(true);
+    }
+
+    /// Takes back bytes reported for data that has to go again (an upload resumed from
+    /// further back).
+    pub fn sub_bytes(&self, n: u64) {
+        let _ = self.bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |b| Some(b.saturating_sub(n)));
+        self.tick(false);
     }
 
     pub fn add_bytes(&self, n: u64) {

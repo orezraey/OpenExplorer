@@ -15,6 +15,8 @@ use crate::ops::{CANCELLED, Progress, Stage};
 pub enum Op {
     Copy,
     Move,
+    /// From the computer to Google Drive.
+    Upload,
 }
 
 impl Op {
@@ -22,6 +24,7 @@ impl Op {
         match self {
             Op::Copy => "Copiar",
             Op::Move => "Mover",
+            Op::Upload => "Upload",
         }
     }
 
@@ -30,6 +33,7 @@ impl Op {
         match self {
             Op::Copy => "Copiado",
             Op::Move => "Movido",
+            Op::Upload => "Enviado",
         }
     }
 }
@@ -125,21 +129,21 @@ impl Batch {
     /// Runs `each` on every row in turn, skipping cancelled ones and going on past a failure,
     /// and sums it up: "Copiado: 3 itens.", or what went wrong.
     pub fn run(&self, mut each: impl FnMut(usize, &Progress) -> Result<(), String>) -> Result<String, String> {
-        let (mut ok, mut cancelled, mut failed) = (0, 0, Vec::new());
         for (i, p) in self.rows.iter().enumerate() {
             if p.cancelled() || !p.begin() {
                 p.end(Err(CANCELLED.into()));
-                cancelled += 1;
                 continue;
             }
-            let result = each(i, p);
-            p.end(result.clone());
-            match p.stage() {
-                Stage::Done => ok += 1,
-                Stage::Cancelled => cancelled += 1,
-                _ => failed.extend(result.err()),
-            }
+            p.end(each(i, p));
         }
+        self.summary()
+    }
+
+    /// How the rows ended, in a line: "Copiado: 3 itens.", or what went wrong.
+    pub fn summary(&self) -> Result<String, String> {
+        let count = |stage| self.rows.iter().filter(|p| p.stage() == stage).count();
+        let (ok, cancelled) = (count(Stage::Done), count(Stage::Cancelled));
+        let failed: Vec<String> = self.rows.iter().filter(|p| p.stage() == Stage::Failed).map(|p| p.error()).collect();
         match (ok, cancelled, failed.as_slice()) {
             (0, 0, [why]) => Err(why.clone()),
             (_, 0, []) => Ok(format!("{}: {}.", self.op.done(), items(ok))),

@@ -6,6 +6,7 @@
 pub mod api;
 pub mod oauth;
 pub mod store;
+pub mod upload;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -105,6 +106,23 @@ pub(crate) fn agent() -> ureq::Agent {
     ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(60))).build().into()
 }
 
+/// The agent uploads go through: a big file takes as long as it takes, so there's no overall
+/// limit, only on connecting and on a stalled connection.
+pub(crate) fn upload_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        // Drive answers 308 Resume Incomplete mid-upload: a status to read, not a redirect.
+        .max_redirects(0)
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_per_write(Some(Duration::from_secs(120)))
+        .timeout_recv_response(Some(Duration::from_secs(300)))
+        .build()
+        .into()
+}
+
+/// The error of an upload (or any transfer) stopped by Cancelar.
+pub const CANCELLED: &str = "Cancelado.";
+
 /// Reads a response as JSON, or turns an error status into a message with Google's reason.
 pub(crate) fn json<T: serde::de::DeserializeOwned>(mut resp: ureq::http::Response<ureq::Body>, what: &str) -> Result<T> {
     let status = resp.status().as_u16();
@@ -116,7 +134,7 @@ pub(crate) fn json<T: serde::de::DeserializeOwned>(mut resp: ureq::http::Respons
 }
 
 /// The human part of a Google error body (`error_description`, `error.message`), else the body.
-fn google_reason(body: &str) -> String {
+pub(crate) fn google_reason(body: &str) -> String {
     let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
     v.get("error_description")
         .and_then(|d| d.as_str())

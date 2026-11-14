@@ -12,6 +12,7 @@ mod model;
 mod ops;
 mod sysicons;
 mod transfers;
+mod uploads;
 mod ui;
 
 use std::collections::HashMap;
@@ -784,7 +785,18 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
     let (mut done, mut skipped) = (0, 0);
     match &loc {
         Location::Drive { .. } => {
-            s.status = "Enviar arquivos para o Google Drive é o próximo passo; por enquanto o painel só lista.".into();
+            // Files and folders from Explorer (or the other pane) go up to this Drive folder;
+            // the simulated drive's items are placeholders in the temp folder and stay out.
+            let real: Vec<PathBuf> = files.iter().filter(|f| !f.starts_with(&s.temp)).cloned().collect();
+            if real.is_empty() {
+                s.status = "Nada para enviar: arraste arquivos ou pastas do computador.".into();
+                return;
+            }
+            let left_out = files.len() - real.len();
+            actions::upload(s, real, &loc, false, vec![loc.clone()]);
+            if left_out > 0 {
+                s.status = format!("Itens do drive simulado não são enviados ({left_out}).");
+            }
             return;
         }
         Location::Local(dir) => {

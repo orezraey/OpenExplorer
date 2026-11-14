@@ -11,6 +11,8 @@ use crate::{ClientConfig, Result, agent, json};
 
 const API: &str = "https://www.googleapis.com/drive/v3";
 pub const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
+/// The fields of a file Drive answers with after a change or an upload.
+pub(crate) const FILE_FIELDS: &str = "id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails(targetId,targetMimeType)";
 
 #[derive(Clone, Debug)]
 pub struct Account {
@@ -49,11 +51,15 @@ pub struct Drive {
     refresh_token: String,
     access: Mutex<Option<(String, Instant)>>,
     agent: ureq::Agent,
+    /// For uploads, which run as long as the file takes: no overall time limit.
+    pub(crate) uploads: ureq::Agent,
+    /// Where uploads go: Google's upload endpoint (a local stand-in in tests).
+    pub(crate) upload_url: String,
 }
 
 impl Drive {
     pub fn new(cfg: ClientConfig, refresh_token: String) -> Drive {
-        Drive { cfg, refresh_token, access: Mutex::new(None), agent: agent() }
+        Drive { cfg, refresh_token, access: Mutex::new(None), agent: agent(), uploads: crate::upload_agent(), upload_url: crate::upload::UPLOAD.into() }
     }
 
     /// Starts from the tokens a login just returned, saving the first refresh.
@@ -64,12 +70,21 @@ impl Drive {
         Ok(d)
     }
 
+    /// A Drive whose uploads go to `upload_url`, with a token that needs no renewing.
+    #[cfg(test)]
+    pub(crate) fn for_tests(upload_url: String) -> Drive {
+        let cfg = ClientConfig { client_id: "x".into(), client_secret: "x".into() };
+        let d = Drive { upload_url, ..Drive::new(cfg, "x".into()) };
+        *d.access.lock().unwrap() = Some(("token".into(), Instant::now() + Duration::from_secs(3600)));
+        d
+    }
+
     pub fn refresh_token(&self) -> &str {
         &self.refresh_token
     }
 
     /// A valid access token, renewed a minute before it runs out.
-    fn token(&self) -> Result<String> {
+    pub(crate) fn token(&self) -> Result<String> {
         let mut access = self.access.lock().unwrap();
         if let Some((t, until)) = access.as_ref()
             && Instant::now() + Duration::from_secs(60) < *until
@@ -79,6 +94,11 @@ impl Drive {
         let fresh = oauth::refresh(&self.agent, &self.cfg, &self.refresh_token)?;
         *access = Some((fresh.access_token.clone(), Instant::now() + Duration::from_secs(fresh.expires_in)));
         Ok(fresh.access_token)
+    }
+
+    /// Drops the access token, for one Google stopped taking before its expiry.
+    pub(crate) fn forget_token(&self) {
+        *self.access.lock().unwrap() = None;
     }
 
     /// A call with the access token: GET when `body` is `None`, else `method` with a JSON body.
@@ -314,7 +334,7 @@ impl Drive {
 
     /// A call that answers with one file record.
     fn file_call(&self, method: &str, path: &str, query: &[(&str, &str)], body: &serde_json::Value, what: &str) -> Result<DriveFile> {
-        let mut q = vec![("supportsAllDrives", "true"), ("fields", "id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails(targetId,targetMimeType)")];
+        let mut q = vec![("supportsAllDrives", "true"), ("fields", FILE_FIELDS)];
         q.extend_from_slice(query);
         let v = self.call(method, path, &q, Some(body), what)?;
         let raw: RawFile = serde_json::from_value(v).map_err(|e| format!("{what}: resposta inesperada: {e}"))?;
@@ -368,7 +388,7 @@ struct Shortcut {
 /// A file as Drive's `files.list` sends it, with the fields [`Drive::list`] asks for.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RawFile {
+pub(crate) struct RawFile {
     id: String,
     name: String,
     mime_type: String,

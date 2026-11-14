@@ -105,6 +105,7 @@ fn queue_row(s: &State, k: &Kit, t: &transfers::Transfer) -> El {
     let (op_icon, op) = match t.op {
         transfers::Op::Copy => (&icons::M_COPY, t.op.label()),
         transfers::Op::Move => (&icons::M_CUT, t.op.label()),
+        transfers::Op::Upload => (&icons::UPLOAD, t.op.label()),
     };
     row()
         .key(format!("t-{:p}", std::sync::Arc::as_ptr(p)))

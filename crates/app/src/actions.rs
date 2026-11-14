@@ -138,11 +138,12 @@ pub fn pick_up(s: &mut State, p: usize, mode: ClipMode) {
     s.clip = Some(Clip { mode, from: loc, items });
 }
 
-/// Whether items of `from` can be copied or moved into `to` as it is: same disk or same Drive
-/// account.
+/// Whether items of `from` can be copied or moved into `to` as it is: same disk, same Drive
+/// account, or from the computer up to a Drive folder.
 fn fits(from: &Location, to: &Location) -> bool {
     match (from, to) {
         (Location::Local(_), Location::Local(_)) => true,
+        (Location::Local(_), Location::Drive { .. }) => drive_folder(to).is_some(),
         (Location::Drive { email: a, .. }, Location::Drive { email: b, .. }) => a == b && drive_folder(to).is_some(),
         _ => false,
     }
@@ -186,9 +187,8 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
     let to = s.panes[p].loc.clone();
     if !fits(&from, &to) {
         s.status = match (&from, &to) {
-            (Location::Local(_), Location::Drive { .. }) | (Location::Drive { .. }, Location::Local(_)) => {
-                "Copiar entre o computador e o Google Drive (envio e download) é o próximo passo; por enquanto, cole na mesma origem.".into()
-            }
+            (Location::Drive { .. }, Location::Local(_)) => "Baixar do Google Drive para o computador é o próximo passo; por enquanto, cole na mesma origem.".into(),
+            (Location::Local(_), Location::Drive { .. }) => "Abra uma pasta do Drive (ou um drive compartilhado) para enviar para ela.".into(),
             (Location::Drive { .. }, Location::Drive { .. }) if drive_folder(&to).is_some() => "Colar entre contas diferentes do Google Drive ainda não é possível.".into(),
             _ => "Não dá para colar aqui.".into(),
         };
@@ -200,6 +200,10 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
         (Location::Local(src), Location::Local(dst)) => {
             let sources = items.iter().map(|e| src.join(&e.name)).collect();
             local_transfer(s, op, sources, dst.clone(), reload);
+        }
+        (Location::Local(src), Location::Drive { .. }) => {
+            let sources = items.iter().map(|e| src.join(&e.name)).collect();
+            upload(s, sources, &to, mode == ClipMode::Cut, reload);
         }
         _ => {
             let (Some((email, src)), Some((_, dst))) = (drive_folder(&from), drive_folder(&to)) else { return };
@@ -248,12 +252,25 @@ pub fn local_transfer(s: &mut State, op: Op, sources: Vec<PathBuf>, dst: PathBuf
         }
         batch.run(|i, p| {
             let moved = match op {
-                Op::Copy => ops::copy_into(&sources[i], &dst, p),
+                Op::Copy | Op::Upload => ops::copy_into(&sources[i], &dst, p),
                 Op::Move => ops::move_into(&sources[i], &dst, p),
             };
             moved.map(|_| ())
         })
     });
+}
+
+/// Uploads `sources` (files and folders on the computer) into the Drive folder `to` shows, a
+/// row each in the queue. With `remove` (Recortar), each original goes to the Recycle Bin once
+/// all of it arrived.
+pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool, reload: Vec<Location>) {
+    let Some((email, parent)) = drive_folder(to) else {
+        s.status = "Abra uma pasta do Drive (ou um drive compartilhado) para enviar para ela.".into();
+        return;
+    };
+    let dest = End::drive(to, None);
+    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Upload, sources.iter().map(|p| (End::local(p), dest.clone())));
+    drive_job(s, &email, reload, move |d| crate::uploads::run(d, &batch, &sources, &parent, remove));
 }
 
 /// Cancelar on a row of the queue.
