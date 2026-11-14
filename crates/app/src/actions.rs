@@ -234,7 +234,9 @@ fn fits(from: &Location, to: &Location) -> bool {
     match (from, to) {
         (Location::Local(_), Location::Local(_)) => true,
         (Location::Local(_), Location::Drive { .. }) => drive_folder(to).is_some(),
-        (Location::Drive { .. }, Location::Local(_)) => drive_folder(from).is_some(),
+        // Downloads only need the items, so any listing of them will do (Com estrela...),
+        // except the shared drives list and Lixeira.
+        (Location::Drive { .. }, Location::Local(_)) => items_editable(from),
         (Location::Drive { email: a, .. }, Location::Drive { email: b, .. }) => a == b && drive_folder(to).is_some(),
         _ => false,
     }
@@ -552,7 +554,7 @@ pub enum Then {
 /// Downloads `items` of the Drive folder `from` into the folder `dst` on the computer, a row
 /// each in the queue; then `then`.
 pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf, then: Then, reload: Vec<Location>) {
-    let Some((email, _)) = drive_folder(from) else {
+    let Some(email) = account(from).map(str::to_string) else {
         s.status = "Não dá para baixar daqui.".into();
         return;
     };
@@ -1054,6 +1056,12 @@ mod tests {
         }
         assert_eq!(drive_folder(&drive(Space::Starred, &["f1"])), Some(("a@b".into(), "f1".into())));
         assert_eq!(drive_folder(&drive(Space::Trash, &["f1"])), None);
+        // Items listed in a view download like any others; Lixeira's and the drives list don't.
+        let local = Location::Local("C:\\".into());
+        assert!(fits(&drive(Space::Starred, &[]), &local));
+        assert!(fits(&drive(Space::SharedWithMe, &[]), &local));
+        assert!(!fits(&drive(Space::Trash, &[]), &local));
+        assert!(!fits(&drive(Space::SharedDrives, &[]), &local));
     }
 
     #[test]
