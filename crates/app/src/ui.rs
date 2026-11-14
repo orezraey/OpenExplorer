@@ -93,7 +93,7 @@ fn options_dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
         .child(option_row(k, "Downloads simultâneos", stepper(k, "downloads", st.downloads, |s, d| change_settings(s, |c| c.downloads = at_once(i32::from(c.downloads) + d)))))
         .child(el().h(6.0))
         .child(segmented)
-        .child(note("Downloads simultâneos e segmentos paralelos valem quando o download do Google Drive chegar. Uploads simultâneos valem a partir do próximo envio."))
+        .child(note("Valem a partir da próxima transferência. Os segmentos paralelos são para arquivos de 64 MB ou mais."))
         .child(row().key("actions").w_full().pt(12.0).justify_end().child(Button::new("OK").on_press(close).build(k)));
     Modal::new("options", "Opções").open(true).child(body).width(500.0).fit().on_close(close).build(k, layer);
 }
@@ -165,6 +165,7 @@ fn queue_row(s: &State, k: &Kit, t: &transfers::Transfer) -> El {
         transfers::Op::Copy => (&icons::M_COPY, t.op.label()),
         transfers::Op::Move => (&icons::M_CUT, t.op.label()),
         transfers::Op::Upload => (&icons::UPLOAD, t.op.label()),
+        transfers::Op::Download => (&icons::DOWNLOAD, t.op.label()),
     };
     row()
         .key(format!("t-{:p}", std::sync::Arc::as_ptr(p)))
@@ -1282,6 +1283,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .on_drag_end(move |s: &mut State, outcome: DragOutcome, _| {
             s.status = match outcome {
                 DragOutcome::Cancelled => "Arrastar cancelado.".into(),
+                _ if crate::drag_left_behind(s, p) => crate::DRAG_OUT_NOTE.into(),
                 o => format!("Arrastar terminou: {o:?}"),
             };
         })

@@ -97,7 +97,7 @@ fn count(n: usize) -> String {
 // ---------------------------------------------------------------------------------------------
 // Open
 
-pub fn open(s: &mut State, p: usize, tx: &mut Tx) {
+pub fn open(s: &mut State, p: usize, _: &mut Tx) {
     let items = selected(s, p);
     let [item] = items.as_slice() else {
         if !items.is_empty() {
@@ -108,17 +108,45 @@ pub fn open(s: &mut State, p: usize, tx: &mut Tx) {
     if item.is_dir {
         return open_entry(s, p, &item.id);
     }
-    match &s.panes[p].loc {
+    open_file(s, p, item);
+}
+
+/// Opens a file with the program Windows associates with it. A Drive file is downloaded to a
+/// temp folder first, as a row of the queue, and opens when it arrives; a file in one of
+/// Google's own formats opens in the browser instead, where editing it changes the original.
+pub fn open_file(s: &mut State, p: usize, item: &Entry) {
+    let loc = s.panes[p].loc.clone();
+    match &loc {
         Location::Local(dir) => {
             if let Err(e) = ops::open(&dir.join(&item.name)) {
                 s.status = e;
             }
         }
-        Location::Drive { .. } => {
-            // Downloading comes with transfers; until then the file opens in Drive on the web.
-            if let Err(e) = tx.open_url(&format!("https://drive.google.com/open?id={}", item.id)) {
-                s.status = format!("Não consegui abrir o navegador: {e:?}");
+        Location::Drive { .. } if item.mime.as_deref().is_some_and(|m| m.starts_with("application/vnd.google-apps.")) => {
+            // ShellExecute opens a URL in the default browser.
+            if let Err(e) = ops::open(std::path::Path::new(&format!("https://drive.google.com/open?id={}", item.id))) {
+                s.status = format!("Não consegui abrir o navegador: {e}");
             }
+        }
+        Location::Drive { .. } => {
+            // Each file in its own folder, so two files of the same name don't meet. A copy
+            // already there from an earlier Abrir, as big as the file and as new, opens at once.
+            let dir = std::env::temp_dir().join("OpenExplorer-abrir").join(ops::windows_name(&item.id));
+            let ready = dir.join(ops::windows_name(&item.name));
+            let fresh = std::fs::metadata(&ready).ok().is_some_and(|m| Some(m.len()) == item.size && item.modified.is_some() && m.modified().ok() == item.modified);
+            if fresh {
+                if let Err(e) = ops::open(&ready) {
+                    s.status = e;
+                }
+                return;
+            }
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                s.status = format!("Não consegui criar a pasta temporária: {e}");
+                return;
+            }
+            // An older copy goes, so the new one takes its name.
+            let _ = std::fs::remove_file(&ready);
+            download(s, &loc, vec![item.clone()], dir, Then::Open, Vec::new());
         }
         Location::Mock(_) => not_here(s),
     }
@@ -141,11 +169,12 @@ pub fn pick_up(s: &mut State, p: usize, mode: ClipMode) {
 }
 
 /// Whether items of `from` can be copied or moved into `to` as it is: same disk, same Drive
-/// account, or from the computer up to a Drive folder.
+/// account, from the computer up to a Drive folder, or from a Drive folder down to the computer.
 fn fits(from: &Location, to: &Location) -> bool {
     match (from, to) {
         (Location::Local(_), Location::Local(_)) => true,
         (Location::Local(_), Location::Drive { .. }) => drive_folder(to).is_some(),
+        (Location::Drive { .. }, Location::Local(_)) => drive_folder(from).is_some(),
         (Location::Drive { email: a, .. }, Location::Drive { email: b, .. }) => a == b && drive_folder(to).is_some(),
         _ => false,
     }
@@ -189,7 +218,6 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
     let to = s.panes[p].loc.clone();
     if !fits(&from, &to) {
         s.status = match (&from, &to) {
-            (Location::Drive { .. }, Location::Local(_)) => "Baixar do Google Drive para o computador é o próximo passo; por enquanto, cole na mesma origem.".into(),
             (Location::Local(_), Location::Drive { .. }) => "Abra uma pasta do Drive (ou um drive compartilhado) para enviar para ela.".into(),
             (Location::Drive { .. }, Location::Drive { .. }) if drive_folder(&to).is_some() => "Colar entre contas diferentes do Google Drive ainda não é possível.".into(),
             _ => "Não dá para colar aqui.".into(),
@@ -207,6 +235,10 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
             let sources = items.iter().map(|e| src.join(&e.name)).collect();
             upload(s, sources, &to, mode == ClipMode::Cut, reload);
         }
+        (Location::Drive { .. }, Location::Local(dst)) => {
+            let then = if mode == ClipMode::Cut { Then::Trash } else { Then::Nothing };
+            download(s, &from, items, dst.clone(), then, reload);
+        }
         _ => {
             let (Some((email, src)), Some((_, dst))) = (drive_folder(&from), drive_folder(&to)) else { return };
             let ends = items.iter().map(|e| (End::drive(&from, Some(&e.name)), End::drive(&to, None)));
@@ -221,16 +253,8 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
             drive_job(s, &email, reload, move |d| {
                 batch.run(|i, _| {
                     let e = &items[i];
-                    let file = DriveFile {
-                        id: e.id.clone(),
-                        name: e.name.clone(),
-                        is_dir: e.is_dir && e.target.is_none(),
-                        size: e.size,
-                        modified: e.modified,
-                        mime: e.mime.clone().unwrap_or_default(),
-                        target: None,
-                        md5: None,
-                    };
+                    // Shortcuts are copied as shortcuts, not followed into their target.
+                    let file = DriveFile { is_dir: e.is_dir && e.target.is_none(), target: None, ..drive_file(e) };
                     match mode {
                         ClipMode::Copy if src == dst => d.copy(&file, &dst, &format!("Cópia de {}", e.name)).map(|_| ()),
                         ClipMode::Copy => d.copy(&file, &dst, &e.name).map(|_| ()),
@@ -254,7 +278,7 @@ pub fn local_transfer(s: &mut State, op: Op, sources: Vec<PathBuf>, dst: PathBuf
         }
         batch.run(|i, p| {
             let moved = match op {
-                Op::Copy | Op::Upload => ops::copy_into(&sources[i], &dst, p),
+                Op::Copy | Op::Upload | Op::Download => ops::copy_into(&sources[i], &dst, p),
                 Op::Move => ops::move_into(&sources[i], &dst, p),
             };
             moved.map(|_| ())
@@ -274,6 +298,51 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Upload, sources.iter().map(|p| (End::local(p), dest.clone())));
     let at_once = s.settings.uploads.into();
     drive_job(s, &email, reload, move |d| crate::uploads::run(d, &batch, &sources, &parent, remove, at_once));
+}
+
+/// A listed Drive item as the Drive client takes it.
+pub fn drive_file(e: &Entry) -> DriveFile {
+    DriveFile {
+        id: e.id.clone(),
+        name: e.name.clone(),
+        is_dir: e.is_dir,
+        size: e.size,
+        modified: e.modified,
+        mime: e.mime.clone().unwrap_or_default(),
+        target: e.target.clone(),
+        md5: e.md5.clone(),
+    }
+}
+
+/// What happens once a download row's files all arrived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Then {
+    Nothing,
+    /// Recortar and Colar: the original goes to the Drive trash, from where it can be restored.
+    Trash,
+    /// Abrir: the file opens with its program.
+    Open,
+}
+
+/// Downloads `items` of the Drive folder `from` into the folder `dst` on the computer, a row
+/// each in the queue; then `then`.
+pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf, then: Then, reload: Vec<Location>) {
+    let Some((email, _)) = drive_folder(from) else {
+        s.status = "Não dá para baixar daqui.".into();
+        return;
+    };
+    let to = End::local(&dst);
+    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Download, items.iter().map(|e| (End::drive(from, Some(&e.name)), to.clone())));
+    let files: Vec<DriveFile> = items.iter().map(drive_file).collect();
+    let (at_once, segmented) = (s.settings.downloads.into(), s.settings.segmented_downloads);
+    drive_job(s, &email, reload, move |d| {
+        let finish = |i: usize, path: &std::path::Path| match then {
+            Then::Nothing => Ok(()),
+            Then::Trash => d.trash(&files[i].id).map(|_| ()),
+            Then::Open => ops::open(path),
+        };
+        crate::downloads::run(d, &batch, &files, &dst, at_once, segmented, &finish)
+    });
 }
 
 /// Cancelar on a row of the queue.
