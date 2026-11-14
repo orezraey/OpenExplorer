@@ -81,7 +81,7 @@ fn account(loc: &Location) -> Option<&str> {
 pub fn editable(loc: &Location) -> bool {
     match loc {
         Location::Local(_) => true,
-        Location::Mock(_) => false,
+        Location::Mock(_) | Location::Found(_) => false,
         Location::Drive { .. } => drive_folder(loc).is_some(),
     }
 }
@@ -92,7 +92,7 @@ pub fn editable(loc: &Location) -> bool {
 pub fn items_editable(loc: &Location) -> bool {
     match loc {
         Location::Drive { space: Space::SharedDrives | Space::Trash, .. } => false,
-        Location::Drive { .. } => true,
+        Location::Drive { .. } | Location::Found(_) => true,
         _ => editable(loc),
     }
 }
@@ -116,6 +116,7 @@ fn why_not(loc: &Location) -> String {
             format!("{} é uma lista do Google Drive, não uma pasta: abra uma pasta para colar, criar pastas ou recortar.", space.label())
         }
         Location::Mock(_) => "O drive simulado só serve para testar a interface; abra o disco local ou o Google Drive.".into(),
+        Location::Found(_) => "Os resultados da pesquisa não são uma pasta: abra uma pasta para colar, criar pastas ou recortar.".into(),
         _ => "Não dá para fazer isso aqui.".into(),
     }
 }
@@ -178,8 +179,10 @@ pub fn open(s: &mut State, p: usize, _: &mut Tx) {
 pub fn open_file(s: &mut State, p: usize, item: &Entry) {
     let loc = s.panes[p].loc.clone();
     match &loc {
-        Location::Local(dir) => {
-            if let Err(e) = ops::open(&dir.join(&item.name)) {
+        Location::Local(_) | Location::Found(_) => {
+            if let Some(path) = loc.local_path(item)
+                && let Err(e) = ops::open(&path)
+            {
                 s.status = e;
             }
         }
@@ -235,8 +238,8 @@ pub fn pick_up(s: &mut State, p: usize, mode: ClipMode) {
 /// account, from the computer up to a Drive folder, or from a Drive folder down to the computer.
 fn fits(from: &Location, to: &Location) -> bool {
     match (from, to) {
-        (Location::Local(_), Location::Local(_)) => true,
-        (Location::Local(_), Location::Drive { .. }) => drive_folder(to).is_some(),
+        (Location::Local(_) | Location::Found(_), Location::Local(_)) => true,
+        (Location::Local(_) | Location::Found(_), Location::Drive { .. }) => drive_folder(to).is_some(),
         // Downloads only need the items, so any listing of them will do (Com estrela...),
         // except the shared drives list and Lixeira.
         (Location::Drive { .. }, Location::Local(_)) => items_editable(from),
@@ -286,7 +289,7 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
     }
     if !fits(&from, &to) {
         s.status = match (&from, &to) {
-            (Location::Local(_), Location::Drive { .. }) => "Abra uma pasta do Drive (ou um drive compartilhado) para enviar para ela.".into(),
+            (Location::Local(_) | Location::Found(_), Location::Drive { .. }) => "Abra uma pasta do Drive (ou um drive compartilhado) para enviar para ela.".into(),
             (Location::Drive { .. }, Location::Drive { .. }) if drive_folder(&to).is_some() => "Colar entre contas diferentes do Google Drive ainda não é possível.".into(),
             _ => "Não dá para colar aqui.".into(),
         };
@@ -295,12 +298,12 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
     let reload = vec![to.clone(), from.clone()];
     let op = if mode == ClipMode::Cut { Op::Move } else { Op::Copy };
     match (&from, &to) {
-        (Location::Local(src), Location::Local(dst)) => {
-            let sources = items.iter().map(|e| src.join(&e.name)).collect();
+        (Location::Local(_) | Location::Found(_), Location::Local(dst)) => {
+            let sources = items.iter().filter_map(|e| from.local_path(e)).collect();
             local_transfer(s, op, sources, dst.clone(), reload);
         }
-        (Location::Local(src), Location::Drive { .. }) => {
-            let sources = items.iter().map(|e| src.join(&e.name)).collect();
+        (Location::Local(_) | Location::Found(_), Location::Drive { .. }) => {
+            let sources = items.iter().filter_map(|e| from.local_path(e)).collect();
             upload(s, sources, &to, mode == ClipMode::Cut, reload);
         }
         (Location::Drive { .. }, Location::Local(dst)) => {
@@ -579,9 +582,57 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
 /// under it, a whole shared drive, My Drive; from Drive's views, everything. A search from a
 /// search's results looks where that one did.
 pub fn search(s: &mut State, p: usize) {
+    if s.panes[p].loc.is_local() {
+        return search_computer(s, p);
+    }
     if let Some(to) = search_from(&s.panes[p].loc, &s.search[p].text) {
         crate::navigate(s, p, to);
     }
+}
+
+/// Searches the computer for the words in pane `p`'s field, under the folder the pane shows (or
+/// where its results looked). From results, the new ones take their place rather than adding a
+/// step to Voltar, so typing a word letter by letter goes back in one step. Emptied, the field
+/// takes the pane back to the folder searched.
+pub fn search_computer(s: &mut State, p: usize) {
+    let text = s.search[p].text.clone();
+    s.searched[p] = text.clone();
+    let loc = s.panes[p].loc.clone();
+    let within = match &loc {
+        Location::Local(dir) => Some(dir.clone()),
+        Location::Found(f) => f.within.clone(),
+        _ => return,
+    };
+    if text.trim().is_empty() {
+        if matches!(loc, Location::Found(_)) {
+            // Back to the folder the search started from: Voltar's last step, or the folder
+            // searched.
+            match (s.panes[p].back.last(), within) {
+                (Some(Location::Local(_)), _) => crate::go_back(s, p),
+                (_, Some(dir)) => crate::switch(s, p, Location::Local(dir)),
+                _ => {}
+            }
+        }
+        return;
+    }
+    let to = Location::Found(Box::new(crate::finder::found(&text, within)));
+    if matches!(loc, Location::Found(_)) {
+        crate::switch(s, p, to);
+    } else {
+        crate::navigate(s, p, to);
+    }
+}
+
+/// Installs the search service, Windows asking for an administrator's permission, and searches
+/// again in the panes waiting on it.
+pub fn install_finder(s: &mut State) {
+    if s.installing_finder {
+        return;
+    }
+    s.installing_finder = true;
+    s.status = "Instalando o serviço de pesquisa (o Windows pede permissão)…".into();
+    let reload: Vec<Location> = s.panes.iter().map(|p| p.loc.clone()).filter(|l| matches!(l, Location::Found(_))).collect();
+    crate::background(s, move |emit| emit(crate::Msg::Installed { reload, result: crate::finder::install() }));
 }
 
 /// Where searching `text` from `loc` leads: its results, scoped as [`search`] says.
@@ -611,8 +662,12 @@ pub(crate) fn search_scope(loc: &Location) -> Option<(openexplorer_gdrive::searc
     })
 }
 
-/// Pesquisar em todo o Drive: the same words, everywhere the account reaches.
+/// Pesquisar em todo o Drive (or the whole computer): the same words, everywhere.
 pub fn search_everywhere(s: &mut State, p: usize) {
+    if let Location::Found(f) = &s.panes[p].loc {
+        let to = Location::Found(Box::new(crate::finder::found(&f.text, None)));
+        return crate::switch(s, p, to);
+    }
     let Location::Drive { email, space: Space::Search(q), .. } = s.panes[p].loc.clone() else { return };
     let q = crate::model::Search { within: openexplorer_gdrive::search::Within::Everything, place: "todo o Drive".into(), ..*q };
     crate::navigate(s, p, Location::Drive { email, space: Space::Search(Box::new(q)), path: Vec::new() });
@@ -664,8 +719,8 @@ pub fn delete(s: &mut State) {
     let loc = s.panes[pane].loc.clone();
     let n = items.len();
     match &loc {
-        Location::Local(dir) => {
-            let paths: Vec<PathBuf> = items.iter().map(|e| dir.join(&e.name)).collect();
+        Location::Local(_) | Location::Found(_) => {
+            let paths: Vec<PathBuf> = items.iter().filter_map(|e| loc.local_path(e)).collect();
             local_job(s, vec![loc.clone()], move || ops::to_recycle_bin(&paths).map(|_| format!("Movido para a Lixeira: {}.", count(n))));
         }
         Location::Drive { email, .. } => {
@@ -792,7 +847,7 @@ fn stem_len(name: &str, is_dir: bool) -> usize {
 /// and `?` that Google Drive accepts, so its rules apply only on the local disk.
 fn name_problem(loc: &Location, name: &str) -> Option<String> {
     match loc {
-        Location::Local(_) => ops::invalid_name(name),
+        Location::Local(_) | Location::Found(_) => ops::invalid_name(name),
         _ if name.trim().is_empty() => Some("O nome não pode ficar vazio.".into()),
         _ => None,
     }
@@ -845,8 +900,8 @@ pub fn apply_name(s: &mut State, pane: usize, item: Option<Entry>, name: String)
     }
     let loc = s.panes[pane].loc.clone();
     match (&loc, item) {
-        (Location::Local(dir), Some(item)) => {
-            let from = dir.join(&item.name);
+        (Location::Local(_) | Location::Found(_), Some(item)) => {
+            let Some(from) = loc.local_path(&item) else { return };
             local_job(s, vec![loc.clone()], move || ops::rename(&from, &name).map(|_| format!("Renomeado para \"{name}\".")));
         }
         (Location::Local(dir), None) => {
@@ -860,7 +915,7 @@ pub fn apply_name(s: &mut State, pane: usize, item: Option<Entry>, name: String)
             let Some((email, folder)) = drive_folder(&loc) else { return not_here(s, pane) };
             drive_job(s, &email, vec![loc.clone()], move |d| d.create_folder(&name, &folder).map(|_| format!("Pasta \"{name}\" criada.")));
         }
-        (Location::Mock(_), _) => not_here(s, pane),
+        (Location::Mock(_) | Location::Found(_), _) => not_here(s, pane),
     }
 }
 
@@ -960,11 +1015,12 @@ pub fn properties(s: &mut State, p: usize) {
     let alive = Arc::new(AtomicBool::new(true));
     let loc = s.panes[p].loc.clone();
     let mut local = None;
-    if let Location::Local(dir) = &loc {
+    if loc.is_local() {
         // One item: its dates and attributes now (one metadata call). Folders and several
         // items: their contents add up in the background.
-        if let [e] = items.as_slice() {
-            let path = dir.join(&e.name);
+        if let [e] = items.as_slice()
+            && let Some(path) = loc.local_path(e)
+        {
             let meta = std::fs::symlink_metadata(&path).ok();
             local = Some(LocalInfo {
                 created: meta.as_ref().and_then(|m| m.created().ok()),
@@ -974,7 +1030,7 @@ pub fn properties(s: &mut State, p: usize) {
             });
         }
         if items.len() > 1 || items.iter().any(|e| e.is_dir) {
-            let paths: Vec<PathBuf> = items.iter().map(|e| dir.join(&e.name)).collect();
+            let paths: Vec<PathBuf> = items.iter().filter_map(|e| loc.local_path(e)).collect();
             let alive = alive.clone();
             props_job(s, id, |_| PropUpdate::Totals(ops::Totals::default()), move || PropUpdate::Totals(ops::totals(&paths, &|| !alive.load(Ordering::Relaxed))));
         }

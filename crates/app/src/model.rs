@@ -112,11 +112,23 @@ impl Entry {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Location {
     Local(PathBuf),
+    /// What the search index found on the computer: files from many folders, each entry's id
+    /// its full path (see [`crate::finder`]).
+    Found(Box<Found>),
     /// A folder in the simulated drive, as its path segments from the root.
     Mock(Vec<String>),
     /// A folder in a connected account: the (id, name) of each folder from the top of `space`
     /// down.
     Drive { email: String, space: Space, path: Vec<(String, String)> },
+}
+
+/// A search of the computer: its words, the folder it looks under (everywhere when `None`), and
+/// that place in words.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Found {
+    pub text: String,
+    pub within: Option<PathBuf>,
+    pub place: String,
 }
 
 /// Where a Drive location's folders hang from.
@@ -180,8 +192,24 @@ impl Location {
         Location::Drive { email: email.into(), space, path: Vec::new() }
     }
 
+    /// Whether what this lists is on the computer's disks: a folder, or search results.
+    pub fn is_local(&self) -> bool {
+        matches!(self, Location::Local(_) | Location::Found(_))
+    }
+
+    /// Where `e`, listed here, is on disk: in the folder shown or, for a search's results, where
+    /// it was found. `None` off the computer.
+    pub fn local_path(&self, e: &Entry) -> Option<PathBuf> {
+        match self {
+            Location::Local(dir) => Some(dir.join(&e.name)),
+            Location::Found(_) => Some(PathBuf::from(&e.id)),
+            _ => None,
+        }
+    }
+
     pub fn home() -> Location {
-        Location::Local(std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\")))
+        let (var, fallback) = if cfg!(windows) { ("USERPROFILE", "C:\\") } else { ("HOME", "/") };
+        Location::Local(std::env::var_os(var).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(fallback)))
     }
 }
 
@@ -221,6 +249,12 @@ fn order(asc: bool, a: &Entry, b: &Entry, by: Ordering) -> Ordering {
         let o = if by == Ordering::Equal { rune_kit::natural_cmp(&a.name, &b.name) } else { by };
         if asc { o } else { o.reverse() }
     })
+}
+
+/// What the fourth column sorts by: the type, or for a search's results the folder (the column
+/// shows Pasta there, as Everything's does).
+fn kind_key(found: bool, e: &Entry) -> String {
+    if found { crate::finder::folder_of(e) } else { e.kind_label() }
 }
 
 fn by_column(col: SortCol, a: &Entry, b: &Entry) -> Ordering {
@@ -278,7 +312,7 @@ impl Pane {
         let entries = match &self.loc {
             Location::Local(dir) => read_local(dir).map_err(|e| format!("{}: {e}", dir.display())),
             Location::Mock(segs) => Ok(mock.list(segs)),
-            Location::Drive { .. } => return,
+            Location::Drive { .. } | Location::Found(_) => return,
         };
         self.set_entries(entries);
     }
@@ -311,7 +345,8 @@ impl Pane {
     pub fn append_entries(&mut self, more: Vec<Entry>) {
         let (col, asc) = self.sort;
         // By Tipo, a new entry's label is built once, not at each comparison.
-        let label = |e: &Entry| (col == SortCol::Kind).then(|| e.kind_label());
+        let found = matches!(self.loc, Location::Found(_));
+        let label = |e: &Entry| (col == SortCol::Kind).then(|| kind_key(found, e));
         let cmp = |a: &Entry, ka: &Option<String>, b: &Entry, kb: &Option<String>| {
             let by = match (ka, kb) {
                 (Some(x), Some(y)) => x.cmp(y),
@@ -347,7 +382,8 @@ impl Pane {
         let (col, asc) = self.sort;
         if col == SortCol::Kind {
             // The label is built once per entry rather than twice per comparison.
-            let mut keyed: Vec<(String, Entry)> = std::mem::take(&mut self.entries).into_iter().map(|e| (e.kind_label(), e)).collect();
+            let found = matches!(self.loc, Location::Found(_));
+            let mut keyed: Vec<(String, Entry)> = std::mem::take(&mut self.entries).into_iter().map(|e| (kind_key(found, &e), e)).collect();
             keyed.sort_by(|(ka, a), (kb, b)| order(asc, a, b, ka.cmp(kb)));
             self.entries = keyed.into_iter().map(|(_, e)| e).collect();
         } else {
@@ -359,6 +395,7 @@ impl Pane {
     pub fn title(&self) -> String {
         match &self.loc {
             Location::Local(p) => p.display().to_string(),
+            Location::Found(f) => format!("“{}” em {}", f.text, f.place),
             Location::Mock(segs) => format!("Meu Drive/{}", segs.join("/")),
             Location::Drive { space, path, .. } => {
                 let mut parts: Vec<&str> = match space {
@@ -574,6 +611,12 @@ pub fn crumbs(loc: &Location) -> Vec<Crumb> {
                     Some(Crumb { label: c.as_os_str().to_string_lossy().into_owned(), to: Location::Local(at.clone()) })
                 })
                 .collect()
+        }
+        // The folder searched, then the search.
+        Location::Found(f) => {
+            let mut out = f.within.as_ref().map(|w| crumbs(&Location::Local(w.clone()))).unwrap_or_default();
+            out.push(Crumb { label: format!("“{}” em {}", f.text, f.place), to: loc.clone() });
+            out
         }
         Location::Mock(segs) => std::iter::once(Crumb { label: "Drive simulado".into(), to: Location::Mock(Vec::new()) })
             .chain((0..segs.len()).map(|i| Crumb { label: segs[i].clone(), to: Location::Mock(segs[..=i].to_vec()) }))

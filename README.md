@@ -24,6 +24,27 @@ O token de renovação fica no Gerenciador de Credenciais do Windows (nunca em a
 `%APPDATA%\OpenExplorer\accounts.json` guarda só e-mail e nome. Em modo Teste, o Google expira
 o acesso a cada 7 dias: o app pede para conectar de novo.
 
+## Pesquisar no computador
+
+O campo de pesquisa de um painel local procura pelo nome em todos os discos NTFS fixos enquanto
+você digita, como o Everything: um serviço do Windows (`openexplorer-index`) lê a tabela de
+arquivos (MFT) de cada disco para a memória e a mantém em dia pelo diário USN do NTFS; o app o
+consulta por um pipe. Na primeira pesquisa o painel oferece **Instalar o serviço de pesquisa**:
+o Windows pede permissão de administrador uma vez, o serviço é copiado para
+`%ProgramFiles%\OpenExplorer` e inicia com o Windows. Para remover:
+`"%ProgramFiles%\OpenExplorer\openexplorer-index.exe" uninstall` como administrador.
+
+No Linux não há MFT: o serviço (`openexplorer-index`, do próprio usuário, sem root) lista as
+pastas em paralelo, vigia cada uma com o inotify e escuta num socket em `$XDG_RUNTIME_DIR`. O app
+o inicia na primeira pesquisa; `openexplorer-index install` faz o systemd do usuário iniciá-lo
+com a sessão (`uninstall` desfaz). O índice fica salvo em `~/.cache/openexplorer` e responde na
+hora enquanto os discos são listados de novo, a cada início. Ficam de fora sistemas de arquivos
+do kernel, de memória (`tmpfs`), de rede e imagens (`squashfs`).
+
+No Windows, sem administrador, para testar: `cargo run -p openexplorer-index --release -- console --walk`
+(lista as pastas em vez de ler a MFT) e o app com `OE_INDEX_CONSOLE=1`. Tempos de busca:
+`cargo run -p openexplorer-index --release --example index_timing -- C:\ D:\`.
+
 ## Rodar
 
 ```sh
@@ -40,6 +61,8 @@ de 50.000 arquivos) ou `--scene account` (uma conta de exemplo, sem rede).
 ## Código
 
 - `crates/app`: a janela (Rune): painéis, seleção, arrastar e soltar.
+- `crates/index`: o índice dos arquivos do computador e o serviço que o mantém (MFT, diário
+  USN, pipe).
 - `crates/gdrive`: login OAuth (PKCE com redirecionamento para 127.0.0.1), contas e tokens,
   chamadas da Drive API v3. `cargo test -p openexplorer-gdrive` testa o login sem rede.
 

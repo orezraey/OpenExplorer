@@ -9,6 +9,7 @@ mod cache;
 mod downloads;
 #[cfg(windows)]
 mod dragout;
+mod finder;
 mod icons;
 mod layout;
 mod model;
@@ -56,6 +57,10 @@ enum Msg {
     Share { item: String, update: sharing::Update },
     /// What Copiar link found out about an item's access.
     Link(sharing::LinkAnswer),
+    /// The answer of a search of the computer for pane `pane`.
+    Found { pane: usize, request: u64, result: Result<Vec<Entry>, String>, info: finder::Info },
+    /// Installing the search service ended: search again in the panes `reload` shows.
+    Installed { reload: Vec<Location>, result: Result<String, String> },
     /// A drag of Drive items `ids` out of pane `from` ended.
     #[cfg(windows)]
     DragEnded { from: usize, ids: Vec<String>, ended: dragout::Ended },
@@ -88,6 +93,18 @@ struct State {
     renaming: Option<(usize, Entry)>,
     /// Each pane's search field.
     search: [rune::TextEdit; 2],
+    /// Each local pane's field as last seen, and when it may be searched: typing searches the
+    /// computer once the keys stop for a moment.
+    typed: [(String, f64); 2],
+    /// The words each pane last searched the computer for.
+    searched: [String; 2],
+    /// What the index said with each pane's search results.
+    found: [Option<finder::Info>; 2],
+    /// The search service is being installed.
+    installing_finder: bool,
+    /// When each pane's search of the computer is asked again, while a disk is still being read
+    /// or the service is starting (0: not).
+    found_again: [f64; 2],
     /// Counts Propriedades dialogs, to tell their background answers apart.
     props_seq: u64,
     /// What Copiar or Recortar picked up.
@@ -156,6 +173,11 @@ fn init() -> State {
         name_edit: rune::TextEdit::new(""),
         renaming: None,
         search: [rune::TextEdit::new(""), rune::TextEdit::new("")],
+        typed: Default::default(),
+        searched: Default::default(),
+        found: Default::default(),
+        installing_finder: false,
+        found_again: [0.0; 2],
         props_seq: 0,
         clip: None,
         local_drives: model::local_drives(),
@@ -244,6 +266,11 @@ fn notice(s: &mut State, now: f64) -> bool {
 /// Seconds a message stays on screen.
 const NOTICE_SECS: f64 = 5.0;
 
+/// How long the keys must pause before what's typed is searched, in seconds.
+const TYPING_PAUSE: f64 = 0.12;
+/// How often a search is asked again while a disk is still being read, in seconds.
+const FOUND_AGAIN: f64 = 1.5;
+
 fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     // Each listing's file types get their icons asked for once.
     let versions = s.panes.each_ref().map(|p| p.version);
@@ -254,6 +281,25 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     let mut changed = s.icons.settle();
     changed |= notice(s, now);
+    // A local pane searches the computer as its field is typed in, once the keys pause.
+    for p in 0..2 {
+        if s.search[p].text != s.typed[p].0 {
+            s.typed[p] = (s.search[p].text.clone(), now + TYPING_PAUSE);
+            tx.wake_at(now + TYPING_PAUSE);
+        } else if s.typed[p].1 > 0.0 && now >= s.typed[p].1 {
+            s.typed[p].1 = 0.0;
+            if s.panes[p].loc.is_local() && s.search[p].text != s.searched[p] {
+                actions::search_computer(s, p);
+                changed = true;
+            }
+        }
+        if s.found_again[p] > 0.0 && now >= s.found_again[p] {
+            s.found_again[p] = 0.0;
+            if matches!(s.panes[p].loc, Location::Found(_)) && !s.panes[p].loading {
+                load(s, p);
+            }
+        }
+    }
     // Rows done leave the queue (the status line says how the job went); cancelled and failed
     // ones stay to be seen. While any runs, its thread wakes the window a few times a second.
     // A redraw is due while any row moves, and once more when the last one stops.
@@ -353,6 +399,30 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             Msg::Link(answer) => sharing::link_answer(s, answer, tx),
             #[cfg(windows)]
             Msg::DragEnded { from, ids, ended } => drive_drag_ended(s, from, ids, ended),
+            Msg::Found { pane, request, result, info } => {
+                if s.live[pane].load(Ordering::Relaxed) != request {
+                    continue;
+                }
+                s.panes[pane].set_entries(result);
+                // Partial: asked again until every disk is read.
+                if !info.indexing.is_empty() || info.service == finder::Service::Starting {
+                    s.found_again[pane] = now + FOUND_AGAIN;
+                    tx.wake_at(s.found_again[pane]);
+                }
+                s.found[pane] = Some(info);
+                drop_stale_rename(s, pane);
+            }
+            Msg::Installed { reload, result } => {
+                s.installing_finder = false;
+                s.status = match result {
+                    Ok(m) | Err(m) => m,
+                };
+                for p in 0..2 {
+                    if reload.contains(&s.panes[p].loc) {
+                        load(s, p);
+                    }
+                }
+            }
             Msg::Prop { id, update } => actions::props_update(s, id, update),
             Msg::Icon { key, rgba } => s.icons.arrived(key, rgba),
             Msg::Clashes { up, made, result } => {
@@ -512,6 +582,19 @@ fn load(s: &mut State, p: usize) {
     // Every load gets a new number, so a Drive answer for a folder left since is dropped,
     // whatever the pane shows now.
     let request = s.live[p].fetch_add(1, Ordering::Relaxed) + 1;
+    // A search of the computer asks the index service, on a thread: milliseconds.
+    if let Location::Found(f) = &s.panes[p].loc {
+        let f = (**f).clone();
+        let pane = &mut s.panes[p];
+        pane.loading = true;
+        pane.error = None;
+        pane.free = None;
+        background(s, move |emit| {
+            let (result, info) = finder::search(&f);
+            emit(Msg::Found { pane: p, request, result, info });
+        });
+        return;
+    }
     let Location::Drive { email, space, path } = s.panes[p].loc.clone() else {
         let State { panes, mock, .. } = s;
         panes[p].load_now(mock);
@@ -664,6 +747,8 @@ fn open(s: &mut State, p: usize, id: &str) {
     }
     let mut loc = pane.loc.clone();
     match &mut loc {
+        // A folder found opens where it is.
+        Location::Found(_) => loc = Location::Local(PathBuf::from(&e.id)),
         Location::Local(dir) => dir.push(&e.name),
         Location::Mock(segs) => segs.push(e.name.clone()),
         Location::Drive { space: space @ Space::SharedDrives, .. } => *space = Space::Shared { id: e.id.clone(), name: e.name.clone() },
@@ -684,6 +769,7 @@ fn go_up(s: &mut State, p: usize) {
             name
         }
         Location::Mock(segs) => segs.pop(),
+        Location::Found(_) => None,
         Location::Drive { space, path, .. } => match (path.pop(), &*space) {
             (Some((id, _)), _) => Some(id),
             // From the top of a shared drive up to the list of shared drives.
@@ -809,7 +895,7 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             pane.selected = pane.entries.iter().map(|e| e.id.clone()).collect();
             return true;
         }
-        _ if ev.is_command('f') && matches!(s.panes[p].loc, Location::Drive { .. }) => {
+        _ if ev.is_command('f') && !matches!(s.panes[p].loc, Location::Mock(_)) => {
             tx.focus(ui::search_key(p), true);
             return true;
         }
@@ -865,7 +951,7 @@ fn drag_item(s: &State, p: usize, id: &str) -> Option<DragItem> {
 fn paths_for(s: &State, p: usize, ids: &[String], materialize: bool) -> Vec<PathBuf> {
     let pane = &s.panes[p];
     match &pane.loc {
-        Location::Local(dir) => ids.iter().filter_map(|id| pane.entry(id)).map(|e| dir.join(&e.name)).collect(),
+        Location::Local(_) | Location::Found(_) => ids.iter().filter_map(|id| pane.entry(id)).filter_map(|e| pane.loc.local_path(e)).collect(),
         Location::Drive { .. } => Vec::new(),
         Location::Mock(segs) => {
             let dir = s.temp.join(if segs.is_empty() { "Meu Drive".to_string() } else { segs.join("_") });
@@ -940,6 +1026,21 @@ fn drive_drag_ended(s: &mut State, from: usize, ids: Vec<String>, ended: dragout
     }
 }
 
+fn found_scene(s: &mut State, installed: bool) {
+    let f = finder::found("relatorio", Some(PathBuf::from(r"C:\Users\voce")));
+    s.search[0] = rune::TextEdit::new("relatorio");
+    s.typed[0] = ("relatorio".into(), 0.0);
+    s.searched[0] = "relatorio".into();
+    s.panes[0].go(Location::Found(Box::new(f)));
+    if installed {
+        s.panes[0].set_entries(Ok(finder::sample()));
+        s.found[0] = Some(finder::Info { total: 1234, shown: 4, indexing: vec![r"D:\".into()], service: finder::Service::Running });
+    } else {
+        s.panes[0].set_entries(Err(finder::MISSING.into()));
+        s.found[0] = Some(finder::Info { total: 0, shown: 0, indexing: Vec::new(), service: finder::Service::Missing });
+    }
+}
+
 fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
     if let Some((from, paths)) = &s.last_drag
         && *from == p
@@ -953,6 +1054,10 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
     let loc = s.panes[p].loc.clone();
     let (mut done, mut skipped) = (0, 0);
     match &loc {
+        Location::Found(_) => {
+            s.status = "Os resultados da pesquisa não são uma pasta: solte os arquivos numa pasta.".into();
+            return;
+        }
         Location::Drive { .. } => {
             // Files and folders from Explorer (or the other pane) go up to this Drive folder;
             // the simulated drive's items are placeholders in the temp folder and stay out.
@@ -1086,6 +1191,10 @@ fn main() {
             }),
             // Opções open.
             ("options", |s| s.dialog = Some(actions::Dialog::Options)),
+            // A search of the computer with results, a disk still being read; and one without
+            // the service installed.
+            ("found", |s| found_scene(s, true)),
+            ("found-missing", |s| found_scene(s, false)),
             // An upload whose names are taken in the Drive folder: all at once, or the second
             // of three asked on its own.
             ("clash", |s| clash_scene(s, true)),

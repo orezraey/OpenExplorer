@@ -379,7 +379,7 @@ fn dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
     let pad = |e: El| col().key("content").w_full().px(16.0).pb(16.0).child(e);
     match d {
         Dialog::Delete { pane, items } => {
-            let local = matches!(s.panes[*pane].loc, Location::Local(_));
+            let local = s.panes[*pane].loc.is_local();
             let title = match items.as_slice() {
                 [one] => format!("Excluir \"{}\"?", one.name),
                 many => format!("Excluir {} itens?", ui_count(many.len())),
@@ -627,8 +627,9 @@ fn prop_tab(k: &Kit, label: &str, tab: actions::PropTab, on: bool) -> El {
 fn place_of(s: &State, p: &actions::Props) -> String {
     let pane = &s.panes[p.pane];
     match (&pane.loc, p.single()) {
-        (Location::Local(dir), Some(e)) => dir.join(&e.name).display().to_string(),
+        (loc @ (Location::Local(_) | Location::Found(_)), Some(e)) => loc.local_path(e).map(|p| p.display().to_string()).unwrap_or_default(),
         (Location::Local(dir), None) => dir.display().to_string(),
+        (Location::Found(f), None) => format!("Resultados de “{}” em {}", f.text, f.place),
         (loc, single) => {
             let mut parts: Vec<String> = crumbs(loc).into_iter().skip(1).map(|c| c.label).collect();
             if let Some(e) = single {
@@ -717,7 +718,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
             let size = match (p.single(), &p.totals) {
                 (_, Some(t)) => format_bytes(t.bytes),
                 (Some(e), None) if !e.is_dir => e.size.map(format_bytes).unwrap_or_else(|| "—".into()),
-                (_, None) if matches!(loc, Location::Local(_)) => "Calculando…".into(),
+                (_, None) if loc.is_local() => "Calculando…".into(),
                 (None, None) => format_bytes(p.listed_bytes),
                 _ => "—".into(),
             };
@@ -1184,7 +1185,15 @@ fn navbar(s: &State, k: &Kit, p: usize) -> El {
 /// [`actions::search`]), Esc empties it; Ctrl+F reaches it from the list. Nothing for the
 /// computer's panes yet.
 fn search_box(s: &State, k: &Kit, p: usize) -> El {
-    let Some((_, place)) = actions::search_scope(&s.panes[p].loc) else { return el().key("search") };
+    let loc = &s.panes[p].loc;
+    let place = match loc {
+        Location::Local(dir) => crate::finder::place_of(dir),
+        Location::Found(f) => f.place.clone(),
+        _ => match actions::search_scope(loc) {
+            Some((_, place)) => place,
+            None => return el().key("search"),
+        },
+    };
     let field = rune::text_input(&s.search[p], k.ty.text_small)
         .single_line()
         .key(search_key(p))
@@ -1223,8 +1232,54 @@ pub(crate) fn search_key(p: usize) -> String {
     format!("search-input-{p}")
 }
 
+/// Under the path bar of a search of the computer: what was searched where, how many were found,
+/// whether the index is still reading a disk, and ways to widen the search or install the
+/// service it needs.
+fn found_bar(s: &State, k: &Kit, p: usize, f: &crate::model::Found) -> El {
+    use crate::finder::Service;
+    let pane = &s.panes[p];
+    let info = s.found[p].as_ref();
+    let mut said = format!("“{}” em {}", f.text, f.place);
+    match info {
+        _ if pane.loading => said.push_str(" · Pesquisando…"),
+        Some(i) if i.service != Service::Running => said.push_str(" · sem o serviço"),
+        Some(i) if i.total > i.shown => said.push_str(&format!(" · mostrando {} de {} resultados", ui_count(i.shown), ui_count(i.total))),
+        Some(i) => said.push_str(&format!(" · {} {}", ui_count(i.total), if i.total == 1 { "resultado" } else { "resultados" })),
+        None => {}
+    }
+    if let Some(i) = info
+        && !i.indexing.is_empty()
+    {
+        said.push_str(&format!(" · lendo {} (resultados incompletos)", i.indexing.join(", ")));
+    }
+    let link = |key: &'static str, label: String, act: fn(&mut State, usize)| {
+        text(label).key(key).role("link").font(k.ty.text_xsmall).color(k.c.text_accent).cursor(Cursor::Pointer).on_press(move |s: &mut State| act(s, p))
+    };
+    let mut bar = row()
+        .key("search-bar")
+        .w_full()
+        .h(28.0)
+        .px(10.0)
+        .gap(10.0)
+        .center_y()
+        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+        .child(text(said).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0))
+        .child(el().grow(1.0));
+    if info.is_some_and(|i| i.service != Service::Running) {
+        let label = if s.installing_finder { "Instalando…" } else { "Instalar o serviço de pesquisa" };
+        bar = bar.child(link("install-finder", label.into(), |s, _| actions::install_finder(s)));
+    }
+    if f.within.is_some() {
+        bar = bar.child(link("search-everywhere", "Pesquisar no computador todo".into(), actions::search_everywhere));
+    }
+    bar
+}
+
 /// Under the path bar of a search's results: what was searched where, and a way to widen it.
 fn search_bar(s: &State, k: &Kit, p: usize) -> El {
+    if let Location::Found(f) = &s.panes[p].loc {
+        return found_bar(s, k, p, f);
+    }
     let Location::Drive { space: Space::Search(q), path, .. } = &s.panes[p].loc else { return el().key("search-bar") };
     if !path.is_empty() {
         return el().key("search-bar");
@@ -1257,6 +1312,7 @@ fn search_bar(s: &State, k: &Kit, p: usize) -> El {
 fn can_go_up(loc: &Location) -> bool {
     match loc {
         Location::Local(dir) => dir.parent().is_some(),
+        Location::Found(_) => false,
         Location::Mock(segs) => !segs.is_empty(),
         Location::Drive { space, path, .. } => !path.is_empty() || matches!(space, Space::Shared { .. }),
     }
@@ -1279,6 +1335,7 @@ fn node_of(loc: &Location) -> String {
                 format!("disk:{}", dir.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned()).unwrap_or_default())
             }
         }
+        Location::Found(f) => f.within.as_ref().map_or_else(|| "found".into(), |w| node_of(&Location::Local(w.clone()))),
         Location::Mock(_) => "mock".into(),
         Location::Drive { email, space, .. } => match space {
             Space::MyDrive => format!("acc:{email}:my"),
@@ -1422,7 +1479,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .child(head(0, "h-name", "Nome", SortCol::Name, false))
         .child(head(1, "h-size", "Tamanho", SortCol::Size, true))
         .child(head(2, "h-mod", "Data", SortCol::Modified, false))
-        .child(head(3, "h-kind", "Tipo", SortCol::Kind, false))
+        .child(head(3, "h-kind", if matches!(pane.loc, Location::Found(_)) { "Pasta" } else { "Tipo" }, SortCol::Kind, false))
         .children(grips);
 
     let selected = k.alpha(k.c.text_accent, if k.dark { 0.26 } else { 0.18 });
@@ -1435,6 +1492,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         let pane = &s.panes[p];
         let e = &pane.entries[i];
         let is_sel = pane.selected.contains(&e.id);
+        let found = matches!(pane.loc, Location::Found(_));
         let mut r = row().key(row_key(&e.id)).role("row").label(e.name.clone()).focus_selected(is_sel).w_full().h(ROW_H).center_y();
         r = if is_sel { r.fill(selected) } else { r.hover(hover) };
         if s.active == p && pane.cursor.as_deref() == Some(e.id.as_str()) {
@@ -1455,7 +1513,8 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         )
         .child(cell(1).justify_end().child(muted(e.size.map(format_size).unwrap_or_default()).align(Align::End)))
         .child(cell(2).child(muted(e.modified.map(format_time).unwrap_or_default())))
-        .child(cell(3).child(muted(e.kind_label())))
+        // A search's results show the folder each is in where the type goes.
+        .child(cell(3).child(muted(if found { crate::finder::folder_of(e) } else { e.kind_label() })))
         .on_press_tx(move |s: &mut State, tx: &mut Tx| {
             click(s, p, &id_press, tx.mods());
             tx.focus(pane_key(p), false);
@@ -1504,16 +1563,18 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .growth(GrowthSpec::default())
         .virtual_rows(n, ROW_H, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
         .virtual_rows_version((pane.version, w.map(f32::to_bits), s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))));
-    let notice = |msg: String, color| col().key("notice").w_full().grow(1.0).padding(16.0).child(text(msg).font(k.ty.text_small).color(color));
+    let notice = |msg: String, color| col().key("notice").w_full().grow(1.0).padding(16.0).child(text(msg).font(k.ty.text_small).color(color).wrap());
     let body = if let Some(err) = &pane.error {
         notice(err.clone(), k.c.danger.fg)
     } else if pane.loading && n == 0 {
-        let searching = matches!(&pane.loc, Location::Drive { space: Space::Search(_), path, .. } if path.is_empty());
+        let searching = matches!(&pane.loc, Location::Found(_)) || matches!(&pane.loc, Location::Drive { space: Space::Search(_), path, .. } if path.is_empty());
         notice(if searching { "Pesquisando…" } else { "Carregando…" }.into(), k.c.text_muted)
     } else if let (0, Location::Drive { space: Space::Search(q), path, .. }) = (n, &pane.loc)
         && path.is_empty()
     {
         notice(format!("Nada com “{}” no nome em {}.", q.text, q.place), k.c.text_faint)
+    } else if let (0, Location::Found(f)) = (n, &pane.loc) {
+        notice(format!("Nada com “{}” no nome em {}.", f.text, f.place), k.c.text_faint)
     } else if n == 0 && matches!(pane.loc, Location::Drive { space: Space::SharedDrives, .. }) {
         notice("Esta conta não participa de nenhum drive compartilhado.".into(), k.c.text_muted)
     } else if let (0, Location::Drive { space, path, .. }) = (n, &pane.loc)

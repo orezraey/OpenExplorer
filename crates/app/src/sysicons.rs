@@ -34,10 +34,10 @@ pub fn key_for(e: &Entry, loc: &Location) -> Option<IconKey> {
         return None;
     }
     let ext = e.ext().unwrap_or_default();
-    if let Location::Local(dir) = loc
-        && OWN_ICON.contains(&ext.as_str())
+    if OWN_ICON.contains(&ext.as_str())
+        && let Some(path) = loc.local_path(e)
     {
-        return Some(IconKey::Path(dir.join(&e.name)));
+        return Some(IconKey::Path(path));
     }
     Some(IconKey::Ext(ext))
 }

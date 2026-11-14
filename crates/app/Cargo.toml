@@ -8,6 +8,7 @@ rune = { workspace = true }
 rune-kit = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 openexplorer-gdrive = { path = "../gdrive" }
+openexplorer-index = { path = "../index" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Deleting local files sends them to the Recycle Bin.
