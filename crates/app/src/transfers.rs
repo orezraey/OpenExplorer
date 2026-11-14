@@ -1,5 +1,5 @@
-//! The transfer queue under the panes, as in Air Explorer: every copy and move (and, to come,
-//! every upload and download) is a row per item, with where it comes from and goes to, its
+//! The transfer queue under the panes, as in Air Explorer: every copy, move, upload and
+//! download is a row per item, with where it comes from and goes to, its
 //! state, size, progress, speed and time left. A job works through its rows in turn; Cancelar
 //! stops one row or all of them.
 
@@ -17,6 +17,8 @@ pub enum Op {
     Move,
     /// From the computer to Google Drive.
     Upload,
+    /// From Google Drive to the computer.
+    Download,
 }
 
 impl Op {
@@ -25,6 +27,7 @@ impl Op {
             Op::Copy => "Copiar",
             Op::Move => "Mover",
             Op::Upload => "Upload",
+            Op::Download => "Download",
         }
     }
 
@@ -34,6 +37,7 @@ impl Op {
             Op::Copy => "Copiado",
             Op::Move => "Movido",
             Op::Upload => "Enviado",
+            Op::Download => "Baixado",
         }
     }
 }

@@ -19,6 +19,9 @@ icon!(SETTINGS, "settings", r##"<circle cx="8" cy="8" r="2.2" fill="none" stroke
 // An upload, in the transfer queue: an arrow up out of a tray.
 icon!(UPLOAD, "upload", r##"<path d="M8 10.5V2.5M4.75 5.5L8 2.25L11.25 5.5M2.5 10V13.5H13.5V10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>"##);
 
+// A download, in the transfer queue: an arrow down into a tray.
+icon!(DOWNLOAD, "download", r##"<path d="M8 2.5V10.5M4.75 7.5L8 10.75L11.25 7.5M2.5 10V13.5H13.5V10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>"##);
+
 // Places and folders.
 icon!(FOLDER, "folder", r##"<path d="M1 3.5C1 2.95 1.45 2.5 2 2.5H6L7.5 4H14C14.55 4 15 4.45 15 5V12.5C15 13.05 14.55 13.5 14 13.5H2C1.45 13.5 1 13.05 1 12.5Z" fill="#E8A93A"/><path d="M1 5.5H15V12.5C15 13.05 14.55 13.5 14 13.5H2C1.45 13.5 1 13.05 1 12.5Z" fill="#F6C451"/>"##);
 icon!(FOLDER_LINK, "folder-link", r##"<path d="M1 3.5C1 2.95 1.45 2.5 2 2.5H6L7.5 4H14C14.55 4 15 4.45 15 5V12.5C15 13.05 14.55 13.5 14 13.5H2C1.45 13.5 1 13.05 1 12.5Z" fill="#E8A93A"/><path d="M1 5.5H15V12.5C15 13.05 14.55 13.5 14 13.5H2C1.45 13.5 1 13.05 1 12.5Z" fill="#F6C451"/><rect x="2" y="8" width="5.5" height="5" rx="1" fill="#FFFFFF"/><path d="M3.3 11.8L5.8 9.3M4.3 9.2H5.9V10.8" stroke="#2F6FDE" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"##);

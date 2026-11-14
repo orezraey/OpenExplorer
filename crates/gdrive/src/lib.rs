@@ -4,6 +4,7 @@
 //! Everything here blocks; the app runs it on background threads.
 
 pub mod api;
+pub mod download;
 pub mod oauth;
 pub mod store;
 pub mod upload;
@@ -116,6 +117,19 @@ pub(crate) fn upload_agent() -> ureq::Agent {
         .timeout_connect(Some(Duration::from_secs(30)))
         .timeout_per_write(Some(Duration::from_secs(120)))
         .timeout_recv_response(Some(Duration::from_secs(300)))
+        .build()
+        .into()
+}
+
+/// The agent downloads go through: like [`upload_agent`] no overall limit, but a read that
+/// waits two minutes for a byte gives up, so a stalled connection is asked again from where
+/// it stopped instead of hanging the download.
+pub(crate) fn download_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_response(Some(Duration::from_secs(120)))
+        .timeout_per_read(Some(Duration::from_secs(120)))
         .build()
         .into()
 }

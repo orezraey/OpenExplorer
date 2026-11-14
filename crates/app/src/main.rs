@@ -6,6 +6,7 @@
 
 mod actions;
 mod cache;
+mod downloads;
 mod icons;
 mod layout;
 mod model;
@@ -15,6 +16,7 @@ mod sysicons;
 mod transfers;
 mod uploads;
 mod ui;
+mod work;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -554,8 +556,7 @@ fn open(s: &mut State, p: usize, id: &str) {
     let pane = &mut s.panes[p];
     let Some(e) = pane.entry(id).cloned() else { return };
     if !e.is_dir {
-        s.status = format!("Abrir \"{}\" ainda não faz parte do protótipo.", e.name);
-        return;
+        return actions::open_file(s, p, &e);
     }
     let mut loc = pane.loc.clone();
     match &mut loc {
@@ -744,14 +745,23 @@ fn drag_item(s: &State, p: usize, id: &str) -> Option<DragItem> {
     Some(paths.into_iter().fold(DragItem::new(), DragItem::file).within_app())
 }
 
-/// Files on disk for the dragged entries. Simulated files become small placeholder files in
-/// the temp folder first, as a download would, when `materialize` is set; without it this only
-/// names the paths. Drive downloads aren't written yet: none.
+/// Files on disk for the dragged entries, written first when `materialize` is set; without it
+/// this only names the paths. Simulated files become small placeholder files in the temp
+/// folder. Drive items get a path in the temp folder, and small files are fetched there (see
+/// [`fetch_for_drag`]); the rest stay names of files that don't exist yet, which only a drop
+/// on the other pane can use.
 fn paths_for(s: &State, p: usize, ids: &[String], materialize: bool) -> Vec<PathBuf> {
     let pane = &s.panes[p];
     match &pane.loc {
         Location::Local(dir) => ids.iter().filter_map(|id| pane.entry(id)).map(|e| dir.join(&e.name)).collect(),
-        Location::Drive { .. } => Vec::new(),
+        Location::Drive { email, .. } => {
+            let entries: Vec<&Entry> = ids.iter().filter_map(|id| pane.entry(id)).collect();
+            let paths: Vec<PathBuf> = entries.iter().map(|e| drive_drag_path(&s.temp, e)).collect();
+            if materialize {
+                fetch_for_drag(s, email, &entries, &paths);
+            }
+            paths
+        }
         Location::Mock(segs) => {
             let dir = s.temp.join(if segs.is_empty() { "Meu Drive".to_string() } else { segs.join("_") });
             if materialize && std::fs::create_dir_all(&dir).is_err() {
@@ -775,7 +785,71 @@ fn paths_for(s: &State, p: usize, ids: &[String], materialize: bool) -> Vec<Path
     }
 }
 
+/// Where a Drive item dragged out of a pane is written: its own folder (by id) in the temp
+/// folder, under the name it gets on the computer.
+fn drive_drag_path(temp: &std::path::Path, e: &Entry) -> PathBuf {
+    let name = if e.is_dir { e.name.clone() } else { openexplorer_gdrive::download::local_name(&actions::drive_file(e)) };
+    temp.join("Drive").join(ops::windows_name(&e.id)).join(ops::windows_name(&name))
+}
+
+/// The most files, and bytes in all, [`fetch_for_drag`] fetches.
+const DRAG_FETCH_FILES: usize = 10;
+const DRAG_FETCH_BYTES: u64 = 16 << 20;
+
+/// Rune's drag-out gives Windows the dragged files the moment the drag starts (a `CF_HDROP`
+/// inside `DoDragDrop`) and has no way to hand them over later, once a download is done. So a
+/// small drag (up to [`DRAG_FETCH_FILES`] files and [`DRAG_FETCH_BYTES`], no folders) is
+/// fetched right here, the window waiting the moment that takes, and can then be dropped
+/// anywhere, Explorer included. A bigger one isn't fetched: dropped on the other pane it
+/// downloads through the queue, and out of the app there's nothing to drop (see
+/// [`DRAG_OUT_NOTE`]). A copy fetched for an earlier drag is used again while it's current.
+fn fetch_for_drag(s: &State, email: &str, entries: &[&Entry], paths: &[PathBuf]) {
+    let google = |e: &Entry| e.mime.as_deref().is_some_and(|m| m.starts_with("application/vnd.google-apps."));
+    // An export's size isn't known before it's made: counted as 1 MB.
+    let bytes: u64 = entries.iter().map(|e| if google(e) { 1 << 20 } else { e.size.unwrap_or(0) }).sum();
+    if entries.len() > DRAG_FETCH_FILES || bytes > DRAG_FETCH_BYTES || entries.iter().any(|e| e.is_dir) {
+        return;
+    }
+    let Some(d) = s.drives.get(email) else { return };
+    for (e, path) in entries.iter().zip(paths) {
+        let current = std::fs::metadata(path).ok().is_some_and(|m| (google(e) || Some(m.len()) == e.size) && e.modified.is_some() && m.modified().ok() == e.modified);
+        if current {
+            continue;
+        }
+        if let Some(dir) = path.parent()
+            && std::fs::create_dir_all(dir).is_ok()
+            && let Err(err) = d.download(&actions::drive_file(e), path, false, &mut |_| true)
+        {
+            openexplorer_gdrive::log(&format!("arrastar: {err}"));
+        }
+    }
+}
+
+/// What a drag out of a Drive pane says when it carried files that weren't fetched.
+const DRAG_OUT_NOTE: &str = "Só dá para arrastar do Google Drive para fora do app até 10 arquivos pequenos (16 MB ao todo). Para pastas e arquivos maiores, arraste para o outro painel ou use Copiar (Ctrl+C) e Colar (Ctrl+V) numa pasta do computador.";
+
+/// Whether the drag that just ended from pane `p` was a Drive drag whose files weren't all
+/// fetched, and wasn't dropped on the other pane.
+fn drag_left_behind(s: &State, p: usize) -> bool {
+    matches!(s.panes[p].loc, Location::Drive { .. }) && s.last_drag.as_ref().is_some_and(|(from, paths)| *from == p && paths.iter().any(|f| !f.exists()))
+}
+
 fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
+    // A drag from a Drive pane onto the other pane: its files may not exist yet, so what it
+    // carried (the selection there) is copied or downloaded as the arrows between the panes do.
+    if let Some((from, paths)) = &s.last_drag
+        && *from != p
+        && paths.as_slice() == files
+        && matches!(s.panes[*from].loc, Location::Drive { .. })
+    {
+        let from = *from;
+        s.last_drag = None;
+        s.active = p;
+        if s.status == DRAG_OUT_NOTE {
+            s.status.clear();
+        }
+        return actions::copy_across(s, from, p);
+    }
     if let Some((from, paths)) = &s.last_drag
         && *from == p
         && paths.as_slice() == files
@@ -878,6 +952,7 @@ fn main() {
                     (Op::Copy, from("Episódio 06.mkv"), End::local(&PathBuf::from(r"C:\Users\voce\Vídeos"))),
                     (Op::Move, End::drive(&drive, Some("Relatório.pdf")), End::drive(&drive, None)),
                     (Op::Copy, from("Episódio 07.mkv"), End::local(&PathBuf::from(r"E:\"))),
+                    (Op::Download, End::drive(&drive, Some("Fotos 2026")), End::local(&PathBuf::from(r"C:\Users\voce\Downloads"))),
                 ];
                 for (op, a, b) in rows {
                     std::mem::forget(transfers::queue(&mut s.transfers, None, op, [(a, b)]));
@@ -892,6 +967,13 @@ fn main() {
                 p(3).size(900_000_000);
                 p(3).begin();
                 p(3).end(Err("Não há espaço suficiente no disco.".into()));
+                p(4).add_items(120);
+                p(4).size(640_000_000);
+                p(4).begin();
+                p(4).add_bytes(212_000_000);
+                for _ in 0..37 {
+                    p(4).item_done();
+                }
             }),
             // The shared drives list of an account, without a network.
             ("shared", |s| {

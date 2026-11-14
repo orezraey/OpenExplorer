@@ -55,11 +55,24 @@ pub struct Drive {
     pub(crate) uploads: ureq::Agent,
     /// Where uploads go: Google's upload endpoint (a local stand-in in tests).
     pub(crate) upload_url: String,
+    /// For downloads: no overall time limit either, but a stalled read gives up.
+    pub(crate) downloads: ureq::Agent,
+    /// Where downloads come from: the Drive API (a local stand-in in tests).
+    pub(crate) api_url: String,
 }
 
 impl Drive {
     pub fn new(cfg: ClientConfig, refresh_token: String) -> Drive {
-        Drive { cfg, refresh_token, access: Mutex::new(None), agent: agent(), uploads: crate::upload_agent(), upload_url: crate::upload::UPLOAD.into() }
+        Drive {
+            cfg,
+            refresh_token,
+            access: Mutex::new(None),
+            agent: agent(),
+            uploads: crate::upload_agent(),
+            upload_url: crate::upload::UPLOAD.into(),
+            downloads: crate::download_agent(),
+            api_url: API.into(),
+        }
     }
 
     /// Starts from the tokens a login just returned, saving the first refresh.
@@ -70,11 +83,12 @@ impl Drive {
         Ok(d)
     }
 
-    /// A Drive whose uploads go to `upload_url`, with a token that needs no renewing.
+    /// A Drive whose uploads and downloads go to `upload_url`, with a token that needs no
+    /// renewing.
     #[cfg(test)]
     pub(crate) fn for_tests(upload_url: String) -> Drive {
         let cfg = ClientConfig { client_id: "x".into(), client_secret: "x".into() };
-        let d = Drive { upload_url, ..Drive::new(cfg, "x".into()) };
+        let d = Drive { api_url: upload_url.clone(), upload_url, ..Drive::new(cfg, "x".into()) };
         *d.access.lock().unwrap() = Some(("token".into(), Instant::now() + Duration::from_secs(3600)));
         d
     }

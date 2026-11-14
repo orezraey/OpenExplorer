@@ -211,8 +211,15 @@ pub fn open(path: &Path) -> Result<(), String> {
 /// `name` in `dir`, or the first of `stem - Cópia`, `stem - Cópia (2)`... that doesn't exist
 /// there yet, keeping the extension.
 pub fn unique_in(dir: &Path, name: &str) -> PathBuf {
+    unique_where(dir, name, &|_| false)
+}
+
+/// [`unique_in`], also passing over the paths `taken` says are spoken for (by downloads under
+/// way that haven't made their file yet).
+pub fn unique_where(dir: &Path, name: &str, taken: &dyn Fn(&Path) -> bool) -> PathBuf {
+    let free = |p: &PathBuf| !p.exists() && !taken(p);
     let first = dir.join(name);
-    if !first.exists() {
+    if free(&first) {
         return first;
     }
     let (stem, ext) = match name.rsplit_once('.') {
@@ -222,8 +229,22 @@ pub fn unique_in(dir: &Path, name: &str) -> PathBuf {
     (1..)
         .map(|n| if n == 1 { format!("{stem} - Cópia{ext}") } else { format!("{stem} - Cópia ({n}){ext}") })
         .map(|n| dir.join(n))
-        .find(|p| !p.exists())
+        .find(free)
         .expect("an unused name exists")
+}
+
+/// A name Windows takes for one Google Drive allows: characters Windows refuses become `_`,
+/// trailing dots and spaces go, and a device name (`CON`, `aux.txt`) gets a `_` after it.
+pub fn windows_name(name: &str) -> String {
+    let mut out: String = name.chars().map(|c| if FORBIDDEN.contains(&c) || c.is_control() { '_' } else { c }).collect();
+    out.truncate(out.trim_end_matches(['.', ' ']).len());
+    let stem = out.split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.as_bytes()[3].is_ascii_digit() && stem.as_bytes()[3] != b'0');
+    if device {
+        out.insert(stem.len(), '_');
+    }
+    if out.is_empty() { "_".into() } else { out }
 }
 
 pub fn rename(from: &Path, name: &str) -> Result<PathBuf, String> {
@@ -467,6 +488,22 @@ mod tests {
         assert_eq!(totals(&[d.join("a"), d.join("solto.txt")], &|| false), Totals { bytes: 10, files: 3, dirs: 2 });
         // The MD5 of "abc".
         assert_eq!(md5_file(&d.join("a/b/dois.txt"), &|| false).unwrap(), "900150983cd24fb0d6963f7d28e17f72");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn drive_names_become_names_windows_takes() {
+        assert_eq!(windows_name("Reunião: pauta?.docx"), "Reunião_ pauta_.docx");
+        assert_eq!(windows_name(r"a/b\c"), "a_b_c");
+        assert_eq!(windows_name("fim. . "), "fim");
+        assert_eq!(windows_name("con.txt"), "con_.txt");
+        assert_eq!(windows_name("COM1"), "COM1_");
+        assert_eq!(windows_name("Console.txt"), "Console.txt");
+        assert_eq!(windows_name("..."), "_");
+        let d = scratch("unique");
+        std::fs::write(d.join("a.txt"), "").unwrap();
+        let taken = d.join("a - Cópia.txt");
+        assert_eq!(unique_where(&d, "a.txt", &|p| p == taken), d.join("a - Cópia (2).txt"));
         let _ = std::fs::remove_dir_all(d);
     }
 
