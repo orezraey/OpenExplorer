@@ -134,6 +134,17 @@ pub enum Space {
     Starred,
     Recent,
     Trash,
+    /// Results of a search; a folder opened from them lists as any folder.
+    Search(Box<Search>),
+}
+
+/// A search's words and where it looks, as a pane shows its results.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Search {
+    pub text: String,
+    pub within: openexplorer_gdrive::search::Within,
+    /// Where it looks, in words: "Meu Drive", "Projetos", "todo o Drive".
+    pub place: String,
 }
 
 impl Space {
@@ -145,7 +156,7 @@ impl Space {
             Space::Starred => Some(View::Starred),
             Space::Recent => Some(View::Recent),
             Space::Trash => Some(View::Trash),
-            Space::MyDrive | Space::SharedDrives | Space::Shared { .. } => None,
+            Space::MyDrive | Space::SharedDrives | Space::Shared { .. } | Space::Search(_) => None,
         }
     }
 
@@ -159,6 +170,7 @@ impl Space {
             Space::Starred => "Com estrela",
             Space::Recent => "Recentes",
             Space::Trash => "Lixeira",
+            Space::Search(_) => "Pesquisa",
         }
     }
 }
@@ -200,6 +212,24 @@ pub struct Pane {
     pub forward: Vec<Location>,
     /// Free space on the local disk shown, read with each listing.
     pub free: Option<u64>,
+}
+
+/// How a pane orders entries: folders first, as in Explorer, then by the column (`by`), ties
+/// by name; `asc` turns all but the folders-first around.
+fn order(asc: bool, a: &Entry, b: &Entry, by: Ordering) -> Ordering {
+    b.is_dir.cmp(&a.is_dir).then_with(|| {
+        let o = if by == Ordering::Equal { rune_kit::natural_cmp(&a.name, &b.name) } else { by };
+        if asc { o } else { o.reverse() }
+    })
+}
+
+fn by_column(col: SortCol, a: &Entry, b: &Entry) -> Ordering {
+    match col {
+        SortCol::Name => Ordering::Equal,
+        SortCol::Size => a.size.cmp(&b.size),
+        SortCol::Modified => a.modified.cmp(&b.modified),
+        SortCol::Kind => a.kind_label().cmp(&b.kind_label()),
+    }
 }
 
 impl Pane {
@@ -275,36 +305,53 @@ impl Pane {
         self.selected.retain(|id| ids.contains(id.as_str()));
     }
 
-    /// Adds a later page of a listing that's still arriving.
+    /// Adds a later page of a listing that's still arriving: the page is sorted on its own and
+    /// merged in, each of its entries finding its place by binary search, rather than sorting
+    /// everything again, which a search's hundred thousand results made slow page after page.
     pub fn append_entries(&mut self, more: Vec<Entry>) {
-        self.entries.extend(more);
-        self.sort_entries();
+        let (col, asc) = self.sort;
+        // By Tipo, a new entry's label is built once, not at each comparison.
+        let label = |e: &Entry| (col == SortCol::Kind).then(|| e.kind_label());
+        let cmp = |a: &Entry, ka: &Option<String>, b: &Entry, kb: &Option<String>| {
+            let by = match (ka, kb) {
+                (Some(x), Some(y)) => x.cmp(y),
+                _ => by_column(col, a, b),
+            };
+            order(asc, a, b, by)
+        };
+        let mut more: Vec<(Option<String>, Entry)> = more.into_iter().map(|e| (label(&e), e)).collect();
+        more.sort_by(|(ka, a), (kb, b)| cmp(a, ka, b, kb));
+        let old = std::mem::take(&mut self.entries);
+        // Where each new entry goes among the old ones, after any equal to it.
+        let mut cuts = Vec::with_capacity(more.len());
+        let mut at = 0;
+        for (k, e) in &more {
+            at += old[at..].partition_point(|o| cmp(o, &label(o), e, k) != Ordering::Greater);
+            cuts.push(at);
+        }
+        let more = more.into_iter().map(|(_, e)| e);
+        let mut merged = Vec::with_capacity(old.len() + more.len());
+        let mut old = old.into_iter();
+        let mut taken = 0;
+        for (e, cut) in more.into_iter().zip(cuts) {
+            merged.extend(old.by_ref().take(cut - taken));
+            taken = cut;
+            merged.push(e);
+        }
+        merged.extend(old);
+        self.entries = merged;
+        self.version += 1;
     }
 
     pub fn sort_entries(&mut self) {
         let (col, asc) = self.sort;
-        // Folders always come first, as in Explorer; ties fall back to the name.
-        let order = |a: &Entry, b: &Entry, by: Ordering| {
-            b.is_dir.cmp(&a.is_dir).then_with(|| {
-                let o = if by == Ordering::Equal { rune_kit::natural_cmp(&a.name, &b.name) } else { by };
-                if asc { o } else { o.reverse() }
-            })
-        };
         if col == SortCol::Kind {
             // The label is built once per entry rather than twice per comparison.
             let mut keyed: Vec<(String, Entry)> = std::mem::take(&mut self.entries).into_iter().map(|e| (e.kind_label(), e)).collect();
-            keyed.sort_by(|(ka, a), (kb, b)| order(a, b, ka.cmp(kb)));
+            keyed.sort_by(|(ka, a), (kb, b)| order(asc, a, b, ka.cmp(kb)));
             self.entries = keyed.into_iter().map(|(_, e)| e).collect();
         } else {
-            self.entries.sort_by(|a, b| {
-                let by = match col {
-                    SortCol::Name => Ordering::Equal,
-                    SortCol::Size => a.size.cmp(&b.size),
-                    SortCol::Modified => a.modified.cmp(&b.modified),
-                    SortCol::Kind => unreachable!(),
-                };
-                order(a, b, by)
-            });
+            self.entries.sort_by(|a, b| order(asc, a, b, by_column(col, a, b)));
         }
         self.version += 1;
     }
@@ -536,7 +583,11 @@ pub fn crumbs(loc: &Location) -> Vec<Crumb> {
             if let Space::Shared { .. } = space {
                 out.push(Crumb { label: "Drives compartilhados".into(), to: Location::drive(email.clone(), Space::SharedDrives) });
             }
-            out.push(Crumb { label: space.label().to_string(), to: Location::drive(email.clone(), space.clone()) });
+            let label = match space {
+                Space::Search(q) => format!("“{}” em {}", q.text, q.place),
+                _ => space.label().to_string(),
+            };
+            out.push(Crumb { label, to: Location::drive(email.clone(), space.clone()) });
             for i in 0..path.len() {
                 out.push(Crumb { label: path[i].1.clone(), to: Location::Drive { email: email.clone(), space: space.clone(), path: path[..=i].to_vec() } });
             }
@@ -644,6 +695,66 @@ mod tests {
 
     fn file(name: &str) -> Entry {
         Entry { id: name.into(), name: name.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false }
+    }
+
+    /// Pages merged in one by one end in the order a full sort gives, for every column and
+    /// direction, folders first.
+    #[test]
+    fn pages_merge_into_the_sorted_order() {
+        let mut seed = 7u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        let pages: Vec<Vec<Entry>> = (0..6)
+            .map(|_| {
+                (0..50)
+                    .map(|_| {
+                        let n = next();
+                        let ext = ["txt", "pdf", "mkv"][(n % 3) as usize];
+                        Entry { is_dir: n % 7 == 0, size: Some(n % 5), modified: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(n % 11)), ..file(&format!("item {} {}.{ext}", n % 40, n)) }
+                    })
+                    .collect()
+            })
+            .collect();
+        for col in [SortCol::Name, SortCol::Size, SortCol::Modified, SortCol::Kind] {
+            for asc in [true, false] {
+                let mut merged = Pane::new(Location::Local("C:\\".into()));
+                merged.sort = (col, asc);
+                for page in &pages {
+                    merged.append_entries(page.clone());
+                }
+                let mut whole = Pane::new(Location::Local("C:\\".into()));
+                whole.sort = (col, asc);
+                whole.entries = pages.concat();
+                whole.sort_entries();
+                let names = |p: &Pane| p.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+                assert_eq!(names(&merged), names(&whole), "{col:?} {asc}");
+            }
+        }
+    }
+
+    /// The UI thread's share of a big search: 110 pages of a thousand results, in no order,
+    /// each added to the pane as it lands.
+    /// `cargo test -p openexplorer --release absorbing_a_big_search -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn absorbing_a_big_search() {
+        let mut pane = Pane::new(Location::Local("C:\\".into()));
+        let mut seed = 12345u64;
+        let mut name = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            format!("Episódio {} - Anime {}.mkv", seed >> 54, (seed >> 20) % 100_000)
+        };
+        let t = std::time::Instant::now();
+        let mut worst = std::time::Duration::ZERO;
+        for _ in 0..110 {
+            let page: Vec<Entry> = (0..1000).map(|_| file(&name())).collect();
+            let p = std::time::Instant::now();
+            pane.append_entries(page);
+            worst = worst.max(p.elapsed());
+        }
+        println!("{} itens em {:.0} ms, pior página {:.1} ms", pane.entries.len(), t.elapsed().as_secs_f64() * 1000.0, worst.as_secs_f64() * 1000.0);
     }
 
     #[test]

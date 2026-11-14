@@ -9,6 +9,7 @@ pub mod oauth;
 pub mod quota;
 pub mod share;
 pub mod store;
+pub mod search;
 pub mod upload;
 
 use std::path::PathBuf;

@@ -109,6 +109,9 @@ fn why_not(loc: &Location) -> String {
         Location::Drive { space: Space::SharedDrives, .. } => "Drives compartilhados lista os drives: abra um deles para trabalhar nas pastas.".into(),
         Location::Drive { space: Space::Trash, path, .. } if path.is_empty() => "A Lixeira não recebe itens: use Restaurar ou Excluir permanentemente.".into(),
         Location::Drive { space: Space::Trash, .. } => "Esta pasta está na lixeira: restaure-a para mexer no que tem dentro.".into(),
+        Location::Drive { space: Space::Search(_), path, .. } if path.is_empty() => {
+            "Os resultados da pesquisa não são uma pasta: abra uma pasta para colar, criar pastas ou recortar.".into()
+        }
         Location::Drive { space, path, .. } if path.is_empty() => {
             format!("{} é uma lista do Google Drive, não uma pasta: abra uma pasta para colar, criar pastas ou recortar.", space.label())
         }
@@ -570,6 +573,49 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
         };
         crate::downloads::run(d, &batch, &files, &dst, at_once, segmented, &finish)
     });
+}
+
+/// Pesquisar: the words in pane `p`'s search field, where the pane is: a folder with what's
+/// under it, a whole shared drive, My Drive; from Drive's views, everything. A search from a
+/// search's results looks where that one did.
+pub fn search(s: &mut State, p: usize) {
+    if let Some(to) = search_from(&s.panes[p].loc, &s.search[p].text) {
+        crate::navigate(s, p, to);
+    }
+}
+
+/// Where searching `text` from `loc` leads: its results, scoped as [`search`] says.
+fn search_from(loc: &Location, text: &str) -> Option<Location> {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Location::Drive { email, .. } = loc else { return None };
+    if text.is_empty() {
+        return None;
+    }
+    let (within, place) = search_scope(loc)?;
+    Some(Location::Drive { email: email.clone(), space: Space::Search(Box::new(crate::model::Search { text, within, place })), path: Vec::new() })
+}
+
+/// Where a search from `loc` looks, and that place in words; `None` off Drive.
+pub(crate) fn search_scope(loc: &Location) -> Option<(openexplorer_gdrive::search::Within, String)> {
+    use openexplorer_gdrive::search::Within;
+    let Location::Drive { space, path, .. } = loc else { return None };
+    Some(match (space, path.last()) {
+        (Space::Search(q), None) => (q.within.clone(), q.place.clone()),
+        // A trashed folder's contents aren't searchable on their own.
+        (Space::Trash, _) => (Within::Everything, "todo o Drive".into()),
+        (Space::Shared { id, .. }, Some((f, name))) => (Within::Folder { id: f.clone(), shared_drive: Some(id.clone()) }, name.clone()),
+        (Space::Shared { id, name }, None) => (Within::SharedDrive(id.clone()), name.clone()),
+        (_, Some((f, name))) => (Within::Folder { id: f.clone(), shared_drive: None }, name.clone()),
+        (Space::MyDrive, None) => (Within::MyDrive, "Meu Drive".into()),
+        _ => (Within::Everything, "todo o Drive".into()),
+    })
+}
+
+/// Pesquisar em todo o Drive: the same words, everywhere the account reaches.
+pub fn search_everywhere(s: &mut State, p: usize) {
+    let Location::Drive { email, space: Space::Search(q), .. } = s.panes[p].loc.clone() else { return };
+    let q = crate::model::Search { within: openexplorer_gdrive::search::Within::Everything, place: "todo o Drive".into(), ..*q };
+    crate::navigate(s, p, Location::Drive { email, space: Space::Search(Box::new(q)), path: Vec::new() });
 }
 
 /// Cancelar on a row of the queue.
@@ -1041,6 +1087,35 @@ mod tests {
 
     fn drive(space: Space, path: &[&str]) -> Location {
         Location::Drive { email: "a@b".into(), space, path: path.iter().map(|id| (id.to_string(), id.to_string())).collect() }
+    }
+
+    /// A search looks where the pane is: under a folder (in its shared drive when it sits in
+    /// one), a whole shared drive, My Drive; from views and Lixeira, everywhere. Searching from
+    /// results keeps their scope; blank words search nothing.
+    #[test]
+    fn a_search_looks_where_the_pane_is() {
+        use openexplorer_gdrive::search::Within;
+        let scope = |loc: &Location, text: &str| match search_from(loc, text) {
+            Some(Location::Drive { space: Space::Search(q), path, .. }) if path.is_empty() => Some((q.text, q.within, q.place)),
+            other => panic!("not a search: {other:?}"),
+        };
+        let shared = Space::Shared { id: "0AA".into(), name: "Equipe".into() };
+        assert_eq!(search_from(&drive(Space::MyDrive, &[]), "  "), None);
+        assert_eq!(search_from(&Location::Local("C:\\".into()), "x"), None);
+        assert_eq!(scope(&drive(Space::MyDrive, &[]), " relatório   2025 "), Some(("relatório 2025".into(), Within::MyDrive, "Meu Drive".into())));
+        assert_eq!(scope(&drive(Space::MyDrive, &["f1", "f2"]), "x").map(|q| q.1), Some(Within::Folder { id: "f2".into(), shared_drive: None }));
+        assert_eq!(scope(&drive(shared.clone(), &[]), "x").map(|q| q.1), Some(Within::SharedDrive("0AA".into())));
+        assert_eq!(scope(&drive(shared, &["f1"]), "x").map(|q| q.1), Some(Within::Folder { id: "f1".into(), shared_drive: Some("0AA".into()) }));
+        assert_eq!(scope(&drive(Space::Starred, &["f1"]), "x").map(|q| q.1), Some(Within::Folder { id: "f1".into(), shared_drive: None }));
+        for everywhere in [drive(Space::Starred, &[]), drive(Space::SharedDrives, &[]), drive(Space::Trash, &[]), drive(Space::Trash, &["f1"])] {
+            assert_eq!(scope(&everywhere, "x").map(|q| q.1), Some(Within::Everything));
+        }
+        let results = search_from(&drive(Space::MyDrive, &["f1"]), "a").unwrap();
+        assert_eq!(scope(&results, "b"), Some(("b".into(), Within::Folder { id: "f1".into(), shared_drive: None }, "f1".into())));
+        // A folder opened from the results searches under it.
+        let Location::Drive { email, space, .. } = results else { unreachable!() };
+        let inside = Location::Drive { email, space, path: vec![("f9".into(), "Nove".into())] };
+        assert_eq!(scope(&inside, "c").map(|q| (q.1, q.2)), Some((Within::Folder { id: "f9".into(), shared_drive: None }, "Nove".into())));
     }
 
     #[test]

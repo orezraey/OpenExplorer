@@ -86,6 +86,8 @@ struct State {
     name_edit: rune::TextEdit,
     /// The item being renamed in place, and its pane.
     renaming: Option<(usize, Entry)>,
+    /// Each pane's search field.
+    search: [rune::TextEdit; 2],
     /// Counts Propriedades dialogs, to tell their background answers apart.
     props_seq: u64,
     /// What Copiar or Recortar picked up.
@@ -153,6 +155,7 @@ fn init() -> State {
         clash_waiting: Default::default(),
         name_edit: rune::TextEdit::new(""),
         renaming: None,
+        search: [rune::TextEdit::new(""), rune::TextEdit::new("")],
         props_seq: 0,
         clip: None,
         local_drives: model::local_drives(),
@@ -573,7 +576,8 @@ fn load(s: &mut State, p: usize) {
             (Space::Trash, Some(f)) => drive.list_trashed(f, &mut page),
             // A folder opened from Compartilhados comigo, Com estrela or Recentes lists as any
             // folder, in whichever drive it sits.
-            (Space::SharedWithMe | Space::Starred | Space::Recent, Some(f)) => drive.list(f, None, &mut page),
+            (Space::SharedWithMe | Space::Starred | Space::Recent | Space::Search(_), Some(f)) => drive.list(f, None, &mut page),
+            (Space::Search(q), None) => drive.search(&q.text, &q.within, &mut page),
             (Space::SharedWithMe | Space::Starred | Space::Recent | Space::Trash, None) => match space.view() {
                 Some(v) => drive.view(v, &mut page),
                 None => Ok(()),
@@ -803,6 +807,10 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         _ if ev.is_command('a') => {
             let pane = &mut s.panes[p];
             pane.selected = pane.entries.iter().map(|e| e.id.clone()).collect();
+            return true;
+        }
+        _ if ev.is_command('f') && matches!(s.panes[p].loc, Location::Drive { .. }) => {
+            tx.focus(ui::search_key(p), true);
             return true;
         }
         _ if ev.is_command('r') => {

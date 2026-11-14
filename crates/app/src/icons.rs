@@ -13,6 +13,9 @@ macro_rules! icon {
 icon!(COPY_RIGHT, "copy-right", r##"<path d="M4.5 1.5L11.5 8L4.5 14.5Z" fill="currentColor"/>"##);
 icon!(COPY_LEFT, "copy-left", r##"<path d="M11.5 1.5L4.5 8L11.5 14.5Z" fill="currentColor"/>"##);
 
+// The search field's magnifier, in `currentColor`.
+icon!(SEARCH, "search", r##"<circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10.4 10.4L14 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>"##);
+
 // Opções, in the toolbar: a gear, in `currentColor`.
 icon!(SETTINGS, "settings", r##"<circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 1.5V3.2M8 12.8V14.5M1.5 8H3.2M12.8 8H14.5M3.4 3.4L4.6 4.6M11.4 11.4L12.6 12.6M3.4 12.6L4.6 11.4M11.4 4.6L12.6 3.4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="8" r="4.6" fill="none" stroke="currentColor" stroke-width="1.3"/>"##);
 

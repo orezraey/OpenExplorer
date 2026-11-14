@@ -33,6 +33,8 @@ pub fn key(loc: &Location) -> Option<Key> {
         Space::Shared { id, .. } => format!("sd/{id}/{}", folder.unwrap_or(id)),
         // A trashed folder lists its trashed contents, not what a folder in My Drive shows.
         Space::Trash => folder.map_or_else(|| "view/trash".to_string(), |f| format!("trash/{f}")),
+        // Results aren't kept: each search asks Drive again. A folder opened from them is.
+        Space::Search(_) => format!("my/{}", folder?),
         // A folder opened from a view lists as it does anywhere else.
         Space::SharedWithMe | Space::Starred | Space::Recent => match folder {
             Some(f) => format!("my/{f}"),

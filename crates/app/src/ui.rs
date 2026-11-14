@@ -1095,6 +1095,7 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
         .on_drop_files(move |s: &mut State, files: &[PathBuf], _| dropped(s, p, files))
         .on_drop_hover(move |s: &mut State, over, _| s.panes[p].drop_over = over)
         .child(navbar(s, k, p))
+        .child(search_bar(s, k, p))
         .child(
             row()
                 .key("body")
@@ -1175,7 +1176,82 @@ fn navbar(s: &State, k: &Kit, p: usize) -> El {
         .child(nav_button(k, "forward", &icons::FORWARD, "Avançar (Alt+→)", !pane.forward.is_empty(), move |s: &mut State| go_forward(s, p)))
         .child(nav_button(k, "up", &icons::UP, "Acima (Backspace)", can_go_up(&pane.loc), move |s: &mut State| go_up(s, p)))
         .child(path.mx(4.0))
+        .child(search_box(s, k, p))
         .child(nav_button(k, "reload", &icons::REFRESH, "Atualizar (Ctrl+R)", true, move |s: &mut State| load(s, p)))
+}
+
+/// The search field of a Drive pane: Enter searches where the pane is (see
+/// [`actions::search`]), Esc empties it; Ctrl+F reaches it from the list. Nothing for the
+/// computer's panes yet.
+fn search_box(s: &State, k: &Kit, p: usize) -> El {
+    let Some((_, place)) = actions::search_scope(&s.panes[p].loc) else { return el().key("search") };
+    let field = rune::text_input(&s.search[p], k.ty.text_small)
+        .single_line()
+        .key(search_key(p))
+        .label("Pesquisar")
+        .placeholder(format!("Pesquisar em {place}"), k.c.text_faint)
+        .grow(1.0)
+        .shrink()
+        .min_w(0.0)
+        .color(k.c.text_base)
+        .caret(k.c.text_base, k.selection())
+        .on_edit(move |s: &mut State| &mut s.search[p])
+        .on_submit(move |s: &mut State, _: &mut Tx| actions::search(s, p))
+        .on_input_key(move |s: &mut State, ev: &KeyEvent, _: &mut Tx| {
+            if ev.key == rune::Key::Escape && !s.search[p].text.is_empty() {
+                s.search[p] = rune::TextEdit::new("");
+                true
+            } else {
+                false
+            }
+        });
+    row()
+        .key("search")
+        .w(210.0)
+        .h(26.0)
+        .px(7.0)
+        .gap(5.0)
+        .mr(4.0)
+        .center_y()
+        .radius(k.radius.sm)
+        .border(1.0, k.c.border_weak)
+        .child(icon(&icons::SEARCH, 14.0).color(k.c.icon_faint))
+        .child(field)
+}
+
+pub(crate) fn search_key(p: usize) -> String {
+    format!("search-input-{p}")
+}
+
+/// Under the path bar of a search's results: what was searched where, and a way to widen it.
+fn search_bar(s: &State, k: &Kit, p: usize) -> El {
+    let Location::Drive { space: Space::Search(q), path, .. } = &s.panes[p].loc else { return el().key("search-bar") };
+    if !path.is_empty() {
+        return el().key("search-bar");
+    }
+    let pane = &s.panes[p];
+    let found = if pane.loading { "Pesquisando…".to_string() } else { format!("{} {}", ui_count(pane.entries.len()), if pane.entries.len() == 1 { "resultado" } else { "resultados" }) };
+    let mut bar = row()
+        .key("search-bar")
+        .w_full()
+        .h(28.0)
+        .px(10.0)
+        .gap(10.0)
+        .center_y()
+        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+        .child(text(format!("“{}” em {} · {found}", q.text, q.place)).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0));
+    if q.within != openexplorer_gdrive::search::Within::Everything {
+        bar = bar.child(el().grow(1.0)).child(
+            text("Pesquisar em todo o Drive")
+                .key("search-everywhere")
+                .role("link")
+                .font(k.ty.text_xsmall)
+                .color(k.c.text_accent)
+                .cursor(Cursor::Pointer)
+                .on_press(move |s: &mut State| actions::search_everywhere(s, p)),
+        );
+    }
+    bar
 }
 
 fn can_go_up(loc: &Location) -> bool {
@@ -1212,6 +1288,7 @@ fn node_of(loc: &Location) -> String {
             Space::Starred => format!("acc:{email}:starred"),
             Space::Recent => format!("acc:{email}:recent"),
             Space::Trash => format!("acc:{email}:trash"),
+            Space::Search(_) => format!("acc:{email}:search"),
         },
     }
 }
@@ -1431,7 +1508,12 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let body = if let Some(err) = &pane.error {
         notice(err.clone(), k.c.danger.fg)
     } else if pane.loading && n == 0 {
-        notice("Carregando…".into(), k.c.text_muted)
+        let searching = matches!(&pane.loc, Location::Drive { space: Space::Search(_), path, .. } if path.is_empty());
+        notice(if searching { "Pesquisando…" } else { "Carregando…" }.into(), k.c.text_muted)
+    } else if let (0, Location::Drive { space: Space::Search(q), path, .. }) = (n, &pane.loc)
+        && path.is_empty()
+    {
+        notice(format!("Nada com “{}” no nome em {}.", q.text, q.place), k.c.text_faint)
     } else if n == 0 && matches!(pane.loc, Location::Drive { space: Space::SharedDrives, .. }) {
         notice("Esta conta não participa de nenhum drive compartilhado.".into(), k.c.text_muted)
     } else if let (0, Location::Drive { space, path, .. }) = (n, &pane.loc)

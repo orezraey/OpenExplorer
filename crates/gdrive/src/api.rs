@@ -254,7 +254,7 @@ impl Drive {
         }
     }
 
-    fn get(&self, path: &str, query: &[(&str, &str)], what: &str) -> Result<serde_json::Value> {
+    pub(crate) fn get(&self, path: &str, query: &[(&str, &str)], what: &str) -> Result<serde_json::Value> {
         self.call("GET", path, query, None, what)
     }
 
@@ -271,7 +271,7 @@ impl Drive {
     /// A paged Drive listing (`files`, `drives`, ...), one page at a time: `each` gets a page's
     /// items and whether more pages follow, and returns `false` to stop early (the reader left
     /// the folder).
-    fn pages<T: serde::de::DeserializeOwned>(
+    pub(crate) fn pages<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
         query: &[(&str, &str)],
@@ -551,11 +551,11 @@ struct Shortcut {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RawFile {
-    id: String,
+    pub(crate) id: String,
     name: String,
     mime_type: String,
     size: Option<String>,
-    modified_time: Option<String>,
+    pub(crate) modified_time: Option<String>,
     md5_checksum: Option<String>,
     shortcut_details: Option<Shortcut>,
     starred: Option<bool>,
