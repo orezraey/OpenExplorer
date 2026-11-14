@@ -43,6 +43,8 @@ enum Msg {
     Prop { id: u64, update: actions::PropUpdate },
     /// Windows' icon for a file type, a folder or a drive.
     Icon { key: sysicons::IconKey, rgba: Option<sysicons::Rgba> },
+    /// What the Drive folder an upload goes into holds, to check its names against.
+    Clashes { up: actions::Upload, made: Option<(String, Arc<Drive>)>, result: Result<Vec<Entry>, String> },
 }
 
 /// Which part of a listing a [`Msg::Listed`] is.
@@ -64,6 +66,8 @@ struct State {
     /// The context menu: the pane it was opened in and where.
     menu: Option<(usize, rune::PointerPress)>,
     dialog: Option<actions::Dialog>,
+    /// Uploads whose clash dialog waits for the one open (or another dialog) to close.
+    clash_waiting: std::collections::VecDeque<actions::ClashAsk>,
     /// The name typed in Renomear or Nova pasta.
     name_edit: rune::TextEdit,
     /// The item being renamed in place, and its pane.
@@ -129,6 +133,7 @@ fn init() -> State {
         panes,
         menu: None,
         dialog: None,
+        clash_waiting: Default::default(),
         name_edit: rune::TextEdit::new(""),
         renaming: None,
         props_seq: 0,
@@ -307,6 +312,14 @@ fn poll(s: &mut State, now: f64, _tx: &mut Tx) -> bool {
             }
             Msg::Prop { id, update } => actions::props_update(s, id, update),
             Msg::Icon { key, rgba } => s.icons.arrived(key, rgba),
+            Msg::Clashes { up, made, result } => {
+                if let Some((email, drive)) = made
+                    && s.accounts.iter().any(|a| a.email == email)
+                {
+                    s.drives.entry(email).or_insert(drive);
+                }
+                actions::clashes_listed(s, up, result);
+            }
             Msg::LoggedIn { pane, attempt, result } => {
                 let current = s.login == Some(attempt);
                 if current {
@@ -329,6 +342,11 @@ fn poll(s: &mut State, now: f64, _tx: &mut Tx) -> bool {
                 }
             }
         }
+    }
+    // An upload's clash dialog waiting for another dialog to close.
+    if s.dialog.is_none() && !s.clash_waiting.is_empty() {
+        actions::next_clash(s);
+        changed = true;
     }
     changed
 }
@@ -840,6 +858,35 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
     load(s, p);
 }
 
+/// The clash dialog over a fake account's Drive folder, for sample files in %TEMP%.
+fn clash_scene(s: &mut State, all: bool) {
+    let dir = std::env::temp_dir().join("openexplorer-clash-scene");
+    let _ = std::fs::create_dir_all(dir.join("Projetos"));
+    for name in ["Relatório.pdf", "foto.jpg", "notas.txt"] {
+        let _ = std::fs::write(dir.join(name), name);
+    }
+    let to = Location::Drive { email: "voce@gmail.com".into(), space: Space::MyDrive, path: vec![("x".into(), "Trabalho".into())] };
+    s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+    switch(s, 0, Location::Local(dir.clone()));
+    s.panes[1].go(to.clone());
+    let e = |id: &str, name: &str, mime: &str| Entry {
+        id: id.into(),
+        name: name.into(),
+        is_dir: mime == openexplorer_gdrive::api::FOLDER_MIME,
+        size: Some(120_000),
+        modified: Some(SystemTime::now()),
+        target: None,
+        mime: Some(mime.into()),
+        md5: None,
+    };
+    let existing = vec![e("a", "Relatório.pdf", "application/pdf"), e("b", "foto.jpg", "image/jpeg"), e("c", "Projetos", openexplorer_gdrive::api::FOLDER_MIME)];
+    s.panes[1].set_entries(Ok(existing.clone()));
+    let sources = ["Projetos", "Relatório.pdf", "foto.jpg", "notas.txt"].map(|n| dir.join(n)).to_vec();
+    let up = actions::Upload { email: "voce@gmail.com".into(), parent: "x".into(), to: to.clone(), sources, remove: false, reload: vec![to] };
+    let chosen = if all { Vec::new() } else { vec![uploads::Clash::KeepBoth] };
+    s.dialog = Some(actions::Dialog::Clash(Box::new(actions::ClashAsk { up, existing, clashes: vec![0, 1, 2], chosen, all })));
+}
+
 fn main() {
     rune::run(AppSpec::<State> {
         min_size: Some((900.0, 420.0)),
@@ -868,6 +915,10 @@ fn main() {
             }),
             // Opções open.
             ("options", |s| s.dialog = Some(actions::Dialog::Options)),
+            // An upload whose names are taken in the Drive folder: all at once, or the second
+            // of three asked on its own.
+            ("clash", |s| clash_scene(s, true)),
+            ("clash-each", |s| clash_scene(s, false)),
             // The transfer queue with a row in each state.
             ("copying", |s| {
                 use transfers::{End, Op};
@@ -911,6 +962,34 @@ mod tests {
 
     fn entries(from: usize, n: usize) -> Vec<Entry> {
         (from..from + n).map(|i| Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None }).collect()
+    }
+
+    /// Dropping items whose names the Drive folder already has asks first, one by one once
+    /// Aplicar a todos is off; Cancelar drops the upload, and skipping everything sends nothing.
+    #[test]
+    fn an_upload_into_taken_names_asks_before_starting() {
+        let mut s = init();
+        s.cache = cache::Cache::memory_only();
+        clash_scene(&mut s, true);
+        let Some(actions::Dialog::Clash(ask)) = s.dialog.take() else { panic!("no clash dialog") };
+        let (to, sources) = (ask.up.to.clone(), ask.up.sources.clone());
+        // The same upload as a drop on the Drive pane: checked against its listing.
+        dropped(&mut s, 1, &sources);
+        let Some(actions::Dialog::Clash(ask)) = &s.dialog else { panic!("no clash dialog") };
+        assert_eq!(ask.clashes, [0, 1, 2]);
+        assert!(ask.all);
+        actions::toggle_clash_all(&mut s);
+        actions::answer_clash(&mut s, Some(uploads::Clash::Skip));
+        let Some(actions::Dialog::Clash(ask)) = &s.dialog else { panic!("the dialog should ask about the next one") };
+        assert_eq!(ask.up.sources[ask.current()].file_name().unwrap(), "Relatório.pdf");
+        actions::answer_clash(&mut s, None);
+        assert!(s.dialog.is_none() && s.transfers.is_empty());
+        // Every name taken, and all skipped: nothing is queued.
+        let only_taken: Vec<PathBuf> = sources.iter().filter(|p| !p.ends_with("notas.txt") && !p.is_dir()).cloned().collect();
+        actions::upload(&mut s, only_taken, &to, false, vec![]);
+        actions::answer_clash(&mut s, Some(uploads::Clash::Skip));
+        assert!(s.dialog.is_none() && s.transfers.is_empty());
+        assert!(s.status.starts_with("Nada enviado"), "{}", s.status);
     }
 
     #[test]

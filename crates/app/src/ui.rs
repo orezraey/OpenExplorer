@@ -409,7 +409,63 @@ fn dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
         }
         Dialog::Properties(p) => props_dialog(s, k, p, layer),
         Dialog::Options => options_dialog(s, k, layer),
+        Dialog::Clash(ask) => clash_dialog(s, k, ask, layer),
     }
+}
+
+/// Names an upload would repeat in its Drive folder, as Air Explorer asks: all at once with
+/// Aplicar a todos ticked, else one by one ("2 de 3"). Closing it cancels the upload.
+fn clash_dialog(s: &State, k: &Kit, ask: &actions::ClashAsk, layer: &mut Vec<El>) {
+    let n = ask.clashes.len();
+    let name_of = |i: usize| ask.up.sources[i].file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    let place = crumbs(&ask.up.to).last().map(|c| c.label.clone()).unwrap_or_default();
+    let all = ask.all && n > 1;
+    let shown: Vec<usize> = if all { ask.clashes.clone() } else { vec![ask.current()] };
+    let current = name_of(shown[0]);
+    let title = match (n, all) {
+        (1, _) => format!("\"{current}\" já existe"),
+        (_, true) => format!("{n} itens já existem"),
+        (_, false) => format!("\"{current}\" já existe ({} de {n})", ask.chosen.len() + 1),
+    };
+    // A folder meeting a folder is merged; the choice is for the files in it.
+    let merged = |i: usize| ask.up.sources[i].is_dir() && ask.there(&name_of(i)).is_some_and(|e| e.is_dir && e.target.is_none() && e.mime.as_deref().is_none_or(|m| m == openexplorer_gdrive::api::FOLDER_MIME));
+    let muted = |t: String| text(t).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
+    let lead = if shown.len() == 1 { format!("Já existe um item com esse nome em \"{place}\".") } else { format!("Já existem itens com estes nomes em \"{place}\".") };
+    let mut list = col().key("items").w_full().gap(4.0);
+    for &i in shown.iter().take(6) {
+        let name = name_of(i);
+        let glyph = ask.there(&name).map_or_else(|| el().w(16.0), |e| entry_icon(s, &ask.up.to, e, 16.0));
+        let mut line = row().key(format!("item-{i}")).w_full().gap(6.0).center_y().child(glyph).child(text(name).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0));
+        if merged(i) {
+            line = line.child(el().grow(1.0)).child(text("pasta: juntar conteúdo").font(k.ty.text_xsmall).color(k.c.text_muted));
+        }
+        list = list.child(line);
+    }
+    if shown.len() > 6 {
+        list = list.child(text(format!("e mais {}", ui_count(shown.len() - 6))).font(k.ty.text_small).color(k.c.text_muted));
+    }
+    let mut body = col().w_full().gap(12.0).child(muted(lead)).child(list);
+    if shown.iter().any(|&i| merged(i)) {
+        body = body.child(muted("Uma pasta que já existe recebe o conteúdo enviado; a escolha vale para os arquivos dentro dela que já existirem.".into()));
+    }
+    body = body.child(muted("Substituir envia o arquivo como nova versão do que está no Drive (a anterior fica no histórico de versões). Manter os dois envia com outro nome, como \"nome (2).ext\".".into()));
+    if n > 1 {
+        body = body.child(rune_kit::Checkbox::new(ask.all).label("Aplicar a todos").on_toggle(actions::toggle_clash_all).build(k));
+    }
+    let choice = |label: &str, c: crate::uploads::Clash, variant: ButtonVariant| Button::new(label).variant(variant).on_press(move |s: &mut State| actions::answer_clash(s, Some(c))).build(k);
+    let buttons = row()
+        .key("actions")
+        .w_full()
+        .pt(4.0)
+        .gap(8.0)
+        .justify_end()
+        .child(Button::new("Cancelar").variant(ButtonVariant::Neutral).on_press(|s: &mut State| actions::answer_clash(s, None)).build(k))
+        .child(el().grow(1.0))
+        .child(choice("Pular", crate::uploads::Clash::Skip, ButtonVariant::Neutral))
+        .child(choice("Manter os dois", crate::uploads::Clash::KeepBoth, ButtonVariant::Neutral))
+        .child(choice("Substituir", crate::uploads::Clash::Replace, ButtonVariant::Submit));
+    let body = col().key("content").w_full().px(16.0).pb(16.0).child(body.child(buttons));
+    Modal::new("clash", title).open(true).child(body).width(520.0).fit().on_close(|s: &mut State| actions::answer_clash(s, None)).build(k, layer);
 }
 
 /// The colours and font of the in-place rename field, copied out of the kit so the row builder
