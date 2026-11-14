@@ -7,7 +7,9 @@
 //!   the connection drops or Google answers 5xx, Drive is asked how much it kept and the rest
 //!   is sent from there, after a backoff.
 //!
-//! Either way the file's dates come along, its type is taken from the extension, and `sent`
+//! The same two routes also send a new version of a file already in Drive ([`Drive::upload_version`]).
+//!
+//! Either way the file's date comes along, a new file's type is taken from its extension, and `sent`
 //! hears how many bytes have gone (and stops the upload by answering `false`).
 //! <https://developers.google.com/workspace/drive/api/guides/manage-uploads>
 
@@ -16,7 +18,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::api::{Drive, DriveFile, FILE_FIELDS, RawFile};
+use crate::api::{Drive, DriveFile, FILE_FIELDS, RawFile, checked};
 use crate::{CANCELLED, Result};
 
 pub(crate) const UPLOAD: &str = "https://www.googleapis.com/upload/drive/v3/files";
@@ -70,15 +72,55 @@ fn parse(body: &str, what: &str) -> Result<DriveFile> {
     Ok(raw.into())
 }
 
+/// Where an upload's content goes.
+enum Dest<'a> {
+    /// A new file `name` in folder `parent`.
+    New { parent: &'a str, name: &'a str },
+    /// A new version of file `id`, which keeps its id, name, folder and sharing.
+    Version { id: &'a str },
+}
+
+/// One upload's request, the same for the multipart and the resumable route: the method, the
+/// URL (without its query), the metadata sent along, and the content's type.
+struct Target {
+    method: &'static str,
+    url: String,
+    meta: serde_json::Value,
+    mime: String,
+}
+
 impl Drive {
     /// Uploads the file at `path` into folder `parent` as `name`.
     pub fn upload(&self, path: &Path, parent: &str, name: &str, sent: &mut dyn FnMut(u64) -> bool) -> Result<DriveFile> {
-        let what = format!("Enviar \"{name}\"");
+        self.send_file(path, Dest::New { parent, name }, &format!("Enviar \"{name}\""), sent)
+    }
+
+    /// Replaces the content of Drive file `id` with the file at `path`: Drive keeps it as a new
+    /// version of the same file (`files.update` with media), so its id, name, folder, sharing
+    /// and earlier versions stay. Small or large, it goes the way [`Drive::upload`] does, with
+    /// the same retries and resuming.
+    pub fn upload_version(&self, id: &str, path: &Path, sent: &mut dyn FnMut(u64) -> bool) -> Result<DriveFile> {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.send_file(path, Dest::Version { id: checked(id)? }, &format!("Substituir \"{name}\""), sent)
+    }
+
+    fn send_file(&self, path: &Path, dest: Dest, what: &str, sent: &mut dyn FnMut(u64) -> bool) -> Result<DriveFile> {
         let meta = std::fs::metadata(path).map_err(|e| format!("{what}: {e}"))?;
         let size = meta.len();
-        let mut body = serde_json::json!({ "name": name, "parents": [parent], "mimeType": mime_of(name) });
+        let local_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut target = match dest {
+            Dest::New { parent, name } => {
+                let mime = mime_of(name);
+                let meta = serde_json::json!({ "name": name, "parents": [parent], "mimeType": mime });
+                Target { method: "POST", url: self.upload_url.clone(), meta, mime }
+            }
+            // The type is left as it is: only the content and its date change.
+            Dest::Version { id } => {
+                Target { method: "PATCH", url: format!("{}/{id}", self.upload_url.trim_end_matches('/')), meta: serde_json::json!({}), mime: mime_of(&local_name) }
+            }
+        };
         if let Some(t) = meta.modified().ok().and_then(rfc3339) {
-            body["modifiedTime"] = t.into();
+            target.meta["modifiedTime"] = t.into();
         }
         let started = Instant::now();
         // The furthest point reached, for the log's speed.
@@ -87,34 +129,38 @@ impl Drive {
             reached = reached.max(n);
             sent(n)
         };
-        let out = if size <= SIMPLE_MAX { self.upload_simple(path, &body, size, &mut track, &what) } else { self.upload_resumable(path, &body, size, &mut track, &what) };
+        let out = if size <= SIMPLE_MAX { self.upload_simple(path, &target, size, &mut track, what) } else { self.upload_resumable(path, &target, size, &mut track, what) };
         let secs = started.elapsed().as_secs_f64();
         let speed = reached as f64 / secs.max(0.001) / 1_048_576.0;
         let how = match &out {
             Ok(_) => "ok".to_string(),
             Err(e) => e.clone(),
         };
-        crate::log(&format!("upload {reached} de {size} bytes em {secs:.1} s ({speed:.1} MB/s): {how}"));
+        crate::log(&format!("upload ({}) {reached} de {size} bytes em {secs:.1} s ({speed:.1} MB/s): {how}", target.method));
         out
     }
 
-    /// Name and content in one multipart/related request.
-    fn upload_simple(&self, path: &Path, meta: &serde_json::Value, size: u64, sent: &mut dyn FnMut(u64) -> bool, what: &str) -> Result<DriveFile> {
+    /// The upload request for `target`: a new file or a new version.
+    fn start(&self, target: &Target, url: &str) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
+        if target.method == "PATCH" { self.uploads.patch(url) } else { self.uploads.post(url) }
+    }
+
+    /// Metadata and content in one multipart/related request.
+    fn upload_simple(&self, path: &Path, target: &Target, size: u64, sent: &mut dyn FnMut(u64) -> bool, what: &str) -> Result<DriveFile> {
         let content = std::fs::read(path).map_err(|e| format!("{what}: {e}"))?;
         // A boundary no file is likely to hold.
         let boundary = format!("openexplorer-{:x}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
         let mut req = Vec::with_capacity(content.len() + 512);
-        req.extend_from_slice(format!("--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n--{boundary}\r\nContent-Type: {}\r\n\r\n", meta["mimeType"].as_str().unwrap_or("application/octet-stream")).as_bytes());
+        req.extend_from_slice(format!("--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{}\r\n--{boundary}\r\nContent-Type: {}\r\n\r\n", target.meta, target.mime).as_bytes());
         req.extend_from_slice(&content);
         req.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-        let url = format!("{}?uploadType=multipart&supportsAllDrives=true&fields={FILE_FIELDS}", self.upload_url);
+        let url = format!("{}?uploadType=multipart&supportsAllDrives=true&fields={FILE_FIELDS}", target.url);
         for attempt in 0..=RETRIES {
             if !sent(0) {
                 return Err(CANCELLED.into());
             }
             let resp = self
-                .uploads
-                .post(&url)
+                .start(target, &url)
                 .header("Authorization", &format!("Bearer {}", self.token()?))
                 .header("Content-Type", &format!("multipart/related; boundary={boundary}"))
                 .send(&req[..]);
@@ -141,17 +187,16 @@ impl Drive {
     }
 
     /// Opens a resumable session, then streams the file into it, resuming after failures.
-    fn upload_resumable(&self, path: &Path, meta: &serde_json::Value, size: u64, sent: &mut dyn FnMut(u64) -> bool, what: &str) -> Result<DriveFile> {
-        let url = format!("{}?uploadType=resumable&supportsAllDrives=true&fields={FILE_FIELDS}", self.upload_url);
+    fn upload_resumable(&self, path: &Path, target: &Target, size: u64, sent: &mut dyn FnMut(u64) -> bool, what: &str) -> Result<DriveFile> {
+        let url = format!("{}?uploadType=resumable&supportsAllDrives=true&fields={FILE_FIELDS}", target.url);
         let mut session = None;
         for attempt in 0..=RETRIES {
             let resp = self
-                .uploads
-                .post(&url)
+                .start(target, &url)
                 .header("Authorization", &format!("Bearer {}", self.token()?))
-                .header("X-Upload-Content-Type", meta["mimeType"].as_str().unwrap_or("application/octet-stream"))
+                .header("X-Upload-Content-Type", &target.mime)
                 .header("X-Upload-Content-Length", &size.to_string())
-                .send_json(meta);
+                .send_json(&target.meta);
             match resp {
                 Ok(mut r) => {
                     let status = r.status().as_u16();
@@ -389,6 +434,75 @@ mod tests {
         let _ = std::fs::remove_file(file);
     }
 
+
+    #[test]
+    fn a_new_version_of_a_small_file_patches_that_file_in_one_request() {
+        let file = std::env::temp_dir().join(format!("openexplorer-version-small-{}.txt", std::process::id()));
+        std::fs::write(&file, "versão 2").unwrap();
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let fake = std::thread::spawn(move || {
+            let mut s = BufReader::new(server.accept().unwrap().0);
+            let (line, _, body) = request(&mut s, usize::MAX);
+            assert!(line.starts_with("PATCH /abc_123?uploadType=multipart"), "{line}");
+            let body = String::from_utf8(body).unwrap();
+            // Only the content and its date: the name, folder and type stay as Drive has them.
+            assert!(body.contains("versão 2") && body.contains("modifiedTime"), "{body}");
+            assert!(!body.contains("parents") && !body.contains("\"name\""), "{body}");
+            answer(&mut s, "200 OK", "", r#"{"id":"abc_123","name":"nota.txt","mimeType":"text/plain","size":"9"}"#);
+        });
+        let d = Drive::for_tests(format!("{base}/"));
+        let made = d.upload_version("abc_123", &file, &mut |_| true).unwrap();
+        fake.join().unwrap();
+        assert_eq!(made.id, "abc_123");
+        assert!(d.upload_version("../outro", &file, &mut |_| true).unwrap_err().contains("Id inválido"));
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn a_new_version_of_a_big_file_resumes_after_the_connection_drops() {
+        let file = std::env::temp_dir().join(format!("openexplorer-version-big-{}.bin", std::process::id()));
+        let content: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 241) as u8).collect();
+        std::fs::write(&file, &content).unwrap();
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let session = format!("{base}/session");
+        let expected = content.clone();
+        let fake = std::thread::spawn(move || {
+            let next = || BufReader::new(server.accept().unwrap().0);
+            // The session is opened on the file itself.
+            let mut s = next();
+            let (line, h, meta) = request(&mut s, usize::MAX);
+            assert!(line.starts_with("PATCH /existente?uploadType=resumable"), "{line}");
+            assert_eq!(header(&h, "x-upload-content-length"), "6291456");
+            assert!(!String::from_utf8_lossy(&meta).contains("parents"));
+            answer(&mut s, "200 OK", &format!("Location: {session}\r\n"), "");
+            // The line drops after 2 MB.
+            let mut s = next();
+            let (_, h, first) = request(&mut s, 2 * 1024 * 1024);
+            assert_eq!(header(&h, "content-range"), "bytes 0-6291455/6291456");
+            drop(s);
+            let mut s = next();
+            request(&mut s, 0);
+            answer(&mut s, "308 Resume Incomplete", "Range: bytes=0-2097151\r\n", "");
+            let mut s = next();
+            let (_, h, rest) = request(&mut s, usize::MAX);
+            assert_eq!(header(&h, "content-range"), "bytes 2097152-6291455/6291456");
+            assert_eq!([first, rest].concat(), expected);
+            answer(&mut s, "200 OK", "", r#"{"id":"existente","name":"grande.bin","mimeType":"application/octet-stream","size":"6291456"}"#);
+        });
+        let d = Drive::for_tests(format!("{base}/"));
+        let mut seen = Vec::new();
+        let made = d.upload_version("existente", &file, &mut |n| {
+            seen.push(n);
+            true
+        });
+        fake.join().unwrap();
+        assert_eq!(made.unwrap().id, "existente");
+        assert!(seen.contains(&2_097_152));
+        assert_eq!(seen.last(), Some(&6_291_456));
+        let _ = std::fs::remove_file(file);
+    }
     #[test]
     fn a_resumed_upload_goes_on_after_what_drive_kept() {
         assert_eq!(kept(Some("bytes=0-262143")), 262_144);

@@ -405,7 +405,7 @@ pub struct Revision {
 
 /// A Drive id, refused if it holds anything but `[A-Za-z0-9_-]`, so it can't reach into the
 /// request path or query.
-fn checked(id: &str) -> Result<&str> {
+pub(crate) fn checked(id: &str) -> Result<&str> {
     if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') { Ok(id) } else { Err(format!("Id inválido: {id}")) }
 }
 

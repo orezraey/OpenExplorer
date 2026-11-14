@@ -12,6 +12,7 @@ use rune::{TextEdit, Tx};
 
 use crate::model::{Entry, Location, Space};
 use crate::transfers::{self, End, Op};
+use crate::uploads::{Clash, Existing, Item, Put};
 use crate::{Msg, State, background, open as open_entry, open_drive, ops};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +36,8 @@ pub enum Dialog {
     Properties(Box<Props>),
     /// Opções: the theme and transfers at once, applied as they change.
     Options,
+    /// Names an upload would repeat in its Drive folder: Substituir, Pular or Manter os dois.
+    Clash(Box<ClashAsk>),
 }
 
 pub fn selected(s: &State, p: usize) -> Vec<Entry> {
@@ -286,18 +289,176 @@ pub fn local_transfer(s: &mut State, op: Op, sources: Vec<PathBuf>, dst: PathBuf
     });
 }
 
+/// An upload waiting for its names to be checked against the Drive folder it goes into.
+pub struct Upload {
+    pub email: String,
+    /// The Drive folder's id, and where it is.
+    pub parent: String,
+    pub to: Location,
+    pub sources: Vec<PathBuf>,
+    pub remove: bool,
+    pub reload: Vec<Location>,
+}
+
 /// Uploads `sources` (files and folders on the computer) into the Drive folder `to` shows, a
 /// row each in the queue. With `remove` (Recortar), each original goes to the Recycle Bin once
 /// all of it arrived.
+///
+/// Names are checked first against what the folder holds: the listing a pane shows of it
+/// when it's complete, else a fresh one. When any is taken, the clash dialog asks what to do
+/// before anything starts.
 pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool, reload: Vec<Location>) {
     let Some((email, parent)) = drive_folder(to) else {
         s.status = "Abra uma pasta do Drive (ou um drive compartilhado) para enviar para ela.".into();
         return;
     };
-    let dest = End::drive(to, None);
-    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Upload, sources.iter().map(|p| (End::local(p), dest.clone())));
+    let up = Upload { email: email.clone(), parent: parent.clone(), to: to.clone(), sources, remove, reload };
+    if let Some(pane) = s.panes.iter().find(|p| p.loc == *to && !p.loading && p.error.is_none()) {
+        let existing = pane.entries.clone();
+        return ask_clashes(s, up, existing);
+    }
+    let (cached, outbox, wake) = (s.drives.get(&email).cloned(), s.outbox.clone(), s.waker.clone());
+    std::thread::spawn(move || {
+        let (made, result) = match cached.map_or_else(|| crate::open_drive(&email).map(|d| (Some(d.clone()), d)), |d| Ok((None, d))) {
+            Ok((made, d)) => {
+                let mut out = Vec::new();
+                let listed = d.list(&parent, None, |page, _| {
+                    out.extend(page.into_iter().map(crate::entry_of));
+                    true
+                });
+                (made.map(|d| (email, d)), listed.map(|_| out))
+            }
+            Err(e) => (None, Err(e)),
+        };
+        let _ = outbox.send(Msg::Clashes { up, made, result });
+        if let Some(w) = wake {
+            w();
+        }
+    });
+}
+
+/// The Drive folder's listing for an upload arrived.
+pub fn clashes_listed(s: &mut State, up: Upload, result: Result<Vec<Entry>, String>) {
+    match result {
+        Ok(existing) => ask_clashes(s, up, existing),
+        Err(e) => s.status = format!("Não consegui ver o que já existe no destino: {e}"),
+    }
+}
+
+/// An upload whose names are taken in its Drive folder, waiting for Substituir, Pular or
+/// Manter os dois.
+pub struct ClashAsk {
+    pub up: Upload,
+    /// What the folder holds.
+    pub existing: Vec<Entry>,
+    /// The sources whose names are taken, by position.
+    pub clashes: Vec<usize>,
+    /// The choices made so far, for the first of `clashes`.
+    pub chosen: Vec<Clash>,
+    /// Aplicar a todos: the next choice goes for every clash left.
+    pub all: bool,
+}
+
+impl ClashAsk {
+    /// The source the dialog asks about now, by position.
+    pub fn current(&self) -> usize {
+        self.clashes[self.chosen.len().min(self.clashes.len() - 1)]
+    }
+
+    /// What's already in the folder under `name`.
+    pub fn there(&self, name: &str) -> Option<&Entry> {
+        self.existing.iter().find(|e| e.name == name)
+    }
+}
+
+fn file_name(p: &std::path::Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Starts `up` at once if none of its names is taken in `existing`, else asks: in the clash
+/// dialog, or after the one open now.
+fn ask_clashes(s: &mut State, up: Upload, existing: Vec<Entry>) {
+    let names: Vec<String> = up.sources.iter().map(|p| file_name(p)).collect();
+    let found: Vec<Existing> = existing.iter().map(Existing::of_entry).collect();
+    let clashes = crate::uploads::clashes(&names, &found);
+    if clashes.is_empty() {
+        return start_upload(s, up, &found, &[]);
+    }
+    let ask = ClashAsk { up, existing, clashes, chosen: Vec::new(), all: true };
+    if s.dialog.is_none() {
+        s.dialog = Some(Dialog::Clash(Box::new(ask)));
+    } else {
+        s.clash_waiting.push_back(ask);
+    }
+}
+
+/// Aplicar a todos, ticked or not.
+pub fn toggle_clash_all(s: &mut State) {
+    if let Some(Dialog::Clash(ask)) = &mut s.dialog {
+        ask.all = !ask.all;
+    }
+}
+
+/// An answer in the clash dialog: a choice for the item it asks about (for all left, with
+/// Aplicar a todos), or `None` for Cancelar, which drops the whole upload. Once every clash
+/// has its choice the upload starts.
+pub fn answer_clash(s: &mut State, choice: Option<Clash>) {
+    let Some(Dialog::Clash(mut ask)) = s.dialog.take() else { return };
+    let Some(c) = choice else {
+        s.status = "Envio cancelado.".into();
+        return next_clash(s);
+    };
+    let n = if ask.all { ask.clashes.len() - ask.chosen.len() } else { 1 };
+    ask.chosen.extend(std::iter::repeat_n(c, n));
+    if ask.chosen.len() < ask.clashes.len() {
+        s.dialog = Some(Dialog::Clash(ask));
+        return;
+    }
+    let found: Vec<Existing> = ask.existing.iter().map(Existing::of_entry).collect();
+    let choices: Vec<(usize, Clash)> = ask.clashes.iter().copied().zip(ask.chosen.iter().copied()).collect();
+    start_upload(s, ask.up, &found, &choices);
+    next_clash(s);
+}
+
+/// Opens the clash dialog of the next upload waiting for one, if the window has no dialog.
+pub fn next_clash(s: &mut State) {
+    if s.dialog.is_none()
+        && let Some(ask) = s.clash_waiting.pop_front()
+    {
+        s.dialog = Some(Dialog::Clash(Box::new(ask)));
+    }
+}
+
+/// Queues `up`'s rows and starts it, each taken name settled by its entry in `choices`
+/// (source position, choice). Items skipped get no row.
+fn start_upload(s: &mut State, up: Upload, existing: &[Existing], choices: &[(usize, Clash)]) {
+    let choice = |i: usize| choices.iter().find(|(j, _)| *j == i).map_or(Clash::KeepBoth, |(_, c)| *c);
+    let local: Vec<(String, bool)> = up.sources.iter().map(|p| (file_name(p), p.is_dir())).collect();
+    let puts = crate::uploads::resolve(&local, existing, choice);
+    let mut items = Vec::new();
+    let mut skipped = 0;
+    for (i, (path, put)) in up.sources.into_iter().zip(puts).enumerate() {
+        if put == Put::Skip {
+            skipped += 1;
+        } else {
+            items.push(Item { path, put, clash: choice(i) });
+        }
+    }
+    if items.is_empty() {
+        s.status = format!("Nada enviado: {} já existe{} no destino.", count(skipped), if skipped == 1 { "" } else { "m" });
+        return;
+    }
+    let dest = End::drive(&up.to, None);
+    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Upload, items.iter().map(|it| (End::local(&it.path), dest.clone())));
     let at_once = s.settings.uploads.into();
-    drive_job(s, &email, reload, move |d| crate::uploads::run(d, &batch, &sources, &parent, remove, at_once));
+    let (parent, remove) = (up.parent, up.remove);
+    drive_job(s, &up.email, up.reload, move |d| {
+        let summary = crate::uploads::run(d, &batch, &items, &parent, remove, at_once);
+        match summary {
+            Ok(line) if skipped > 0 => Ok(format!("{line} Pulados (já existiam): {skipped}.")),
+            other => other,
+        }
+    });
 }
 
 /// A listed Drive item as the Drive client takes it.

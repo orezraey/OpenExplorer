@@ -110,6 +110,12 @@ impl Progress {
         self.tick(false);
     }
 
+    /// Takes `bytes` off its size: part of it left out (an upload's skipped files).
+    pub fn unsize(&self, bytes: u64) {
+        let _ = self.total.try_update(Ordering::Relaxed, Ordering::Relaxed, |t| Some(t.saturating_sub(bytes)));
+        self.tick(false);
+    }
+
     /// Starts it running, unless it was cancelled while waiting.
     pub fn begin(&self) -> bool {
         if self.stage.compare_exchange(Stage::Waiting as u8, Stage::Running as u8, Ordering::Relaxed, Ordering::Relaxed).is_err() {
