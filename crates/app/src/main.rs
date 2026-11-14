@@ -7,6 +7,8 @@
 mod actions;
 mod cache;
 mod downloads;
+#[cfg(windows)]
+mod dragout;
 mod icons;
 mod layout;
 mod model;
@@ -54,6 +56,9 @@ enum Msg {
     Share { item: String, update: sharing::Update },
     /// What Copiar link found out about an item's access.
     Link(sharing::LinkAnswer),
+    /// A drag of Drive items `ids` out of pane `from` ended.
+    #[cfg(windows)]
+    DragEnded { from: usize, ids: Vec<String>, ended: dragout::Ended },
 }
 
 /// Which part of a listing a [`Msg::Listed`] is.
@@ -343,6 +348,8 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
             Msg::Share { item, update } => sharing::update(s, &item, update),
             Msg::Link(answer) => sharing::link_answer(s, answer, tx),
+            #[cfg(windows)]
+            Msg::DragEnded { from, ids, ended } => drive_drag_ended(s, from, ids, ended),
             Msg::Prop { id, update } => actions::props_update(s, id, update),
             Msg::Icon { key, rgba } => s.icons.arrived(key, rgba),
             Msg::Clashes { up, made, result } => {
@@ -831,6 +838,12 @@ fn dragged_ids(pane: &Pane, id: &str) -> Vec<String> {
 }
 
 fn drag_item(s: &State, p: usize, id: &str) -> Option<DragItem> {
+    // Drive items go out as virtual files through a drag of our own; Rune's needs files on disk.
+    #[cfg(windows)]
+    if matches!(s.panes[p].loc, Location::Drive { .. }) {
+        start_drive_drag(s, p, dragged_ids(&s.panes[p], id));
+        return None;
+    }
     let paths = paths_for(s, p, &dragged_ids(&s.panes[p], id), true);
     if paths.is_empty() {
         return None;
@@ -840,21 +853,12 @@ fn drag_item(s: &State, p: usize, id: &str) -> Option<DragItem> {
 
 /// Files on disk for the dragged entries, written first when `materialize` is set; without it
 /// this only names the paths. Simulated files become small placeholder files in the temp
-/// folder. Drive items get a path in the temp folder, and small files are fetched there (see
-/// [`fetch_for_drag`]); the rest stay names of files that don't exist yet, which only a drop
-/// on the other pane can use.
+/// folder. Drive items have none: they're dragged as virtual files (see [`start_drive_drag`]).
 fn paths_for(s: &State, p: usize, ids: &[String], materialize: bool) -> Vec<PathBuf> {
     let pane = &s.panes[p];
     match &pane.loc {
         Location::Local(dir) => ids.iter().filter_map(|id| pane.entry(id)).map(|e| dir.join(&e.name)).collect(),
-        Location::Drive { email, .. } => {
-            let entries: Vec<&Entry> = ids.iter().filter_map(|id| pane.entry(id)).collect();
-            let paths: Vec<PathBuf> = entries.iter().map(|e| drive_drag_path(&s.temp, e)).collect();
-            if materialize {
-                fetch_for_drag(s, email, &entries, &paths);
-            }
-            paths
-        }
+        Location::Drive { .. } => Vec::new(),
         Location::Mock(segs) => {
             let dir = s.temp.join(if segs.is_empty() { "Meu Drive".to_string() } else { segs.join("_") });
             if materialize && std::fs::create_dir_all(&dir).is_err() {
@@ -878,71 +882,57 @@ fn paths_for(s: &State, p: usize, ids: &[String], materialize: bool) -> Vec<Path
     }
 }
 
-/// Where a Drive item dragged out of a pane is written: its own folder (by id) in the temp
-/// folder, under the name it gets on the computer.
-fn drive_drag_path(temp: &std::path::Path, e: &Entry) -> PathBuf {
-    let name = if e.is_dir { e.name.clone() } else { openexplorer_gdrive::download::local_name(&actions::drive_file(e)) };
-    temp.join("Drive").join(ops::windows_name(&e.id)).join(ops::windows_name(&name))
-}
-
-/// The most files, and bytes in all, [`fetch_for_drag`] fetches.
-const DRAG_FETCH_FILES: usize = 10;
-const DRAG_FETCH_BYTES: u64 = 16 << 20;
-
-/// Rune's drag-out gives Windows the dragged files the moment the drag starts (a `CF_HDROP`
-/// inside `DoDragDrop`) and has no way to hand them over later, once a download is done. So a
-/// small drag (up to [`DRAG_FETCH_FILES`] files and [`DRAG_FETCH_BYTES`], no folders) is
-/// fetched right here, the window waiting the moment that takes, and can then be dropped
-/// anywhere, Explorer included. A bigger one isn't fetched: dropped on the other pane it
-/// downloads through the queue, and out of the app there's nothing to drop (see
-/// [`DRAG_OUT_NOTE`]). A copy fetched for an earlier drag is used again while it's current.
-fn fetch_for_drag(s: &State, email: &str, entries: &[&Entry], paths: &[PathBuf]) {
-    let google = |e: &Entry| e.mime.as_deref().is_some_and(|m| m.starts_with("application/vnd.google-apps."));
-    // An export's size isn't known before it's made: counted as 1 MB.
-    let bytes: u64 = entries.iter().map(|e| if google(e) { 1 << 20 } else { e.size.unwrap_or(0) }).sum();
-    if entries.len() > DRAG_FETCH_FILES || bytes > DRAG_FETCH_BYTES || entries.iter().any(|e| e.is_dir) {
+/// Starts dragging the Drive items `ids` of pane `p` out as virtual files (see [`dragout`]):
+/// nothing is fetched until the drop, so any number and size of files and folders go.
+#[cfg(windows)]
+fn start_drive_drag(s: &State, p: usize, ids: Vec<String>) {
+    let Location::Drive { email, .. } = &s.panes[p].loc else { return };
+    let Some(drive) = s.drives.get(email).cloned() else { return };
+    let files: Vec<DriveFile> = ids.iter().filter_map(|id| s.panes[p].entry(id)).map(actions::drive_file).collect();
+    if files.is_empty() {
         return;
     }
-    let Some(d) = s.drives.get(email) else { return };
-    for (e, path) in entries.iter().zip(paths) {
-        let current = std::fs::metadata(path).ok().is_some_and(|m| (google(e) || Some(m.len()) == e.size) && e.modified.is_some() && m.modified().ok() == e.modified);
-        if current {
-            continue;
-        }
-        if let Some(dir) = path.parent()
-            && std::fs::create_dir_all(dir).is_ok()
-            && let Err(err) = d.download(&actions::drive_file(e), path, false, &mut |_| true)
-        {
-            openexplorer_gdrive::log(&format!("arrastar: {err}"));
-        }
+    // SAFETY: plain Win32 queries; the window pressed on is in front, and is this process's.
+    let hwnd = unsafe {
+        let w = windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+        let mut pid = 0;
+        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(w, &mut pid);
+        if pid == std::process::id() { w as isize } else { 0 }
+    };
+    if hwnd == 0 {
+        return;
     }
+    let (out, wake) = (s.outbox.clone(), s.waker.clone());
+    dragout::start(
+        hwnd,
+        drive,
+        files,
+        Box::new(move |ended| {
+            let _ = out.send(Msg::DragEnded { from: p, ids, ended });
+            if let Some(w) = &wake {
+                w();
+            }
+        }),
+    );
 }
 
-/// What a drag out of a Drive pane says when it carried files that weren't fetched.
-const DRAG_OUT_NOTE: &str = "Só dá para arrastar do Google Drive para fora do app até 10 arquivos pequenos (16 MB ao todo). Para pastas e arquivos maiores, arraste para o outro painel ou use Copiar (Ctrl+C) e Colar (Ctrl+V) numa pasta do computador.";
-
-/// Whether the drag that just ended from pane `p` was a Drive drag whose files weren't all
-/// fetched, and wasn't dropped on the other pane.
-fn drag_left_behind(s: &State, p: usize) -> bool {
-    matches!(s.panes[p].loc, Location::Drive { .. }) && s.last_drag.as_ref().is_some_and(|(from, paths)| *from == p && paths.iter().any(|f| !f.exists()))
+/// A drag of Drive items ended: let go over the other pane, they're copied there as the
+/// arrows between the panes copy; let go over another app, that app is pulling them.
+#[cfg(windows)]
+fn drive_drag_ended(s: &mut State, from: usize, ids: Vec<String>, ended: dragout::Ended) {
+    match ended {
+        dragout::Ended::InApp(to) if to != from => {
+            let pane = &mut s.panes[from];
+            pane.selected = ids.into_iter().collect();
+            s.active = to;
+            actions::copy_across(s, from, to);
+        }
+        dragout::Ended::Outside => s.status = "Baixando para onde os itens foram soltos: o Windows mostra o andamento.".into(),
+        _ => {}
+    }
 }
 
 fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
-    // A drag from a Drive pane onto the other pane: its files may not exist yet, so what it
-    // carried (the selection there) is copied or downloaded as the arrows between the panes do.
-    if let Some((from, paths)) = &s.last_drag
-        && *from != p
-        && paths.as_slice() == files
-        && matches!(s.panes[*from].loc, Location::Drive { .. })
-    {
-        let from = *from;
-        s.last_drag = None;
-        s.active = p;
-        if s.status == DRAG_OUT_NOTE {
-            s.status.clear();
-        }
-        return actions::copy_across(s, from, p);
-    }
     if let Some((from, paths)) = &s.last_drag
         && *from == p
         && paths.as_slice() == files

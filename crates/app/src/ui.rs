@@ -1415,7 +1415,6 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .on_drag_end(move |s: &mut State, outcome: DragOutcome, _| {
             s.status = match outcome {
                 DragOutcome::Cancelled => "Arrastar cancelado.".into(),
-                _ if crate::drag_left_behind(s, p) => crate::DRAG_OUT_NOTE.into(),
                 o => format!("Arrastar terminou: {o:?}"),
             };
         })

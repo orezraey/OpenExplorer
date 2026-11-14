@@ -123,15 +123,7 @@ impl Drive {
         if !file.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') || file.id.is_empty() {
             return Err(format!("Id inválido: {}", file.id));
         }
-        let base = self.api_url.trim_end_matches('/');
-        let (url, size) = if file.mime.starts_with(GOOGLE) {
-            let Some((mime, _)) = export_format(&file.mime) else {
-                return Err(format!("{what}: este tipo de arquivo do Google não pode ser baixado, só aberto no navegador."));
-            };
-            (format!("{base}/files/{}/export?mimeType={}", file.id, url::form_urlencoded::byte_serialize(mime.as_bytes()).collect::<String>()), None)
-        } else {
-            (format!("{base}/files/{}?alt=media&supportsAllDrives=true", file.id), file.size)
-        };
+        let (url, size) = self.media_url(file, &what)?;
         let part = part_path(to);
         let started = Instant::now();
         let out = self.fetch_to(&url, &part, size, pieces, got, &what).and_then(|written| {
@@ -153,6 +145,57 @@ impl Drive {
         };
         crate::log(&format!("download {}: {how}", file.id));
         out
+    }
+
+    /// Where `file`'s bytes come from, and how many there are when known: the file itself, or
+    /// its export for Google's own formats (whose size isn't known before).
+    fn media_url(&self, file: &DriveFile, what: &str) -> Result<(String, Option<u64>)> {
+        let base = self.api_url.trim_end_matches('/');
+        Ok(if file.mime.starts_with(GOOGLE) {
+            let Some((mime, _)) = export_format(&file.mime) else {
+                return Err(format!("{what}: este tipo de arquivo do Google não pode ser baixado, só aberto no navegador."));
+            };
+            (format!("{base}/files/{}/export?mimeType={}", file.id, url::form_urlencoded::byte_serialize(mime.as_bytes()).collect::<String>()), None)
+        } else {
+            (format!("{base}/files/{}?alt=media&supportsAllDrives=true", file.id), file.size)
+        })
+    }
+
+    /// A reader of `file`'s bytes from `from` on, in one request, for streaming them somewhere
+    /// else (a drag into Windows Explorer pulls them this way). The caller asks again from
+    /// where it got to when a read fails. An export, which takes no `Range`, skips to `from`.
+    pub fn open_media(&self, file: &DriveFile, from: u64) -> Result<Box<dyn Read + Send>> {
+        let what = format!("Baixar \"{}\"", file.name);
+        if file.is_dir || file.mime == FOLDER_MIME || file.mime == SHORTCUT {
+            return Err(format!("{what}: não é um arquivo."));
+        }
+        if !file.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') || file.id.is_empty() {
+            return Err(format!("Id inválido: {}", file.id));
+        }
+        let (url, _) = self.media_url(file, &what)?;
+        for renewed in [false, true] {
+            let mut req = self.downloads.get(&url).header("Authorization", &format!("Bearer {}", self.token()?)).header("Accept-Encoding", "identity");
+            if from > 0 {
+                req = req.header("Range", &format!("bytes={from}-"));
+            }
+            let mut r = req.call().map_err(|e| format!("{what}: sem conexão com o Google: {e}"))?;
+            match r.status().as_u16() {
+                206 => return Ok(Box::new(r.into_body().into_reader())),
+                200 => {
+                    let mut body = r.into_body().into_reader();
+                    if from > 0 && std::io::copy(&mut (&mut body).take(from), &mut std::io::sink()).map_err(|e| format!("{what}: {e}"))? != from {
+                        return Err(format!("{what}: o arquivo acabou antes do esperado."));
+                    }
+                    return Ok(Box::new(body));
+                }
+                401 if !renewed => self.forget_token(),
+                s => {
+                    let text = r.body_mut().read_to_string().unwrap_or_default();
+                    return Err(refused(&what, s, &text));
+                }
+            }
+        }
+        Err(format!("{what}: o Google recusou o acesso."))
     }
 
     /// Fetches `url` into `part`: `size` bytes in `pieces` segments when known, else one stream
