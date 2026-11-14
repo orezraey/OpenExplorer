@@ -19,7 +19,7 @@ use crate::layout::{self, clamp_col, clamp_tree};
 const ROW_H: f32 = crate::ROW_H;
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
-    let k = Kit::neutral(cx.system_dark());
+    let k = Kit::neutral(s.settings.theme.dark(cx.system_dark()));
     // Menus and dialogs draw in a layer above everything.
     let mut layer = Vec::new();
     let menu = context(s, &k, &mut layer);
@@ -40,6 +40,62 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(menu)
         .child(queue_menu);
     rune_kit::root(body, layer)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Opções
+
+/// A label and its control, on one line of Opções.
+fn option_row(k: &Kit, label: &str, control: El) -> El {
+    row().w_full().h(32.0).gap(12.0).center_y().child(text(label.to_string()).font(k.ty.text_small).color(k.c.text_base).w(190.0)).child(control)
+}
+
+/// A number with − and + beside it, as Air Explorer's spin boxes.
+fn stepper(k: &Kit, key: &str, value: u8, set: fn(&mut State, i32)) -> El {
+    let button = |label: &str, delta: i32, enabled: bool| {
+        Button::new(label).variant(ButtonVariant::Neutral).disabled(!enabled).on_press(move |s: &mut State| set(s, delta)).build(k).key(format!("{key}-{delta}"))
+    };
+    row()
+        .key(key.to_string())
+        .gap(6.0)
+        .center_y()
+        .child(button("−", -1, value > 1))
+        .child(text(value.to_string()).font(k.ty.text_small_medium).color(k.c.text_base).w(28.0).align(Align::Center))
+        .child(button("+", 1, value < crate::settings::MAX_AT_ONCE))
+}
+
+fn change_settings(s: &mut State, f: impl FnOnce(&mut crate::settings::Settings)) {
+    f(&mut s.settings);
+    s.settings.save();
+}
+
+fn options_dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
+    use crate::settings::{Theme, at_once};
+    let st = s.settings;
+    let theme = rune_kit::SegmentedControl::new(&Theme::ALL.map(Theme::label), Theme::ALL.iter().position(|t| *t == st.theme))
+        .label("Tema")
+        .on_pick(|s: &mut State, i: usize, _: &mut Tx| change_settings(s, |c| c.theme = Theme::ALL[i]))
+        .build(k);
+    let note = |t: &str| text(t.to_string()).font(k.ty.text_xsmall).color(k.c.text_muted).wrap().w_full();
+    let segmented = rune_kit::Checkbox::new(st.segmented_downloads)
+        .label("Baixar arquivos grandes em segmentos paralelos")
+        .description("Para aumentar a velocidade.")
+        .on_toggle(|s: &mut State| change_settings(s, |c| c.segmented_downloads = !c.segmented_downloads))
+        .build(k);
+    let body = col()
+        .key("content")
+        .w_full()
+        .px(16.0)
+        .pb(16.0)
+        .gap(6.0)
+        .child(option_row(k, "Tema", theme))
+        .child(option_row(k, "Uploads simultâneos", stepper(k, "uploads", st.uploads, |s, d| change_settings(s, |c| c.uploads = at_once(i32::from(c.uploads) + d)))))
+        .child(option_row(k, "Downloads simultâneos", stepper(k, "downloads", st.downloads, |s, d| change_settings(s, |c| c.downloads = at_once(i32::from(c.downloads) + d)))))
+        .child(el().h(6.0))
+        .child(segmented)
+        .child(note("Downloads simultâneos e segmentos paralelos valem quando o download do Google Drive chegar. Uploads simultâneos valem a partir do próximo envio."))
+        .child(row().key("actions").w_full().pt(12.0).justify_end().child(Button::new("OK").on_press(close).build(k)));
+    Modal::new("options", "Opções").open(true).child(body).width(500.0).fit().on_close(close).build(k, layer);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -94,7 +150,10 @@ fn queue_row(s: &State, k: &Kit, t: &transfers::Transfer) -> El {
         Stage::Cancelled => ("Cancelado", k.c.warning.fg),
         Stage::Failed => ("Erro", k.c.danger.fg),
     };
-    let mut state_cell = queue_cell(w[3]).child(el().size(8.0, 8.0).radius(4.0).fill(dot)).child(muted(state.into()));
+    // A folder's row counts its items while running: "Em andamento · 120 de 1.946".
+    let items = p.items.load(Relaxed);
+    let state = if p.stage() == Stage::Running && items > 1 { format!("{state} · {} de {}", ui_count(p.items_done.load(Relaxed) as usize), ui_count(items as usize)) } else { state.to_string() };
+    let mut state_cell = queue_cell(w[3]).child(el().size(8.0, 8.0).radius(4.0).fill(dot)).child(muted(state.clone()).help_when_truncated(state));
     if p.stage() == Stage::Failed {
         state_cell = state_cell.help(p.error());
     }
@@ -349,6 +408,7 @@ fn dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
             Modal::new("name", "Nova pasta").open(true).child(pad(body)).width(420.0).fit().on_close(close).build(k, layer);
         }
         Dialog::Properties(p) => props_dialog(s, k, p, layer),
+        Dialog::Options => options_dialog(s, k, layer),
     }
 }
 
@@ -772,6 +832,7 @@ fn toolbar(s: &State, k: &Kit) -> El {
         .child(sep())
         .child(tool(k, "reload-all", &icons::REFRESH, "Atualizar", true, |s: &mut State, _| load(s, s.active)))
         .child(el().grow(1.0))
+        .child(tool(k, "options", &icons::SETTINGS, "Opções", true, |s: &mut State, _| s.dialog = Some(Dialog::Options)))
         .child(text("Open Explorer").font(k.ty.text_small_medium).color(k.c.text_faint).mx(8.0))
 }
 

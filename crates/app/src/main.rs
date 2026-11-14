@@ -10,6 +10,7 @@ mod icons;
 mod layout;
 mod model;
 mod ops;
+mod settings;
 mod sysicons;
 mod transfers;
 mod uploads;
@@ -103,6 +104,8 @@ struct State {
     inbox: Receiver<Msg>,
     outbox: Sender<Msg>,
     waker: Option<Waker>,
+    /// What the user picked in Opções.
+    settings: settings::Settings,
     /// Copies and moves under way, each with its bar.
     transfers: Vec<transfers::Transfer>,
     /// The transfer queue's right-click menu: the row it was opened on, and where.
@@ -149,6 +152,7 @@ fn init() -> State {
         inbox,
         outbox,
         waker: None,
+        settings: settings::Settings::load(),
         transfers: Vec::new(),
         transfer_menu: None,
         transfers_live: 0,
@@ -862,6 +866,8 @@ fn main() {
                 switch(s, 0, Location::Local(dir.clone()));
                 switch(s, 1, Location::Local(dir.join("Projetos")));
             }),
+            // Opções open.
+            ("options", |s| s.dialog = Some(actions::Dialog::Options)),
             // The transfer queue with a row in each state.
             ("copying", |s| {
                 use transfers::{End, Op};

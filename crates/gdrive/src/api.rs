@@ -103,9 +103,13 @@ impl Drive {
 
     /// A call with the access token: GET when `body` is `None`, else `method` with a JSON body.
     /// A 401 means Google dropped the token before its expiry (revoked access, clock skew):
-    /// renew it and try once more. Each call's time goes to [`crate::log`].
+    /// renew it and try once more. A 429 or a 403 for Drive's rate limit means the request was
+    /// turned away undone (making hundreds of folders hits it): wait and send it again, up to
+    /// five times. Each call's time goes to [`crate::log`].
     fn call(&self, method: &str, path: &str, query: &[(&str, &str)], body: Option<&serde_json::Value>, what: &str) -> Result<serde_json::Value> {
-        for retry in [false, true] {
+        let mut renewed = false;
+        let mut limited = 0u32;
+        loop {
             let started = Instant::now();
             let url = format!("{API}{path}");
             let auth = format!("Bearer {}", self.token()?);
@@ -136,16 +140,29 @@ impl Drive {
                 crate::log(&format!("{method} {path} falhou em {} ms: {e}", started.elapsed().as_millis()));
                 format!("{what}: sem conexão com o Google: {e}")
             })?;
+            let mut resp = resp;
             let status = resp.status().as_u16();
-            if status == 401 && !retry {
+            if status == 401 && !renewed {
+                renewed = true;
                 *self.access.lock().unwrap() = None;
                 continue;
+            }
+            if status == 429 || status == 403 {
+                let text = resp.body_mut().read_to_string().unwrap_or_default();
+                let rate = status == 429 || text.contains("rateLimitExceeded") || text.contains("userRateLimitExceeded");
+                if rate && limited < 5 {
+                    crate::log(&format!("{method} {path} {status}: limite de taxa do Drive, tentando de novo"));
+                    std::thread::sleep(Duration::from_secs(1 << limited));
+                    limited += 1;
+                    continue;
+                }
+                crate::log(&format!("{method} {path} {status} em {} ms", started.elapsed().as_millis()));
+                return Err(format!("{what}: HTTP {status}: {}", crate::google_reason(&text)));
             }
             let out = json(resp, what);
             crate::log(&format!("{method} {path} {status} em {} ms", started.elapsed().as_millis()));
             return out;
         }
-        unreachable!("the second attempt always returns")
     }
 
     fn get(&self, path: &str, query: &[(&str, &str)], what: &str) -> Result<serde_json::Value> {

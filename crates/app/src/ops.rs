@@ -26,6 +26,9 @@ pub struct Progress {
     pub bytes: AtomicU64,
     pub total: AtomicU64,
     pub sized: AtomicBool,
+    /// Items (files and folders) done, and found so far: a folder's grow as it's walked.
+    pub items_done: AtomicU64,
+    pub items: AtomicU64,
     stage: AtomicU8,
     /// Why it failed.
     error: Mutex<String>,
@@ -46,6 +49,8 @@ impl Progress {
             bytes: AtomicU64::new(0),
             total: AtomicU64::new(0),
             sized: AtomicBool::new(false),
+            items_done: AtomicU64::new(0),
+            items: AtomicU64::new(0),
             stage: AtomicU8::new(Stage::Waiting as u8),
             error: Mutex::new(String::new()),
             began: Mutex::new(None),
@@ -145,6 +150,17 @@ impl Progress {
     /// further back).
     pub fn sub_bytes(&self, n: u64) {
         let _ = self.bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |b| Some(b.saturating_sub(n)));
+        self.tick(false);
+    }
+
+    /// More items found to do.
+    pub fn add_items(&self, n: u64) {
+        self.items.fetch_add(n, Ordering::Relaxed);
+        self.tick(false);
+    }
+
+    pub fn item_done(&self) {
+        self.items_done.fetch_add(1, Ordering::Relaxed);
         self.tick(false);
     }
 

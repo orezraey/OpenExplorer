@@ -13,6 +13,9 @@ macro_rules! icon {
 icon!(COPY_RIGHT, "copy-right", r##"<path d="M4.5 1.5L11.5 8L4.5 14.5Z" fill="currentColor"/>"##);
 icon!(COPY_LEFT, "copy-left", r##"<path d="M11.5 1.5L4.5 8L11.5 14.5Z" fill="currentColor"/>"##);
 
+// Opções, in the toolbar: a gear, in `currentColor`.
+icon!(SETTINGS, "settings", r##"<circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 1.5V3.2M8 12.8V14.5M1.5 8H3.2M12.8 8H14.5M3.4 3.4L4.6 4.6M11.4 11.4L12.6 12.6M3.4 12.6L4.6 11.4M11.4 4.6L12.6 3.4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="8" r="4.6" fill="none" stroke="currentColor" stroke-width="1.3"/>"##);
+
 // An upload, in the transfer queue: an arrow up out of a tray.
 icon!(UPLOAD, "upload", r##"<path d="M8 10.5V2.5M4.75 5.5L8 2.25L11.25 5.5M2.5 10V13.5H13.5V10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>"##);
 

@@ -33,6 +33,8 @@ pub enum Dialog {
     /// The name being typed is `State::name_edit`.
     NewFolder { pane: usize, error: Option<String> },
     Properties(Box<Props>),
+    /// Opções: the theme and transfers at once, applied as they change.
+    Options,
 }
 
 pub fn selected(s: &State, p: usize) -> Vec<Entry> {
@@ -270,7 +272,8 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
     };
     let dest = End::drive(to, None);
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Upload, sources.iter().map(|p| (End::local(p), dest.clone())));
-    drive_job(s, &email, reload, move |d| crate::uploads::run(d, &batch, &sources, &parent, remove));
+    let at_once = s.settings.uploads.into();
+    drive_job(s, &email, reload, move |d| crate::uploads::run(d, &batch, &sources, &parent, remove, at_once));
 }
 
 /// Cancelar on a row of the queue.

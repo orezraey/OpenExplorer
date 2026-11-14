@@ -21,7 +21,7 @@ pub const QUEUE_H_MAX: f32 = 700.0;
 
 /// The queue's columns: Operação, Origem, Destino, Estado, Tamanho, Progresso, Velocidade,
 /// Estimado.
-pub const QUEUE_COLS: [f32; 8] = [92.0, 300.0, 240.0, 124.0, 128.0, 112.0, 96.0, 88.0];
+pub const QUEUE_COLS: [f32; 8] = [92.0, 300.0, 240.0, 190.0, 128.0, 112.0, 96.0, 88.0];
 pub const QUEUE_COL_MIN: f32 = 50.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
