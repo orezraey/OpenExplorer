@@ -105,8 +105,9 @@ impl Drive {
     /// A 401 means Google dropped the token before its expiry (revoked access, clock skew):
     /// renew it and try once more. A 429 or a 403 for Drive's rate limit means the request was
     /// turned away undone (making hundreds of folders hits it): wait and send it again, up to
-    /// five times. Each call's time goes to [`crate::log`].
-    fn call(&self, method: &str, path: &str, query: &[(&str, &str)], body: Option<&serde_json::Value>, what: &str) -> Result<serde_json::Value> {
+    /// five times. DELETE takes no body and answers none (204): that gives `Null`. Each call's
+    /// time goes to [`crate::log`].
+    pub(crate) fn call(&self, method: &str, path: &str, query: &[(&str, &str)], body: Option<&serde_json::Value>, what: &str) -> Result<serde_json::Value> {
         let mut renewed = false;
         let mut limited = 0u32;
         loop {
@@ -114,6 +115,7 @@ impl Drive {
             let url = format!("{API}{path}");
             let auth = format!("Bearer {}", self.token()?);
             let sent = match (method, body) {
+                ("DELETE", _) => self.agent.delete(&url).header("Authorization", &auth).query_pairs(query.iter().copied()).call(),
                 ("GET", _) | (_, None) => {
                     let mut req = self.agent.get(&url).header("Authorization", &auth);
                     for (k, v) in query {
@@ -159,7 +161,7 @@ impl Drive {
                 crate::log(&format!("{method} {path} {status} em {} ms", started.elapsed().as_millis()));
                 return Err(format!("{what}: HTTP {status}: {}", crate::google_reason(&text)));
             }
-            let out = json(resp, what);
+            let out = if status == 204 { Ok(serde_json::Value::Null) } else { json(resp, what) };
             crate::log(&format!("{method} {path} {status} em {} ms", started.elapsed().as_millis()));
             return out;
         }
@@ -391,7 +393,7 @@ pub struct Revision {
 
 /// A Drive id, refused if it holds anything but `[A-Za-z0-9_-]`, so it can't reach into the
 /// request path or query.
-fn checked(id: &str) -> Result<&str> {
+pub(crate) fn checked(id: &str) -> Result<&str> {
     if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') { Ok(id) } else { Err(format!("Id inválido: {id}")) }
 }
 
