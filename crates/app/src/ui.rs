@@ -432,7 +432,11 @@ fn dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
                 [one] => format!("Excluir \"{}\" permanentemente?", shown(&one.name)),
                 many => format!("Excluir {} itens permanentemente?", ui_count(many.len())),
             };
-            let note = "Os itens serão apagados para sempre do Google Drive. Isso não pode ser desfeito.";
+            let note = if s.panes[*pane].loc.is_local() {
+                "Aqui não há Lixeira: os itens serão apagados para sempre. Isso não pode ser desfeito."
+            } else {
+                "Os itens serão apagados para sempre do Google Drive. Isso não pode ser desfeito."
+            };
             let body = col()
                 .w_full()
                 .gap(12.0)
@@ -1263,6 +1267,8 @@ fn navbar(s: &State, k: &Kit, p: usize) -> El {
 fn search_box(s: &State, k: &Kit, p: usize) -> El {
     let loc = &s.panes[p].loc;
     let place = match loc {
+        // The index reads the computer's own disks: the network has nothing in it.
+        Location::Local(dir) if crate::network::is_remote(dir) => return el().key("search"),
         Location::Local(dir) => crate::finder::place_of(dir),
         Location::Found(f) => f.place.clone(),
         _ => match actions::search_scope(loc) {
@@ -1387,7 +1393,7 @@ fn search_bar(s: &State, k: &Kit, p: usize) -> El {
 
 fn can_go_up(loc: &Location) -> bool {
     match loc {
-        Location::Local(dir) => dir.parent().is_some(),
+        Location::Local(dir) => crate::network::parent(dir).is_some(),
         Location::Found(_) => false,
         Location::Mock(segs) => !segs.is_empty(),
         Location::Drive { space, path, .. } => !path.is_empty() || matches!(space, Space::Shared { .. }),

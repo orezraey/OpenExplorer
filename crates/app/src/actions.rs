@@ -78,10 +78,11 @@ fn account(loc: &Location) -> Option<&str> {
 }
 
 /// Whether `loc` is a folder items can be put in (Colar, Nova pasta) and taken out of
-/// (Recortar): not the shared drives list, Drive's views or Lixeira, nor the simulated drive.
+/// (Recortar): not the shared drives list, Drive's views or Lixeira, nor the simulated drive,
+/// nor a computer on the network (`\\servidor`, whose items are its shared folders).
 pub fn editable(loc: &Location) -> bool {
     match loc {
-        Location::Local(_) => true,
+        Location::Local(dir) => !crate::network::is_server(dir),
         Location::Mock(_) | Location::Found(_) => false,
         Location::Drive { .. } => drive_folder(loc).is_some(),
     }
@@ -118,6 +119,7 @@ fn why_not(loc: &Location) -> String {
         }
         Location::Mock(_) => "O drive simulado só serve para testar a interface; abra o disco local ou o Google Drive.".into(),
         Location::Found(_) => "Os resultados da pesquisa não são uma pasta: abra uma pasta para colar, criar pastas ou recortar.".into(),
+        Location::Local(dir) if crate::network::is_server(dir) => "Aqui estão as pastas compartilhadas do computador: abra uma delas para mexer no que tem dentro.".into(),
         _ => "Não dá para fazer isso aqui.".into(),
     }
 }
@@ -687,6 +689,8 @@ pub fn search_computer(s: &mut State, p: usize) {
     s.searched[p] = text.clone();
     let loc = s.panes[p].loc.clone();
     let within = match &loc {
+        // The index has nothing of the network's (the field isn't shown there).
+        Location::Local(dir) if crate::network::is_remote(dir) => return,
         Location::Local(dir) => Some(dir.clone()),
         Location::Found(f) => f.within.clone(),
         _ => return,
@@ -799,6 +803,14 @@ pub fn ask_delete(s: &mut State, p: usize) {
     if !items_editable(&s.panes[p].loc) {
         return not_here(s, p);
     }
+    // The network and WSL have no Lixeira: Del deletes for good there, after asking (as
+    // Explorer does).
+    if let Location::Local(dir) = &s.panes[p].loc
+        && crate::network::is_remote(dir)
+    {
+        s.dialog = Some(Dialog::Purge { pane: p, items });
+        return;
+    }
     s.dialog = Some(Dialog::Delete { pane: p, items });
 }
 
@@ -855,8 +867,14 @@ pub fn ask_purge(s: &mut State, p: usize) {
 pub fn purge(s: &mut State) {
     let Some(Dialog::Purge { pane, items }) = s.dialog.take() else { return };
     let loc = s.panes[pane].loc.clone();
-    let Some(email) = account(&loc) else { return };
     let n = items.len();
+    if let Location::Local(_) = &loc {
+        let paths: Vec<PathBuf> = items.iter().filter_map(|e| loc.local_path(e)).collect();
+        local_job(s, vec![loc.clone()], move || ops::delete_forever(&paths).map(|_| format!("Excluído permanentemente: {}.", count(n))));
+        s.status = format!("Excluindo permanentemente {}…", count(n));
+        return;
+    }
+    let Some(email) = account(&loc) else { return };
     drive_job(s, email, account_panes(s, email), move |d| {
         for (i, e) in items.iter().enumerate() {
             // Say how far it got: what went before an error is gone for good.

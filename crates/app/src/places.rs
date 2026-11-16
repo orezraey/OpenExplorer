@@ -1,7 +1,7 @@
 //! The computer's special folders, which the tree shows under Área de Trabalho as Explorer's
 //! navigation pane does: the desktop itself (the user's and the one every user shares), the
 //! user's folders (Documentos, Downloads, Imagens, Músicas, Vídeos) and the home folder, with
-//! the names Windows gives them.
+//! the names Windows gives them; and WSL's distributions, which the tree shows under Linux.
 
 use std::path::{Path, PathBuf};
 
@@ -14,6 +14,8 @@ pub struct Places {
     pub desktop_also: Vec<PathBuf>,
     /// The user's folders and the home folder, each with its name.
     pub user: Vec<(PathBuf, String)>,
+    /// WSL's Linux distributions, by name (see [`crate::network::distros`]).
+    pub wsl: Vec<String>,
 }
 
 impl Places {
@@ -36,7 +38,12 @@ pub fn places() -> Places {
         .filter(|p| p.is_dir())
         .map(named)
         .collect();
-    Places { desktop: known_folder(&FOLDERID_Desktop).filter(|p| p.is_dir()).map(named), desktop_also: known_folder(&FOLDERID_PublicDesktop).filter(|p| p.is_dir()).into_iter().collect(), user }
+    Places {
+        desktop: known_folder(&FOLDERID_Desktop).filter(|p| p.is_dir()).map(named),
+        desktop_also: known_folder(&FOLDERID_PublicDesktop).filter(|p| p.is_dir()).into_iter().collect(),
+        user,
+        wsl: crate::network::distros(),
+    }
 }
 
 /// Where Windows keeps known folder `id` (moved to OneDrive or another disk included).
@@ -48,12 +55,8 @@ fn known_folder(id: &windows_sys::core::GUID) -> Option<PathBuf> {
     let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
     // SAFETY: Windows writes a string it allocated to `raw`, freed below whatever the outcome.
     let ok = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut raw) } == 0;
-    let path = (ok && !raw.is_null()).then(|| {
-        // SAFETY: a NUL-terminated string from Windows.
-        let len = unsafe { (0..).take_while(|&i| *raw.add(i) != 0).count() };
-        // SAFETY: `len` characters were just read from it.
-        PathBuf::from(std::ffi::OsString::from_wide(unsafe { std::slice::from_raw_parts(raw, len) }))
-    });
+    // SAFETY: a NUL-terminated string from Windows, freed only below.
+    let path = (ok && !raw.is_null()).then(|| PathBuf::from(std::ffi::OsString::from_wide(unsafe { crate::network::wide(raw) })));
     // SAFETY: freeing what SHGetKnownFolderPath allocated (null is allowed).
     unsafe { CoTaskMemFree(raw as _) };
     path
@@ -82,5 +85,5 @@ pub fn places() -> Places {
         (p, name)
     };
     let user = ["Documents", "Downloads", "Pictures", "Music", "Videos"].iter().map(|n| home.join(n)).chain([home.clone()]).filter(|p| p.is_dir()).map(named).collect();
-    Places { desktop: Some(home.join("Desktop")).filter(|p| p.is_dir()).map(named), desktop_also: Vec::new(), user }
+    Places { desktop: Some(home.join("Desktop")).filter(|p| p.is_dir()).map(named), desktop_also: Vec::new(), user, wsl: Vec::new() }
 }

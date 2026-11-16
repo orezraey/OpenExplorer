@@ -313,7 +313,8 @@ impl Pane {
         self.version += 1;
     }
 
-    /// Lists a local or simulated folder in place. Drive folders load in the background instead.
+    /// Lists a local or simulated folder in place. Drive folders, and the network's, load in the
+    /// background instead.
     pub fn load_now(&mut self, mock: &MockDrive) {
         self.free = match &self.loc {
             Location::Local(dir) => free_space(dir),
@@ -419,7 +420,13 @@ impl Pane {
     }
 }
 
-fn read_local(dir: &Path) -> std::io::Result<Vec<Entry>> {
+/// What a folder on the computer holds; a computer on the network (`\\servidor`) holds its
+/// shared folders.
+pub fn read_local(dir: &Path) -> std::io::Result<Vec<Entry>> {
+    if let Some((server, _)) = crate::network::unc(dir).filter(|(_, share)| share.is_empty()) {
+        let folder = |name: String| Entry { id: name.clone(), name, is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        return Ok(crate::network::shares(&server)?.into_iter().map(folder).collect());
+    }
     let mut out = Vec::new();
     for item in std::fs::read_dir(dir)? {
         let Ok(item) = item else { continue };
@@ -615,6 +622,21 @@ pub struct Crumb {
 /// The clickable path of a location: `C:\ › Users › Ana`, `ana@gmail.com › Meu Drive › Fotos`.
 pub fn crumbs(loc: &Location) -> Vec<Crumb> {
     match loc {
+        Location::Local(dir) if let Some((server, share)) = crate::network::unc(dir) => {
+            use crate::network::{is_wsl, server_path, share_path};
+            let label = if is_wsl(&server) { "Linux".to_string() } else { format!(r"\\{server}") };
+            let mut out = vec![Crumb { label, to: Location::Local(server_path(&server)) }];
+            if share.is_empty() {
+                return out;
+            }
+            let mut at = share_path(&server, &share);
+            out.push(Crumb { label: share, to: Location::Local(at.clone()) });
+            for c in dir.strip_prefix(&at).map(|r| r.components().collect::<Vec<_>>()).unwrap_or_default() {
+                at.push(c);
+                out.push(Crumb { label: c.as_os_str().to_string_lossy().into_owned(), to: Location::Local(at.clone()) });
+            }
+            out
+        }
         Location::Local(dir) => {
             let mut at = PathBuf::new();
             dir.components()

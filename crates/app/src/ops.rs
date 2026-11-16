@@ -286,6 +286,24 @@ pub fn to_recycle_bin(paths: &[PathBuf]) -> Result<(), String> {
     trash::delete_all(paths).map_err(|e| format!("Não consegui mover para a Lixeira: {e}"))
 }
 
+/// Deletes files and folders for good, where there's no Recycle Bin (a shared folder, WSL).
+/// A link to a folder goes, not what it leads to.
+pub fn delete_forever(paths: &[PathBuf]) -> Result<(), String> {
+    for (i, path) in paths.iter().enumerate() {
+        // A link to a folder isn't `is_dir` here; Windows removes it as a folder.
+        let gone = std::fs::symlink_metadata(path).and_then(|meta| match meta.is_dir() {
+            true => std::fs::remove_dir_all(path),
+            false => std::fs::remove_file(path).or_else(|e| if meta.is_symlink() { std::fs::remove_dir(path) } else { Err(e) }),
+        });
+        // Say how far it got: what went before an error is gone for good.
+        gone.map_err(|e| {
+            let done = if i == 0 { String::new() } else { format!(" (já excluídos para sempre: {i})") };
+            format!("Não consegui excluir {}: {e}{done}", path.display())
+        })?;
+    }
+    Ok(())
+}
+
 /// Copies a file or a whole folder into `dir`, under a free name there.
 pub fn copy_into(src: &Path, dir: &Path, prog: &Progress) -> Result<PathBuf, String> {
     let name = src.file_name().ok_or("Item sem nome.")?.to_string_lossy().into_owned();

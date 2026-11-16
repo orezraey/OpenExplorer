@@ -14,6 +14,7 @@ mod finder;
 mod icons;
 mod layout;
 mod model;
+mod network;
 mod ops;
 mod settings;
 mod sharing;
@@ -48,6 +49,8 @@ enum Msg {
     Opened { email: String, drive: Arc<Drive> },
     /// The folders of tree node `id`, read on a thread or from Drive.
     TreeKids { id: tree::NodeId, result: Result<Vec<tree::Node>, String> },
+    /// Computers for Rede; `done` once the network search ended.
+    Servers { found: Vec<String>, done: bool },
     /// A file operation finished: reload the panes showing `reload`, and say how it went.
     Done { reload: Vec<Location>, result: Result<String, String> },
     /// Something Propriedades number `id` was waiting for.
@@ -353,6 +356,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         match msg {
             Msg::Opened { email, drive } => keep_drive(s, email, drive),
             Msg::TreeKids { id, result } => tree::arrived(s, id, result),
+            Msg::Servers { found, done } => tree::servers_found(s, found, done),
             Msg::Listed { pane, request, part, result } => {
                 if s.live[pane].load(Ordering::Relaxed) != request {
                     continue;
@@ -688,6 +692,22 @@ fn load(s: &mut State, p: usize) {
         });
         return;
     }
+    // The network's folders on a thread: a computer that's off, or a distribution starting,
+    // would hold the window for seconds.
+    if let Location::Local(dir) = &s.panes[p].loc
+        && network::is_remote(dir)
+    {
+        let dir = dir.clone();
+        let pane = &mut s.panes[p];
+        pane.loading = true;
+        pane.error = None;
+        pane.free = None;
+        background(s, move |emit| {
+            let result = catch_panic("listar", || model::read_local(&dir).map_err(|e| format!("{}: {e}", dir.display())));
+            emit(Msg::Listed { pane: p, request, part: Part::WHOLE, result });
+        });
+        return;
+    }
     let Location::Drive { email, space, path } = s.panes[p].loc.clone() else {
         let State { panes, mock, .. } = s;
         panes[p].load_now(mock);
@@ -851,10 +871,10 @@ fn go_up(s: &mut State, p: usize) {
     // The folder we come out of, to land on it.
     let from = match &mut loc {
         Location::Local(dir) => {
-            let name = dir.file_name().map(|n| n.to_string_lossy().into_owned());
-            if !dir.pop() {
-                return;
-            }
+            // From a shared folder up to its computer too, which `PathBuf::pop` doesn't do.
+            let Some(up) = network::parent(dir) else { return };
+            let name = network::name(dir);
+            *dir = up;
             name
         }
         Location::Mock(segs) => segs.pop(),
@@ -1160,6 +1180,10 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
             s.status = "Os resultados da pesquisa não são uma pasta: solte os arquivos numa pasta.".into();
             return;
         }
+        Location::Local(dir) if network::is_server(dir) => {
+            s.status = "Aqui estão as pastas compartilhadas do computador: solte os arquivos numa delas.".into();
+            return;
+        }
         Location::Drive { .. } => {
             // Files and folders from Explorer (or the other pane) go up to this Drive folder;
             // the simulated drive's items are placeholders in the temp folder and stay out.
@@ -1290,6 +1314,12 @@ fn main() {
                 }
                 switch(s, 0, Location::Local(dir.clone()));
                 switch(s, 1, Location::Local(dir.join("Projetos")));
+            }),
+            // This computer's own shared folders (as the network shows them) and WSL's
+            // distributions, read only.
+            ("network", |s| {
+                switch(s, 0, Location::Local(network::server_path("localhost")));
+                switch(s, 1, Location::Local(network::server_path(network::WSL)));
             }),
             // Opções open.
             ("options", |s| s.dialog = Some(actions::Dialog::Options)),

@@ -1,7 +1,8 @@
 //! The tree beside each pane, as in Air Explorer and Explorer's navigation pane: Área de
-//! Trabalho, holding the desktop's folders, the user's folders, the home folder and Este
-//! Computador with its disks; then each Google Drive account with Meu Drive, its shared drives
-//! and Drive's lists; then the simulated drive.
+//! Trabalho, holding the desktop's folders, the user's folders, the home folder, Este
+//! Computador with its disks, Linux with WSL's distributions and Rede with the computers on the
+//! network and their shared folders; then each Google Drive account with Meu Drive, its shared
+//! drives and Drive's lists; then the simulated drive.
 //!
 //! A folder's arrow opens it. Its folders are read the first time it opens (from the disk on a
 //! thread, or from Drive) and kept, and refreshed whenever a pane lists that folder. Each pane
@@ -14,6 +15,7 @@ use std::path::{Path, PathBuf};
 use rune::Icon;
 
 use crate::model::{DriveKind, Entry, Location, Space, shown};
+use crate::network::{self, WSL, is_wsl, server_path, share_path};
 use crate::places::Places;
 use crate::sysicons::IconKey;
 use crate::{Msg, State, background, drive_task, icons};
@@ -23,6 +25,10 @@ use crate::{Msg, State, background, drive_task, icons};
 pub enum NodeId {
     Desktop,
     Computer,
+    /// Rede: the computers on the network (each a `Local` node, `\\servidor`).
+    Network,
+    /// WSL's distributions, `\\wsl.localhost`.
+    Linux,
     Local(PathBuf),
     Account(String),
     /// In an account: `"root"` (Meu Drive), `"shared-drives"`, `"view:…"` for Drive's lists,
@@ -38,6 +44,8 @@ impl NodeId {
         match self {
             NodeId::Desktop => "desktop".into(),
             NodeId::Computer => "computer".into(),
+            NodeId::Network => "network".into(),
+            NodeId::Linux => "linux".into(),
             NodeId::Local(p) => format!("l:{}", p.display()),
             NodeId::Account(e) => format!("a:{e}"),
             NodeId::Drive(e, id) => format!("d:{e}:{id}"),
@@ -79,6 +87,12 @@ pub struct Tree {
     pub version: u64,
     /// Per pane: bring the node of the folder shown into view once it's in the tree.
     follow: [bool; 2],
+    /// Rede's computers, by name: those the network search found, those of the network drives,
+    /// and those reached by address this session.
+    servers: Vec<String>,
+    /// Rede was searched, and the search is still going.
+    searched: bool,
+    searching: bool,
 }
 
 /// A row of a pane's tree.
@@ -134,6 +148,19 @@ impl Tree {
         }
         self.version += 1;
     }
+
+    /// Adds a computer to Rede, unless it's there by another spelling.
+    fn saw_server(&mut self, server: &str) {
+        if !self.servers.iter().any(|s| s.eq_ignore_ascii_case(server)) {
+            self.servers.push(server.to_string());
+            self.version += 1;
+        }
+    }
+
+    /// A computer's name as Rede spells it ("NAS" for a typed `\\nas`), so they're one node.
+    fn spelled(&self, server: &str) -> String {
+        self.servers.iter().find(|s| s.eq_ignore_ascii_case(server)).cloned().unwrap_or_else(|| server.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -148,14 +175,35 @@ fn computer_node() -> Node {
     Node { id: NodeId::Computer, label: "Este Computador".into(), icon: None, fallback: &icons::COMPUTER, to: None, opens: true }
 }
 
-/// A folder on the computer: one of the user's folders by its Windows name and icon, any
-/// other by its own name.
+fn network_node() -> Node {
+    Node { id: NodeId::Network, label: "Rede".into(), icon: None, fallback: &icons::NETWORK, to: None, opens: true }
+}
+
+fn linux_node() -> Node {
+    Node { id: NodeId::Linux, label: "Linux".into(), icon: None, fallback: &icons::LINUX, to: Some(Location::Local(server_path(WSL))), opens: true }
+}
+
+/// A computer on the network, `\\servidor`, which holds its shared folders. Windows' icon for
+/// it would ask the computer, so it's the app's own.
+fn server_node(server: &str) -> Node {
+    let path = server_path(server);
+    Node { id: NodeId::Local(path.clone()), label: server.into(), icon: None, fallback: &icons::COMPUTER, to: Some(Location::Local(path)), opens: true }
+}
+
+/// A folder on the computer, a shared folder or a distribution: one of the user's folders by
+/// its Windows name and icon, any other by its own name.
 fn local_node(places: &Places, path: PathBuf) -> Node {
-    let (label, icon) = match places.name_of(&path) {
-        Some(name) => (name.to_string(), IconKey::Path(path.clone())),
-        None => (path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()), IconKey::Folder),
+    let (label, icon, fallback): (String, Option<IconKey>, &'static Icon) = match places.name_of(&path) {
+        Some(name) => (name.to_string(), Some(IconKey::Path(path.clone())), &icons::FOLDER),
+        None => {
+            let label = network::name(&path).unwrap_or_else(|| path.display().to_string());
+            match network::unc(&path) {
+                Some((server, _)) if is_wsl(&server) && path.parent().is_none() => (label, None, &icons::LINUX),
+                _ => (label, Some(IconKey::Folder), &icons::FOLDER),
+            }
+        }
     };
-    Node { id: NodeId::Local(path.clone()), label, icon: Some(icon), fallback: &icons::FOLDER, to: Some(Location::Local(path)), opens: true }
+    Node { id: NodeId::Local(path.clone()), label, icon, fallback, to: Some(Location::Local(path)), opens: true }
 }
 
 /// A disk, named as Explorer names it ("Disco Local (C:)").
@@ -222,6 +270,9 @@ fn sorted(mut nodes: Vec<Node>) -> Vec<Node> {
 fn kids_of<'a>(s: &'a State, node: &Node) -> Cow<'a, Kids> {
     Cow::Owned(match &node.id {
         NodeId::Computer => Kids::Ready(s.local_drives.iter().map(|(d, kind)| disk_node(d, *kind)).collect()),
+        NodeId::Linux => Kids::Ready(s.places.wsl.iter().map(|d| local_node(&s.places, share_path(WSL, d))).collect()),
+        NodeId::Network if !s.tree.searched => Kids::Unknown,
+        NodeId::Network => Kids::Ready(sorted(s.tree.servers.iter().map(|sv| server_node(sv)).collect())),
         NodeId::Account(email) => Kids::Ready([Space::MyDrive, Space::SharedDrives, Space::SharedWithMe, Space::Starred, Space::Recent, Space::Trash].into_iter().map(|sp| space_node(email, sp)).collect()),
         NodeId::Mock(segs) => Kids::Ready(sorted(s.mock.list(segs).into_iter().filter(|e| e.is_dir).map(|e| mock_node(segs.iter().cloned().chain([e.name]).collect())).collect())),
         id => return s.tree.kids.get(id).map_or(Cow::Owned(Kids::Unknown), Cow::Borrowed),
@@ -240,6 +291,7 @@ fn load(s: &mut State, node: &Node) {
         move |result| Msg::TreeKids { id, result }
     };
     match (&node.id, node.to.clone()) {
+        (NodeId::Network, _) => return search_network(s),
         (NodeId::Desktop, _) => {
             let places = s.places.clone();
             background(s, move |emit| emit(done(crate::catch_panic("ler a área de trabalho", || Ok(desktop_kids(&places))))));
@@ -270,6 +322,34 @@ fn load(s: &mut State, node: &Node) {
     s.tree.version += 1;
 }
 
+/// Looks for Rede's computers: the network drives' at once, then those the network answers
+/// for, which takes up to half a minute. Those found join the ones known; none leave.
+fn search_network(s: &mut State) {
+    if s.tree.searching {
+        return;
+    }
+    s.tree.searched = true;
+    s.tree.searching = true;
+    s.tree.version += 1;
+    let drives = s.local_drives.clone();
+    background(s, move |emit| {
+        emit(Msg::Servers { found: network::mapped_servers(&drives), done: false });
+        let found = crate::catch_panic("procurar computadores na rede", || Ok(network::computers())).unwrap_or_default();
+        emit(Msg::Servers { found, done: true });
+    });
+}
+
+/// Computers the network search found.
+pub fn servers_found(s: &mut State, found: Vec<String>, done: bool) {
+    for server in found {
+        s.tree.saw_server(&server);
+    }
+    if done {
+        s.tree.searching = false;
+    }
+    s.tree.version += 1;
+}
+
 fn extend(path: &[(String, String)], id: &str, name: &str) -> Vec<(String, String)> {
     path.iter().cloned().chain([(id.to_string(), name.to_string())]).collect()
 }
@@ -292,8 +372,13 @@ fn desktop_kids(places: &Places) -> Vec<Node> {
             nodes.push(local_node(places, path.clone()));
         }
     }
-    nodes.push(computer_node());
+    nodes.extend(beside_computer(places));
     sorted(nodes)
+}
+
+/// Este Computador, Rede and Linux (where WSL has distributions).
+fn beside_computer(places: &Places) -> Vec<Node> {
+    [computer_node(), network_node()].into_iter().chain((!places.wsl.is_empty()).then(linux_node)).collect()
 }
 
 fn local_kids(places: &Places, dir: &Path) -> Result<Vec<Node>, String> {
@@ -303,9 +388,19 @@ fn local_kids(places: &Places, dir: &Path) -> Result<Vec<Node>, String> {
 
 /// The folders in `dir` (links to folders included). The listing already says which entries
 /// are folders; only a link is looked up, so a folder of thousands of files costs no more.
-fn subfolders(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+fn folders_in(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let folder = |e: &std::fs::DirEntry| e.file_type().is_ok_and(|t| t.is_dir() || (t.is_symlink() && e.path().is_dir()));
     Ok(std::fs::read_dir(dir)?.filter_map(Result::ok).filter(folder).map(|e| e.path()).collect())
+}
+
+/// The folders in `dir`; in a computer on the network, its shared folders.
+fn subfolders(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    if let Some((server, share)) = network::unc(dir)
+        && share.is_empty()
+    {
+        return Ok(network::shares(&server)?.into_iter().map(|name| share_path(&server, &name)).collect());
+    }
+    folders_in(dir)
 }
 
 /// `id`'s folders arrived.
@@ -327,12 +422,24 @@ pub fn learn(s: &mut State, p: usize) {
         s.tree.version += 1;
         return;
     }
+    // Linux's distributions, as a listing of `\\wsl.localhost` has them now: one installed or
+    // removed since the app started.
+    if node.id == NodeId::Linux {
+        let mut names: Vec<String> = pane.entries.iter().filter(|e| e.is_dir).map(|e| e.name.clone()).collect();
+        names.sort_by_key(|n| n.to_lowercase());
+        if names != s.places.wsl {
+            s.places.wsl = names;
+            s.tree.version += 1;
+        }
+        return;
+    }
     if !matches!(s.tree.kids.get(&node.id), Some(Kids::Ready(_) | Kids::Failed(_))) {
         return;
     }
     let dirs = pane.entries.iter().filter(|e| e.is_dir);
     let kids: Vec<Node> = match (&node.id, &pane.loc) {
-        (NodeId::Local(_), Location::Local(dir)) => dirs.map(|e| local_node(&s.places, dir.join(&e.name))).collect(),
+        // Under the node's path, which may spell a computer as Rede does rather than as typed.
+        (NodeId::Local(at), Location::Local(_)) => dirs.map(|e| local_node(&s.places, at.join(&e.name))).collect(),
         (NodeId::Drive(email, _), Location::Drive { space: Space::SharedDrives, .. }) => dirs.map(|e| shared_drive_node(email, e.id.clone(), e.name.clone())).collect(),
         (NodeId::Drive(email, _), Location::Drive { space, path, .. }) => dirs.map(|e| drive_folder_node(email, space.clone(), extend(path, opened(e), &e.name))).collect(),
         _ => return,
@@ -353,7 +460,12 @@ fn opened(e: &Entry) -> &str {
 pub fn toggle(s: &mut State, p: usize, node: &Node) {
     if !s.tree.open[p].remove(&node.id) {
         s.tree.open[p].insert(node.id.clone());
-        load(s, node);
+        // Rede looks again each time it opens: a computer may have come on since.
+        if node.id == NodeId::Network {
+            search_network(s);
+        } else {
+            load(s, node);
+        }
     }
     s.tree.version += 1;
 }
@@ -399,6 +511,28 @@ fn local_chain(s: &State, path: &Path) -> Vec<Node> {
         }
     }
     let top: Vec<Node> = desktop.iter().cloned().collect();
+    // On the network: Rede › the computer (or Linux, for WSL's) › the shared folder › ….
+    if let Some((server, share)) = network::unc(path) {
+        let mut out = top;
+        let spelled = if is_wsl(&server) {
+            out.push(linux_node());
+            WSL.to_string()
+        } else {
+            let spelled = s.tree.spelled(&server);
+            out.extend([network_node(), server_node(&spelled)]);
+            spelled
+        };
+        if share.is_empty() {
+            return out;
+        }
+        let mut at = share_path(&spelled, &share);
+        out.push(local_node(places, at.clone()));
+        for c in path.strip_prefix(share_path(&server, &share)).map(|r| r.components().collect::<Vec<_>>()).unwrap_or_default() {
+            at.push(c);
+            out.push(local_node(places, at.clone()));
+        }
+        return out;
+    }
     // Without a desktop the tree starts at Este Computador: the user's folders are on the disks.
     if let Some(d) = &desktop {
         for (dir, _) in &places.user {
@@ -422,6 +556,13 @@ fn local_chain(s: &State, path: &Path) -> Vec<Node> {
 /// Opens pane `p`'s tree down to the folder it now shows (reading what's needed on the way)
 /// and has the next frames bring that node into view.
 pub fn follow(s: &mut State, p: usize) {
+    // A computer reached by address shows in Rede, where the network search may not find it.
+    if let Location::Local(dir) = &s.panes[p].loc
+        && let Some((server, _)) = network::unc(dir)
+        && !is_wsl(&server)
+    {
+        s.tree.saw_server(&server);
+    }
     let chain = chain(s, &s.panes[p].loc.clone());
     for node in chain.iter().take(chain.len().saturating_sub(1)) {
         if node.opens {
@@ -437,7 +578,14 @@ pub fn follow(s: &mut State, p: usize) {
 pub fn lines(s: &State, p: usize) -> Vec<Line> {
     let current = chain(s, &s.panes[p].loc).pop().map(|n| n.id);
     let mut w = Walk { s, p, current: current.as_ref(), seen: HashMap::new(), out: Vec::new() };
-    w.node(desktop_node(&s.places).unwrap_or_else(computer_node), 0);
+    match desktop_node(&s.places) {
+        Some(desktop) => w.node(desktop, 0),
+        None => {
+            for node in beside_computer(&s.places) {
+                w.node(node, 0);
+            }
+        }
+    }
     if !s.accounts.is_empty() {
         w.out.push(Line::Heading("Google Drive"));
     }
@@ -464,7 +612,9 @@ impl Walk<'_> {
         let (s, p) = (self.s, self.p);
         let open = node.opens && s.tree.open[p].contains(&node.id);
         let kids = if open { kids_of(s, &node) } else { Cow::Owned(Kids::Unknown) };
-        let empty = matches!(&*kids, Kids::Ready(k) if k.is_empty());
+        // Rede keeps its arrow: closing and opening it looks again.
+        let network = node.id == NodeId::Network;
+        let empty = matches!(&*kids, Kids::Ready(k) if k.is_empty()) && !network;
         let on = self.current == Some(&node.id);
         let id = node.id.key();
         let times = self.seen.entry(id.clone()).or_default();
@@ -474,6 +624,9 @@ impl Walk<'_> {
         let after = match &*kids {
             Kids::Loading => Some(note("Carregando…".into(), true)),
             Kids::Failed(e) => Some(note(e.clone(), false)),
+            // Not `loading`: following a computer reached by address needn't wait on the search.
+            Kids::Ready(_) if network && s.tree.searching => Some(note("Procurando computadores…".into(), false)),
+            Kids::Ready(k) if network && k.is_empty() => Some(note(r"Nenhum computador encontrado. Digite \\nome na barra de endereço.".into(), false)),
             Kids::Ready(_) | Kids::Unknown => None,
         };
         self.out.push(Line::Node { key, depth, node, open, empty, on });
@@ -531,6 +684,7 @@ mod tests {
             desktop: Some((root.join("Desk"), "Área de Trabalho".into())),
             desktop_also: Vec::new(),
             user: vec![(root.join("Home/Downloads"), "Downloads".into()), (root.join("Home"), "Pessoal".into())],
+            wsl: vec!["Ubuntu".into()],
         };
         s.local_drives = vec![(root.join("Disco"), DriveKind::Fixed)];
         (s, root)
@@ -560,9 +714,48 @@ mod tests {
     fn the_desktop_and_a_folder_list_their_folders() {
         let (s, root) = scene("lists");
         let labels = |nodes: Vec<Node>| nodes.into_iter().map(|n| n.label).collect::<Vec<_>>();
-        assert_eq!(labels(desktop_kids(&s.places)), ["Downloads", "Este Computador", "Pessoal", "Projeto"]);
+        assert_eq!(labels(desktop_kids(&s.places)), ["Downloads", "Este Computador", "Linux", "Pessoal", "Projeto", "Rede"]);
         assert_eq!(labels(local_kids(&s.places, &root.join("Home")).unwrap()), ["Downloads", "Notas"]);
         assert!(local_kids(&s.places, &root.join("não existe")).is_err());
+    }
+
+    /// A folder on the network hangs from Rede › its computer (as Rede spells it) › its shared
+    /// folder; one in WSL from Linux › its distribution. Rede lists the computers known.
+    #[test]
+    fn network_folders_hang_from_rede_and_linux() {
+        let (mut s, _) = scene("network");
+        let local = |p: &str| NodeId::Local(PathBuf::from(p));
+        s.tree.saw_server("NAS");
+        let nas = chain(&s, &Location::Local(PathBuf::from(r"\\nas\Fotos\2024")));
+        assert_eq!(ids(&nas), [NodeId::Desktop, NodeId::Network, local(r"\\NAS"), local(r"\\NAS\Fotos"), local(r"\\NAS\Fotos\2024")]);
+        assert_eq!(nas.iter().map(|n| n.label.as_str()).collect::<Vec<_>>(), ["Área de Trabalho", "Rede", "NAS", "Fotos", "2024"]);
+        assert_eq!(ids(&chain(&s, &Location::Local(PathBuf::from(r"\\nas")))), [NodeId::Desktop, NodeId::Network, local(r"\\NAS")]);
+        let wsl = chain(&s, &Location::Local(PathBuf::from(r"\\wsl.localhost\Ubuntu\home")));
+        assert_eq!(ids(&wsl), [NodeId::Desktop, NodeId::Linux, local(r"\\wsl.localhost\Ubuntu"), local(r"\\wsl.localhost\Ubuntu\home")]);
+        assert_eq!(ids(&chain(&s, &Location::Local(PathBuf::from(r"\\wsl.localhost")))), [NodeId::Desktop, NodeId::Linux]);
+        // Linux lists the distributions; Rede, once searched, the computers known.
+        let Kids::Ready(distros) = &*kids_of(&s, &linux_node()) else { panic!() };
+        assert_eq!(ids(distros), [local(r"\\wsl.localhost\Ubuntu")]);
+        s.tree.searched = true;
+        s.tree.saw_server("nas");
+        s.tree.saw_server("Estudio");
+        let Kids::Ready(servers) = &*kids_of(&s, &network_node()) else { panic!() };
+        assert_eq!(servers.iter().map(|n| n.label.as_str()).collect::<Vec<_>>(), ["Estudio", "NAS"]);
+
+        // A listing of `\\nas` gives `\\NAS` its folders under Rede's spelling, so they match
+        // the way down to them.
+        let dir = |name: &str| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        s.tree.kids.insert(local(r"\\NAS"), Kids::Ready(Vec::new()));
+        s.panes[0].go(Location::Local(PathBuf::from(r"\\nas")));
+        s.panes[0].set_entries(Ok(vec![dir("Fotos")]));
+        learn(&mut s, 0);
+        let Some(Kids::Ready(shares)) = s.tree.kids.get(&local(r"\\NAS")) else { panic!() };
+        assert_eq!(ids(shares), [local(r"\\NAS\Fotos")]);
+        // A listing of Linux brings a distribution installed since.
+        s.panes[0].go(Location::Local(PathBuf::from(r"\\wsl.localhost")));
+        s.panes[0].set_entries(Ok(vec![dir("Ubuntu"), dir("Debian")]));
+        learn(&mut s, 0);
+        assert_eq!(s.places.wsl, ["Debian", "Ubuntu"]);
     }
 
     /// The arrow opens and closes a node; the simulated drive's folders show at once, the

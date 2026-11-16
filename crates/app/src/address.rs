@@ -220,11 +220,17 @@ fn local_path(typed: &str, here: &Location) -> PathBuf {
         Location::Found(f) => f.within.clone(),
         _ => None,
     };
+    // `\\nas` alone is, to `Path`, a folder at the top of the current disk.
+    if let Some((server, share)) = crate::network::unc(&path)
+        && share.is_empty()
+    {
+        return crate::network::tidy(crate::network::server_path(&server));
+    }
     let path = match base {
         Some(base) if path.is_relative() => base.join(path),
         _ => path,
     };
-    normalize(&path)
+    crate::network::tidy(normalize(&path))
 }
 
 /// `%NAME%` replaced by the environment variable, when there's one by that name.
@@ -270,6 +276,13 @@ fn normalize(path: &Path) -> PathBuf {
 /// Where a path on the computer leads: the folder itself, or a file's folder with the file
 /// selected. It asks the disk, which can take a while on a network drive: off the UI thread.
 pub fn reach_local(path: &Path) -> Result<Reached, String> {
+    // A computer on the network, which lists its shared folders, isn't a folder to look up.
+    if let Some((server, share)) = crate::network::unc(path)
+        && share.is_empty()
+    {
+        crate::network::shares(&server).map_err(|e| format!("Não consegui abrir “{}”: {e}", path.display()))?;
+        return Ok(Reached { loc: Location::Local(crate::network::server_path(&server)), reveal: None });
+    }
     let meta = std::fs::metadata(path).map_err(|_| format!("Não encontrei “{}”.", path.display()))?;
     let path = &as_on_disk(path);
     if meta.is_dir() {
