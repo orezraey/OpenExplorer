@@ -243,6 +243,9 @@ pub struct Pane {
     /// The entry (id, name) to select and scroll to once the listing brings it (Mostrar na
     /// pasta).
     pub reveal: Option<(String, String)>,
+    /// Counts moves to another location (not reloads), so an answer looked up for where the pane
+    /// was (Mostrar na pasta, the address) is dropped once it moved on.
+    pub moves: u64,
 }
 
 /// How a pane orders entries: folders first, as in Explorer, then by the column (`by`), ties
@@ -286,6 +289,7 @@ impl Pane {
             forward: Vec::new(),
             free: None,
             reveal: None,
+            moves: 0,
         }
     }
 
@@ -304,6 +308,7 @@ impl Pane {
         self.cursor = None;
         self.anchor = None;
         self.reveal = None;
+        self.moves += 1;
         self.entries.clear();
         self.version += 1;
     }
@@ -585,6 +590,22 @@ mod unix_ms {
     }
 }
 
+/// What a `/` in a Drive name shows as: U+FF0F, the full-width solidus. It looks like one but
+/// separates nothing, in an address or on the computer (where a name can't hold `/`), as in
+/// Air Explorer. Drive keeps the `/`.
+pub const NAME_SLASH: char = '／';
+
+/// A name as the app shows it, in lists, paths, dialogs and names given on the computer: each
+/// `/` as [`NAME_SLASH`] (only Drive names have one).
+pub fn shown(name: &str) -> String {
+    name.replace('/', &NAME_SLASH.to_string())
+}
+
+/// A name typed over a shown one, as Drive gets it: each [`NAME_SLASH`] back to `/`.
+pub fn typed(name: &str) -> String {
+    name.replace(NAME_SLASH, "/")
+}
+
 /// One step of a location's path, and where clicking it goes.
 pub struct Crumb {
     pub label: String,
@@ -633,11 +654,11 @@ pub fn crumbs(loc: &Location) -> Vec<Crumb> {
             }
             let label = match space {
                 Space::Search(q) => format!("“{}” em {}", q.text, q.place),
-                _ => space.label().to_string(),
+                _ => shown(space.label()),
             };
             out.push(Crumb { label, to: Location::drive(email.clone(), space.clone()) });
             for i in 0..path.len() {
-                out.push(Crumb { label: path[i].1.clone(), to: Location::Drive { email: email.clone(), space: space.clone(), path: path[..=i].to_vec() } });
+                out.push(Crumb { label: shown(&path[i].1), to: Location::Drive { email: email.clone(), space: space.clone(), path: path[..=i].to_vec() } });
             }
             out
         }

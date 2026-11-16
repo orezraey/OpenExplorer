@@ -10,7 +10,8 @@ use std::time::SystemTime;
 use openexplorer_gdrive::{Details, Drive, DriveFile, Revision, Sharing};
 use rune::{TextEdit, Tx};
 
-use crate::model::{Entry, Location, Space};
+use crate::address::{self, Reached, Target};
+use crate::model::{Entry, Location, Space, shown, typed};
 use crate::transfers::{self, End, Op};
 use crate::uploads::{Clash, Existing, Item, Put};
 use crate::{Msg, State, background, drive_task, open as open_entry, ops};
@@ -224,33 +225,92 @@ pub fn show_in_folder(s: &mut State, p: usize, _: &mut Tx) {
                 return;
             };
             let name = name.to_string_lossy().into_owned();
-            crate::navigate(s, p, Location::Local(dir.to_path_buf()));
-            s.panes[p].reveal = Some((name.clone(), name));
+            arrive(s, p, Reached { loc: Location::Local(dir.to_path_buf()), reveal: Some((name.clone(), name)) });
         }
         Location::Drive { email, .. } if shows_results(&loc) => {
-            s.status = format!("Procurando a pasta de “{}”…", item.name);
-            let request = s.live[p].load(Ordering::Relaxed);
-            let (account, id, item) = (email.clone(), item.id.clone(), (item.id.clone(), item.name.clone()));
-            drive_task(s, email, "achar a pasta", move |d| d.place(&id).map(|place| place_location(account, place)), move |result| Msg::Placed {
-                pane: p,
-                request,
-                item,
-                result,
-            });
+            s.status = format!("Procurando a pasta de “{}”…", shown(&item.name));
+            let (account, item) = (email.clone(), (item.id.clone(), item.name.clone()));
+            let find = move |d: &Drive| d.place(&item.0).map(|place| Reached { loc: address::place_location(account, place), reveal: Some(item) });
+            reach(s, p, email, "achar a pasta", find);
         }
         _ => {}
     }
 }
 
-/// The folder Drive says an item of `email`'s sits in, as a pane goes there.
-fn place_location(email: String, place: openexplorer_gdrive::Place) -> Location {
-    use openexplorer_gdrive::Top;
-    let space = match place.top {
-        Top::MyDrive => Space::MyDrive,
-        Top::SharedDrive { id, name } => Space::Shared { id, name },
-        Top::SharedWithMe => Space::SharedWithMe,
+/// Takes pane `p` to `to` as a step Voltar undoes, selecting what `to` reveals once it's
+/// listed.
+pub fn arrive(s: &mut State, p: usize, to: Reached) {
+    crate::navigate(s, p, to.loc);
+    s.panes[p].reveal = to.reveal;
+}
+
+/// Looks for where pane `p` goes with `email`'s Drive in the background; the pane goes there
+/// unless it moved on meanwhile. `doing` names the work in a panic's error.
+fn reach(s: &State, p: usize, email: &str, doing: &'static str, find: impl FnOnce(&Drive) -> Result<Reached, String> + Send + 'static) {
+    let moves = s.panes[p].moves;
+    drive_task(s, email, doing, find, move |result| Msg::Reached { pane: p, moves, result });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Address bar
+
+/// Turns pane `p`'s path bar into a field holding its address, all selected (a click on the
+/// bar's empty part, Ctrl+L, Alt+D or F4, as in Explorer).
+pub fn edit_address(s: &mut State, p: usize) {
+    let text = address::text(&s.panes[p].loc);
+    let mut edit = TextEdit::new(text.clone());
+    edit.set_selection(0, text.len());
+    edit.focused = true;
+    s.address[p] = Some(edit);
+    s.active = p;
+}
+
+/// Goes where `typed` leads from pane `p`: a folder, or a file's folder with the file selected.
+/// Looking it up can take a while (a network drive, Drive), so it runs in the background.
+/// `false` when `typed` can't be read at all: the address field, if open, stays to fix it.
+pub fn go_to_address(s: &mut State, p: usize, typed: &str) -> bool {
+    let accounts: Vec<String> = s.accounts.iter().map(|a| a.email.clone()).collect();
+    let target = match address::parse(typed, &s.panes[p].loc, &accounts) {
+        Ok(t) => t,
+        Err(e) => {
+            s.status = e;
+            return false;
+        }
     };
-    Location::Drive { email, space, path: place.folders }
+    s.address[p] = None;
+    match target {
+        Target::Mock(segs) => crate::navigate(s, p, Location::Mock(segs)),
+        Target::Local(path) => {
+            let moves = s.panes[p].moves;
+            background(s, move |emit| emit(Msg::Reached { pane: p, moves, result: crate::catch_panic("abrir o endereço", || address::reach_local(&path)) }));
+        }
+        Target::Drive { email, way } => {
+            let account = email.clone();
+            reach(s, p, &email, "abrir o endereço", move |d| address::reach_drive(d, account, way));
+        }
+    }
+    true
+}
+
+/// Copiar endereço: what the bar shows, as text.
+pub fn copy_address(s: &mut State, p: usize, tx: &mut Tx) {
+    tx.copy(address::text(&s.panes[p].loc));
+    s.status = "Endereço copiado.".into();
+}
+
+/// Copiar link do Drive: the drive.google.com link of the place pane `p` shows.
+pub fn copy_drive_link(s: &mut State, p: usize, tx: &mut Tx) {
+    if let Some(link) = address::drive_link(&s.panes[p].loc) {
+        tx.copy(link);
+        s.status = "Link do Drive copiado.".into();
+    }
+}
+
+/// Colar e ir: goes where the clipboard's text leads.
+pub fn paste_and_go(_: &mut State, p: usize, tx: &mut Tx) {
+    tx.read_clipboard(move |s: &mut State, content: &rune::ClipboardContent, _: &mut Tx| {
+        go_to_address(s, p, content.text());
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -682,9 +742,9 @@ pub(crate) fn search_scope(loc: &Location) -> Option<(openexplorer_gdrive::searc
         (Space::Search(q), None) => (q.within.clone(), q.place.clone()),
         // A trashed folder's contents aren't searchable on their own.
         (Space::Trash, _) => (Within::Everything, "todo o Drive".into()),
-        (Space::Shared { id, .. }, Some((f, name))) => (Within::Folder { id: f.clone(), shared_drive: Some(id.clone()) }, name.clone()),
-        (Space::Shared { id, name }, None) => (Within::SharedDrive(id.clone()), name.clone()),
-        (_, Some((f, name))) => (Within::Folder { id: f.clone(), shared_drive: None }, name.clone()),
+        (Space::Shared { id, .. }, Some((f, name))) => (Within::Folder { id: f.clone(), shared_drive: Some(id.clone()) }, shown(name)),
+        (Space::Shared { id, name }, None) => (Within::SharedDrive(id.clone()), shown(name)),
+        (_, Some((f, name))) => (Within::Folder { id: f.clone(), shared_drive: None }, shown(name)),
         (Space::MyDrive, None) => (Within::MyDrive, "Meu Drive".into()),
         _ => (Within::Everything, "todo o Drive".into()),
     })
@@ -854,11 +914,18 @@ pub fn ask_rename(s: &mut State, p: usize, tx: &mut Tx) {
     if !items_editable(&s.panes[p].loc) {
         return not_here(s, p);
     }
-    let mut edit = TextEdit::new(item.name.clone());
-    edit.set_selection(0, stem_len(&item.name, item.is_dir));
-    s.name_edit = edit;
+    s.name_edit = name_field(item);
     s.renaming = Some((p, item.clone()));
     tx.scroll_into_view_in(crate::pane_key(p), crate::row_key(&item.id));
+}
+
+/// The field Renomear (and Propriedades' name) starts with: the name as shown, its stem
+/// selected.
+pub(crate) fn name_field(item: &Entry) -> TextEdit {
+    let name = shown(&item.name);
+    let mut edit = TextEdit::new(name.clone());
+    edit.set_selection(0, stem_len(&name, item.is_dir));
+    edit
 }
 
 /// How much of a name Renomear selects, in bytes (`set_selection` takes byte offsets: "Relatório"
@@ -922,11 +989,16 @@ pub fn submit_name(s: &mut State) {
 }
 
 /// Renames `item` to `name`, or with no item creates folder `name`, in pane `pane`'s folder.
+/// Renames `item` (or makes a new folder, `None`) to `name` as typed over the shown one: in
+/// Drive each `／` goes back to the `/` it shows (see [`crate::model::NAME_SLASH`]).
 pub fn apply_name(s: &mut State, pane: usize, item: Option<Entry>, name: String) {
-    if item.as_ref().is_some_and(|i| i.name == name) {
+    let loc = s.panes[pane].loc.clone();
+    let shown_name = name.clone();
+    let name = if matches!(loc, Location::Drive { .. }) { typed(&name) } else { name };
+    // Unchanged as shown (a real `／` kept), or the same name typed with `/`.
+    if item.as_ref().is_some_and(|i| shown(&i.name) == shown_name || i.name == name) {
         return;
     }
-    let loc = s.panes[pane].loc.clone();
     match (&loc, item) {
         (Location::Local(_) | Location::Found(_), Some(item)) => {
             let Some(from) = loc.local_path(&item) else { return };
@@ -937,11 +1009,11 @@ pub fn apply_name(s: &mut State, pane: usize, item: Option<Entry>, name: String)
             local_job(s, vec![loc.clone()], move || ops::new_folder(&dir, &name).map(|_| format!("Pasta \"{name}\" criada.")));
         }
         (Location::Drive { email, .. }, Some(item)) => {
-            drive_job(s, email, account_panes(s, email), move |d| d.rename(&item.id, &name).map(|_| format!("Renomeado para \"{name}\".")));
+            drive_job(s, email, account_panes(s, email), move |d| d.rename(&item.id, &name).map(|_| format!("Renomeado para \"{shown_name}\".")));
         }
         (Location::Drive { .. }, None) => {
             let Some((email, folder)) = drive_folder(&loc) else { return not_here(s, pane) };
-            drive_job(s, &email, vec![loc.clone()], move |d| d.create_folder(&name, &folder).map(|_| format!("Pasta \"{name}\" criada.")));
+            drive_job(s, &email, vec![loc.clone()], move |d| d.create_folder(&name, &folder).map(|_| format!("Pasta \"{shown_name}\" criada.")));
         }
         (Location::Mock(_) | Location::Found(_), _) => not_here(s, pane),
     }
@@ -1071,9 +1143,7 @@ pub fn properties(s: &mut State, p: usize) {
         drive_task(s, email, "ler as propriedades", move |d| d.sharing(&sharing_id), move |r| Msg::Prop { id, update: PropUpdate::Sharing(r) });
     }
     if let [item] = items.as_slice() {
-        let mut edit = TextEdit::new(item.name.clone());
-        edit.set_selection(0, stem_len(&item.name, item.is_dir));
-        s.name_edit = edit;
+        s.name_edit = name_field(item);
     }
     let first = items[0].kind_label();
     let kind = if items.iter().all(|e| e.kind_label() == first) { first } else { "Vários tipos".into() };
@@ -1141,7 +1211,7 @@ pub fn props_ok(s: &mut State) {
     let rename = p.renamable(s).then(|| (p.pane, p.single().cloned())).and_then(|(pane, e)| e.map(|e| (pane, e)));
     let name = s.name_edit.text.trim().to_string();
     if let Some((pane, item)) = rename
-        && name != item.name
+        && name != shown(&item.name)
     {
         if let Some(why) = name_problem(&s.panes[pane].loc, &name) {
             s.status = why;
@@ -1165,6 +1235,18 @@ pub fn close_properties(s: &mut State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Drive name's `/` shows as `／` in the rename field, its stem selected by bytes, and
+    /// what's typed goes back to `/` for Drive.
+    #[test]
+    fn a_slash_in_a_name_is_edited_as_shown() {
+        let e = Entry { id: "f1".into(), name: "a/b.txt".into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let edit = name_field(&e);
+        assert_eq!(edit.text, "a／b.txt");
+        assert_eq!((edit.anchor.min(edit.focus), edit.anchor.max(edit.focus)), (0, "a／b".len()));
+        assert_eq!(typed(&edit.text), "a/b.txt");
+        assert_eq!(shown("Relatório 2025.pdf"), "Relatório 2025.pdf");
+    }
 
     fn drive(space: Space, path: &[&str]) -> Location {
         Location::Drive { email: "a@b".into(), space, path: path.iter().map(|id| (id.to_string(), id.to_string())).collect() }

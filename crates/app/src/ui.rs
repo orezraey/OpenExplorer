@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use rune::{Align, Color, Cursor, Cx, Drag, DragOutcome, El, GrowthSpec, Icon, KeyEvent, Phase, ScrollSpec, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, ScrollBar, Toast, ToastRegion, context_menu};
 
-use crate::model::{Kind, Location, SortCol, Space, crumbs, format_bytes, format_long, format_size, format_time};
+use crate::model::{Kind, Location, SortCol, Space, crumbs, format_bytes, format_long, format_size, format_time, shown};
 use crate::actions::{self, ClipMode, Dialog};
 use crate::{State, click, connect, disconnect, drag_item, dragged_ids, dropped, go_back, go_forward, go_up, key, load, navigate, open, pane_key, paths_for, row_key, set_sort};
 use crate::icons;
@@ -24,6 +24,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let mut layer = Vec::new();
     let menu = context(s, &k, &mut layer);
     let queue_menu = transfer_context(s, &k, &mut layer);
+    let address_menu = address_context(s, &k, &mut layer);
     dialog(s, &k, &mut layer);
     // What the last action said, for a few seconds at the bottom right.
     if !s.status.is_empty() && s.now < s.status_until {
@@ -38,7 +39,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(panes(s, &k))
         .child(transfers(s, &k))
         .child(menu)
-        .child(queue_menu);
+        .child(queue_menu)
+        .child(address_menu);
     rune_kit::root(body, layer)
 }
 
@@ -288,6 +290,28 @@ fn transfer_context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         .build(k, layer)
 }
 
+/// The path bar's right-click menu: copy the address (or the Drive link), paste one and go
+/// there, or edit it.
+fn address_context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
+    let anchor = el().key("address-menu-anchor").size(0.0, 0.0);
+    let Some((p, at)) = s.address_menu else { return anchor };
+    let item = |label: &str, glyph: &'static Icon, keys: &str, f: fn(&mut State, usize, &mut Tx)| {
+        MenuItem::new(label).icon(glyph).shortcut(keys).on_select_tx(move |s: &mut State, tx: &mut Tx| {
+            s.address_menu = None;
+            f(s, p, tx);
+        })
+    };
+    let mut menu = context_menu("address-menu", anchor, Some(at)).min_width(220.0).item(item("Copiar endereço", &icons::M_COPY, "", actions::copy_address));
+    if crate::address::drive_link(&s.panes[p].loc).is_some() {
+        menu = menu.item(item("Copiar link do Drive", &icons::M_LINK, "", actions::copy_drive_link));
+    }
+    menu.item(item("Colar e ir", &icons::M_PASTE, "", actions::paste_and_go))
+        .separator()
+        .item(item("Editar endereço", &icons::M_RENAME, "Ctrl+L", |s, p, _| actions::edit_address(s, p)))
+        .on_close(|s: &mut State| s.address_menu = None)
+        .build(k, layer)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Context menu
 
@@ -384,7 +408,7 @@ fn dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
         Dialog::Delete { pane, items } => {
             let local = s.panes[*pane].loc.is_local();
             let title = match items.as_slice() {
-                [one] => format!("Excluir \"{}\"?", one.name),
+                [one] => format!("Excluir \"{}\"?", shown(&one.name)),
                 many => format!("Excluir {} itens?", ui_count(many.len())),
             };
             let where_to = if local {
@@ -400,7 +424,7 @@ fn dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
         }
         Dialog::Purge { pane, items } => {
             let title = match items.as_slice() {
-                [one] => format!("Excluir \"{}\" permanentemente?", one.name),
+                [one] => format!("Excluir \"{}\" permanentemente?", shown(&one.name)),
                 many => format!("Excluir {} itens permanentemente?", ui_count(many.len())),
             };
             let note = "Os itens serão apagados para sempre do Google Drive. Isso não pode ser desfeito.";
@@ -524,7 +548,7 @@ fn item_list(s: &State, k: &Kit, pane: usize, items: &[crate::model::Entry]) -> 
     let mut list = col().key("items").w_full().gap(4.0);
     for e in items.iter().take(6) {
         list = list.child(
-            row().gap(6.0).center_y().child(entry_icon(s, &s.panes[pane].loc, e, 16.0)).child(text(e.name.clone()).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0)),
+            row().gap(6.0).center_y().child(entry_icon(s, &s.panes[pane].loc, e, 16.0)).child(text(shown(&e.name)).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0)),
         );
     }
     if items.len() > 6 {
@@ -636,7 +660,7 @@ fn place_of(s: &State, p: &actions::Props) -> String {
         (loc, single) => {
             let mut parts: Vec<String> = crumbs(loc).into_iter().skip(1).map(|c| c.label).collect();
             if let Some(e) = single {
-                parts.push(e.name.clone());
+                parts.push(shown(&e.name));
             }
             parts.join("/")
         }
@@ -660,7 +684,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
     // Header: the item's icon and its name, which renames on OK.
     let loc = &s.panes[p.pane].loc;
     let (glyph, title) = match p.single() {
-        Some(e) => (entry_icon(s, loc, e, 40.0), e.name.clone()),
+        Some(e) => (entry_icon(s, loc, e, 40.0), shown(&e.name)),
         None if p.items.iter().all(|e| e.is_dir) => (shell_icon(s, Some(&IconKey::Folder), &icons::FOLDER, 40.0), format!("{} itens", ui_count(p.items.len()))),
         None => (icon(&icons::FILE, 40.0), format!("{} itens", ui_count(p.items.len()))),
     };
@@ -815,7 +839,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
                     // Several items: their names.
                     let mut names = col().w_full().gap(4.0);
                     for e in p.items.iter().take(20) {
-                        names = names.child(row().gap(6.0).center_y().child(entry_icon(s, loc, e, 16.0)).child(text(e.name.clone()).font(k.ty.text_small).color(k.c.text_base).truncate().min_w(0.0)));
+                        names = names.child(row().gap(6.0).center_y().child(entry_icon(s, loc, e, 16.0)).child(text(shown(&e.name)).font(k.ty.text_small).color(k.c.text_base).truncate().min_w(0.0)));
                     }
                     if p.items.len() > 20 {
                         names = names.child(muted(&format!("e mais {}", ui_count(p.items.len() - 20))));
@@ -1133,10 +1157,44 @@ fn nav_button<F: Fn(&mut State) + 'static>(k: &Kit, key: &str, glyph: &'static I
     b
 }
 
-fn navbar(s: &State, k: &Kit, p: usize) -> El {
-    let pane = &s.panes[p];
-    let mut path = row().key("crumbs").grow(1.0).min_w(0.0).h(26.0).px(4.0).center_y().radius(k.radius.sm).border(1.0, k.c.border_weak).clip_soft(8.0);
-    let steps = crumbs(&pane.loc);
+/// The path bar: each step of the path a link back to it, or, while editing, a field with the
+/// address (see [`actions::edit_address`]). Its empty part edits on a click; a right click
+/// offers copying and pasting the address (not while editing: the menu would take the field's
+/// focus, and with it what was typed).
+fn path_bar(s: &State, k: &Kit, p: usize) -> El {
+    let bar = row().grow(1.0).min_w(0.0).h(26.0).px(4.0).center_y().radius(k.radius.sm).border(1.0, k.c.border_weak);
+    if let Some(edit) = &s.address[p] {
+        let field = rune::text_input(edit, k.ty.text_small)
+            .single_line()
+            .key(address_key(p))
+            .label("Endereço")
+            .grow(1.0)
+            .shrink()
+            .min_w(0.0)
+            .px(3.0)
+            .color(k.c.text_base)
+            .caret(k.c.text_base, k.selection())
+            // Only reached while the field shows; one closed meanwhile comes back empty and
+            // unfocused, which `poll` closes again.
+            .on_edit(move |s: &mut State| s.address[p].get_or_insert_with(|| rune::TextEdit::new("")))
+            .on_submit(move |s: &mut State, tx: &mut Tx| {
+                let typed = s.address[p].as_ref().map(|a| a.text.clone()).unwrap_or_default();
+                if actions::go_to_address(s, p, &typed) {
+                    tx.focus(pane_key(p), false);
+                }
+            })
+            .on_input_key(move |s: &mut State, ev: &KeyEvent, tx: &mut Tx| {
+                if ev.key != rune::Key::Escape {
+                    return false;
+                }
+                s.address[p] = None;
+                tx.focus(pane_key(p), false);
+                true
+            });
+        return bar.key("address").border(1.0, k.c.border_strong).child(field);
+    }
+    let mut path = bar.key("crumbs").clip_soft(8.0).on_secondary_press(move |s: &mut State, at: rune::PointerPress, _: &mut Tx| s.address_menu = Some((p, at)));
+    let steps = crumbs(&s.panes[p].loc);
     let last = steps.len().saturating_sub(1);
     for (i, c) in steps.into_iter().enumerate() {
         if i > 0 {
@@ -1168,6 +1226,16 @@ fn navbar(s: &State, k: &Kit, p: usize) -> El {
                 ),
         );
     }
+    // The bar's empty part, after the last step: a click there edits the address.
+    path.child(el().key("address-edit").grow(1.0).h_full().min_w(16.0).cursor(Cursor::Text).on_press(move |s: &mut State| actions::edit_address(s, p)))
+}
+
+pub(crate) fn address_key(p: usize) -> String {
+    format!("address-input-{p}")
+}
+
+fn navbar(s: &State, k: &Kit, p: usize) -> El {
+    let pane = &s.panes[p];
     row()
         .key("nav")
         .w_full()
@@ -1179,7 +1247,7 @@ fn navbar(s: &State, k: &Kit, p: usize) -> El {
         .child(nav_button(k, "back", &icons::BACK, "Voltar (Alt+←)", !pane.back.is_empty(), move |s: &mut State| go_back(s, p)))
         .child(nav_button(k, "forward", &icons::FORWARD, "Avançar (Alt+→)", !pane.forward.is_empty(), move |s: &mut State| go_forward(s, p)))
         .child(nav_button(k, "up", &icons::UP, "Acima (Backspace)", can_go_up(&pane.loc), move |s: &mut State| go_up(s, p)))
-        .child(path.mx(4.0))
+        .child(path_bar(s, k, p).mx(4.0))
         .child(search_box(s, k, p))
         .child(nav_button(k, "reload", &icons::REFRESH, "Atualizar (Ctrl+R)", true, move |s: &mut State| load(s, p)))
 }
@@ -1400,7 +1468,7 @@ fn tree(s: &State, k: &Kit, p: usize) -> El {
         if let Some(drives) = s.cache.shared_drives(e) {
             for d in drives.iter() {
                 let space = Space::Shared { id: d.id.clone(), name: d.name.clone() };
-                t = t.child(node(k, p, format!("acc:{e}:sd:{}", d.id), 2, icon(&icons::SHARED, 16.0), &d.name, &current, Location::drive(e.clone(), space)));
+                t = t.child(node(k, p, format!("acc:{e}:sd:{}", d.id), 2, icon(&icons::SHARED, 16.0), &shown(&d.name), &current, Location::drive(e.clone(), space)));
             }
         }
         // Drive's own lists, as on the Drive website.
@@ -1496,7 +1564,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         let e = &pane.entries[i];
         let is_sel = pane.selected.contains(&e.id);
         let found = matches!(pane.loc, Location::Found(_));
-        let mut r = row().key(row_key(&e.id)).role("row").label(e.name.clone()).focus_selected(is_sel).w_full().h(ROW_H).center_y();
+        let mut r = row().key(row_key(&e.id)).role("row").label(shown(&e.name)).focus_selected(is_sel).w_full().h(ROW_H).center_y();
         r = if is_sel { r.fill(selected) } else { r.hover(hover) };
         if s.active == p && pane.cursor.as_deref() == Some(e.id.as_str()) {
             r = r.outline(1.0, -1.0, ring);
@@ -1511,7 +1579,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                 .child(entry_icon(s, &pane.loc, e, 16.0))
                 .child(match &s.renaming {
                     Some((rp, item)) if *rp == p && item.id == e.id => rename_field(s, rename_look),
-                    _ => text(e.name.clone()).font(font).color(text_c).truncate().shrink().min_w(0.0),
+                    _ => text(shown(&e.name)).font(font).color(text_c).truncate().shrink().min_w(0.0),
                 }),
         )
         .child(cell(1).justify_end().child(muted(e.size.map(format_size).unwrap_or_default()).align(Align::End)))

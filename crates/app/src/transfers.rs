@@ -60,7 +60,7 @@ impl End {
     /// Item `name` in a Drive folder (`None` for the folder itself).
     pub fn drive(loc: &Location, name: Option<&str>) -> End {
         let mut parts: Vec<String> = crumbs(loc).into_iter().skip(1).map(|c| c.label).collect();
-        parts.extend(name.map(str::to_string));
+        parts.extend(name.map(crate::model::shown));
         let account = match loc {
             Location::Drive { email, .. } => format!(" [{email}]"),
             _ => String::new(),

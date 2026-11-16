@@ -239,10 +239,11 @@ pub fn unique_where(dir: &Path, name: &str, taken: &dyn Fn(&Path) -> bool) -> Pa
         .expect("an unused name exists")
 }
 
-/// A name Windows takes for one Google Drive allows: characters Windows refuses become `_`,
-/// trailing dots and spaces go, and a device name (`CON`, `aux.txt`) gets a `_` after it.
+/// A name Windows takes for one Google Drive allows: a `/` becomes the `／` the app shows for it
+/// (see [`crate::model::NAME_SLASH`]), other characters Windows refuses become `_`, trailing dots
+/// and spaces go, and a device name (`CON`, `aux.txt`) gets a `_` after it.
 pub fn windows_name(name: &str) -> String {
-    let mut out: String = name.chars().map(|c| if FORBIDDEN.contains(&c) || c.is_control() { '_' } else { c }).collect();
+    let mut out: String = crate::model::shown(name).chars().map(|c| if FORBIDDEN.contains(&c) || c.is_control() { '_' } else { c }).collect();
     out.truncate(out.trim_end_matches(['.', ' ']).len());
     let stem = out.split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
     let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
@@ -500,7 +501,7 @@ mod tests {
     #[test]
     fn drive_names_become_names_windows_takes() {
         assert_eq!(windows_name("Reunião: pauta?.docx"), "Reunião_ pauta_.docx");
-        assert_eq!(windows_name(r"a/b\c"), "a_b_c");
+        assert_eq!(windows_name(r"a/b\c"), "a／b_c");
         assert_eq!(windows_name("fim. . "), "fim");
         assert_eq!(windows_name("con.txt"), "con_.txt");
         assert_eq!(windows_name("COM1"), "COM1_");

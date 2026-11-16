@@ -27,7 +27,7 @@ use std::sync::{Condvar, Mutex};
 use serde::Deserialize;
 
 use crate::Result;
-use crate::api::{Drive, DriveFile, FOLDER_MIME};
+use crate::api::{Drive, DriveFile, FOLDER_MIME, valid_id};
 
 /// Where a search looks.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,17 +66,13 @@ const NARROWEST: i64 = 1000;
 /// The `q` of a search: every word in the name, trash left out. `None` when nothing was typed.
 /// Quotes and backslashes are escaped, so what's typed can't change the query.
 pub fn query(text: &str) -> Option<String> {
-    let words: Vec<String> = text.split_whitespace().map(|w| format!("name contains '{}'", w.replace('\\', "\\\\").replace('\'', "\\'"))).collect();
+    let words: Vec<String> = text.split_whitespace().map(|w| format!("name contains {}", crate::api::quoted(w))).collect();
     (!words.is_empty()).then(|| format!("{} and trashed = false", words.join(" and ")))
 }
 
 /// `'a' in parents or 'b' in parents ...`, for ids already checked by [`valid_id`] or from Drive.
 fn in_parents(folders: &[String]) -> String {
     folders.iter().map(|p| format!("'{p}' in parents")).collect::<Vec<_>>().join(" or ")
-}
-
-fn valid_id(id: &str) -> bool {
-    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// A result, with the folders it sits in when a folder search asked for them.

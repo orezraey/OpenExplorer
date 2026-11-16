@@ -5,6 +5,7 @@
 //! window; `poll` applies it.
 
 mod actions;
+mod address;
 mod cache;
 mod downloads;
 #[cfg(windows)]
@@ -59,9 +60,9 @@ enum Msg {
     Link(sharing::LinkAnswer),
     /// The answer of a search of the computer for pane `pane`.
     Found { pane: usize, request: u64, result: Result<Vec<Entry>, String>, info: finder::Info },
-    /// Where Drive item `item` (id, name), shown in pane `pane` while its listing was number
-    /// `request`, sits: the folder to go to.
-    Placed { pane: usize, request: u64, item: (String, String), result: Result<Location, String> },
+    /// Where pane `pane` goes (Mostrar na pasta, the address), looked up when it had made
+    /// `moves` moves (see [`model::Pane::moves`]).
+    Reached { pane: usize, moves: u64, result: Result<address::Reached, String> },
     /// Installing the search service ended: search again in the panes `reload` shows.
     Installed { reload: Vec<Location>, result: Result<String, String> },
     /// A drag of Drive items `ids` out of pane `from` ended.
@@ -96,6 +97,10 @@ struct State {
     renaming: Option<(usize, Entry)>,
     /// Each pane's search field.
     search: [rune::TextEdit; 2],
+    /// Each pane's path bar while it's a field to type an address in.
+    address: [Option<rune::TextEdit>; 2],
+    /// The path bar's right-click menu: the pane it was opened in and where.
+    address_menu: Option<(usize, rune::PointerPress)>,
     /// Each local pane's field as last seen, and when it may be searched: typing searches the
     /// computer once the keys stop for a moment.
     typed: [(String, f64); 2],
@@ -176,6 +181,8 @@ fn init() -> State {
         name_edit: rune::TextEdit::new(""),
         renaming: None,
         search: [rune::TextEdit::new(""), rune::TextEdit::new("")],
+        address: Default::default(),
+        address_menu: None,
         typed: Default::default(),
         searched: Default::default(),
         found: Default::default(),
@@ -440,24 +447,28 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     Err(e) => s.status = e,
                 }
             }
-            Msg::Placed { pane, request, item, result } => {
-                // The pane moved on (or listed again) while the folder was looked for.
-                if s.live[pane].load(Ordering::Relaxed) != request {
+            Msg::Reached { pane, moves, result } => {
+                // The pane moved on while the place was looked for.
+                if s.panes[pane].moves != moves {
                     continue;
                 }
                 match result {
                     Ok(to) => {
                         s.status.clear();
-                        navigate(s, pane, to);
-                        s.panes[pane].reveal = Some(item);
+                        actions::arrive(s, pane, to);
                     }
-                    Err(e) => s.status = format!("Não consegui achar a pasta: {e}"),
+                    Err(e) => s.status = e,
                 }
             }
         }
     }
-    // Mostrar na pasta: the item is selected and brought into view once its folder lists it.
     for p in 0..2 {
+        // The address field closes when the keyboard leaves it (a click elsewhere).
+        if s.address[p].as_ref().is_some_and(|a| !a.focused) {
+            s.address[p] = None;
+            changed = true;
+        }
+        // Mostrar na pasta: the item is selected and brought into view once its folder lists it.
         let pane = &mut s.panes[p];
         let Some((id, name)) = pane.reveal.clone() else { continue };
         if pane.entry(&id).is_some() {
@@ -902,6 +913,19 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             actions::ask_rename(s, p, tx);
             return true;
         }
+        // The address, to edit, as in Explorer.
+        Key::Function(4) => {
+            actions::edit_address(s, p);
+            return true;
+        }
+        _ if ev.is_command('l') => {
+            actions::edit_address(s, p);
+            return true;
+        }
+        Key::Text(t) if ev.mods.alt && t.eq_ignore_ascii_case("d") => {
+            actions::edit_address(s, p);
+            return true;
+        }
         Key::Enter if ev.mods.alt => {
             actions::properties(s, p);
             return true;
@@ -1234,6 +1258,31 @@ fn main() {
             }),
             // Opções open.
             ("options", |s| s.dialog = Some(actions::Dialog::Options)),
+            // The address being edited, all selected.
+            ("address", |s| actions::edit_address(s, 0)),
+            // Drive names holding `/`, shown with `／` in the path bar, the list and the rename
+            // field, without a network.
+            ("slash", |s| {
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.panes[1].go(Location::Drive { email: "voce@gmail.com".into(), space: Space::MyDrive, path: vec![("x".into(), "Séries/Filmes".into())] });
+                let mut entries = view_sample();
+                entries[0].name = "tes/test".into();
+                entries[1].name = "Fotos 2024/25.pdf".into();
+                // Renomear open on the second one, as F2 opens it.
+                let renamed = entries[1].clone();
+                s.panes[1].set_entries(Ok(entries));
+                s.panes[1].selected = [renamed.id.clone()].into();
+                s.name_edit = actions::name_field(&renamed);
+                s.renaming = Some((1, renamed));
+            }),
+            // The path bar's menu over a Drive folder (with Copiar link do Drive), without a
+            // network.
+            ("address-menu", |s| {
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.panes[1].go(Location::Drive { email: "voce@gmail.com".into(), space: Space::MyDrive, path: vec![("x".into(), "Projetos".into())] });
+                s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
+                s.address_menu = Some((1, rune::PointerPress { x: 820.0, y: 92.0 }));
+            }),
             // A search of the computer with results, a disk still being read; and one without
             // the service installed.
             ("found", |s| found_scene(s, true)),

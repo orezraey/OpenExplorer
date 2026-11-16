@@ -112,11 +112,15 @@ pub struct SharedDrive {
 }
 
 /// Where a file sits: the top it hangs from, and the folders from just under that top down to
-/// the one holding it (empty when it sits at the top itself).
+/// the one holding it (empty when it sits at the top itself). A shared drive's own root sits
+/// at its top with no folders.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Place {
     pub top: Top,
     pub folders: Vec<(String, String)>,
+    /// The file's own name, and whether it's a folder.
+    pub name: String,
+    pub is_folder: bool,
 }
 
 /// What a file's folders hang from.
@@ -472,15 +476,17 @@ impl Drive {
         Ok(folder)
     }
 
-    /// Where file `id` sits, for Mostrar na pasta: climbs through its parents to the top of its
-    /// shared drive or My Drive, or to the highest folder the account can see.
+    /// Where file `id` sits, for Mostrar na pasta and Drive links: climbs through its parents to
+    /// the top of its shared drive or My Drive, or to the highest folder the account can see.
     pub fn place(&self, id: &str) -> Result<Place> {
-        const WHAT: &str = "Mostrar na pasta";
+        const WHAT: &str = "Achar a pasta";
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Up {
             #[serde(default)]
             name: String,
+            #[serde(default)]
+            mime_type: String,
             #[serde(default)]
             parents: Vec<String>,
             drive_id: Option<String>,
@@ -489,7 +495,17 @@ impl Drive {
             let v = self.get(&format!("/files/{}", checked(id)?), &[("fields", fields), ("supportsAllDrives", "true")], WHAT)?;
             serde_json::from_value(v).map_err(|e| format!("{WHAT}: resposta inesperada: {e}"))
         };
-        let file = up(id, "parents,driveId")?;
+        let drive_name = |drive: &str| -> Result<String> {
+            let d = self.get(&format!("/drives/{}", checked(drive)?), &[("fields", "name")], WHAT)?;
+            Ok(d.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string())
+        };
+        let file = up(id, "name,mimeType,parents,driveId")?;
+        let (name, is_folder) = (file.name, file.mime_type == FOLDER_MIME);
+        // A shared drive's root is a folder with the drive's id.
+        if file.drive_id.as_deref() == Some(id) {
+            let top = Top::SharedDrive { id: id.to_string(), name: drive_name(id)? };
+            return Ok(Place { top, folders: Vec::new(), name, is_folder });
+        }
         let root = match &file.drive_id {
             Some(_) => None,
             None => Some(self.root_id()?),
@@ -499,8 +515,7 @@ impl Drive {
         let top = loop {
             let Some(at) = next else { break Top::SharedWithMe };
             if file.drive_id.as_deref() == Some(at.as_str()) {
-                let d = self.get(&format!("/drives/{}", checked(&at)?), &[("fields", "name")], WHAT)?;
-                let name = d.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
+                let name = drive_name(&at)?;
                 break Top::SharedDrive { id: at, name };
             }
             if root.as_deref() == Some(at.as_str()) {
@@ -515,7 +530,43 @@ impl Drive {
             next = folder.parents.into_iter().next();
         };
         folders.reverse();
-        Ok(Place { top, folders })
+        Ok(Place { top, folders, name, is_folder })
+    }
+
+    /// The item named `name` in folder `parent` (in shared drive `shared_drive`, when it's in
+    /// one; `"root"` is My Drive), a folder first when a file has the same name. Drive lets
+    /// names repeat: the first one Drive lists wins.
+    pub fn child_named(&self, parent: &str, shared_drive: Option<&str>, name: &str) -> Result<Option<DriveFile>> {
+        let q = format!("'{}' in parents and name = {} and trashed = false", checked(parent)?, quoted(name));
+        let mut query = vec![("q", q.as_str()), ("fields", LIST_FIELDS), ("pageSize", "100"), ("supportsAllDrives", "true"), ("includeItemsFromAllDrives", "true")];
+        match shared_drive {
+            Some(d) => query.extend([("corpora", "drive"), ("driveId", checked(d)?)]),
+            None => query.push(("corpora", "allDrives")),
+        }
+        self.first_named(&query)
+    }
+
+    /// The item named `name` in Compartilhados comigo or Com estrela, a folder first; `None`
+    /// there or in a view that lists no such thing (Recentes has no folders; Lixeira opens only
+    /// as a list).
+    pub fn view_child_named(&self, view: View, name: &str) -> Result<Option<DriveFile>> {
+        let (filter, corpus) = match view {
+            View::SharedWithMe => ("sharedWithMe = true", "user"),
+            View::Starred => ("starred = true", "allDrives"),
+            View::Recent | View::Trash => return Ok(None),
+        };
+        let q = format!("{filter} and name = {} and trashed = false", quoted(name));
+        let query = [("q", q.as_str()), ("fields", LIST_FIELDS), ("pageSize", "100"), ("supportsAllDrives", "true"), ("includeItemsFromAllDrives", "true"), ("corpora", corpus)];
+        self.first_named(&query)
+    }
+
+    /// The first folder `query` finds, else its first file.
+    fn first_named(&self, query: &[(&str, &str)]) -> Result<Option<DriveFile>> {
+        let mut v = self.get("/files", query, "Achar pelo nome")?;
+        let found: Vec<RawFile> = serde_json::from_value(v.get_mut("files").map(serde_json::Value::take).unwrap_or_default()).map_err(|e| format!("Achar pelo nome: resposta inesperada: {e}"))?;
+        let mut found: Vec<DriveFile> = found.into_iter().map(DriveFile::from).collect();
+        let at = found.iter().position(|f| f.is_dir).unwrap_or(0);
+        Ok((!found.is_empty()).then(|| found.swap_remove(at)))
     }
 
     /// One file's details, for Propriedades.
@@ -611,10 +662,21 @@ pub struct Revision {
     pub name: Option<String>,
 }
 
-/// A Drive id, refused if it holds anything but `[A-Za-z0-9_-]`, so it can't reach into the
-/// request path or query.
+/// `text` as a quoted string in a `files.list` query, its quotes and backslashes escaped so
+/// it can't change the query.
+pub(crate) fn quoted(text: &str) -> String {
+    format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// Whether `id` can be a Drive id: `[A-Za-z0-9_-]` only, so it can't reach into a request's
+/// path or query.
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// A Drive id, refused unless [`valid_id`].
 pub(crate) fn checked(id: &str) -> Result<&str> {
-    if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') { Ok(id) } else { Err(format!("Id inválido: {id}")) }
+    if valid_id(id) { Ok(id) } else { Err(format!("Id inválido: {id}")) }
 }
 
 #[derive(Deserialize)]
