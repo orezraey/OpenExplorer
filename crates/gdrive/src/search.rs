@@ -15,8 +15,9 @@
 //! dates are split, and Drive's index there misses some files `allDrives` finds. A folder
 //! can't be asked for with its subfolders, so its tree is walked for folder ids (only folders,
 //! many parents per request, several requests at once) while the search runs, and results keep
-//! to that tree: those whose folder is already known in it show at once, the rest once the walk
-//! ends.
+//! to that tree: those whose folder is already known in it show at once; when the search ends
+//! before the walk, the few left are placed by climbing from their folders up, the many wait
+//! for the walk to end.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -47,6 +48,15 @@ const SEARCHERS: usize = 16;
 const PARENTS_PER_REQUEST: usize = 30;
 /// Folder-walk requests at the same time.
 const WALKERS: usize = 6;
+/// Page size when asking for the folders of several parents at once: Drive answers HTTP 500
+/// ("Internal Error") to `'a' in parents or 'b' in parents ...` with pages over about 500
+/// when the parents hold that many (measured: 500 works, 700 fails). One parent takes 1000.
+const PAGE_OF_MANY_PARENTS: &str = "500";
+/// The most folders of results still waiting on the walk that are placed by climbing from them
+/// (a request per folder on the way up) rather than by walking on.
+const CLIMB_AT_MOST: usize = 300;
+/// How deep Drive nests folders: a climb any longer is going round in circles.
+const DEEPEST_FOLDER: usize = 100;
 /// The first results, asked for apart: a short unsorted page comes back in a fraction of the
 /// time of a full sorted one.
 const GLIMPSE: &str = "100";
@@ -227,13 +237,35 @@ impl Drive {
                 }
                 more
             });
+            // `stop` set by now means the walk failed or the caller left: the search may have been
+            // cut short, and only the walk's outcome tells.
+            let whole = searched.is_ok() && !stop.load(Ordering::Relaxed);
+            // Few results still waiting are placed by climbing from their folders instead: far
+            // fewer requests than the rest of a big tree's walk.
+            let mut climbed = None;
+            if whole && !waiting.is_empty() && !walked.load(Ordering::Acquire) {
+                let known = tree.lock().unwrap();
+                let folders: HashSet<String> = waiting.iter().flat_map(|h| h.parents.iter()).filter(|p| !known.contains(*p)).cloned().collect();
+                drop(known);
+                if folders.len() <= CLIMB_AT_MOST {
+                    climbed = self.climb(folders, shared_drive.as_deref(), &tree);
+                }
+            }
+            let placed = whole && (waiting.is_empty() || climbed.is_some());
+            // With every result placed, what's left of the walk would decide nothing.
+            if placed {
+                stop.store(true, Ordering::Relaxed);
+            }
             let walk = walk.join().unwrap_or_else(|_| Err("Erro interno ao percorrer a pasta.".into()));
             stop.store(true, Ordering::Relaxed);
-            walk?;
+            if !placed {
+                walk?;
+            }
             searched?;
             if !left {
                 let known = tree.lock().unwrap();
-                let rest: Vec<DriveFile> = waiting.into_iter().filter(|h| h.parents.iter().any(|p| known.contains(p))).map(|h| h.file.into()).collect();
+                let inside = |p: &String| known.contains(p) || climbed.as_ref().is_some_and(|c| c.contains(p));
+                let rest: Vec<DriveFile> = waiting.into_iter().filter(|h| h.parents.iter().any(inside)).map(|h| h.file.into()).collect();
                 each(rest, false);
             }
             Ok(())
@@ -365,14 +397,73 @@ impl Drive {
         Ok(())
     }
 
+    /// The folders among `folders` and on their way up that are inside `tree`, told by climbing
+    /// from each through its parents until a folder known to be inside or the top of the drive,
+    /// several at once. `tree` is only read: the walk, still running, adds to it what it finds.
+    /// `None` when climbing can't tell: a request failed, a folder has several parents (only the
+    /// walk follows them all), or the way up is deeper than Drive nests folders.
+    fn climb(&self, folders: HashSet<String>, shared_drive: Option<&str>, tree: &Mutex<HashSet<String>>) -> Option<HashSet<String>> {
+        let folders: Vec<String> = folders.into_iter().collect();
+        let inside = Mutex::new(HashSet::new());
+        let outside: Mutex<HashSet<String>> = Mutex::new(shared_drive.map(str::to_string).into_iter().collect());
+        let at = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..SEARCHERS.min(folders.len()) {
+                scope.spawn(|| {
+                    while let Some(start) = folders.get(at.fetch_add(1, Ordering::Relaxed)) {
+                        let mut way = Vec::new();
+                        let mut folder = start.clone();
+                        let is_inside = loop {
+                            if failed.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            if tree.lock().unwrap().contains(&folder) || inside.lock().unwrap().contains(&folder) {
+                                break true;
+                            }
+                            if outside.lock().unwrap().contains(&folder) || !valid_id(&folder) {
+                                break false;
+                            }
+                            let got = self.get(&format!("/files/{folder}"), &[("fields", "parents"), ("supportsAllDrives", "true")], "Pastas da pesquisa");
+                            let parents: Option<Vec<String>> = got.ok().map(|mut v| v.get_mut("parents").map(serde_json::Value::take).and_then(|p| serde_json::from_value(p).ok()).unwrap_or_default());
+                            let Some(parents) = parents.filter(|p| p.len() <= 1 && way.len() < DEEPEST_FOLDER) else {
+                                failed.store(true, Ordering::Relaxed);
+                                return;
+                            };
+                            way.push(std::mem::replace(&mut folder, parents.into_iter().next().unwrap_or_default()));
+                        };
+                        if is_inside { inside.lock().unwrap().extend(way) } else { outside.lock().unwrap().extend(way) }
+                    }
+                });
+            }
+        });
+        (!failed.into_inner()).then(|| inside.into_inner().unwrap())
+    }
+
     /// Adds every folder under `root` to `tree`, a level at a time: each request asks for the
     /// folders in up to [`PARENTS_PER_REQUEST`] parents, [`WALKERS`] requests at once.
     fn walk_folders(&self, root: &str, shared_drive: Option<&str>, tree: &Mutex<HashSet<String>>, stop: &AtomicBool) -> Result<()> {
         let corpus = shared_drive.map_or(Corpus::All, |d| Corpus::Drive(d.to_string()));
         let corpus = &corpus;
+        // The folders in `parents`, into `tree` and `next`.
+        let folders_in = |parents: &[String], next: &Mutex<Vec<String>>| {
+            let q = format!("({}) and mimeType = '{FOLDER_MIME}' and trashed = false", in_parents(parents));
+            let size = if parents.len() == 1 { "1000" } else { PAGE_OF_MANY_PARENTS };
+            let mut query = vec![("q", q.as_str()), ("fields", "nextPageToken,files(id)"), ("pageSize", size), ("supportsAllDrives", "true"), ("includeItemsFromAllDrives", "true")];
+            corpus.params(&mut query);
+            self.pages("/files", &query, "files", "Pastas da pesquisa", |found: Vec<FolderId>, _| {
+                let mut tree = tree.lock().unwrap();
+                let fresh: Vec<String> = found.into_iter().map(|f| f.id).filter(|id| tree.insert(id.clone())).collect();
+                drop(tree);
+                next.lock().unwrap().extend(fresh);
+                !stop.load(Ordering::Relaxed)
+            })
+        };
         let mut level = vec![root.to_string()];
         while !level.is_empty() && !stop.load(Ordering::Relaxed) {
-            let batches: Vec<&[String]> = level.chunks(PARENTS_PER_REQUEST).collect();
+            // Few parents are spread over every walker rather than asked for together.
+            let per = level.len().div_ceil(WALKERS).clamp(1, PARENTS_PER_REQUEST);
+            let batches: Vec<&[String]> = level.chunks(per).collect();
             let next = Mutex::new(Vec::new());
             let error = Mutex::new(None);
             let at = AtomicUsize::new(0);
@@ -383,16 +474,15 @@ impl Drive {
                             if stop.load(Ordering::Relaxed) || error.lock().unwrap().is_some() {
                                 return;
                             }
-                            let q = format!("({}) and mimeType = '{FOLDER_MIME}' and trashed = false", in_parents(batch));
-                            let mut query = vec![("q", q.as_str()), ("fields", "nextPageToken,files(id)"), ("pageSize", "1000"), ("supportsAllDrives", "true"), ("includeItemsFromAllDrives", "true")];
-                            corpus.params(&mut query);
-                            let got = self.pages("/files", &query, "files", "Pastas da pesquisa", |found: Vec<FolderId>, _| {
-                                let mut tree = tree.lock().unwrap();
-                                let fresh: Vec<String> = found.into_iter().map(|f| f.id).filter(|id| tree.insert(id.clone())).collect();
-                                drop(tree);
-                                next.lock().unwrap().extend(fresh);
-                                !stop.load(Ordering::Relaxed)
-                            });
+                            let mut got = folders_in(batch, &next);
+                            // Drive can fail a query on many parents with a server error even so:
+                            // each parent is then asked for on its own, which is what fails for
+                            // real (what came already is in `tree` and comes again only as
+                            // repeats, which are dropped).
+                            if batch.len() > 1 && got.is_err() {
+                                crate::log(&format!("pastas de {} pais falharam, uma a uma", batch.len()));
+                                got = batch.iter().try_for_each(|p| folders_in(std::slice::from_ref(p), &next));
+                            }
                             if let Err(e) = got {
                                 error.lock().unwrap().get_or_insert(e);
                             }
