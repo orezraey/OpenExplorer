@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 
 use rune::{Align, Color, Cursor, Cx, Drag, DragOutcome, El, GrowthSpec, Icon, KeyEvent, Phase, ScrollSpec, Tx, col, el, icon, row, text};
-use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, ScrollBar, Toast, ToastRegion, context_menu};
+use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, ScrollBar, ScrollBarStyle, Toast, ToastRegion, context_menu};
 
 use crate::model::{Kind, Location, SortCol, Space, crumbs, format_bytes, format_long, format_size, format_time, shown};
 use crate::actions::{self, ClipMode, Dialog};
@@ -194,6 +194,9 @@ fn queue_row(s: &State, k: &Kit, t: &transfers::Transfer) -> El {
 /// The transfer queue under the panes: a row per item being copied or moved. It shows only
 /// while there's a row; its top edge drags to change its height, and its columns resize as the
 /// file list's do.
+/// The transfer queue's column header, stuck to the top of its viewport.
+const QUEUE_HEADER_H: f32 = 22.0;
+
 fn transfers(s: &State, k: &Kit) -> El {
     if s.transfers.is_empty() {
         return el().key("queue-wrap");
@@ -202,12 +205,12 @@ fn transfers(s: &State, k: &Kit) -> El {
     let total: f32 = w.iter().sum();
     let grips = (0..8).map(|i| {
         let edge = w[..=i].iter().sum();
-        grip(k, &format!("queue-grip-{i}"), edge, 22.0, move |s| &mut s.layout.queue_cols[i], layout::QUEUE_COLS[i], move |v| layout::clamp_queue_col(i, v))
+        grip(k, &format!("queue-grip-{i}"), edge, QUEUE_HEADER_H, move |s| &mut s.layout.queue_cols[i], layout::QUEUE_COLS[i], move |v| layout::clamp_queue_col(i, v))
     });
     let header = row()
         .key("queue-header")
         .w_full()
-        .h(22.0)
+        .h(QUEUE_HEADER_H)
         .fill(k.c.bg_base)
         .sticky_top(0.0)
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
@@ -217,7 +220,9 @@ fn transfers(s: &State, k: &Kit) -> El {
         .children(grips);
     // Only the rows in view are built: copying a 5,000-file folder makes 5,000 rows.
     let kit = k.clone();
-    let rows = col().key("queue-rows").w_full().growth(GrowthSpec::default()).virtual_rows(
+    // As in the file list: the bar runs below the header, beside the rows.
+    let bar = bar_style(k).track_offset(QUEUE_HEADER_H, 0.0);
+    let rows = col().key("queue-rows").w_full().pr(bar.strip()).growth(GrowthSpec::default()).virtual_rows(
         s.transfers.len(),
         22.0,
         |s: &State, i| Cow::Owned(format!("t-{:p}", std::sync::Arc::as_ptr(&s.transfers[i].progress))),
@@ -225,7 +230,7 @@ fn transfers(s: &State, k: &Kit) -> El {
     );
     // One viewport scrolls both ways, as the file list's: sideways when the columns are wider
     // than the window, with the header stuck to the top.
-    let table = col().key("queue-table").w_full().min_w(total).child(header).child(rows);
+    let table = col().key("queue-table").w_full().min_w(total + bar.strip()).child(header).child(rows);
     let queue = col()
         .key("queue")
         .w_full()
@@ -235,7 +240,7 @@ fn transfers(s: &State, k: &Kit) -> El {
         .border(1.0, k.c.border_weak)
         .clip_soft(0.0)
         .on_secondary_press(|s: &mut State, at: rune::PointerPress, _: &mut Tx| s.transfer_menu = Some((None, at)))
-        .child(col().key("queue-viewport").w_full().grow(1.0).min_h(0.0).scroll_xy().child(table).scroll_bar(k))
+        .child(col().key("queue-viewport").w_full().grow(1.0).min_h(0.0).scroll_xy().child(table).scroll_bar_styled(bar))
         .child(row().key("queue-foot").w_full().h(22.0).px(8.0).justify_end().center_y().border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_weak).child(queue_totals(s, k)));
     // The strip above the queue drags up and down to change its height. On a window too
     // short for it, the queue gives way rather than the panes.
@@ -1465,10 +1470,12 @@ pub(crate) fn tree_key(p: usize) -> String {
 fn tree(s: &State, k: &Kit, p: usize) -> El {
     let lines = std::rc::Rc::new(crate::tree::lines(s, p));
     let (keys, kit, n) = (lines.clone(), k.clone(), lines.len());
+    let bar = bar_style(k);
     let rows = col()
         .key("tree")
         .w_full()
         .pb(8.0)
+        .pr(bar.strip())
         .growth(GrowthSpec::default())
         .virtual_rows(n, ROW_H, move |_: &State, i| Cow::Owned(format!("t:{}", keys[i].key())), move |s: &State, i| tree_line(s, &kit, p, &lines[i]))
         .virtual_rows_version((s.tree.version, s.panes[p].moves, s.accounts.len()));
@@ -1481,6 +1488,7 @@ fn tree(s: &State, k: &Kit, p: usize) -> El {
         .fill(k.alpha(k.c.text_base, if k.dark { 0.02 } else { 0.015 }))
         .scroll(ScrollSpec { stick_bottom: false })
         .child(rows)
+        .scroll_bar_styled(bar)
 }
 // ---------------------------------------------------------------------------------------------
 // File list
@@ -1510,6 +1518,16 @@ fn grip(k: &Kit, key: &str, edge: f32, height: f32, size: impl Fn(&mut State) ->
         })
 }
 
+/// The app's scroll bars: a thumb dark enough to see at rest (the kit's is a faint line on a
+/// light theme), wider and darker under the pointer. Shown always, the bar sits over the
+/// viewport's end edge: what it scrolls leaves [`ScrollBarStyle::strip`] of room there.
+fn bar_style(k: &Kit) -> ScrollBarStyle {
+    ScrollBarStyle::from_kit(k).thumb(k.alpha(k.c.text_base, 0.3)).thumb_hover(k.alpha(k.c.text_base, 0.5)).width(8.0).hover_width(10.0)
+}
+
+/// The file list's column header, stuck to the top of its viewport.
+const HEADER_H: f32 = 24.0;
+
 fn list(s: &State, k: &Kit, p: usize) -> El {
     let pane = &s.panes[p];
     let w = s.layout.columns[p];
@@ -1537,7 +1555,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let header = row()
         .key("header")
         .w_full()
-        .h(24.0)
+        .h(HEADER_H)
         .fill(k.c.bg_base)
         .sticky_top(0.0)
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
@@ -1622,9 +1640,12 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     };
 
     let n = pane.entries.len();
+    // The rows end where the scroll bar starts; the header runs on above it.
+    let bar = bar_style(k).track_offset(HEADER_H, 0.0);
     let rows = col()
         .key("rows")
         .w_full()
+        .pr(bar.strip())
         .growth(GrowthSpec::default())
         .virtual_rows(n, ROW_H, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
         .virtual_rows_version((pane.version, w.map(f32::to_bits), s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))));
@@ -1661,10 +1682,12 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     // One viewport scrolls both ways: sideways when the columns are wider than the pane,
     // header and rows together, and up and down with the header stuck to the top. Its
     // vertical bar sits on the pane's right edge, wherever the columns end.
-    let table = col().key("table").w_full().min_w(total).child(header).child(body);
+    let table = col().key("table").w_full().min_w(total + bar.strip()).child(header).child(body);
     // A right click on empty space opens the folder's menu (Colar, Nova pasta).
+    // Its key is the pane's own: the scroll bar keeps its state, and finds the viewport it
+    // scrolls, by this key, so with one key for both panes each bar moved the left pane.
     let viewport = col()
-        .key("viewport")
+        .key(format!("viewport-{p}"))
         .w_full()
         .h_full()
         .scroll_xy()
@@ -1675,7 +1698,8 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
             s.menu = Some((p, at));
         })
         .child(table)
-        .scroll_bar(k);
+        // The bar runs below the header, which stays put, as Explorer's does.
+        .scroll_bar_styled(bar);
     col().key("list").w(0.0).grow(1.0).h_full().min_w(0.0).child(viewport)
 }
 

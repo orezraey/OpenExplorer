@@ -1266,7 +1266,7 @@ fn view_sample() -> Vec<Entry> {
 }
 
 fn main() {
-    rune::run(AppSpec::<State> {
+    rune::App::new(AppSpec::<State> {
         min_size: Some((900.0, 420.0)),
         setup: Some(setup),
         poll: Some(poll),
@@ -1439,12 +1439,35 @@ fn main() {
             }),
         ],
         ..AppSpec::new("Open Explorer", (1280.0, 760.0), init, ui::view)
-    });
+    })
+    .args(rune_args(std::env::args().skip(1)))
+    .run();
+}
+
+/// Rune's flags: what the command line says, with scroll bars always shown on Windows unless
+/// it says otherwise. Rune reads the "Show scroll bars" preference only on macOS and elsewhere
+/// fades bars out at rest; on Windows, as in Explorer, a list shows where it stands.
+fn rune_args(given: impl Iterator<Item = String>) -> Vec<String> {
+    let mut args: Vec<String> = given.collect();
+    if cfg!(windows) && !args.iter().any(|a| a == "--scroll-bars") {
+        args.extend(["--scroll-bars".into(), "always".into()]);
+    }
+    args
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rune gets the command line as given (so --snap and --script still work), and on Windows
+    /// always-shown scroll bars unless the command line picks its own.
+    #[test]
+    fn rune_gets_the_command_line_and_shown_scroll_bars() {
+        let args = |given: &[&str]| rune_args(given.iter().map(|a| a.to_string()));
+        let shown: &[&str] = if cfg!(windows) { &["--scroll-bars", "always"] } else { &[] };
+        assert_eq!(args(&["--snap", "a.png"]), [&["--snap", "a.png"][..], shown].concat());
+        assert_eq!(args(&["--scroll-bars", "when-scrolling"]), ["--scroll-bars", "when-scrolling"]);
+    }
 
     fn entries(from: usize, n: usize) -> Vec<Entry> {
         (from..from + n).map(|i| Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false }).collect()
