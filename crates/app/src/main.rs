@@ -17,8 +17,10 @@ mod model;
 mod ops;
 mod settings;
 mod sharing;
+mod places;
 mod sysicons;
 mod transfers;
+mod tree;
 mod uploads;
 mod ui;
 mod work;
@@ -44,6 +46,8 @@ enum Msg {
     LoggedIn { pane: usize, attempt: u64, result: Result<(StoredAccount, Arc<Drive>), String> },
     /// An account a background job had to open, for `poll` to keep (see [`AccountRef::open`]).
     Opened { email: String, drive: Arc<Drive> },
+    /// The folders of tree node `id`, read on a thread or from Drive.
+    TreeKids { id: tree::NodeId, result: Result<Vec<tree::Node>, String> },
     /// A file operation finished: reload the panes showing `reload`, and say how it went.
     Done { reload: Vec<Location>, result: Result<String, String> },
     /// Something Propriedades number `id` was waiting for.
@@ -119,8 +123,12 @@ struct State {
     clip: Option<actions::Clip>,
     /// Each pane's tree width, which its splitter changes.
     layout: layout::Layout,
-    /// The disks "Este computador" lists, read at start.
+    /// The disks "Este Computador" lists, read at start.
     local_drives: Vec<(PathBuf, model::DriveKind)>,
+    /// The desktop and the user's folders, read at start.
+    places: places::Places,
+    /// What each pane's tree has open, and the folders read for it.
+    tree: tree::Tree,
     /// Each pane's current listing request, bumped by every load: `poll` drops answers for an
     /// older one, and the listing thread stops fetching pages once the pane has moved on.
     live: [Arc<AtomicU64>; 2],
@@ -173,6 +181,8 @@ fn init() -> State {
     for p in &mut panes {
         p.load_now(&mock);
     }
+    let accounts = store::accounts();
+    let tree = tree::Tree::new(accounts.iter().map(|a| a.email.clone()));
     State {
         panes,
         menu: None,
@@ -191,11 +201,13 @@ fn init() -> State {
         props_seq: 0,
         clip: None,
         local_drives: model::local_drives(),
+        places: places::places(),
+        tree,
         layout: layout::Layout::load(),
         live: Default::default(),
         cache: Default::default(),
         mock,
-        accounts: store::accounts(),
+        accounts,
         drives: HashMap::new(),
         quotas: HashMap::new(),
         login: None,
@@ -220,9 +232,13 @@ fn init() -> State {
 }
 
 fn setup(s: &mut State, waker: Waker) {
-    let fixed = s.local_drives.iter().map(|(p, _)| sysicons::drive_key(p)).chain(sysicons::home_key());
+    let fixed = tree::fixed_icons(&s.places, &s.local_drives).into_iter().chain(sysicons::home_key());
     s.icons.start(rune::ImageCache::new(waker.clone()), s.outbox.clone(), waker.clone(), fixed);
     s.waker = Some(waker);
+    // Each tree opens down to the folder its pane starts in.
+    for p in 0..2 {
+        tree::follow(s, p);
+    }
 }
 
 /// Runs `f`, turning a panic into an error that names it (and logging it), so background work
@@ -285,9 +301,14 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     // Each listing's file types get their icons asked for once.
     let versions = s.panes.each_ref().map(|p| p.version);
     if s.icons_for != versions {
+        let relisted: Vec<usize> = (0..2).filter(|&p| s.icons_for[p] != versions[p]).collect();
         s.icons_for = versions;
         let keys = s.panes.iter().flat_map(|p| sysicons::keys_of(&p.entries, &p.loc)).collect();
         s.icons.show(keys);
+        // The trees take in the folders a new listing shows.
+        for p in relisted {
+            tree::learn(s, p);
+        }
     }
     let mut changed = s.icons.settle();
     changed |= notice(s, now);
@@ -331,6 +352,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         changed = true;
         match msg {
             Msg::Opened { email, drive } => keep_drive(s, email, drive),
+            Msg::TreeKids { id, result } => tree::arrived(s, id, result),
             Msg::Listed { pane, request, part, result } => {
                 if s.live[pane].load(Ordering::Relaxed) != request {
                     continue;
@@ -437,6 +459,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     Ok((account, drive)) => {
                         s.status = format!("Conta conectada: {}", account.email);
                         s.drives.insert(account.email.clone(), drive);
+                        s.tree.account_added(&account.email);
                         let email = account.email.clone();
                         match s.accounts.iter_mut().find(|a| a.email == account.email) {
                             Some(a) => *a = account,
@@ -482,6 +505,16 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             pane.reveal = None;
             if pane.error.is_none() {
                 s.status = format!("“{name}” não está mais nesta pasta.");
+                changed = true;
+            }
+        }
+    }
+    // Each tree brings the folder its pane shows into view, once that's in the tree.
+    for p in 0..2 {
+        if tree::following(s, p) {
+            let lines = tree::lines(s, p);
+            if let Some(key) = tree::to_reveal(s, p, &lines) {
+                tx.scroll_into_view_in(ui::tree_key(p), format!("t:{key}"));
                 changed = true;
             }
         }
@@ -609,6 +642,7 @@ fn disconnect(s: &mut State, email: &str) {
     s.drives.remove(email);
     s.quotas.remove(email);
     s.cache.forget(email);
+    s.tree.forget(email);
     s.accounts.retain(|a| a.email != email);
     for p in 0..2 {
         let gone = |l: &Location| matches!(l, Location::Drive { email: e, .. } if e == email);
@@ -750,6 +784,7 @@ fn switch(s: &mut State, p: usize, loc: Location) {
     }
     s.panes[p].go(loc);
     load(s, p);
+    tree::follow(s, p);
 }
 
 /// Ends a rename whose item a reload took out of pane `p` (deleted or moved by another

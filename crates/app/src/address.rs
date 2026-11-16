@@ -271,6 +271,7 @@ fn normalize(path: &Path) -> PathBuf {
 /// selected. It asks the disk, which can take a while on a network drive: off the UI thread.
 pub fn reach_local(path: &Path) -> Result<Reached, String> {
     let meta = std::fs::metadata(path).map_err(|_| format!("Não encontrei “{}”.", path.display()))?;
+    let path = &as_on_disk(path);
     if meta.is_dir() {
         return Ok(Reached { loc: Location::Local(path.to_path_buf()), reveal: None });
     }
@@ -279,6 +280,29 @@ pub fn reach_local(path: &Path) -> Result<Reached, String> {
     };
     let name = name.to_string_lossy().into_owned();
     Ok(Reached { loc: Location::Local(dir.to_path_buf()), reveal: Some((name.clone(), name)) })
+}
+
+/// `path` (which exists) spelled as the disk spells it, "C:\Projetos" for "c:\projetos", so it
+/// matches what's listed from the disk (the tree's folders). As typed when spelling it so would
+/// go through a link to somewhere else.
+#[cfg(windows)]
+fn as_on_disk(path: &Path) -> PathBuf {
+    let Ok(real) = std::fs::canonicalize(path) else { return path.to_path_buf() };
+    // Without the `\\?\` canonicalize puts in front.
+    let real = match real.to_str() {
+        Some(r) => match r.strip_prefix(r"\\?\UNC\") {
+            Some(unc) => PathBuf::from(format!(r"\\{unc}")),
+            None => PathBuf::from(r.strip_prefix(r"\\?\").unwrap_or(r)),
+        },
+        None => return path.to_path_buf(),
+    };
+    let folded = |p: &Path| p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect::<Vec<_>>();
+    if folded(&real) == folded(path) { real } else { path.to_path_buf() }
+}
+
+#[cfg(not(windows))]
+fn as_on_disk(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 /// Where a Drive address leads in `email`'s account: a folder, or a file's folder with the file
@@ -560,5 +584,17 @@ mod tests {
         assert_eq!(reach_local(&dir), Ok(Reached { loc: Location::Local(dir.clone()), reveal: None }));
         assert_eq!(reach_local(&dir.join("notas.txt")), Ok(Reached { loc: Location::Local(dir.clone()), reveal: Some(("notas.txt".into(), "notas.txt".into())) }));
         assert!(reach_local(&dir.join("não existe")).unwrap_err().starts_with("Não encontrei"));
+    }
+
+    /// A folder typed in other letters opens as the disk spells it, as the tree lists it.
+    #[cfg(windows)]
+    #[test]
+    fn a_local_path_typed_in_other_case_opens_as_the_disk_spells_it() {
+        let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let temp = PathBuf::from(temp.to_str().unwrap().trim_start_matches(r"\\?\"));
+        let dir = temp.join("openexplorer-address-case").join("Pasta Mista");
+        std::fs::create_dir_all(&dir).unwrap();
+        let typed = PathBuf::from(dir.to_str().unwrap().to_lowercase());
+        assert_eq!(reach_local(&typed).map(|r| r.loc), Ok(Location::Local(dir)));
     }
 }

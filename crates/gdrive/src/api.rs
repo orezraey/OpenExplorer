@@ -11,6 +11,7 @@ use crate::{ClientConfig, Result, agent, json};
 
 const API: &str = "https://www.googleapis.com/drive/v3";
 pub const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
+pub const SHORTCUT_MIME: &str = "application/vnd.google-apps.shortcut";
 /// The fields of a file Drive answers with after a change or an upload.
 pub(crate) const FILE_FIELDS: &str = "id,name,mimeType,size,modifiedTime,md5Checksum,starred,shortcutDetails(targetId,targetMimeType)";
 /// What a listing asks of each file: [`FILE_FIELDS`] and the next page.
@@ -376,6 +377,24 @@ impl Drive {
             None => query.push(("corpora", "allDrives")),
         }
         self.pages("/files", &query, "files", "Listagem da pasta", |raw: Vec<RawFile>, more| each(raw.into_iter().map(DriveFile::from).collect(), more))
+    }
+
+    /// The folders in folder `folder_id` (and shortcuts to folders), for the tree: only those
+    /// are asked for, so a folder of thousands of files costs no more than its folders.
+    pub fn folders(&self, folder_id: &str, shared_drive: Option<&str>) -> Result<Vec<DriveFile>> {
+        let q = format!("'{}' in parents and trashed = false and (mimeType = '{FOLDER_MIME}' or mimeType = '{SHORTCUT_MIME}')", checked(folder_id)?);
+        let mut query = vec![("q", q.as_str()), ("fields", LIST_FIELDS), ("pageSize", "1000"), ("supportsAllDrives", "true"), ("includeItemsFromAllDrives", "true")];
+        match shared_drive {
+            Some(d) => query.extend([("corpora", "drive"), ("driveId", checked(d)?)]),
+            None => query.push(("corpora", "allDrives")),
+        }
+        let mut out = Vec::new();
+        self.pages("/files", &query, "files", "Pastas", |raw: Vec<RawFile>, _| {
+            // A shortcut to a file isn't a folder.
+            out.extend(raw.into_iter().map(DriveFile::from).filter(|f| f.is_dir));
+            true
+        })?;
+        Ok(out)
     }
 
     /// The files of a [`View`], handed to `each` a page at a time like [`Drive::list`].

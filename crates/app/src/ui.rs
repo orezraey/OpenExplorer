@@ -1392,102 +1392,96 @@ fn can_go_up(loc: &Location) -> bool {
 // ---------------------------------------------------------------------------------------------
 // Location tree
 
-/// The tree node a location sits under, to highlight it.
-fn node_of(loc: &Location) -> String {
-    match loc {
-        Location::Local(dir) => {
-            let home = match Location::home() {
-                Location::Local(h) => h,
-                _ => PathBuf::new(),
-            };
-            if dir.starts_with(&home) {
-                "home".into()
-            } else {
-                format!("disk:{}", dir.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned()).unwrap_or_default())
-            }
+/// A row of a pane's tree: a heading, a note under a node being read, or a node with its arrow
+/// (which opens and closes it), icon and name (a click opens the folder; a double click opens
+/// or closes the node, as in Explorer).
+fn tree_line(s: &State, k: &Kit, p: usize, line: &crate::tree::Line) -> El {
+    use crate::tree::Line;
+    let indent = |depth: usize| 4.0 + depth as f32 * 16.0;
+    let (depth, node, open, empty, on) = match line {
+        Line::Heading(label) => return heading(k, label).key(format!("t:{}", line.key())),
+        Line::Note { depth, text: note, .. } => {
+            return row()
+                .key(format!("t:{}", line.key()))
+                .w_full()
+                .h(ROW_H)
+                .pl(indent(*depth) + 22.0)
+                .center_y()
+                .child(text(note.clone()).font(k.ty.text_xsmall).color(k.c.text_faint).truncate().shrink().min_w(0.0).help_when_truncated(note.clone()));
         }
-        Location::Found(f) => f.within.as_ref().map_or_else(|| "found".into(), |w| node_of(&Location::Local(w.clone()))),
-        Location::Mock(_) => "mock".into(),
-        Location::Drive { email, space, .. } => match space {
-            Space::MyDrive => format!("acc:{email}:my"),
-            Space::SharedDrives => format!("acc:{email}:sd"),
-            Space::Shared { id, .. } => format!("acc:{email}:sd:{id}"),
-            Space::SharedWithMe => format!("acc:{email}:shared-with-me"),
-            Space::Starred => format!("acc:{email}:starred"),
-            Space::Recent => format!("acc:{email}:recent"),
-            Space::Trash => format!("acc:{email}:trash"),
-            Space::Search(_) => format!("acc:{email}:search"),
-        },
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn node(k: &Kit, p: usize, id: String, depth: usize, glyph: El, label: &str, current: &str, to: Location) -> El {
-    let on = id == current;
+        Line::Node { depth, node, open, empty, on, .. } => (*depth, node, *open, *empty, *on),
+    };
+    let arrow = if node.opens && !empty {
+        let n = node.clone();
+        row()
+            .key("arrow")
+            .size(16.0, 16.0)
+            .center()
+            .radius(k.radius.sm)
+            .hover(k.alpha(k.c.text_base, 0.08))
+            .cursor(Cursor::Pointer)
+            .on_press(move |s: &mut State| crate::tree::toggle(s, p, &n))
+            .child(icon(if open { &icons::CHEVRON_DOWN } else { &icons::CHEVRON }, 12.0).color(k.c.icon_faint))
+    } else {
+        el().size(16.0, 16.0)
+    };
+    let (go, flip) = (node.clone(), node.clone());
     row()
-        .key(format!("node-{id}"))
+        .key(format!("t:{}", line.key()))
         .role("treeitem")
-        .label(label.to_string())
+        .label(node.label.clone())
         .checked(on)
         .w_full()
         .h(ROW_H)
-        .pl(8.0 + depth as f32 * 16.0)
+        .pl(indent(depth))
         .pr(6.0)
-        .gap(6.0)
+        .gap(4.0)
         .center_y()
         .fill(if on { k.alpha(k.c.text_accent, if k.dark { 0.24 } else { 0.16 }) } else { Color::TRANSPARENT })
         .hover(if on { k.alpha(k.c.text_accent, 0.24) } else { k.alpha(k.c.text_base, 0.05) })
         .cursor(Cursor::Pointer)
-        .on_press(move |s: &mut State| navigate(s, p, to.clone()))
-        .child(glyph)
-        .child(text(label.to_string()).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0).help_when_truncated(label.to_string()))
+        .on_press(move |s: &mut State| match &go.to {
+            Some(to) => navigate(s, p, to.clone()),
+            None => crate::tree::toggle(s, p, &go),
+        })
+        .on_double_press(move |s: &mut State| crate::tree::toggle(s, p, &flip))
+        .child(arrow)
+        .child(row().gap(6.0).center_y().grow(1.0).min_w(0.0).child(shell_icon(s, node.icon.as_ref(), node.fallback, 16.0)).child(
+            text(node.label.clone()).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0).help_when_truncated(node.label.clone()),
+        ))
 }
 
 fn heading(k: &Kit, label: &str) -> El {
     row().w_full().h(24.0).px(10.0).pt(6.0).center_y().child(text(label.to_string()).font(k.ty.text_xsmall).color(k.c.text_faint))
 }
 
-fn tree(s: &State, k: &Kit, p: usize) -> El {
-    let current = node_of(&s.panes[p].loc);
-    let mut t = col().key("tree").w_full().pb(8.0);
-    t = t.child(heading(k, "Este computador")).child(node(k, p, "home".into(), 0, shell_icon(s, sysicons::home_key().as_ref(), &icons::HOME, 16.0), "Pasta pessoal", &current, Location::home()));
-    for (d, kind) in &s.local_drives {
-        let letter = d.display().to_string().trim_end_matches('\\').to_string();
-        t = t.child(node(k, p, format!("disk:{letter}"), 0, shell_icon(s, Some(&sysicons::drive_key(d)), &icons::DISK, 16.0), &kind.label(&letter), &current, Location::Local(d.clone())));
-    }
-    if !s.accounts.is_empty() {
-        t = t.child(heading(k, "Google Drive"));
-    }
-    for a in &s.accounts {
-        let e = &a.email;
-        t = t
-            .child(node(k, p, format!("acc:{e}"), 0, icon(&icons::CLOUD, 16.0), e, &current, Location::drive(e.clone(), Space::MyDrive)))
-            .child(node(k, p, format!("acc:{e}:my"), 1, shell_icon(s, Some(&IconKey::Folder), &icons::FOLDER, 16.0), "Meu Drive", &current, Location::drive(e.clone(), Space::MyDrive)))
-            .child(node(k, p, format!("acc:{e}:sd"), 1, icon(&icons::SHARED, 16.0), "Drives compartilhados", &current, Location::drive(e.clone(), Space::SharedDrives)));
-        // The shared drives, once their list has been loaded.
-        if let Some(drives) = s.cache.shared_drives(e) {
-            for d in drives.iter() {
-                let space = Space::Shared { id: d.id.clone(), name: d.name.clone() };
-                t = t.child(node(k, p, format!("acc:{e}:sd:{}", d.id), 2, icon(&icons::SHARED, 16.0), &shown(&d.name), &current, Location::drive(e.clone(), space)));
-            }
-        }
-        // Drive's own lists, as on the Drive website.
-        for (space, glyph) in [(Space::SharedWithMe, &icons::SHARED_WITH_ME), (Space::Starred, &icons::STAR), (Space::Recent, &icons::RECENT), (Space::Trash, &icons::TRASH)] {
-            let to = Location::drive(e.clone(), space.clone());
-            t = t.child(node(k, p, node_of(&to), 1, icon(glyph, 16.0), space.label(), &current, to));
-        }
-    }
-    t = t.child(heading(k, "Testes")).child(node(k, p, "mock".into(), 0, icon(&icons::LAB, 16.0), "Drive simulado", &current, Location::Mock(Vec::new())));
-    col()
-        .key("tree-scroll")
-        .w(s.layout.tree[p])
-        .h_full()
-        
-        .fill(k.alpha(k.c.text_base, if k.dark { 0.02 } else { 0.015 }))
-        .scroll(ScrollSpec { stick_bottom: false })
-        .child(t)
+/// The scroll view of pane `p`'s tree, which `poll` scrolls to the folder shown.
+pub(crate) fn tree_key(p: usize) -> String {
+    format!("tree-scroll-{p}")
 }
 
+/// The tree beside pane `p` (see [`crate::tree`]): only the rows in view are built, so a node
+/// with thousands of folders opens at once.
+fn tree(s: &State, k: &Kit, p: usize) -> El {
+    let lines = std::rc::Rc::new(crate::tree::lines(s, p));
+    let (keys, kit, n) = (lines.clone(), k.clone(), lines.len());
+    let rows = col()
+        .key("tree")
+        .w_full()
+        .pb(8.0)
+        .growth(GrowthSpec::default())
+        .virtual_rows(n, ROW_H, move |_: &State, i| Cow::Owned(format!("t:{}", keys[i].key())), move |s: &State, i| tree_line(s, &kit, p, &lines[i]))
+        .virtual_rows_version((s.tree.version, s.panes[p].moves, s.accounts.len()));
+    // Opening or closing a node lands at once, as in Explorer, rather than sliding its rows.
+    col()
+        .key(tree_key(p))
+        .instant_changes()
+        .w(s.layout.tree[p])
+        .h_full()
+        .fill(k.alpha(k.c.text_base, if k.dark { 0.02 } else { 0.015 }))
+        .scroll(ScrollSpec { stick_bottom: false })
+        .child(rows)
+}
 // ---------------------------------------------------------------------------------------------
 // File list
 

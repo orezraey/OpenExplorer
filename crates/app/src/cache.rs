@@ -114,11 +114,6 @@ impl Cache {
         self.mem.get(k)
     }
 
-    /// An account's shared drives, if their list was loaded this session.
-    pub fn shared_drives(&self, email: &str) -> Option<&Arc<Vec<Entry>>> {
-        self.mem.get(&Key { email: email.to_string(), folder: "sd-list".into() })
-    }
-
     #[cfg(test)]
     pub fn memory_only() -> Cache {
         Cache { memory_only: true, ..Cache::default() }

@@ -35,7 +35,7 @@ const RETRIES: u32 = 6;
 
 /// What Drive calls its own formats: they have no content of their own, only exports.
 const GOOGLE: &str = "application/vnd.google-apps.";
-const SHORTCUT: &str = "application/vnd.google-apps.shortcut";
+use crate::api::SHORTCUT_MIME as SHORTCUT;
 
 /// The format a file in one of Google's own formats is exported as, (MIME type, extension):
 /// the Office format for Docs, Sheets and Slides, PDF for Drawings. `None` for what can't be
