@@ -10,7 +10,7 @@ use rune_kit::{Button, ButtonVariant, Checkbox, Dialog as Modal, Kit, SegmentedC
 
 use crate::actions::{Dialog, selected};
 use crate::model::{Entry, Location, Space};
-use crate::{Msg, State, background, open_drive};
+use crate::{Msg, State, drive_task};
 
 /// The open Compartilhar dialog.
 pub struct Share {
@@ -91,14 +91,6 @@ fn target(s: &mut State, p: usize) -> Option<(String, Entry)> {
     }
 }
 
-/// Runs `work` with the account's [`Drive`] on a background thread; what it gives goes to `make`.
-fn job<T: Send + 'static>(s: &State, email: &str, work: impl FnOnce(&Drive) -> Result<T, String> + Send + 'static, make: impl FnOnce(Result<T, String>) -> Msg + Send + 'static) {
-    let (cached, email) = (s.drives.get(email).cloned(), email.to_string());
-    background(s, move |emit| {
-        let result = crate::catch_panic("compartilhar", || cached.map_or_else(|| open_drive(&email), Ok).and_then(|d| work(&d)));
-        emit(make(result));
-    });
-}
 
 // ---------------------------------------------------------------------------------------------
 // Copiar link
@@ -108,7 +100,7 @@ pub fn copy_link(s: &mut State, p: usize, _: &mut Tx) {
     let Some((email, item)) = target(s, p) else { return };
     let (id, account) = (item.id.clone(), email.clone());
     s.status = format!("Buscando o link de \"{}\"…", item.name);
-    job(s, &email, move |d| d.sharing(&id), move |result| Msg::Link(LinkAnswer { email: account, item, opened: false, result }));
+    drive_task(s, &email, "compartilhar", move |d| d.sharing(&id), move |result| Msg::Link(LinkAnswer { email: account, item, opened: false, result }));
 }
 
 /// An open item's link goes to the clipboard; a private one first asks (when this account may
@@ -142,7 +134,7 @@ pub fn make_public(s: &mut State) {
     let MakePublic { email, item, .. } = *m;
     let (id, account) = (item.id.clone(), email.clone());
     s.status = format!("Liberando o link de \"{}\"…", item.name);
-    job(s, &email, move |d| d.set_link_access(&id, true).and_then(|_| d.sharing(&id)), move |result| Msg::Link(LinkAnswer { email: account, item, opened: true, result }));
+    drive_task(s, &email, "compartilhar", move |d| d.set_link_access(&id, true).and_then(|_| d.sharing(&id)), move |result| Msg::Link(LinkAnswer { email: account, item, opened: true, result }));
 }
 
 /// Copiar sem mudar o acesso.
@@ -162,7 +154,7 @@ pub fn ask_share(s: &mut State, p: usize, _: &mut Tx) {
     s.name_edit = rune::TextEdit::new("");
     let id = item.id.clone();
     let key = item.id.clone();
-    job(s, &email, move |d| d.sharing(&id), move |r| Msg::Share { item: key, update: Update::Loaded(r) });
+    drive_task(s, &email, "compartilhar", move |d| d.sharing(&id), move |r| Msg::Share { item: key, update: Update::Loaded(r) });
     s.dialog = Some(Dialog::Share(Box::new(Share { email, item, sharing: None, busy: false, error: None, role: Role::Reader, notify: true })));
 }
 
@@ -201,7 +193,7 @@ fn change(s: &mut State, added: bool, work: impl FnOnce(&Drive, &str) -> Result<
     sh.error = None;
     let (email, id) = (sh.email.clone(), sh.item.id.clone());
     let key = id.clone();
-    job(s, &email, move |d| work(d, &id).and_then(|_| d.sharing(&id)), move |result| Msg::Share { item: key, update: Update::Saved { result, added } });
+    drive_task(s, &email, "compartilhar", move |d| work(d, &id).and_then(|_| d.sharing(&id)), move |result| Msg::Share { item: key, update: Update::Saved { result, added } });
 }
 
 /// Compartilhar: gives the e-mail typed the role picked.

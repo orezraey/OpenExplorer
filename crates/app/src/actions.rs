@@ -13,7 +13,7 @@ use rune::{TextEdit, Tx};
 use crate::model::{Entry, Location, Space};
 use crate::transfers::{self, End, Op};
 use crate::uploads::{Clash, Existing, Item, Put};
-use crate::{Msg, State, background, open as open_entry, open_drive, ops};
+use crate::{Msg, State, background, drive_task, open as open_entry, ops};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClipMode {
@@ -133,22 +133,11 @@ fn account_panes(s: &State, email: &str) -> Vec<Location> {
 
 /// Runs `work` on a background thread with the account's [`Drive`], then reloads `reload`.
 fn drive_job(s: &State, email: &str, reload: Vec<Location>, work: impl FnOnce(&Drive) -> Result<String, String> + Send + 'static) {
-    let (cached, email) = (s.drives.get(email).cloned(), email.to_string());
-    background(s, move |emit| {
-        let (drive, made) = match cached {
-            Some(d) => (d, None),
-            None => match open_drive(&email) {
-                Ok(d) => (d.clone(), Some((email, d))),
-                Err(e) => return emit(Msg::Done { reload, made: None, result: Err(e) }),
-            },
-        };
-        let result = crate::catch_panic("operar no Drive", || work(&drive));
-        emit(Msg::Done { reload, made, result });
-    });
+    drive_task(s, email, "operar no Drive", work, move |result| Msg::Done { reload, result });
 }
 
 fn local_job(s: &State, reload: Vec<Location>, work: impl FnOnce() -> Result<String, String> + Send + 'static) {
-    background(s, move |emit| emit(Msg::Done { reload, made: None, result: crate::catch_panic("operar no disco", work) }));
+    background(s, move |emit| emit(Msg::Done { reload, result: crate::catch_panic("operar no disco", work) }));
 }
 
 /// How many items, in words: "1 item", "3 itens".
@@ -226,8 +215,8 @@ pub fn shows_results(loc: &Location) -> bool {
 pub fn show_in_folder(s: &mut State, p: usize, _: &mut Tx) {
     let items = selected(s, p);
     let [item] = items.as_slice() else { return };
-    let from = s.panes[p].loc.clone();
-    match &from {
+    let loc = s.panes[p].loc.clone();
+    match &loc {
         Location::Found(_) => {
             let path = PathBuf::from(&item.id);
             let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
@@ -238,33 +227,30 @@ pub fn show_in_folder(s: &mut State, p: usize, _: &mut Tx) {
             crate::navigate(s, p, Location::Local(dir.to_path_buf()));
             s.panes[p].reveal = Some((name.clone(), name));
         }
-        Location::Drive { email, .. } if shows_results(&from) => {
+        Location::Drive { email, .. } if shows_results(&loc) => {
             s.status = format!("Procurando a pasta de “{}”…", item.name);
             let request = s.live[p].load(Ordering::Relaxed);
-            let (cached, email, id, name) = (s.drives.get(email).cloned(), email.clone(), item.id.clone(), item.name.clone());
-            background(s, move |emit| {
-                let placed = |made, result| Msg::Placed { pane: p, request, item: (id.clone(), name.clone()), made, result };
-                let (drive, made) = match cached {
-                    Some(d) => (d, None),
-                    None => match open_drive(&email) {
-                        Ok(d) => (d.clone(), Some((email.clone(), d))),
-                        Err(e) => return emit(placed(None, Err(e))),
-                    },
-                };
-                let result = crate::catch_panic("achar a pasta", || drive.place(&id)).map(|place| {
-                    use openexplorer_gdrive::Top;
-                    let space = match place.top {
-                        Top::MyDrive => Space::MyDrive,
-                        Top::SharedDrive { id, name } => Space::Shared { id, name },
-                        Top::SharedWithMe => Space::SharedWithMe,
-                    };
-                    Location::Drive { email: email.clone(), space, path: place.folders }
-                });
-                emit(placed(made, result));
+            let (account, id, item) = (email.clone(), item.id.clone(), (item.id.clone(), item.name.clone()));
+            drive_task(s, email, "achar a pasta", move |d| d.place(&id).map(|place| place_location(account, place)), move |result| Msg::Placed {
+                pane: p,
+                request,
+                item,
+                result,
             });
         }
         _ => {}
     }
+}
+
+/// The folder Drive says an item of `email`'s sits in, as a pane goes there.
+fn place_location(email: String, place: openexplorer_gdrive::Place) -> Location {
+    use openexplorer_gdrive::Top;
+    let space = match place.top {
+        Top::MyDrive => Space::MyDrive,
+        Top::SharedDrive { id, name } => Space::Shared { id, name },
+        Top::SharedWithMe => Space::SharedWithMe,
+    };
+    Location::Drive { email, space, path: place.folders }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -439,24 +425,15 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
         let existing = pane.entries.clone();
         return ask_clashes(s, up, existing);
     }
-    let (cached, outbox, wake) = (s.drives.get(&email).cloned(), s.outbox.clone(), s.waker.clone());
-    std::thread::spawn(move || {
-        let (made, result) = match cached.map_or_else(|| crate::open_drive(&email).map(|d| (Some(d.clone()), d)), |d| Ok((None, d))) {
-            Ok((made, d)) => {
-                let mut out = Vec::new();
-                let listed = d.list(&parent, None, |page, _| {
-                    out.extend(page.into_iter().map(crate::entry_of));
-                    true
-                });
-                (made.map(|d| (email, d)), listed.map(|_| out))
-            }
-            Err(e) => (None, Err(e)),
-        };
-        let _ = outbox.send(Msg::Clashes { up, made, result });
-        if let Some(w) = wake {
-            w();
-        }
-    });
+    let list = move |d: &Drive| {
+        let mut out = Vec::new();
+        d.list(&parent, None, |page, _| {
+            out.extend(page.into_iter().map(crate::entry_of));
+            true
+        })?;
+        Ok(out)
+    };
+    drive_task(s, &email, "listar a pasta", list, move |result| Msg::Clashes { up, result });
 }
 
 /// The Drive folder's listing for an upload arrived.
@@ -1048,9 +1025,10 @@ fn props_mut(s: &mut State) -> Option<&mut Props> {
     }
 }
 
-/// Runs `work` for the open Propriedades; its answer lands only if that dialog is still open.
-/// `work` gives what the task found; a panic in it ends that same task with the error (the hash
-/// row stops saying "Calculando…"), through `failed`.
+/// Runs local `work` for the open Propriedades (Drive's answers come through [`drive_task`]); its
+/// answer lands only if that dialog is still open. `work` gives what the task found; a panic in
+/// it ends that same task with the error (the hash row stops saying "Calculando…"), through
+/// `failed`.
 fn props_job(s: &State, id: u64, failed: fn(String) -> PropUpdate, work: impl FnOnce() -> PropUpdate + Send + 'static) {
     background(s, move |emit| emit(Msg::Prop { id, update: crate::catch_panic("ler as propriedades", || Ok(work())).unwrap_or_else(failed) }));
 }
@@ -1087,13 +1065,10 @@ pub fn properties(s: &mut State, p: usize) {
         }
     }
     // One Drive item: its owner, dates, description and checksum from Drive.
-    if let ([item], Some(email)) = (items.as_slice(), account(&loc).map(str::to_string)) {
-        let (item_id, cached) = (item.id.clone(), s.drives.get(&email).cloned());
-        let (sharing_id, sharing_drive, sharing_email) = (item_id.clone(), cached.clone(), email.clone());
-        props_job(s, id, |e| PropUpdate::Details(Err(e)), move || PropUpdate::Details(cached.map_or_else(|| open_drive(&email), Ok).and_then(|d| d.details(&item_id))));
-        props_job(s, id, |e| PropUpdate::Sharing(Err(e)), move || {
-            PropUpdate::Sharing(sharing_drive.map_or_else(|| open_drive(&sharing_email), Ok).and_then(|d| d.sharing(&sharing_id)))
-        });
+    if let ([item], Some(email)) = (items.as_slice(), account(&loc)) {
+        let (details_id, sharing_id) = (item.id.clone(), item.id.clone());
+        drive_task(s, email, "ler as propriedades", move |d| d.details(&details_id), move |r| Msg::Prop { id, update: PropUpdate::Details(r) });
+        drive_task(s, email, "ler as propriedades", move |d| d.sharing(&sharing_id), move |r| Msg::Prop { id, update: PropUpdate::Sharing(r) });
     }
     if let [item] = items.as_slice() {
         let mut edit = TextEdit::new(item.name.clone());
@@ -1147,9 +1122,8 @@ pub fn props_tab(s: &mut State, tab: PropTab) {
     p.revisions_asked = true;
     let (id, pane) = (p.id, p.pane);
     let Some(item_id) = p.single().map(|e| e.id.clone()) else { return };
-    let Location::Drive { email, .. } = &s.panes[pane].loc else { return };
-    let (cached, email) = (s.drives.get(email).cloned(), email.clone());
-    props_job(s, id, |e| PropUpdate::Revisions(Err(e)), move || PropUpdate::Revisions(cached.map_or_else(|| open_drive(&email), Ok).and_then(|d| d.revisions(&item_id))));
+    let Some(email) = account(&s.panes[pane].loc) else { return };
+    drive_task(s, email, "ler as versões", move |d| d.revisions(&item_id), move |r| Msg::Prop { id, update: PropUpdate::Revisions(r) });
 }
 
 /// Works out a local file's MD5 on request: reading a large file takes a while.

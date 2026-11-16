@@ -38,21 +38,21 @@ use model::{Entry, Location, MockDrive, Pane, SortCol, Space};
 const ROW_H: f32 = 22.0;
 
 enum Msg {
-    /// Part of a folder listing. `made` carries an account opened on the background thread,
-    /// for `poll` to keep.
-    Listed { pane: usize, request: u64, made: Option<(String, Arc<Drive>)>, part: Part, result: Result<Vec<Entry>, String> },
+    /// Part of a folder listing.
+    Listed { pane: usize, request: u64, part: Part, result: Result<Vec<Entry>, String> },
     LoggedIn { pane: usize, attempt: u64, result: Result<(StoredAccount, Arc<Drive>), String> },
+    /// An account a background job had to open, for `poll` to keep (see [`AccountRef::open`]).
+    Opened { email: String, drive: Arc<Drive> },
     /// A file operation finished: reload the panes showing `reload`, and say how it went.
-    /// `made` is an account the operation had to open, for `poll` to keep.
-    Done { reload: Vec<Location>, made: Option<(String, Arc<Drive>)>, result: Result<String, String> },
+    Done { reload: Vec<Location>, result: Result<String, String> },
     /// Something Propriedades number `id` was waiting for.
     Prop { id: u64, update: actions::PropUpdate },
     /// Windows' icon for a file type, a folder or a drive.
     Icon { key: sysicons::IconKey, rgba: Option<sysicons::Rgba> },
     /// What the Drive folder an upload goes into holds, to check its names against.
-    Clashes { up: actions::Upload, made: Option<(String, Arc<Drive>)>, result: Result<Vec<Entry>, String> },
+    Clashes { up: actions::Upload, result: Result<Vec<Entry>, String> },
     /// An account's storage, for the status bar.
-    Quota { email: String, made: Option<(String, Arc<Drive>)>, result: Result<Quota, String> },
+    Quota { email: String, result: Result<Quota, String> },
     /// Something the Compartilhar dialog for Drive item `item` was waiting for.
     Share { item: String, update: sharing::Update },
     /// What Copiar link found out about an item's access.
@@ -61,7 +61,7 @@ enum Msg {
     Found { pane: usize, request: u64, result: Result<Vec<Entry>, String>, info: finder::Info },
     /// Where Drive item `item` (id, name), shown in pane `pane` while its listing was number
     /// `request`, sits: the folder to go to.
-    Placed { pane: usize, request: u64, item: (String, String), made: Option<(String, Arc<Drive>)>, result: Result<Location, String> },
+    Placed { pane: usize, request: u64, item: (String, String), result: Result<Location, String> },
     /// Installing the search service ended: search again in the panes `reload` shows.
     Installed { reload: Vec<Location>, result: Result<String, String> },
     /// A drag of Drive items `ids` out of pane `from` ended.
@@ -323,12 +323,8 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     while let Ok(msg) = s.inbox.try_recv() {
         changed = true;
         match msg {
-            Msg::Listed { pane, request, made, part, result } => {
-                if let Some((email, drive)) = made
-                    && s.accounts.iter().any(|a| a.email == email)
-                {
-                    s.drives.entry(email).or_insert(drive);
-                }
+            Msg::Opened { email, drive } => keep_drive(s, email, drive),
+            Msg::Listed { pane, request, part, result } => {
                 if s.live[pane].load(Ordering::Relaxed) != request {
                     continue;
                 }
@@ -365,12 +361,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     s.cache.put(k, entries);
                 }
             }
-            Msg::Done { reload, made, result } => {
-                if let Some((email, drive)) = made
-                    && s.accounts.iter().any(|a| a.email == email)
-                {
-                    s.drives.entry(email).or_insert(drive);
-                }
+            Msg::Done { reload, result } => {
                 match result {
                     Ok(msg) | Err(msg) => s.status = msg,
                 }
@@ -386,8 +377,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     ask_quota(s, email);
                 }
             }
-            Msg::Quota { email, made, result } => {
-                keep_drive(s, made);
+            Msg::Quota { email, result } => {
                 if s.accounts.iter().any(|a| a.email == email) {
                     match result {
                         Ok(q) => {
@@ -428,14 +418,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
             Msg::Prop { id, update } => actions::props_update(s, id, update),
             Msg::Icon { key, rgba } => s.icons.arrived(key, rgba),
-            Msg::Clashes { up, made, result } => {
-                if let Some((email, drive)) = made
-                    && s.accounts.iter().any(|a| a.email == email)
-                {
-                    s.drives.entry(email).or_insert(drive);
-                }
-                actions::clashes_listed(s, up, result);
-            }
+            Msg::Clashes { up, result } => actions::clashes_listed(s, up, result),
             Msg::LoggedIn { pane, attempt, result } => {
                 let current = s.login == Some(attempt);
                 if current {
@@ -457,8 +440,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     Err(e) => s.status = e,
                 }
             }
-            Msg::Placed { pane, request, item, made, result } => {
-                keep_drive(s, made);
+            Msg::Placed { pane, request, item, result } => {
                 // The pane moved on (or listed again) while the folder was looked for.
                 if s.live[pane].load(Ordering::Relaxed) != request {
                     continue;
@@ -501,15 +483,6 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed
 }
 
-/// Keeps an account a background job had to open, if it's still connected.
-fn keep_drive(s: &mut State, made: Option<(String, Arc<Drive>)>) {
-    if let Some((email, drive)) = made
-        && s.accounts.iter().any(|a| a.email == email)
-    {
-        s.drives.entry(email).or_insert(drive);
-    }
-}
-
 fn entry_of(f: DriveFile) -> Entry {
     Entry { id: f.id, name: f.name, is_dir: f.is_dir, size: f.size, modified: f.modified, target: f.target, mime: Some(f.mime), md5: f.md5, starred: f.starred }
 }
@@ -531,6 +504,54 @@ fn open_drive(email: &str) -> Result<Arc<Drive>, String> {
     let cfg = ClientConfig::load()?;
     let token = store::refresh_token(email)?;
     Ok(Arc::new(Drive::new(cfg, token)))
+}
+
+/// An account as a background job reaches it: by e-mail, with the [`Drive`] the app already
+/// keeps for it, if any. Taken on the UI thread, opened on the job's.
+struct AccountRef {
+    email: String,
+    kept: Option<Arc<Drive>>,
+}
+
+impl AccountRef {
+    fn of(s: &State, email: &str) -> AccountRef {
+        AccountRef { email: email.to_string(), kept: s.drives.get(email).cloned() }
+    }
+
+    /// The account's Drive: the one kept, or one opened now and handed to `poll` through
+    /// `emit` to keep, so the next job finds it.
+    fn open(self, emit: &dyn Fn(Msg)) -> Result<Arc<Drive>, String> {
+        if let Some(drive) = self.kept {
+            return Ok(drive);
+        }
+        let drive = open_drive(&self.email)?;
+        emit(Msg::Opened { email: self.email, drive: drive.clone() });
+        Ok(drive)
+    }
+}
+
+/// Keeps an account a background job had to open, if it's still connected.
+fn keep_drive(s: &mut State, email: String, drive: Arc<Drive>) {
+    if s.accounts.iter().any(|a| a.email == email) {
+        s.drives.entry(email).or_insert(drive);
+    }
+}
+
+/// Runs `work` with `email`'s Drive on a background thread, then emits the message `done`
+/// makes of what it gave. `doing` names the work in the error a panic in it ends with ("ler a
+/// cota").
+fn drive_task<T>(
+    s: &State,
+    email: &str,
+    doing: &'static str,
+    work: impl FnOnce(&Drive) -> Result<T, String> + Send + 'static,
+    done: impl FnOnce(Result<T, String>) -> Msg + Send + 'static,
+) {
+    let account = AccountRef::of(s, email);
+    background(s, move |emit| {
+        let result = account.open(emit).and_then(|drive| catch_panic(doing, || work(&drive)));
+        emit(done(result));
+    });
 }
 
 fn connect(s: &mut State, p: usize, tx: &mut Tx) {
@@ -596,18 +617,8 @@ fn ask_quota(s: &mut State, email: &str) {
         return;
     }
     s.quotas.entry(email.to_string()).or_insert(None);
-    let (cached, email) = (s.drives.get(email).cloned(), email.to_string());
-    background(s, move |emit| {
-        let (drive, made) = match cached {
-            Some(d) => (d, None),
-            None => match open_drive(&email) {
-                Ok(d) => (d.clone(), Some((email.clone(), d))),
-                Err(e) => return emit(Msg::Quota { email, made: None, result: Err(e) }),
-            },
-        };
-        let result = catch_panic("ler a cota", || drive.quota());
-        emit(Msg::Quota { email, made, result });
-    });
+    let who = email.to_string();
+    drive_task(s, email, "ler a cota", |d| d.quota(), move |result| Msg::Quota { email: who, result });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -642,7 +653,7 @@ fn load(s: &mut State, p: usize) {
     if !s.quotas.contains_key(&email) {
         ask_quota(s, &email);
     }
-    let opened = s.drives.get(&email).cloned();
+    let account = AccountRef::of(s, &email);
     let key = cache::key(&s.panes[p].loc);
     // A folder seen this session shows at once; the fresh listing then replaces it whole.
     let in_memory = key.as_ref().and_then(|k| s.cache.get(k)).map(|e| e.to_vec());
@@ -656,21 +667,16 @@ fn load(s: &mut State, p: usize) {
     let live = s.live[p].clone();
     let folder = path.last().map(|(id, _)| id.clone());
     background(s, move |emit| {
-        let listed = |made, part, result| Msg::Listed { pane: p, request, made, part, result };
+        let listed = |part, result| Msg::Listed { pane: p, request, part, result };
         // Else one from an earlier run, read here off the UI thread.
         if !quiet && let Some(entries) = key.as_ref().and_then(cache::load_disk) {
-            emit(listed(None, Part::Cached, Ok(entries)));
+            emit(listed(Part::Cached, Ok(entries)));
             quiet = true;
         }
-        let (drive, made) = match opened {
-            Some(d) => (d, None),
-            None => match open_drive(&email) {
-                Ok(d) => (d.clone(), Some((email, d))),
-                Err(e) => return emit(listed(None, Part::Page { first: !quiet, more: false }, Err(e))),
-            },
+        let drive = match account.open(emit) {
+            Ok(d) => d,
+            Err(e) => return emit(listed(Part::Page { first: !quiet, more: false }, Err(e))),
         };
-        // Handed over with the first message, from whichever path sends it.
-        let made = std::cell::Cell::new(made);
         // Without a cached listing each page shows as soon as it lands, so a big folder fills
         // in instead of staying blank. With one, pages are gathered and replace it in one go,
         // so the list doesn't shrink to the first page and grow back.
@@ -681,10 +687,10 @@ fn load(s: &mut State, p: usize) {
             if quiet {
                 gathered.extend(entries);
                 if !more {
-                    emit(listed(made.take(), Part::WHOLE, Ok(std::mem::take(&mut gathered))));
+                    emit(listed(Part::WHOLE, Ok(std::mem::take(&mut gathered))));
                 }
             } else {
-                emit(listed(made.take(), Part::Page { first, more }, Ok(entries.collect())));
+                emit(listed(Part::Page { first, more }, Ok(entries.collect())));
                 first = false;
             }
             live.load(Ordering::Relaxed) == request
@@ -717,11 +723,11 @@ fn load(s: &mut State, p: usize) {
                         starred: false,
                     })
                     .collect::<Vec<_>>()
-            }).map(|entries| emit(listed(made.take(), Part::WHOLE, Ok(entries)))),
+            }).map(|entries| emit(listed(Part::WHOLE, Ok(entries)))),
         });
         if let Err(e) = result {
             // Over a cached or partly shown listing, keep it and only report the error.
-            emit(listed(made.take(), Part::Page { first: first && !quiet, more: false }, Err(e)));
+            emit(listed(Part::Page { first: first && !quiet, more: false }, Err(e)));
         }
     });
 }
@@ -1398,7 +1404,7 @@ mod tests {
         let mut from = 0;
         for (i, n) in pages.iter().enumerate() {
             let part = Part::Page { first: i == 0, more: i + 1 < pages.len() };
-            s.outbox.send(Msg::Listed { pane: 1, request: 7, made: None, part, result: Ok(entries(from, *n)) }).unwrap();
+            s.outbox.send(Msg::Listed { pane: 1, request: 7, part, result: Ok(entries(from, *n)) }).unwrap();
             from += n;
         }
         poll(&mut s, 0.0, &mut Tx::default());
