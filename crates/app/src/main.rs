@@ -686,6 +686,23 @@ fn load(s: &mut State, p: usize) {
         pane.loading = true;
         pane.error = None;
         pane.free = None;
+        // In WSL or on the network, where the index has nothing: read there, the results
+        // coming in pages as they're found.
+        if f.within.as_deref().is_some_and(finder::elsewhere) {
+            s.found[p] = None;
+            let live = s.live[p].clone();
+            background(s, move |emit| {
+                let alive = || live.load(Ordering::Relaxed) == request;                let mut first = true;
+                let result = catch_panic("pesquisar", || {
+                    finder::search_elsewhere(&f, &alive, &mut |entries, more| {                        emit(Msg::Listed { pane: p, request, part: Part::Page { first, more }, result: Ok(entries) });                        first = false;
+                    })
+                });
+                if let Err(e) = result {
+                    emit(Msg::Listed { pane: p, request, part: Part::Page { first, more: false }, result: Err(e) });
+                }
+            });
+            return;
+        }
         background(s, move |emit| {
             let (result, info) = finder::search(&f);
             emit(Msg::Found { pane: p, request, result, info });

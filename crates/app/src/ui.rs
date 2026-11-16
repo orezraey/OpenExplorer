@@ -1267,8 +1267,6 @@ fn navbar(s: &State, k: &Kit, p: usize) -> El {
 fn search_box(s: &State, k: &Kit, p: usize) -> El {
     let loc = &s.panes[p].loc;
     let place = match loc {
-        // The index reads the computer's own disks: the network has nothing in it.
-        Location::Local(dir) if crate::network::is_remote(dir) => return el().key("search"),
         Location::Local(dir) => crate::finder::place_of(dir),
         Location::Found(f) => f.place.clone(),
         _ => match actions::search_scope(loc) {
@@ -1322,7 +1320,12 @@ fn found_bar(s: &State, k: &Kit, p: usize, f: &crate::model::Found) -> El {
     let pane = &s.panes[p];
     let info = s.found[p].as_ref();
     let mut said = format!("“{}” em {}", f.text, f.place);
+    let n = pane.entries.len();
+    let results = |n: usize| format!("{} {}", ui_count(n), if n == 1 { "resultado" } else { "resultados" });
     match info {
+        // In WSL or on the network (no index): results come in as folders are read.
+        None if pane.loading && n > 0 => said.push_str(&format!(" · Pesquisando… {} até agora", results(n))),
+        None if !pane.loading && pane.error.is_none() => said.push_str(&format!(" · {}", results(n))),
         _ if pane.loading => said.push_str(" · Pesquisando…"),
         Some(i) if i.service != Service::Running => said.push_str(" · sem o serviço"),
         Some(i) if i.total > i.shown => said.push_str(&format!(" · mostrando {} de {} resultados", ui_count(i.shown), ui_count(i.total))),

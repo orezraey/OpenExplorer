@@ -124,6 +124,15 @@ fn why_not(loc: &Location) -> String {
     }
 }
 
+/// Whether one of `items`, listed in `loc`, is a shared folder or a distribution itself (a
+/// search of a computer or of Linux finds them): deleting one would empty it, and its name is
+/// the computer's to change.
+fn holds_a_share(loc: &Location, items: &[Entry]) -> bool {
+    items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_share_root(&path))
+}
+
+const SHARE_STAYS: &str = "Pastas compartilhadas e distribuições não podem ser excluídas nem renomeadas daqui: abra uma delas para mexer no que tem dentro.";
+
 fn not_here(s: &mut State, p: usize) {
     s.status = why_not(&s.panes[p].loc);
 }
@@ -689,8 +698,6 @@ pub fn search_computer(s: &mut State, p: usize) {
     s.searched[p] = text.clone();
     let loc = s.panes[p].loc.clone();
     let within = match &loc {
-        // The index has nothing of the network's (the field isn't shown there).
-        Location::Local(dir) if crate::network::is_remote(dir) => return,
         Location::Local(dir) => Some(dir.clone()),
         Location::Found(f) => f.within.clone(),
         _ => return,
@@ -803,11 +810,14 @@ pub fn ask_delete(s: &mut State, p: usize) {
     if !items_editable(&s.panes[p].loc) {
         return not_here(s, p);
     }
+    if holds_a_share(&s.panes[p].loc, &items) {
+        s.status = SHARE_STAYS.into();
+        return;
+    }
     // The network and WSL have no Lixeira: Del deletes for good there, after asking (as
-    // Explorer does).
-    if let Location::Local(dir) = &s.panes[p].loc
-        && crate::network::is_remote(dir)
-    {
+    // Explorer does). By the items' own paths, so a search's results there count too.
+    let loc = &s.panes[p].loc;
+    if items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_remote(&path)) {
         s.dialog = Some(Dialog::Purge { pane: p, items });
         return;
     }
@@ -868,7 +878,7 @@ pub fn purge(s: &mut State) {
     let Some(Dialog::Purge { pane, items }) = s.dialog.take() else { return };
     let loc = s.panes[pane].loc.clone();
     let n = items.len();
-    if let Location::Local(_) = &loc {
+    if loc.is_local() {
         let paths: Vec<PathBuf> = items.iter().filter_map(|e| loc.local_path(e)).collect();
         local_job(s, vec![loc.clone()], move || ops::delete_forever(&paths).map(|_| format!("Excluído permanentemente: {}.", count(n))));
         s.status = format!("Excluindo permanentemente {}…", count(n));
@@ -931,6 +941,10 @@ pub fn ask_rename(s: &mut State, p: usize, tx: &mut Tx) {
     let [item] = items.as_slice() else { return };
     if !items_editable(&s.panes[p].loc) {
         return not_here(s, p);
+    }
+    if holds_a_share(&s.panes[p].loc, &items) {
+        s.status = SHARE_STAYS.into();
+        return;
     }
     s.name_edit = name_field(item);
     s.renaming = Some((p, item.clone()));
@@ -1099,7 +1113,8 @@ impl Props {
 
     /// Whether the name field renames: one item, somewhere names can change.
     pub fn renamable(&self, s: &State) -> bool {
-        self.single().is_some() && items_editable(&s.panes[self.pane].loc)
+        let loc = &s.panes[self.pane].loc;
+        self.single().is_some() && items_editable(loc) && !holds_a_share(loc, &self.items)
     }
 
     /// The Histórico de versões tab is for one Drive file (folders have no versions).
@@ -1361,6 +1376,37 @@ mod tests {
         s.panes[1].go(drive(Space::MyDrive, &[]));
         ask_empty_trash(&mut s, 1);
         assert!(s.dialog.is_none());
+
+        // On the network and in WSL there's no Lixeira: a folder's items, and a search's
+        // results there, are deleted for good after asking; on the computer's disks they go to
+        // the Lixeira.
+        let found = |text: &str, at: &str| Location::Found(Box::new(crate::finder::found(text, Some(at.into()))));
+        for (loc, id, purge) in [
+            (Location::Local(r"\\nas\Fotos".into()), "a.jpg", true),
+            (found("a", r"\\wsl.localhost\Ubuntu\home"), r"\\wsl.localhost\Ubuntu\home\a.txt", true),
+            (Location::Local(r"C:\Fotos".into()), "a.jpg", false),
+            (found("a", r"C:\Fotos"), r"C:\Fotos\a.jpg", false),
+        ] {
+            s.dialog = None;
+            s.panes[0].go(loc);
+            s.panes[0].set_entries(Ok(vec![e(id)]));
+            s.panes[0].selected = [id.to_string()].into();
+            ask_delete(&mut s, 0);
+            assert_eq!(matches!(s.dialog, Some(Dialog::Purge { .. })), purge, "{id}");
+            assert_eq!(matches!(s.dialog, Some(Dialog::Delete { .. })), !purge, "{id}");
+        }
+        // A shared folder or a distribution found by a search of its computer or of Linux is
+        // neither deleted nor renamed.
+        for (within, id) in [(r"\\nas", r"\\nas\Fotos"), (r"\\wsl.localhost", r"\\wsl.localhost\Ubuntu")] {
+            s.dialog = None;
+            s.panes[0].go(found("x", within));
+            s.panes[0].set_entries(Ok(vec![Entry { is_dir: true, ..e(id) }]));
+            s.panes[0].selected = [id.to_string()].into();
+            ask_delete(&mut s, 0);
+            assert!(s.dialog.is_none() && s.status == SHARE_STAYS, "{id}");
+            ask_rename(&mut s, 0, &mut Tx::default());
+            assert!(s.renaming.is_none(), "{id}");
+        }
     }
 
     #[test]

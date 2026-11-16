@@ -39,6 +39,12 @@ pub fn is_server(path: &Path) -> bool {
     unc(path).is_some_and(|(_, share)| share.is_empty())
 }
 
+/// Whether `path` is a shared folder itself, or a distribution (`\\nas\Fotos`,
+/// `\\wsl.localhost\Ubuntu`): what's in it can change, not it.
+pub fn is_share_root(path: &Path) -> bool {
+    unc(path).is_some_and(|(_, share)| !share.is_empty()) && path.parent().is_none()
+}
+
 pub fn is_wsl(server: &str) -> bool {
     server.eq_ignore_ascii_case(WSL)
 }
