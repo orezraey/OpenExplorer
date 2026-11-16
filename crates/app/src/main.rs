@@ -59,6 +59,9 @@ enum Msg {
     Link(sharing::LinkAnswer),
     /// The answer of a search of the computer for pane `pane`.
     Found { pane: usize, request: u64, result: Result<Vec<Entry>, String>, info: finder::Info },
+    /// Where Drive item `item` (id, name), shown in pane `pane` while its listing was number
+    /// `request`, sits: the folder to go to.
+    Placed { pane: usize, request: u64, item: (String, String), made: Option<(String, Arc<Drive>)>, result: Result<Location, String> },
     /// Installing the search service ended: search again in the panes `reload` shows.
     Installed { reload: Vec<Location>, result: Result<String, String> },
     /// A drag of Drive items `ids` out of pane `from` ended.
@@ -453,6 +456,40 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     }
                     Err(e) => s.status = e,
                 }
+            }
+            Msg::Placed { pane, request, item, made, result } => {
+                keep_drive(s, made);
+                // The pane moved on (or listed again) while the folder was looked for.
+                if s.live[pane].load(Ordering::Relaxed) != request {
+                    continue;
+                }
+                match result {
+                    Ok(to) => {
+                        s.status.clear();
+                        navigate(s, pane, to);
+                        s.panes[pane].reveal = Some(item);
+                    }
+                    Err(e) => s.status = format!("Não consegui achar a pasta: {e}"),
+                }
+            }
+        }
+    }
+    // Mostrar na pasta: the item is selected and brought into view once its folder lists it.
+    for p in 0..2 {
+        let pane = &mut s.panes[p];
+        let Some((id, name)) = pane.reveal.clone() else { continue };
+        if pane.entry(&id).is_some() {
+            pane.reveal = None;
+            pane.selected = [id.clone()].into();
+            pane.cursor = Some(id.clone());
+            pane.anchor = Some(id.clone());
+            tx.scroll_into_view_in(pane_key(p), row_key(&id));
+            changed = true;
+        } else if !pane.loading {
+            pane.reveal = None;
+            if pane.error.is_none() {
+                s.status = format!("“{name}” não está mais nesta pasta.");
+                changed = true;
             }
         }
     }

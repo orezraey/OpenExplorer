@@ -111,6 +111,24 @@ pub struct SharedDrive {
     pub hidden: bool,
 }
 
+/// Where a file sits: the top it hangs from, and the folders from just under that top down to
+/// the one holding it (empty when it sits at the top itself).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Place {
+    pub top: Top,
+    pub folders: Vec<(String, String)>,
+}
+
+/// What a file's folders hang from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Top {
+    MyDrive,
+    SharedDrive { id: String, name: String },
+    /// Someone else's Drive: the account sees no folder above the first of `folders` (or above
+    /// the file, which then sits in Compartilhados comigo).
+    SharedWithMe,
+}
+
 /// One connected account. Cheap to share across threads; it renews its access token as needed.
 pub struct Drive {
     cfg: ClientConfig,
@@ -125,6 +143,8 @@ pub struct Drive {
     pub(crate) downloads: ureq::Agent,
     /// Where Drive calls and downloads go: Google's API (a local stand-in in tests).
     pub(crate) api_url: String,
+    /// My Drive's top folder's id, asked for once.
+    root: std::sync::OnceLock<String>,
 }
 
 impl Drive {
@@ -138,7 +158,18 @@ impl Drive {
             upload_url: crate::upload::UPLOAD.into(),
             downloads: crate::download_agent(),
             api_url: API.into(),
+            root: std::sync::OnceLock::new(),
         }
+    }
+
+    /// My Drive's top folder's id ("root" is only its alias), asked for the first time.
+    fn root_id(&self) -> Result<String> {
+        if let Some(id) = self.root.get() {
+            return Ok(id.clone());
+        }
+        let v = self.get("/files/root", &[("fields", "id")], "Meu Drive")?;
+        let id = v.get("id").and_then(|v| v.as_str()).filter(|id| !id.is_empty()).ok_or("Meu Drive: o Google não informou a pasta raiz.")?;
+        Ok(self.root.get_or_init(|| id.to_string()).clone())
     }
 
     /// Starts from the tokens a login just returned, saving the first refresh.
@@ -439,6 +470,52 @@ impl Drive {
             self.copy(&c, &folder.id, &c.name.clone())?;
         }
         Ok(folder)
+    }
+
+    /// Where file `id` sits, for Mostrar na pasta: climbs through its parents to the top of its
+    /// shared drive or My Drive, or to the highest folder the account can see.
+    pub fn place(&self, id: &str) -> Result<Place> {
+        const WHAT: &str = "Mostrar na pasta";
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Up {
+            #[serde(default)]
+            name: String,
+            #[serde(default)]
+            parents: Vec<String>,
+            drive_id: Option<String>,
+        }
+        let up = |id: &str, fields: &str| -> Result<Up> {
+            let v = self.get(&format!("/files/{}", checked(id)?), &[("fields", fields), ("supportsAllDrives", "true")], WHAT)?;
+            serde_json::from_value(v).map_err(|e| format!("{WHAT}: resposta inesperada: {e}"))
+        };
+        let file = up(id, "parents,driveId")?;
+        let root = match &file.drive_id {
+            Some(_) => None,
+            None => Some(self.root_id()?),
+        };
+        let mut folders = Vec::new();
+        let mut next = file.parents.into_iter().next();
+        let top = loop {
+            let Some(at) = next else { break Top::SharedWithMe };
+            if file.drive_id.as_deref() == Some(at.as_str()) {
+                let d = self.get(&format!("/drives/{}", checked(&at)?), &[("fields", "name")], WHAT)?;
+                let name = d.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
+                break Top::SharedDrive { id: at, name };
+            }
+            if root.as_deref() == Some(at.as_str()) {
+                break Top::MyDrive;
+            }
+            // Deeper than Drive nests folders: going round in circles.
+            if folders.len() >= 100 {
+                return Err(format!("{WHAT}: a pasta de {id} não tem fim."));
+            }
+            let folder = up(&at, "name,parents")?;
+            folders.push((at, folder.name));
+            next = folder.parents.into_iter().next();
+        };
+        folders.reverse();
+        Ok(Place { top, folders })
     }
 
     /// One file's details, for Propriedades.

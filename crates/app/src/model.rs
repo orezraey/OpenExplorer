@@ -240,6 +240,9 @@ pub struct Pane {
     pub forward: Vec<Location>,
     /// Free space on the local disk shown, read with each listing.
     pub free: Option<u64>,
+    /// The entry (id, name) to select and scroll to once the listing brings it (Mostrar na
+    /// pasta).
+    pub reveal: Option<(String, String)>,
 }
 
 /// How a pane orders entries: folders first, as in Explorer, then by the column (`by`), ties
@@ -282,6 +285,7 @@ impl Pane {
             back: Vec::new(),
             forward: Vec::new(),
             free: None,
+            reveal: None,
         }
     }
 
@@ -299,6 +303,7 @@ impl Pane {
         self.selected.clear();
         self.cursor = None;
         self.anchor = None;
+        self.reveal = None;
         self.entries.clear();
         self.version += 1;
     }

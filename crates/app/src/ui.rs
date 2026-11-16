@@ -324,8 +324,11 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     }
     let changeable = actions::items_editable(&s.panes[p].loc);
     if n > 0 {
+        menu = menu.item(item("Abrir", &icons::M_OPEN, "Enter", n == 1, actions::open));
+        if actions::shows_results(&s.panes[p].loc) {
+            menu = menu.item(item("Mostrar na pasta", &icons::M_SHOW_IN_FOLDER, "", n == 1, actions::show_in_folder));
+        }
         menu = menu
-            .item(item("Abrir", &icons::M_OPEN, "Enter", n == 1, actions::open))
             .separator()
             .item(item("Recortar", &icons::M_CUT, "Ctrl+X", editable, |s, p, _| actions::pick_up(s, p, ClipMode::Cut)))
             .item(item("Copiar", &icons::M_COPY, "Ctrl+C", changeable, |s, p, _| actions::pick_up(s, p, ClipMode::Copy)));

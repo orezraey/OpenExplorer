@@ -216,6 +216,57 @@ pub fn open_file(s: &mut State, p: usize, item: &Entry) {
     }
 }
 
+/// Whether `loc` lists search results, whose items Mostrar na pasta takes to their folder.
+pub fn shows_results(loc: &Location) -> bool {
+    matches!(loc, Location::Found(_)) || matches!(loc, Location::Drive { space: Space::Search(_), path, .. } if path.is_empty())
+}
+
+/// Mostrar na pasta: goes from a search's results to the folder the selected item sits in, and
+/// selects it there. A Drive item's folder is looked for first, climbing through its parents.
+pub fn show_in_folder(s: &mut State, p: usize, _: &mut Tx) {
+    let items = selected(s, p);
+    let [item] = items.as_slice() else { return };
+    let from = s.panes[p].loc.clone();
+    match &from {
+        Location::Found(_) => {
+            let path = PathBuf::from(&item.id);
+            let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+                s.status = format!("“{}” é a raiz de um disco: não fica em pasta nenhuma.", item.name);
+                return;
+            };
+            let name = name.to_string_lossy().into_owned();
+            crate::navigate(s, p, Location::Local(dir.to_path_buf()));
+            s.panes[p].reveal = Some((name.clone(), name));
+        }
+        Location::Drive { email, .. } if shows_results(&from) => {
+            s.status = format!("Procurando a pasta de “{}”…", item.name);
+            let request = s.live[p].load(Ordering::Relaxed);
+            let (cached, email, id, name) = (s.drives.get(email).cloned(), email.clone(), item.id.clone(), item.name.clone());
+            background(s, move |emit| {
+                let placed = |made, result| Msg::Placed { pane: p, request, item: (id.clone(), name.clone()), made, result };
+                let (drive, made) = match cached {
+                    Some(d) => (d, None),
+                    None => match open_drive(&email) {
+                        Ok(d) => (d.clone(), Some((email.clone(), d))),
+                        Err(e) => return emit(placed(None, Err(e))),
+                    },
+                };
+                let result = crate::catch_panic("achar a pasta", || drive.place(&id)).map(|place| {
+                    use openexplorer_gdrive::Top;
+                    let space = match place.top {
+                        Top::MyDrive => Space::MyDrive,
+                        Top::SharedDrive { id, name } => Space::Shared { id, name },
+                        Top::SharedWithMe => Space::SharedWithMe,
+                    };
+                    Location::Drive { email: email.clone(), space, path: place.folders }
+                });
+                emit(placed(made, result));
+            });
+        }
+        _ => {}
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Cut, copy, paste
 

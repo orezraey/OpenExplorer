@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-pub use api::{Account, Details, Drive, DriveFile, Revision, SharedDrive, View};
+pub use api::{Account, Details, Drive, DriveFile, Place, Revision, SharedDrive, Top, View};
 pub use quota::Quota;
 pub use share::{Access, Permission, Role, Sharing};
 
