@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
-use openexplorer_remote::{self as remote, Conn, Item, Pool, Protocol, Server, Store};
+use openexplorer_remote::{self as remote, Conn, Item, Pool, Protocol, Refusal, Rejected, Server, Store};
 use rune::TextEdit;
 
 use crate::actions::{Dialog, Then};
@@ -92,7 +92,7 @@ fn cancelled(e: String) -> String {
     if e == remote::CANCELLED { CANCELLED.into() } else { e }
 }
 
-fn child(dir: &str, name: &str) -> String {
+pub(crate) fn child(dir: &str, name: &str) -> String {
     format!("{}/{name}", dir.trim_end_matches('/'))
 }
 
@@ -208,7 +208,7 @@ fn job(s: &State, server: &Server, reload: Vec<Location>, work: impl FnOnce(&mut
 const DEEPEST: usize = 64;
 
 /// The bytes the file or folder at `path` holds, as far down as a download goes.
-fn measure(c: &mut dyn Conn, path: &str, stop: &dyn Fn() -> bool) -> u64 {
+pub(crate) fn measure(c: &mut dyn Conn, path: &str, stop: &dyn Fn() -> bool) -> u64 {
     let mut total = 0;
     let mut todo = vec![(path.to_string(), 0)];
     while let Some((dir, depth)) = todo.pop() {
@@ -226,34 +226,89 @@ fn measure(c: &mut dyn Conn, path: &str, stop: &dyn Fn() -> bool) -> u64 {
     total
 }
 
+/// Runs `batch`'s rows on `server`, up to `at_once` at a time, each worker with a connection of
+/// its own, one connection left over for the panes' listings; then reloads `reload` and says how
+/// it went. `prepare` runs first, on one connection, and gives what the rows share.
+#[allow(clippy::too_many_arguments)]
+fn transfer<P: Send + Sync + 'static>(
+    s: &State,
+    server: &Server,
+    reload: Vec<Location>,
+    at_once: usize,
+    batch: transfers::Batch,
+    prepare: impl FnOnce(&mut dyn Conn, &transfers::Batch) -> Result<P, String> + Send + 'static,
+    step: impl Fn(&mut dyn Conn, &P, usize, &Progress) -> Result<(), String> + Send + Sync + 'static,
+) {
+    let workers = at_once.min(server.limit().saturating_sub(1)).min(batch.rows().len()).max(1);
+    let (pool, server) = (s.servers.pool.clone(), server.clone());
+    background(s, move |emit| {
+        let result = catch_panic("transferir", || {
+            let shared = with(&pool, &server, |c| prepare(c, &batch))?;
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let failed = std::sync::Mutex::new(None);
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    scope.spawn(|| {
+                        let ran = with(&pool, &server, |c| {
+                            while let Some((i, p)) = batch.next(&next) {
+                                p.end(step(c, &shared, i, p));
+                            }
+                            Ok(())
+                        });
+                        // A worker that couldn't log in leaves its rows to the others.
+                        if let Err(e) = ran {
+                            failed.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
+                        }
+                    });
+                }
+            });
+            if let Some(e) = failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                batch.abandon(&e);
+            }
+            batch.summary()
+        });
+        emit(Msg::Done { reload, result });
+    });
+}
+
 /// Downloads `items` of the server folder `from` into the folder `dst` on the computer, a row
-/// each in the queue; then `then` (Recortar: deleting them from the server).
+/// each in the queue, several at once; then `then` (Recortar: deleting them from the server).
 pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf, then: Then, reload: Vec<Location>) {
     let Location::Server { server, .. } = from else { return };
     let paths: Vec<String> = items.iter().filter_map(|e| path_of(from, e)).collect();
     let to = End::local(&dst);
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Download, items.iter().map(|e| (end(from, Some(&e.name)), to.clone())));
-    job(s, server, reload, move |c| {
-        for ((p, e), path) in batch.rows().iter().zip(&items).zip(&paths) {
-            p.size(if e.is_dir { measure(c, path, &|| p.cancelled()) } else { e.size.unwrap_or(0) });
+    let at_once = usize::from(s.settings.downloads);
+    let sizes: Vec<(bool, Option<u64>, String)> = items.iter().zip(&paths).map(|(e, p)| (e.is_dir, e.size, p.clone())).collect();
+    let prepare = move |c: &mut dyn Conn, batch: &transfers::Batch| {
+        for (p, (is_dir, size, path)) in batch.rows().iter().zip(&sizes) {
+            p.size(if *is_dir { measure(c, path, &|| p.cancelled()) } else { size.unwrap_or(0) });
         }
-        batch.run(|i, p| {
-            let e = &items[i];
-            let local = ops::unique_in(&dst, &ops::windows_name(&e.name));
-            if let Err(err) = fetch(c, &paths[i], e.is_dir, e.modified, &local, p, 0) {
-                // What arrived of an item cancelled midway is no use.
-                if err == CANCELLED {
-                    let _ = if e.is_dir { std::fs::remove_dir_all(&local) } else { std::fs::remove_file(&local) };
-                }
-                return Err(err);
+        // The names the rows took in `dst`, before their files are made.
+        Ok(std::sync::Mutex::new(HashSet::<PathBuf>::new()))
+    };
+    let step = move |c: &mut dyn Conn, claimed: &std::sync::Mutex<HashSet<PathBuf>>, i: usize, p: &Progress| {
+        let e = &items[i];
+        let local = {
+            let mut claimed = claimed.lock().unwrap_or_else(|e| e.into_inner());
+            let local = ops::unique_where(&dst, &ops::windows_name(&e.name), &|p| claimed.contains(p));
+            claimed.insert(local.clone());
+            local
+        };
+        if let Err(err) = fetch(c, &paths[i], e.is_dir, e.modified, &local, p, 0) {
+            // What arrived of an item cancelled midway is no use.
+            if err == CANCELLED {
+                let _ = if e.is_dir { std::fs::remove_dir_all(&local) } else { std::fs::remove_file(&local) };
             }
-            match then {
-                Then::Nothing => Ok(()),
-                Then::Trash => c.remove(&paths[i], e.is_dir),
-                Then::Open => ops::open(&local),
-            }
-        })
-    });
+            return Err(err);
+        }
+        match then {
+            Then::Nothing => Ok(()),
+            Then::Trash => c.remove(&paths[i], e.is_dir),
+            Then::Open => ops::open(&local),
+        }
+    };
+    transfer(s, server, reload, at_once, batch, prepare, step);
 }
 
 /// A file or a folder and all it holds, from `path` on the server to `local`, `depth` folders
@@ -294,8 +349,8 @@ fn fetch(c: &mut dyn Conn, path: &str, is_dir: bool, modified: Option<SystemTime
 }
 
 /// Uploads `sources` (files and folders on the computer) into the server folder `to` shows, a
-/// row each in the queue, a taken name getting a free one ("nome (2).ext"). With `remove`
-/// (Recortar), each original goes to the Recycle Bin once all of it arrived.
+/// row each in the queue, several at once, a taken name getting a free one ("nome (2).ext").
+/// With `remove` (Recortar), each original goes to the Recycle Bin once all of it arrived.
 pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool, reload: Vec<Location>) {
     let Some((server, dir)) = target(to) else {
         s.status = "Abra uma pasta do servidor para enviar para ela.".into();
@@ -304,36 +359,45 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
     let server = server.clone();
     let dest = end(to, None);
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Upload, sources.iter().map(|p| (End::local(p), dest.clone())));
-    job(s, &server, reload, move |c| {
-        for (p, src) in batch.rows().iter().zip(&sources) {
+    let at_once = usize::from(s.settings.uploads);
+    let measured = sources.clone();
+    let listed = dir.clone();
+    let prepare = move |c: &mut dyn Conn, batch: &transfers::Batch| {
+        for (p, src) in batch.rows().iter().zip(&measured) {
             p.size(ops::measure(src, &|| p.cancelled()));
         }
         // Lowercased: a server on Windows (or many NAS) takes "Nota.txt" and "nota.txt" for one
         // file, and an upload under the other spelling would replace it.
-        let mut taken: HashSet<String> = c.list(&dir)?.into_iter().map(|i| i.name.to_lowercase()).collect();
-        batch.run(|i, p| {
-            let src = &sources[i];
-            let is_dir = src.is_dir();
-            let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let taken: HashSet<String> = c.list(&listed)?.into_iter().map(|i| i.name.to_lowercase()).collect();
+        Ok(std::sync::Mutex::new(taken))
+    };
+    let step = move |c: &mut dyn Conn, taken: &std::sync::Mutex<HashSet<String>>, i: usize, p: &Progress| {
+        let src = &sources[i];
+        let is_dir = src.is_dir();
+        let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = {
+            let mut taken = taken.lock().unwrap_or_else(|e| e.into_inner());
             let name = free_name(&name, is_dir, &taken);
             taken.insert(name.to_lowercase());
-            let target = child(&dir, &name);
-            if let Err(e) = send(c, src, &target, p) {
-                if e == CANCELLED {
-                    let _ = c.remove(&target, is_dir);
-                }
-                return Err(e);
+            name
+        };
+        let target = child(&dir, &name);
+        if let Err(e) = send(c, src, &target, p) {
+            if e == CANCELLED {
+                let _ = c.remove(&target, is_dir);
             }
-            if remove {
-                trash::delete(src).map_err(|e| format!("Enviado, mas não consegui mover o original para a Lixeira: {e}"))?;
-            }
-            Ok(())
-        })
-    });
+            return Err(e);
+        }
+        if remove {
+            trash::delete(src).map_err(|e| format!("Enviado, mas não consegui mover o original para a Lixeira: {e}"))?;
+        }
+        Ok(())
+    };
+    transfer(s, &server, reload, at_once, batch, prepare, step);
 }
 
 /// `name`, or the first "nome (2).ext" whose lowercase isn't in `taken` (lowercased names).
-fn free_name(name: &str, is_dir: bool, taken: &HashSet<String>) -> String {
+pub(crate) fn free_name(name: &str, is_dir: bool, taken: &HashSet<String>) -> String {
     if !taken.contains(&name.to_lowercase()) {
         return name.to_string();
     }
@@ -437,6 +501,12 @@ pub struct Form {
     pub password: TextEdit,
     pub folder: TextEdit,
     pub key: TextEdit,
+    /// Conexões simultâneas; empty for the usual number.
+    pub connections: TextEdit,
+    /// The fingerprint of the certificate the user trusts for this server (FTPS, https).
+    pub trusted: Option<String>,
+    /// A certificate the last check turned down, waiting for the user to trust it or not.
+    pub untrusted: Option<Rejected>,
     pub error: Option<String>,
     /// The connection check under way, by number.
     pub checking: Option<u64>,
@@ -457,6 +527,9 @@ impl Form {
             password: TextEdit::new("").secure(),
             folder: blank(),
             key: blank(),
+            connections: blank(),
+            trusted: None,
+            untrusted: None,
             error: None,
             checking: None,
         }
@@ -475,6 +548,10 @@ impl Form {
         f.user = TextEdit::new(server.user.clone());
         f.folder = TextEdit::new(server.root.clone());
         f.key = TextEdit::new(server.key.clone().unwrap_or_default());
+        if server.connections != remote::USUAL_CONNECTIONS {
+            f.connections = TextEdit::new(server.connections.to_string());
+        }
+        f.trusted = server.cert.clone();
         f
     }
 
@@ -548,10 +625,16 @@ impl Form {
         {
             return Err(format!("A chave {k} não existe."));
         }
+        let connections = match self.connections.text.trim() {
+            "" => remote::USUAL_CONNECTIONS,
+            t => t.parse::<u8>().ok().filter(|n| (1..=remote::MOST_CONNECTIONS).contains(n)).ok_or(format!("Conexões simultâneas é um número de 1 a {}.", remote::MOST_CONNECTIONS))?,
+        };
+        // A certificate trusted is only for the protocols over TLS.
+        let cert = self.trusted.clone().filter(|_| matches!(protocol, Protocol::Ftps | Protocol::Davs));
         let id = self.editing.clone().unwrap_or_else(remote::store::new_id);
         // The host key seen before stays, unless the server is another one now.
         let host_key = self.editing.as_ref().and_then(|id| s.servers.list.iter().find(|sv| sv.id == *id)).filter(|old| old.host == host && old.port == port && old.protocol == protocol).and_then(|old| old.host_key.clone());
-        Ok((Server { id, name, protocol, host, port, user, root, key, host_key }, pasted))
+        Ok((Server { id, name, protocol, host, port, user, root, key, host_key, cert, connections, implicit: false }, pasted))
     }
 }
 
@@ -590,20 +673,30 @@ pub fn submit(s: &mut State) {
     if let Some(Dialog::Server(f)) = &mut s.dialog {
         f.checking = Some(attempt);
         f.error = None;
+        f.untrusted = None;
     }
     background(s, move |emit| {
-        let result = catch_panic("conectar ao servidor", || {
+        let checked = catch_panic("conectar ao servidor", || {
             let mut server = server;
-            remote::probe(&mut server, secret.as_deref())?;
-            Ok(server)
+            Ok(remote::probe(&mut server, secret.as_deref()).map(|_| server))
         });
+        let result = checked.unwrap_or_else(|e| Err(Refusal::Failed(e)));
         emit(Msg::ServerChecked { attempt, result, secret: keep });
     });
 }
 
+/// Confiar e salvar: trusts the certificate the check turned down, by its fingerprint, and
+/// checks again.
+pub fn trust(s: &mut State) {
+    let Some(Dialog::Server(f)) = &mut s.dialog else { return };
+    let Some(r) = f.untrusted.take() else { return };
+    f.trusted = Some(r.fingerprint);
+    submit(s);
+}
+
 /// The add dialog's connection check ended: the server is saved and opens in the active pane,
 /// or the dialog says what went wrong.
-pub fn checked(s: &mut State, attempt: u64, result: Result<Server, String>, secret: Option<String>) {
+pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, secret: Option<String>) {
     let Some(Dialog::Server(form)) = &mut s.dialog else { return };
     if form.checking != Some(attempt) {
         return;
@@ -611,7 +704,12 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, String>, secr
     form.checking = None;
     let server = match result {
         Ok(sv) => sv,
-        Err(e) => {
+        // The dialog shows the certificate and asks whether to trust it.
+        Err(Refusal::Untrusted(r)) => {
+            form.untrusted = Some(r);
+            return;
+        }
+        Err(Refusal::Failed(e)) => {
             form.error = Some(e);
             return;
         }
@@ -799,7 +897,7 @@ mod tests {
     use super::*;
 
     fn server(protocol: Protocol, host: &str, root: &str) -> Server {
-        Server { id: format!("{host}{root}"), name: host.into(), protocol, host: host.into(), port: protocol.default_port(), user: "ana".into(), root: root.into(), key: None, host_key: None }
+        Server { id: format!("{host}{root}"), name: host.into(), protocol, host: host.into(), port: protocol.default_port(), user: "ana".into(), root: root.into(), key: None, host_key: None, cert: None, connections: 4, implicit: false }
     }
 
     #[test]
@@ -904,7 +1002,7 @@ mod real {
         while std::net::TcpStream::connect(("127.0.0.1", 28097)).is_err() {
             std::thread::sleep(Duration::from_millis(100));
         }
-        let server = Server { id: "teste-app".into(), name: "Teste".into(), protocol: Protocol::Dav, host: "127.0.0.1".into(), port: 28097, user: String::new(), root: "/".into(), key: None, host_key: None };
+        let server = Server { id: "teste-app".into(), name: "Teste".into(), protocol: Protocol::Dav, host: "127.0.0.1".into(), port: 28097, user: String::new(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
         let mut s = crate::init();
         s.cache = crate::cache::Cache::memory_only();
         s.servers.list = vec![server.clone()];
@@ -1055,11 +1153,264 @@ mod real {
         // A different key under the same address is refused when changing it too.
         let mut forged = after.clone();
         forged.host_key = Some("SHA256:outra".into());
-        assert!(remote::probe(&mut forged, Some("s3nh@ forte")).unwrap_err().contains("mudou"));
+        assert!(remote::probe(&mut forged, Some("s3nh@ forte")).unwrap_err().to_string().contains("mudou"));
 
         remove(&mut s, &sv.id);
         assert!(s.servers.store.servers().is_empty() && s.servers.list.is_empty());
         assert_eq!(remote::store::secret(&sv.id), None);
         assert!(!matches!(s.panes[0].loc, Location::Server { .. }));
+    }
+
+    /// A WebDAV server over https with a certificate of its own (as a NAS has): the check turns
+    /// it down and the dialog asks; Confiar e salvar keeps the server with that certificate's
+    /// fingerprint, and its folders list.
+    #[test]
+    #[ignore]
+    fn trusting_a_servers_own_certificate() {
+        let base = std::env::temp_dir().join(format!("oe-app-cert-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("raiz/Fotos")).unwrap();
+        let (cert, key) = (base.join("cert.pem"), base.join("key.pem"));
+        let made = std::process::Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "30", "-subj", "/CN=nas.local", "-addext", "basicConstraints=critical,CA:TRUE"])
+            .arg("-keyout")
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .output()
+            .expect("openssl on the PATH");
+        assert!(made.status.success());
+        let child = std::process::Command::new("rclone")
+            .args(["serve", "webdav", &base.join("raiz").display().to_string(), "--addr", "127.0.0.1:28443", "--cert", &cert.display().to_string(), "--key", &key.display().to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("rclone on the PATH");
+        let _guard = Served(child, base.clone());
+        while std::net::TcpStream::connect(("127.0.0.1", 28443)).is_err() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        s.servers.store = Store::at(base.join("servers.json"));
+        s.servers.list.clear();
+        let wait = |s: &mut State| {
+            let start = Instant::now();
+            loop {
+                let checking = matches!(&s.dialog, Some(Dialog::Server(f)) if f.checking.is_some());
+                if !checking && !s.panes[0].loading {
+                    return;
+                }
+                crate::poll(s, 0.0, &mut rune::Tx::default());
+                assert!(start.elapsed() < Duration::from_secs(30));
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        };
+        ask_add(&mut s);
+        let Some(Dialog::Server(f)) = &mut s.dialog else { panic!() };
+        f.host = TextEdit::new("https://127.0.0.1:28443");
+        submit(&mut s);
+        wait(&mut s);
+        let Some(Dialog::Server(f)) = &s.dialog else { panic!("saved with an untrusted certificate") };
+        let fp = f.untrusted.as_ref().map(|r| r.fingerprint.clone()).expect("the dialog asks about the certificate");
+        assert!(f.error.is_none() && s.servers.store.servers().is_empty());
+        trust(&mut s);
+        wait(&mut s);
+        assert!(s.dialog.is_none());
+        let saved = s.servers.store.servers();
+        assert_eq!(saved[0].cert.as_deref(), Some(fp.as_str()));
+        assert_eq!(names(&s, 0), ["Fotos"], "{:?}", s.panes[0].error);
+        remove(&mut s, &saved[0].id);
+    }
+
+    /// rclone serving `dir` over `kind` on `port`, logged in as ana.
+    fn rclone(kind: &str, dir: &Path, port: u16) -> std::process::Child {
+        let mut args = vec!["serve".to_string(), kind.into(), dir.display().to_string(), "--addr".into(), format!("127.0.0.1:{port}"), "--user".into(), "ana".into(), "--pass".into(), "s3nh@".into()];
+        if kind == "ftp" {
+            args.extend(["--passive-port".into(), format!("{}-{}", port + 1, port + 30)]);
+        }
+        let child = std::process::Command::new("rclone").args(&args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().expect("rclone on the PATH");
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        child
+    }
+
+    /// Copying between servers and within one, by Colar, as the panes do it.
+    #[test]
+    #[ignore]
+    fn copying_between_servers_and_within_one() {
+        let base = std::env::temp_dir().join(format!("oe-app-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (sd, dd, fd) = (base.join("sftp"), base.join("dav"), base.join("ftp"));
+        for d in [&sd, &dd, &fd] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::create_dir_all(sd.join("Projeto/src")).unwrap();
+        std::fs::write(sd.join("Projeto/src/main.rs"), vec![b'x'; 700_000]).unwrap();
+        std::fs::write(sd.join("notas.txt"), b"oi").unwrap();
+        std::fs::write(fd.join("de-ftp.txt"), b"ftp").unwrap();
+        std::fs::write(dd.join("doc.txt"), b"dav").unwrap();
+        let children = [rclone("sftp", &sd, 28501), rclone("webdav", &dd, 28502), rclone("ftp", &fd, 28503)];
+        struct Kill<const N: usize>([std::process::Child; N], PathBuf);
+        impl<const N: usize> Drop for Kill<N> {
+            fn drop(&mut self) {
+                for c in &mut self.0 {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                let _ = std::fs::remove_dir_all(&self.1);
+            }
+        }
+        let _guard = Kill(children, base.clone());
+        let mk = |id: &str, protocol: Protocol, port: u16, connections: u8| Server {
+            id: id.into(),
+            name: id.into(),
+            protocol,
+            host: "127.0.0.1".into(),
+            port,
+            user: "ana".into(),
+            root: "/".into(),
+            key: None,
+            host_key: None,
+            cert: None,
+            connections,
+            implicit: false,
+        };
+        let (sftp, dav, ftp) = (mk("c-sftp", Protocol::Sftp, 28501, 4), mk("c-dav", Protocol::Dav, 28502, 4), mk("c-ftp", Protocol::Ftp, 28503, 4));
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        // The password from the credential store, as the app reads it.
+        s.servers.store = Store::at(base.join("servers.json"));
+        for sv in [&sftp, &dav, &ftp] {
+            s.servers.store.save(sv.clone(), Some("s3nh@")).unwrap();
+        }
+        let paste = |s: &mut State, from: &Location, names: &[&str], to: Location, mode: ClipMode| {
+            crate::switch(s, 0, from.clone());
+            s.status = "listado".into();
+            settle(s);
+            let items: Vec<Entry> = s.panes[0].entries.iter().filter(|e| names.contains(&e.name.as_str())).cloned().collect();
+            assert_eq!(items.len(), names.len(), "{:?}", s.panes[0].entries);
+            crate::switch(s, 1, to);
+            s.status = "listado".into();
+            settle(s);
+            s.status.clear();
+            s.clip = Some(Clip { mode, from: from.clone(), items });
+            actions::paste(s, 1);
+            settle(s);
+        };
+
+        // SFTP to WebDAV: a folder and a file, straight through.
+        paste(&mut s, &folder(&sftp, vec![]), &["Projeto", "notas.txt"], folder(&dav, vec![]), ClipMode::Copy);
+        assert!(s.status.starts_with("Copiado: 2"), "{}", s.status);
+        assert_eq!(std::fs::read(dd.join("Projeto/src/main.rs")).unwrap().len(), 700_000);
+        assert_eq!(std::fs::read(dd.join("notas.txt")).unwrap(), b"oi");
+
+        // FTP to SFTP with Recortar: the original goes once it arrived.
+        paste(&mut s, &folder(&ftp, vec![]), &["de-ftp.txt"], folder(&sftp, vec![]), ClipMode::Cut);
+        assert!(s.status.starts_with("Movido: 1"), "{}", s.status);
+        assert_eq!(std::fs::read(sd.join("de-ftp.txt")).unwrap(), b"ftp");
+        assert!(!fd.join("de-ftp.txt").exists());
+
+        // Within SFTP, into the same folder: a copy under a free name, two connections.
+        paste(&mut s, &folder(&sftp, vec![]), &["Projeto"], folder(&sftp, vec![]), ClipMode::Copy);
+        assert_eq!(std::fs::read(sd.join("Projeto (2)/src/main.rs")).unwrap().len(), 700_000, "{}", s.status);
+
+        // Within SFTP allowed one connection: through a temporary file.
+        let one = Server { connections: 1, ..sftp.clone() };
+        s.servers.store.save(one.clone(), None).unwrap();
+        paste(&mut s, &folder(&one, vec![]), &["notas.txt"], folder(&one, vec!["Projeto".into()]), ClipMode::Copy);
+        assert_eq!(std::fs::read(sd.join("Projeto/notas.txt")).unwrap(), b"oi", "{}", s.status);
+
+        // Within WebDAV: the server copies by itself.
+        paste(&mut s, &folder(&dav, vec![]), &["doc.txt"], folder(&dav, vec!["Projeto".into()]), ClipMode::Copy);
+        assert_eq!(std::fs::read(dd.join("Projeto/doc.txt")).unwrap(), b"dav", "{}", s.status);
+        // And a whole folder, into the folder it's in: a copy under a free name.
+        paste(&mut s, &folder(&dav, vec![]), &["Projeto"], folder(&dav, vec![]), ClipMode::Copy);
+        assert_eq!(std::fs::read(dd.join("Projeto (2)/src/main.rs")).unwrap().len(), 700_000, "{}", s.status);
+        assert_eq!(std::fs::read(dd.join("Projeto (2)/doc.txt")).unwrap(), b"dav");
+
+        // A folder into itself is refused.
+        paste(&mut s, &folder(&sftp, vec![]), &["Projeto"], folder(&sftp, vec!["Projeto".into(), "src".into()]), ClipMode::Copy);
+        assert!(s.status.contains("dentro dela mesma"), "{}", s.status);
+        for sv in [&sftp, &dav, &ftp] {
+            s.servers.store.remove(&sv.id).unwrap();
+        }
+    }
+
+    /// A drag out of a server pane, as Explorer reads it after the drop: the description of a
+    /// folder, then a file's bytes from the start and from the middle.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn dragging_out_of_a_server() {
+        use crate::dragout::{Fetch, Files};
+        use std::io::Read;
+        let base = std::env::temp_dir().join(format!("oe-app-drag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("Fotos/2024")).unwrap();
+        std::fs::write(base.join("Fotos/2024/praia.jpg"), b"0123456789").unwrap();
+        std::fs::write(base.join("Fotos/capa.txt"), b"capa").unwrap();
+        let _guard = Served(rclone("sftp", &base, 28520), base.clone());
+        let server = Server { id: "drag".into(), name: "drag".into(), protocol: Protocol::Sftp, host: "127.0.0.1".into(), port: 28520, user: "ana".into(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
+        let store = Store::at(base.join("servers.json"));
+        store.save(server.clone(), Some("s3nh@")).unwrap();
+        let pool = std::sync::Arc::new(Pool::default());
+        let fotos = Entry { id: "Fotos".into(), name: "Fotos".into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let files = crate::relay::ServerFiles { pool, server: server.clone(), top: vec![("/Fotos".into(), fotos)] };
+        let list = files.list(&std::sync::atomic::AtomicBool::new(false)).unwrap();
+        let mut paths: Vec<&str> = list.iter().map(|v| v.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, ["Fotos", "Fotos\\2024", "Fotos\\2024\\praia.jpg", "Fotos\\capa.txt"]);
+        let praia = list.iter().find(|v| v.path.ends_with("praia.jpg")).and_then(|v| v.file.clone()).unwrap();
+        assert!(matches!(&praia.fetch, Fetch::Server(p) if p == "/Fotos/2024/praia.jpg"));
+        assert_eq!(praia.size, Some(10));
+        let read = |from: u64| {
+            let mut out = String::new();
+            files.open(&praia, from).unwrap().read_to_string(&mut out).unwrap();
+            out
+        };
+        assert_eq!(read(0), "0123456789");
+        assert_eq!(read(6), "6789");
+        // A stream let go of midway frees its connection: the pool still serves.
+        drop(files.open(&praia, 0).unwrap());
+        assert_eq!(read(0), "0123456789");
+        store.remove(&server.id).unwrap();
+    }
+
+    /// Colar from the first connected Drive account into a server: a small file from My Drive
+    /// arrives whole. Only reads the account. Needs a connected account and rclone.
+    #[test]
+    #[ignore]
+    fn copying_from_drive_to_a_server() {
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        let email = s.accounts.first().expect("uma conta conectada").email.clone();
+        let drive = openexplorer_gdrive::Drive::new(openexplorer_gdrive::ClientConfig::load().unwrap(), openexplorer_gdrive::store::refresh_token(&email).unwrap());
+        let mut small = None;
+        drive
+            .list("root", None, |page, _| {
+                small = small.take().or_else(|| page.into_iter().find(|f| !f.is_dir && !f.mime.starts_with("application/vnd.google-apps.") && f.size.is_some_and(|n| n > 0 && n < 2 << 20)));
+                small.is_none()
+            })
+            .unwrap();
+        let file = small.expect("um arquivo pequeno no Meu Drive");
+        let base = std::env::temp_dir().join(format!("oe-app-fromdrive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let _guard = Served(rclone("webdav", &base, 28530), base.clone());
+        let server = Server { id: "do-drive".into(), name: "do-drive".into(), protocol: Protocol::Dav, host: "127.0.0.1".into(), port: 28530, user: "ana".into(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
+        s.servers.store = Store::at(base.join("servers.json"));
+        s.servers.store.save(server.clone(), Some("s3nh@")).unwrap();
+        let from = Location::Drive { email: email.clone(), space: crate::model::Space::MyDrive, path: Vec::new() };
+        let item = crate::entry_of(file.clone());
+        crate::switch(&mut s, 1, folder(&server, vec![]));
+        s.status.clear();
+        crate::relay::drive_to_server(&mut s, &from, vec![item], &folder(&server, vec![]), false, vec![folder(&server, vec![])]);
+        settle(&mut s);
+        assert!(s.status.starts_with("Copiado: 1"), "{}", s.status);
+        let name = crate::model::shown(&file.name);
+        assert_eq!(std::fs::metadata(base.join(crate::ops::windows_name(&name))).map(|m| m.len()).ok(), file.size, "{name}");
+        s.servers.store.remove(&server.id).unwrap();
     }
 }

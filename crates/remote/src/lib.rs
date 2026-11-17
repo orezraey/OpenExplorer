@@ -7,6 +7,7 @@ mod dav;
 mod ftp;
 mod sftp;
 pub mod store;
+mod tls;
 
 use std::io::{Read, Write};
 use std::collections::HashMap;
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 
 pub use store::Store;
+pub use tls::{Rejected, fingerprint};
 
 /// Errors are shown to the user as they are, so they're plain Portuguese sentences.
 pub type Result<T> = std::result::Result<T, String>;
@@ -118,6 +120,27 @@ pub struct Server {
     /// SFTP: the host key's fingerprint seen when it was added; a different key is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_key: Option<String>,
+    /// FTPS and https: the fingerprint of a certificate the usual authorities don't vouch for
+    /// (a NAS's own) that the user chose to trust; any other such certificate is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert: Option<String>,
+    /// How many connections to it may be open at once, from 1 to [`MOST_CONNECTIONS`]: some
+    /// servers cap them per user.
+    #[serde(default = "usual_connections")]
+    pub connections: u8,
+    /// FTPS that starts with TLS (implicit) rather than switching to it (explicit): port 990,
+    /// or a server found not to greet in the clear when it was added.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub implicit: bool,
+}
+
+/// The connections a server gets unless told otherwise.
+pub const USUAL_CONNECTIONS: u8 = 4;
+/// The most a server may get.
+pub const MOST_CONNECTIONS: u8 = 10;
+
+fn usual_connections() -> u8 {
+    USUAL_CONNECTIONS
 }
 
 impl Server {
@@ -127,6 +150,11 @@ impl Server {
         let host = if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() };
         let port = if self.port == self.protocol.default_port() { String::new() } else { format!(":{}", self.port) };
         format!("{}://{user}{host}{port}", self.protocol.scheme())
+    }
+
+    /// How many connections it gets, within bounds.
+    pub fn limit(&self) -> usize {
+        self.connections.clamp(1, MOST_CONNECTIONS) as usize
     }
 
     /// The full path on the server of `segs` under [`Server::root`].
@@ -186,6 +214,14 @@ pub trait Conn: Send {
     /// Whether `path` is a symbolic link itself.
     fn is_link(&mut self, path: &str) -> Result<bool>;
 
+    /// Copies a file or a whole folder within the server, on the server's side; `false` when
+    /// the protocol has no such command (FTP, SFTP), and the bytes have to go through the app.
+    /// Fails if `to` exists.
+    fn copy(&mut self, from: &str, to: &str) -> Result<bool> {
+        let _ = (from, to);
+        Ok(false)
+    }
+
     /// A file, or a folder and all it holds. A link, to a folder or not, goes alone: what it
     /// points to stays.
     fn remove(&mut self, path: &str, is_dir: bool) -> Result<()> {
@@ -218,29 +254,70 @@ fn remove_tree<C: Conn + ?Sized>(c: &mut C, path: &str) -> Result<()> {
     c.remove_dir(path)
 }
 
+/// Logs in to `server` with the TLS trust `trust` gives. `secret` is its password (or the key's
+/// passphrase).
+fn open(server: &Server, secret: &str, trust: &tls::Trust) -> Result<Box<dyn Conn>> {
+    match server.protocol {
+        Protocol::Ftp | Protocol::Ftps => Ok(Box::new(ftp::Ftp::connect(server, secret, trust)?)),
+        Protocol::Sftp => Ok(Box::new(sftp::Sftp::connect(server, secret)?)),
+        Protocol::Dav | Protocol::Davs => Ok(Box::new(dav::Dav::connect(server, secret, trust)?)),
+    }
+}
+
 /// Logs in to `server`. `secret` is its password (or the key's passphrase).
 pub fn connect(server: &Server, secret: Option<&str>) -> Result<Box<dyn Conn>> {
-    let secret = secret.unwrap_or("");
-    match server.protocol {
-        Protocol::Ftp | Protocol::Ftps => Ok(Box::new(ftp::Ftp::connect(server, secret)?)),
-        Protocol::Sftp => Ok(Box::new(sftp::Sftp::connect(server, secret)?)),
-        Protocol::Dav | Protocol::Davs => Ok(Box::new(dav::Dav::connect(server, secret)?)),
+    let trust = tls::Trust::new(server.cert.clone());
+    open(server, secret.unwrap_or(""), &trust).map_err(|e| trust.refusal(&server.host).unwrap_or(e))
+}
+
+/// Why adding a server didn't work.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Refusal {
+    /// Its certificate isn't one the usual authorities vouch for (nor the one trusted before):
+    /// the user may trust it by its fingerprint.
+    Untrusted(Rejected),
+    Failed(String),
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::Untrusted(r) => write!(f, "O certificado do servidor não é confiável: {} (impressão digital {}).", r.why, r.fingerprint),
+            Refusal::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+impl From<String> for Refusal {
+    fn from(e: String) -> Refusal {
+        Refusal::Failed(e)
     }
 }
 
 /// Logs in to a server being added: checks the address, user and password, and fills in what
 /// only the server knows (its home folder when no folder was given, its host key).
-pub fn probe(server: &mut Server, secret: Option<&str>) -> Result<()> {
+pub fn probe(server: &mut Server, secret: Option<&str>) -> std::result::Result<(), Refusal> {
     let secret = secret.unwrap_or("");
-    let mut conn: Box<dyn Conn> = match server.protocol {
+    let trust = tls::Trust::new(server.cert.clone());
+    // Which FTPS it is, found out once here rather than at every connection.
+    if server.protocol == Protocol::Ftps {
+        // Silence on connecting can also be an explicit server slow to greet (a reverse DNS
+        // lookup, say): implicit only if a greeting does come over TLS.
+        server.implicit = server.port == 990 || ftp::silent(&server.host, server.port) && ftp::greets_over_tls(&server.host, server.port, &trust);
+    }
+    let opened = match server.protocol {
         // A key seen before is checked, never taken anew: a server changed under the same
         // address is refused.
-        Protocol::Sftp if server.host_key.is_none() => {
-            let (conn, seen) = sftp::Sftp::connect_seeing(server, secret)?;
+        Protocol::Sftp if server.host_key.is_none() => sftp::Sftp::connect_seeing(server, secret).map(|(conn, seen)| {
             server.host_key = Some(seen);
-            Box::new(conn)
-        }
-        _ => connect(server, Some(secret))?,
+            Box::new(conn) as Box<dyn Conn>
+        }),
+        _ => open(server, secret, &trust),
+    };
+    let mut conn = match (opened, trust.rejected()) {
+        (Ok(c), _) => c,
+        (Err(_), Some(r)) => return Err(Refusal::Untrusted(r)),
+        (Err(e), None) => return Err(Refusal::Failed(e)),
     };
     if server.root.trim().is_empty() {
         server.root = conn.home()?;
@@ -248,14 +325,10 @@ pub fn probe(server: &mut Server, secret: Option<&str>) -> Result<()> {
     let root = server.root.clone();
     match conn.stat(&root)? {
         Some(i) if i.is_dir => Ok(()),
-        Some(_) => Err(format!("{root} é um arquivo, não uma pasta.")),
-        None => Err(format!("A pasta {root} não existe no servidor.")),
+        Some(_) => Err(Refusal::Failed(format!("{root} é um arquivo, não uma pasta."))),
+        None => Err(Refusal::Failed(format!("A pasta {root} não existe no servidor."))),
     }
 }
-
-/// How many connections to one server may be open at once: a busy server (or one capped per
-/// user) isn't flooded by a tree opening down a deep folder while a copy runs.
-pub const PER_SERVER: usize = 4;
 
 /// An idle connection given back this recently is taken as alive without asking the server.
 const FRESH: Duration = Duration::from_secs(15);
@@ -265,7 +338,8 @@ const STALE: Duration = Duration::from_secs(120);
 
 /// Open connections waiting to be used again, per server. Connecting takes a round trip or
 /// several (TLS, SSH): a folder opened after another reuses the same login. At most
-/// [`PER_SERVER`] are out at once; another job waits for one to come back.
+/// [`Server::limit`] are out at once, so a busy server (or one capped per user) isn't flooded by
+/// a tree opening down a deep folder while a copy runs; another job waits for one to come back.
 #[derive(Default)]
 pub struct Pool {
     state: Mutex<Slots>,
@@ -344,28 +418,52 @@ impl Drop for Lease<'_> {
 
 impl Pool {
     /// A connection to `server`: an idle one that still answers, else a new login once fewer
-    /// than [`PER_SERVER`] are out. `secret` gives the password, asked only for a new login.
-    pub fn take(&self, server: &Server, secret: impl FnOnce() -> Option<String>) -> Result<Lease<'_>> {
+    /// than [`Server::limit`] are out. `secret` gives the password, asked only for a new login.
+    pub fn take(&self, server: &Server, secret: impl Fn() -> Option<String>) -> Result<Lease<'_>> {
+        Ok(self.take_all(&[(server, &secret)])?.remove(0))
+    }
+
+    /// A connection to each of two servers (or two to one), taken together: a job that held one
+    /// while waiting for the other could wait forever on another job doing the same. Two to one
+    /// server need it to allow two.
+    pub fn take_two(&self, a: (&Server, &dyn Fn() -> Option<String>), b: (&Server, &dyn Fn() -> Option<String>)) -> Result<(Lease<'_>, Lease<'_>)> {
+        if a.0.id == b.0.id && a.0.limit() < 2 {
+            return Err(format!("{} só permite uma conexão por vez.", a.0.name));
+        }
+        let mut both = self.take_all(&[a, b])?;
+        let second = both.pop().expect("two leases");
+        Ok((both.pop().expect("two leases"), second))
+    }
+
+    fn take_all(&self, wants: &[(&Server, &dyn Fn() -> Option<String>)]) -> Result<Vec<Lease<'_>>> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // Idle ones gone stale are closed, never asked.
         let (stale, keep): (Vec<Idle>, Vec<Idle>) = std::mem::take(&mut st.idle).into_iter().partition(|i| i.since.elapsed() > STALE);
         st.idle = keep;
         close_later(stale.into_iter().map(|i| i.conn).collect());
-        loop {
-            let out = st.busy.get(&server.id).copied().unwrap_or(0);
-            let idle = st.idle.iter().position(|i| i.id == server.id);
-            if idle.is_none() && out >= PER_SERVER {
-                st = self.freed.wait(st).unwrap_or_else(|e| e.into_inner());
-                continue;
-            }
-            *st.busy.entry(server.id.clone()).or_default() += 1;
-            let found = idle.map(|i| st.idle.swap_remove(i));
-            let era = st.era.get(&server.id).copied().unwrap_or(0);
-            drop(st);
-            // From here the place is the lease's: an error frees it as the lease drops.
-            let mut lease = Lease { conn: None, pool: self, id: server.id.clone(), era };
+        // Each server must have room for all it's asked for (idle ones count among those out:
+        // a server's idle and busy connections together stay within its limit).
+        let fits = |st: &Slots| {
+            wants.iter().all(|(sv, _)| {
+                let asked = wants.iter().filter(|(o, _)| o.id == sv.id).count();
+                st.busy.get(&sv.id).copied().unwrap_or(0) + asked <= sv.limit()
+            })
+        };
+        while !fits(&st) {
+            st = self.freed.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        let mut found = Vec::new();
+        for (sv, _) in wants {
+            *st.busy.entry(sv.id.clone()).or_default() += 1;
+            let idle = st.idle.iter().position(|i| i.id == sv.id).map(|i| st.idle.swap_remove(i));
+            found.push((idle, st.era.get(&sv.id).copied().unwrap_or(0)));
+        }
+        drop(st);
+        // From here each place is its lease's: an error frees them as the leases drop.
+        let mut leases: Vec<Lease<'_>> = wants.iter().zip(&found).map(|((sv, _), (_, era))| Lease { conn: None, pool: self, id: sv.id.clone(), era: *era }).collect();
+        for ((lease, (sv, secret)), (idle, _)) in leases.iter_mut().zip(wants).zip(found) {
             // One used a moment ago is alive; an older one is asked, and replaced if gone.
-            let reused = found.and_then(|mut i| {
+            let reused = idle.and_then(|mut i| {
                 if i.since.elapsed() < FRESH || i.conn.alive() {
                     Some(i.conn)
                 } else {
@@ -375,10 +473,10 @@ impl Pool {
             });
             lease.conn = Some(match reused {
                 Some(c) => c,
-                None => connect(server, secret().as_deref())?,
+                None => connect(sv, secret().as_deref())?,
             });
-            return Ok(lease);
         }
+        Ok(leases)
     }
 
     /// Closes the idle connections to `id`, and those out when they come back: its address or
@@ -438,7 +536,7 @@ mod tests {
     use super::*;
 
     fn server(protocol: Protocol, port: u16) -> Server {
-        Server { id: "x".into(), name: "x".into(), protocol, host: "nas".into(), port, user: "ana@casa".into(), root: "/".into(), key: None, host_key: None }
+        Server { id: "x".into(), name: "x".into(), protocol, host: "nas".into(), port, user: "ana@casa".into(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false }
     }
 
     #[test]
@@ -512,6 +610,16 @@ mod tests {
         let mut c = Fake(tree(&[("/pasta", true, false), ("/pasta/atalho", true, true), ("/pasta/a.txt", false, false)]));
         c.remove("/pasta", true).unwrap();
         assert_eq!(c.0, tree(&[]));
+    }
+
+    /// A list saved before servers had certificates, a connection limit or implicit FTPS
+    /// still loads, with the usual values.
+    #[test]
+    fn an_older_server_list_still_loads() {
+        let old = r#"[{"id":"s1","name":"NAS","protocol":"ftps","host":"nas","port":21,"user":"ana","root":"/"}]"#;
+        let list: Vec<Server> = serde_json::from_str(old).unwrap();
+        assert_eq!((list[0].cert.as_ref(), list[0].connections, list[0].implicit), (None, USUAL_CONNECTIONS, false));
+        assert_eq!(list[0].limit(), 4);
     }
 
     #[test]

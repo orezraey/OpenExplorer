@@ -31,15 +31,21 @@ fn method(name: &str) -> Method {
 }
 
 impl Dav {
-    pub fn connect(server: &Server, secret: &str) -> Result<Dav> {
-        let agent: Agent = Agent::config_builder()
+    pub fn connect(server: &Server, secret: &str, trust: &crate::tls::Trust) -> Result<Dav> {
+        use ureq::unversioned::resolver::DefaultResolver;
+        use ureq::unversioned::transport::{Connector, TcpConnector};
+        let config = Agent::config_builder()
             .http_status_as_error(false)
             .allow_non_standard_methods(true)
             .max_redirects(0)
             .timeout_connect(Some(TIMEOUT))
             .timeout_recv_response(Some(Duration::from_secs(60)))
-            .build()
-            .into();
+            // The connector below goes straight to the server: no proxy from the environment.
+            .proxy(None)
+            .build();
+        // TCP, then TLS that trusts the certificate the user did (see `tls`).
+        let connector = ().chain(TcpConnector::default()).chain(crate::tls::Connector { config: crate::tls::config(trust) });
+        let agent = Agent::with_parts(config, connector, DefaultResolver::default());
         let scheme = if server.protocol == Protocol::Davs { "https" } else { "http" };
         let host = if server.host.contains(':') { format!("[{}]", server.host) } else { server.host.clone() };
         let port = if server.port == server.protocol.default_port() { String::new() } else { format!(":{}", server.port) };
@@ -106,7 +112,7 @@ impl Dav {
             ureq::Error::ConnectionFailed => format!("{} recusou a conexão: o servidor não está rodando nessa porta.", self.host),
             ureq::Error::Timeout(_) => format!("{} não respondeu a tempo.", self.host),
             ureq::Error::Tls(m) => format!("Erro de TLS com {}: {m}", self.host),
-            ureq::Error::Rustls(e) => format!("O certificado de {} não é confiável ({e}). Servidores com certificado próprio ainda não são aceitos.", self.host),
+            ureq::Error::Rustls(e) => format!("Erro de TLS com {}: {e}", self.host),
             e => format!("Erro com {}: {e}", self.host),
         }
     }
@@ -262,6 +268,13 @@ impl Conn for Dav {
         self.ok(res)
     }
 
+    /// COPY, with all a folder holds (Depth infinity), never over something there.
+    fn copy(&mut self, from: &str, to: &str) -> Result<bool> {
+        let dir = self.stat(from)?.is_some_and(|i| i.is_dir);
+        let res = self.call("COPY", &self.url(from, dir), &[("Destination", self.url(to, dir)), ("Overwrite", "F".into()), ("Depth", "infinity".into())], "")?;
+        self.ok(res).map(|_| true)
+    }
+
     fn remove_file(&mut self, path: &str) -> Result<()> {
         let res = self.call("DELETE", &self.url(path, false), &[], "")?;
         self.ok(res)
@@ -373,7 +386,7 @@ mod tests {
 
     #[test]
     fn addresses_escape_each_segment() {
-        let server = Server { id: "x".into(), name: "x".into(), protocol: Protocol::Davs, host: "h".into(), port: 443, user: String::new(), root: "/".into(), key: None, host_key: None };
+        let server = Server { id: "x".into(), name: "x".into(), protocol: Protocol::Davs, host: "h".into(), port: 443, user: String::new(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
         let dav = Dav { agent: Agent::new_with_defaults(), origin: "https://h".into(), host: server.host.clone(), auth: None };
         assert_eq!(dav.url("/a b/c#d%", false), "https://h/a%20b/c%23d%25");
         assert_eq!(dav.url("/a", true), "https://h/a/");

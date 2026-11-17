@@ -383,7 +383,10 @@ fn fits(from: &Location, to: &Location) -> bool {
         (Location::Drive { email: a, .. }, Location::Drive { email: b, .. }) => a == b && drive_folder(to).is_some(),
         (Location::Local(_) | Location::Found(_), Location::Server { .. }) => crate::servers::target(to).is_some(),
         (Location::Server { .. }, Location::Local(dst)) => !crate::network::is_server(dst),
-        (Location::Server { server: a, .. }, Location::Server { server: b, .. }) => a.id == b.id && crate::servers::target(to).is_some(),
+        // Between servers, within one, and between a server and Drive: through the app.
+        (Location::Server { .. }, Location::Server { .. }) => crate::servers::target(to).is_some(),
+        (Location::Server { .. }, Location::Drive { .. }) => drive_folder(to).is_some(),
+        (Location::Drive { .. }, Location::Server { .. }) => items_editable(from) && crate::servers::target(to).is_some(),
         _ => false,
     }
 }
@@ -431,10 +434,6 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
         s.status = match (&from, &to) {
             (Location::Local(_) | Location::Found(_), Location::Drive { .. }) => "Abra uma pasta do Drive (ou um drive compartilhado) para enviar para ela.".into(),
             (Location::Drive { .. }, Location::Drive { .. }) if drive_folder(&to).is_some() => "Colar entre contas diferentes do Google Drive ainda não é possível.".into(),
-            (Location::Server { .. }, Location::Server { .. }) => "Colar entre servidores diferentes ainda não é possível: copie para o computador e de lá para o outro servidor.".into(),
-            (Location::Server { .. }, Location::Drive { .. }) | (Location::Drive { .. }, Location::Server { .. }) => {
-                "Colar entre o Google Drive e um servidor ainda não é possível: copie para o computador e de lá para o destino.".into()
-            }
             _ => "Não dá para colar aqui.".into(),
         };
         return;
@@ -463,10 +462,13 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
             let then = if mode == ClipMode::Cut { Then::Trash } else { Then::Nothing };
             crate::servers::download(s, &from, items, dst.clone(), then, reload);
         }
-        (Location::Server { .. }, Location::Server { .. }) if mode == ClipMode::Copy => {
-            s.status = "Copiar dentro do mesmo servidor ainda não é possível: use Recortar para mover, ou copie pelo computador.".into();
+        // Recortar within one server is a rename; anything else copies through the app.
+        (Location::Server { server: a, .. }, Location::Server { server: b, .. }) if a.id == b.id && mode == ClipMode::Cut => {
+            crate::servers::move_within(s, &from, items, &to, reload)
         }
-        (Location::Server { .. }, Location::Server { .. }) => crate::servers::move_within(s, &from, items, &to, reload),
+        (Location::Server { .. }, Location::Server { .. }) => crate::relay::between_servers(s, &from, items, &to, mode == ClipMode::Cut, reload),
+        (Location::Server { .. }, Location::Drive { .. }) => crate::relay::server_to_drive(s, &from, items, &to, mode == ClipMode::Cut, reload),
+        (Location::Drive { .. }, Location::Server { .. }) => crate::relay::drive_to_server(s, &from, items, &to, mode == ClipMode::Cut, reload),
         _ => {
             // Copied out of a view (Com estrela...), the items have no one folder they come from.
             let src = drive_folder(&from).map(|(_, id)| id).unwrap_or_default();

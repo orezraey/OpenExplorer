@@ -500,6 +500,13 @@ fn dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
     }
 }
 
+/// A certificate's fingerprint, which has no spaces to wrap at, as two halves on two lines.
+fn fingerprint_lines(fp: &str) -> String {
+    let groups: Vec<&str> = fp.split(':').collect();
+    let half = groups.len().div_ceil(2);
+    format!("{}\n{}", groups[..half].join(":"), groups[half..].join(":"))
+}
+
 /// Adicionar servidor (or Editar servidor): the protocol, the address, the login and the folder
 /// to open in. Salvar logs in first; the server is kept only once that worked.
 fn server_dialog(k: &Kit, f: &crate::servers::Form, layer: &mut Vec<El>) {
@@ -550,15 +557,46 @@ fn server_dialog(k: &Kit, f: &crate::servers::Form, layer: &mut Vec<El>) {
         body = body.child(field("key", "Chave SSH (opcional)", &f.key, "C:\\Users\\voce\\.ssh\\id_ed25519 (a senha vira a da chave)", |f| &mut f.key));
         body = body.child(muted("Sem senha nem chave, as chaves de ~/.ssh são tentadas. Na primeira conexão a chave do servidor é guardada; se ela mudar depois, o app recusa conectar.".into()));
     }
-    body = body.child(field("name", "Nome na árvore (opcional)", &f.name, "o endereço do servidor, se vazio", |f| &mut f.name));
+    let connections_hint = format!("{} (de 1 a {})", openexplorer_remote::USUAL_CONNECTIONS, openexplorer_remote::MOST_CONNECTIONS);
+    body = body.child(half(
+        field("name", "Nome na árvore (opcional)", &f.name, "o endereço do servidor, se vazio", |f| &mut f.name),
+        field("connections", "Conexões simultâneas", &f.connections, &connections_hint, |f| &mut f.connections),
+    ));
+    body = body.child(muted("Mais conexões listam pastas e transferem vários arquivos ao mesmo tempo; alguns servidores limitam quantas cada usuário pode abrir.".into()));
+    if let (Some(fp), None, true) = (&f.trusted, &f.untrusted, matches!(f.protocol, Protocol::Ftps | Protocol::Davs)) {
+        body = body.child(muted(format!("Certificado confiado (SHA-256): {}", fingerprint_lines(fp))));
+    }
     if f.protocol.plain() {
         body = body.child(text(format!("{} não usa criptografia: a senha e os arquivos passam pela rede sem proteção. Prefira {} se o servidor aceitar.", f.protocol.label(), if f.protocol == Protocol::Ftp { "FTPS ou SFTP" } else { "WebDAV (https)" })).font(k.ty.text_xsmall).color(k.c.warning.fg).wrap().w_full().min_w(0.0));
     }
     if let Some(e) = &f.error {
         body = body.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0));
     }
+    // A certificate the usual authorities don't vouch for: shown, and trusted only on a click.
+    if let Some(r) = &f.untrusted {
+        let changed = f.trusted.as_ref().is_some_and(|old| *old != r.fingerprint);
+        let lead = if changed {
+            format!("O certificado do servidor mudou desde que você confiou nele: o novo {}. Se você não trocou o certificado do servidor, alguém pode estar se passando por ele.", r.why)
+        } else {
+            format!("O certificado do servidor {}. Isso é comum num NAS ou servidor de casa; confira a impressão digital com a que o servidor mostra (no painel dele) antes de confiar.", r.why)
+        };
+        let warn = col()
+            .key("untrusted")
+            .w_full()
+            .gap(6.0)
+            .padding(10.0)
+            .radius(k.radius.sm)
+            .border(1.0, k.c.warning.fg)
+            .child(text(lead).font(k.ty.text_small).color(k.c.text_base).wrap().w_full().min_w(0.0))
+            .child(text(format!("SHA-256: {}", fingerprint_lines(&r.fingerprint))).font(k.ty.text_xsmall).color(k.c.text_muted).wrap().w_full().min_w(0.0));
+        body = body.child(warn);
+    }
     let checking = f.checking.is_some();
-    let save = Button::new(if checking { "Conectando…" } else { "Salvar" }).variant(ButtonVariant::Submit).on_press(crate::servers::submit);
+    let save = match (&f.untrusted, checking) {
+        (_, true) => Button::new("Conectando…").variant(ButtonVariant::Submit).on_press(crate::servers::submit),
+        (Some(_), false) => Button::new("Confiar e salvar").variant(ButtonVariant::Danger).on_press(crate::servers::trust),
+        (None, false) => Button::new("Salvar").variant(ButtonVariant::Submit).on_press(crate::servers::submit),
+    };
     body = body.child(actions_row(k, "Cancelar", save));
     let title = if f.editing.is_some() { "Editar servidor" } else { "Adicionar servidor" };
     Modal::new("server", title).open(true).child(body).width(560.0).fit().on_close(close).build(k, layer);

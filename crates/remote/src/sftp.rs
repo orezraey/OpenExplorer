@@ -238,17 +238,25 @@ impl Conn for Sftp {
             let mut file = sftp.open(path).await.map_err(said)?;
             let mut buf = vec![0u8; 256 * 1024];
             let mut done = 0u64;
-            loop {
-                let n = file.read(&mut buf).await.map_err(|e| format!("A transferência parou: {e}"))?;
-                if n == 0 {
-                    return file.close().await.map_err(|e| format!("A transferência parou: {e}"));
-                }
-                out.write_all(&buf[..n]).map_err(|e| format!("A transferência parou: {e}"))?;
-                done += n as u64;
-                if !progress(done) {
-                    return Err(crate::CANCELLED.to_string());
+            let read = async {
+                loop {
+                    let n = file.read(&mut buf).await.map_err(|e| format!("A transferência parou: {e}"))?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    out.write_all(&buf[..n]).map_err(|e| format!("A transferência parou: {e}"))?;
+                    done += n as u64;
+                    if !progress(done) {
+                        return Err(crate::CANCELLED.to_string());
+                    }
                 }
             }
+            .await;
+            // Closed however it ended: the connection goes back to the pool, and an open handle
+            // would stay with it.
+            // Not for long, though: after a dropped connection it would wait out the timeout.
+            let closed = tokio::time::timeout(Duration::from_secs(5), file.close()).await;
+            read.and(closed.map_err(|_| "A transferência parou: o servidor não respondeu.".to_string())?.map_err(|e| format!("A transferência parou: {e}")))
         })
     }
 

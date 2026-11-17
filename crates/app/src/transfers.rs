@@ -143,6 +143,27 @@ impl Batch {
         self.summary()
     }
 
+    /// For jobs that run several rows at once: the next row, by the counter `at` they share,
+    /// begun; cancelled ones are ended and passed over. The caller ends it with its result.
+    pub fn next(&self, at: &std::sync::atomic::AtomicUsize) -> Option<(usize, &Progress)> {
+        loop {
+            let i = at.fetch_add(1, Ordering::Relaxed);
+            let p = self.rows.get(i)?;
+            if p.cancelled() || !p.begin() {
+                p.end(Err(CANCELLED.into()));
+                continue;
+            }
+            return Some((i, p));
+        }
+    }
+
+    /// Ends the rows nothing ran (every worker failed to start) with `why`.
+    pub fn abandon(&self, why: &str) {
+        for p in self.rows.iter().filter(|p| !p.over()) {
+            p.end(Err(why.to_string()));
+        }
+    }
+
     /// How the rows ended, in a line: "Copiado: 3 itens.", or what went wrong.
     pub fn summary(&self) -> Result<String, String> {
         let count = |stage| self.rows.iter().filter(|p| p.stage() == stage).count();

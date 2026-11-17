@@ -1,8 +1,7 @@
-//! FTP and FTPS (explicit TLS), through suppaftp.
+//! FTP and FTPS (explicit, AUTH TLS, or implicit, TLS from the start), through suppaftp.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::Arc;
 use std::time::Duration;
 
 use suppaftp::list::ListParser;
@@ -29,29 +28,52 @@ fn socket(addr: std::net::SocketAddr, host: &str) -> Result<TcpStream> {
     Ok(tcp)
 }
 
-/// TLS that checks the server's certificate against the usual authorities.
-pub(crate) fn tls_config() -> Arc<rustls::ClientConfig> {
-    let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let cfg = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .expect("ring supports the default TLS versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Arc::new(cfg)
+/// Whether the server at `host:port` says nothing on connecting: it waits for TLS first
+/// (implicit FTPS), rather than greeting in the clear and switching on AUTH TLS (explicit).
+pub(crate) fn silent(host: &str, port: u16) -> bool {
+    let Ok(addr) = resolve(host, port) else { return false };
+    let Ok(tcp) = TcpStream::connect_timeout(&addr, TIMEOUT) else { return false };
+    let _ = tcp.set_read_timeout(Some(Duration::from_secs(4)));
+    matches!(tcp.peek(&mut [0u8; 1]), Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut))
+}
+
+/// Whether the server at `host:port` greets once TLS is up (implicit FTPS). A certificate
+/// turned down counts: TLS was what it spoke, and `trust` notes the certificate.
+pub(crate) fn greets_over_tls(host: &str, port: u16, trust: &crate::tls::Trust) -> bool {
+    let Ok(addr) = resolve(host, port) else { return false };
+    // suppaftp waits on this connection without a limit: a server that answers nothing at all
+    // would hold the check forever, so it runs aside, and is given up on after a while.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (config, host_name) = (crate::tls::config(trust), host.to_string());
+    std::thread::spawn(move || {
+        let _ = tx.send(RustlsFtpStream::connect_secure_implicit(addr, RustlsConnector::from(config), &host_name).is_ok());
+    });
+    rx.recv_timeout(TIMEOUT).unwrap_or(false) || trust.rejected().is_some()
 }
 
 impl Ftp {
-    pub fn connect(server: &Server, secret: &str) -> Result<Ftp> {
+    pub fn connect(server: &Server, secret: &str, trust: &crate::tls::Trust) -> Result<Ftp> {
         let host = server.host.as_str();
         let addr = resolve(host, server.port)?;
-        let mut s = RustlsFtpStream::connect_with_stream(socket(addr, host)?).map_err(|e| said(host, e))?;
+        let tls = server.protocol == Protocol::Ftps;
+        // Implicit FTPS (port 990, and servers that greet only over TLS) starts with TLS;
+        // explicit FTPS greets in the clear, then switches.
+        let implicit = tls && (server.port == 990 || server.implicit);
+        let mut s = if implicit {
+            let s = RustlsFtpStream::connect_secure_implicit(addr, RustlsConnector::from(crate::tls::config(trust)), host).map_err(|e| secure(host, e))?;
+            // suppaftp opens this one without the timeouts the others get.
+            let _ = s.get_ref().set_read_timeout(Some(STALL));
+            let _ = s.get_ref().set_write_timeout(Some(STALL));
+            s
+        } else {
+            RustlsFtpStream::connect_with_stream(socket(addr, host)?).map_err(|e| said(host, e))?
+        };
         // A server behind NAT answers PASV with its private address: use the one we reached.
         s.set_passive_nat_workaround(true);
         let named = host.to_string();
         let mut s = s.passive_stream_builder(move |addr| socket(addr, &named).map_err(|e| FtpError::ConnectionError(std::io::Error::other(e))));
-        if server.protocol == Protocol::Ftps {
-            s = s.into_secure(RustlsConnector::from(tls_config()), host).map_err(|e| secure(host, e))?;
+        if tls && !implicit {
+            s = s.into_secure(RustlsConnector::from(crate::tls::config(trust)), host).map_err(|e| secure(host, e))?;
         }
         let user = if server.user.is_empty() { "anonymous" } else { server.user.as_str() };
         // Anonymous FTP asks for some password, by custom an e-mail; many refuse an empty one.
@@ -60,6 +82,14 @@ impl Ftp {
             FtpError::UnexpectedResponse(r) if r.status == Status::NotLoggedIn => format!("{host} recusou o usuário ou a senha."),
             e => said(host, e),
         })?;
+        // Implicit FTPS asks for the data connections to be encrypted too (suppaftp does it only
+        // on the explicit switch, and always encrypts them): a server that won't can't be used.
+        if implicit {
+            for command in ["PBSZ 0", "PROT P"] {
+                s.custom_command(command, &[Status::CommandOk])
+                    .map_err(|_| format!("{host} usa FTPS, mas não aceita criptografar as transferências (recusou {command}). Tente o servidor como FTP, se ele aceitar."))?;
+            }
+        }
         s.transfer_type(FileType::Binary).map_err(|e| said(host, e))?;
         let features = s.feat().unwrap_or_default();
         let has = |f: &str| features.keys().any(|k| k.eq_ignore_ascii_case(f));
@@ -78,9 +108,6 @@ impl Ftp {
 
 fn secure(host: &str, e: FtpError) -> String {
     match e {
-        FtpError::SecureError(m) if m.contains("certificate") || m.contains("Certificate") => {
-            format!("O certificado de {host} não é confiável ({m}). Servidores com certificado próprio ainda não são aceitos.")
-        }
         FtpError::UnexpectedResponse(_) => format!("{host} não aceita FTPS: tente FTP."),
         e => said(host, e),
     }
@@ -261,8 +288,8 @@ mod tests {
         while TcpStream::connect(("127.0.0.1", 21250)).is_err() {
             std::thread::sleep(Duration::from_millis(100));
         }
-        let server = Server { id: "x".into(), name: "x".into(), protocol: Protocol::Ftp, host: "127.0.0.1".into(), port: 21250, user: "u".into(), root: "/".into(), key: None, host_key: None };
-        let mut c = Ftp::connect(&server, "p").unwrap();
+        let server = Server { id: "x".into(), name: "x".into(), protocol: Protocol::Ftp, host: "127.0.0.1".into(), port: 21250, user: "u".into(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
+        let mut c = Ftp::connect(&server, "p", &crate::tls::Trust::default()).unwrap();
         let offered = c.mlsd;
         for mlsd in [true, false] {
             c.mlsd = mlsd;
@@ -280,3 +307,4 @@ mod tests {
         eprintln!("rclone offers MLSD: {offered}");
     }
 }
+

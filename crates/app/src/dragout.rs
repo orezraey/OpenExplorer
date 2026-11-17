@@ -1,7 +1,7 @@
-//! Dragging Google Drive items out of the app, as "virtual files".
+//! Dragging Google Drive items, and a server's, out of the app, as "virtual files".
 //!
 //! Rune's drag-out hands Windows paths of files that must already be on disk the moment the
-//! drag starts, which for Drive would mean downloading everything first. Instead this drag
+//! drag starts, which for Drive (or a server) would mean downloading everything first. Instead this drag
 //! carries a description of the files (`FileGroupDescriptorW`: names, folders, sizes, dates)
 //! and offers each file's bytes as a stream (`FileContents`), the way browsers and mail apps
 //! drag out attachments. Nothing is fetched until the drop: the target (Explorer) then reads
@@ -43,10 +43,38 @@ pub enum Ended {
     Cancelled,
 }
 
-/// Starts dragging `files` of `drive` out of the window `hwnd`; `done` hears how it ended, on
-/// the UI thread, once the session is over.
-pub fn start(hwnd: isize, drive: Arc<Drive>, files: Vec<DriveFile>, done: Box<dyn FnOnce(Ended)>) {
-    let pending = Pending { hwnd, drive, files, done };
+/// Where the dragged files come from: Google Drive or a server.
+pub trait Files: Send + Sync + 'static {
+    /// The description of what's dragged: each item, and for folders everything in them, a
+    /// folder before what's in it, as the target makes them. Stops early once `stop` is set.
+    fn list(&self, stop: &AtomicBool) -> Result<Vec<Virtual>, String>;
+    /// File `file`'s bytes from byte `from` on.
+    fn open(&self, file: &File, from: u64) -> Result<Box<dyn Read + Send>, String>;
+}
+
+/// The dragged items of a Drive account.
+pub struct DriveSource {
+    pub drive: Arc<Drive>,
+    pub files: Vec<DriveFile>,
+}
+
+impl Files for DriveSource {
+    fn list(&self, stop: &AtomicBool) -> Result<Vec<Virtual>, String> {
+        list(&self.drive, &self.files, stop)
+    }
+
+    fn open(&self, file: &File, from: u64) -> Result<Box<dyn Read + Send>, String> {
+        match &file.fetch {
+            Fetch::Drive(f) => self.drive.open_media(f, from),
+            Fetch::Server(_) => Err("Arquivo de outro lugar.".into()),
+        }
+    }
+}
+
+/// Starts dragging what `source` describes out of the window `hwnd`; `done` hears how it ended,
+/// on the UI thread, once the session is over.
+pub fn start(hwnd: isize, source: Arc<dyn Files>, done: Box<dyn FnOnce(Ended)>) {
+    let pending = Pending { hwnd, source, done };
     if let Some(old) = PENDING.with(|p| p.borrow_mut().replace(pending)) {
         (old.done)(Ended::Cancelled);
     }
@@ -66,8 +94,7 @@ pub fn start(hwnd: isize, drive: Arc<Drive>, files: Vec<DriveFile>, done: Box<dy
 
 struct Pending {
     hwnd: isize,
-    drive: Arc<Drive>,
-    files: Vec<DriveFile>,
+    source: Arc<dyn Files>,
     done: Box<dyn FnOnce(Ended)>,
 }
 
@@ -126,7 +153,7 @@ fn session(p: &Pending) -> Option<Ended> {
     // no-op. The objects made here are released when they drop.
     unsafe {
         let _ = OleInitialize(None);
-        let data: IDataObject = Data::new(p.drive.clone(), p.files.clone()).into();
+        let data: IDataObject = Data::new(p.source.clone()).into();
         let escaped = Arc::new(AtomicBool::new(false));
         let source: IDropSource = Source(escaped.clone()).into();
         let mut effect = DROPEFFECT_NONE;
@@ -191,9 +218,28 @@ fn contents_format() -> u16 {
 
 /// One entry of the description: a folder, or a file and where its bytes come from. `path` is
 /// relative, with backslashes, as the target creates it.
-struct Virtual {
-    path: String,
-    file: Option<DriveFile>,
+pub struct Virtual {
+    pub path: String,
+    pub file: Option<File>,
+}
+
+/// A dragged file.
+#[derive(Clone)]
+pub struct File {
+    /// Its name, as it lands.
+    pub name: String,
+    /// `None` when it isn't known before the file is made (a Google Docs export).
+    pub size: Option<u64>,
+    pub modified: Option<std::time::SystemTime>,
+    pub fetch: Fetch,
+}
+
+/// Where a dragged file's bytes are.
+#[derive(Clone)]
+pub enum Fetch {
+    Drive(DriveFile),
+    /// Its path on the server.
+    Server(String),
 }
 
 const DV_E_FORMATETC: HRESULT = HRESULT(0x8004_0064_u32 as i32);
@@ -204,7 +250,7 @@ const DATA_S_SAMEFORMATETC: HRESULT = HRESULT(0x0004_0130);
 
 #[implement(IDataObject, IDataObjectAsyncCapability)]
 struct Data {
-    drive: Arc<Drive>,
+    source: Arc<dyn Files>,
     /// The description, being listed from the moment the drag started.
     listing: Arc<Listing>,
     /// Small files fetched ahead of the target.
@@ -216,9 +262,9 @@ struct Data {
 }
 
 impl Data {
-    fn new(drive: Arc<Drive>, top: Vec<DriveFile>) -> Data {
-        let listing = Listing::start(drive.clone(), top);
-        Data { drive, listing, ahead: Arc::new(Ahead::default()), extra: Mutex::new(Vec::new()), asynchronous: AtomicBool::new(true), busy: AtomicBool::new(false) }
+    fn new(source: Arc<dyn Files>) -> Data {
+        let listing = Listing::start(source.clone());
+        Data { source, listing, ahead: Arc::new(Ahead::default()), extra: Mutex::new(Vec::new()), asynchronous: AtomicBool::new(true), busy: AtomicBool::new(false) }
     }
 
     fn listing(&self) -> Result<Arc<Vec<Virtual>>, String> {
@@ -244,11 +290,11 @@ struct Listing {
 }
 
 impl Listing {
-    fn start(drive: Arc<Drive>, top: Vec<DriveFile>) -> Arc<Listing> {
+    fn start(source: Arc<dyn Files>) -> Arc<Listing> {
         let l = Arc::new(Listing { result: Mutex::new(None), ready: Condvar::new(), stop: AtomicBool::new(false) });
         let me = l.clone();
         std::thread::spawn(move || {
-            let r = list(&drive, &top, &me.stop).map(Arc::new);
+            let r = source.list(&me.stop).map(Arc::new);
             // A drag that was let go of stops its listing: not an error.
             if let Err(e) = &r
                 && e != CANCELLED
@@ -334,7 +380,9 @@ fn list(d: &Drive, top: &[DriveFile], stop: &AtomicBool) -> Result<Vec<Virtual>,
             return;
         }
         if !f.is_dir {
-            out.push(Virtual { path, file: Some(f.clone()) });
+            // An export's size isn't known before it's made.
+            let size = if export_format(&f.mime).is_some() { None } else { f.size };
+            out.push(Virtual { path, file: Some(File { name: local_name(f), size, modified: f.modified, fetch: Fetch::Drive(f.clone()) }) });
             return;
         }
         let id = f.target.clone().unwrap_or_else(|| f.id.clone());
@@ -396,7 +444,7 @@ impl Ahead {
     }
 
     /// The target opened file `i`: the next small files start coming, within the limits.
-    fn plan(self: &Arc<Self>, drive: &Arc<Drive>, items: &Arc<Vec<Virtual>>, i: usize) {
+    fn plan(self: &Arc<Self>, source: &Arc<dyn Files>, items: &Arc<Vec<Virtual>>, i: usize) {
         self.planned.lock().unwrap().insert(i);
         // Files the target passed over (Explorer's Pular for names already there) won't be
         // read: their bytes go, and stop counting against the budget.
@@ -413,7 +461,7 @@ impl Ahead {
         for (j, v) in items.iter().enumerate().skip(i + 1).take(AHEAD * 2).filter(|(_, v)| v.file.is_some()).take(AHEAD) {
             let Some(file) = &v.file else { continue };
             // An export's size isn't known before it's made: counted as 1 MB.
-            let weight = if export_format(&file.mime).is_some() { 1 << 20 } else { file.size.unwrap_or(u64::MAX) };
+            let weight = file.size.unwrap_or(1 << 20);
             if weight > AHEAD_MAX_FILE || !self.planned.lock().unwrap().insert(j) {
                 continue;
             }
@@ -424,7 +472,7 @@ impl Ahead {
             self.held.fetch_add(weight, Ordering::Relaxed);
             let slot = Arc::new(Slot { state: Mutex::new(None), ready: Condvar::new(), weight });
             self.slots.lock().unwrap().insert(j, slot.clone());
-            let (me, drive, file) = (self.clone(), drive.clone(), file.clone());
+            let (me, source, file) = (self.clone(), source.clone(), file.clone());
             std::thread::spawn(move || {
                 // A turn among the fetches running.
                 {
@@ -437,7 +485,7 @@ impl Ahead {
                 let got = if me.stop.load(Ordering::Relaxed) {
                     None
                 } else {
-                    drive.open_media(&file, 0).ok().and_then(|mut r| {
+                    source.open(&file, 0).ok().and_then(|mut r| {
                         let mut buf = Vec::with_capacity(file.size.unwrap_or(0) as usize);
                         r.read_to_end(&mut buf).ok().map(|_| Arc::new(buf))
                     })
@@ -471,8 +519,7 @@ fn descriptor_bytes(items: &[Virtual]) -> Vec<u8> {
             None => d.dwFileAttributes = 0x10, // FILE_ATTRIBUTE_DIRECTORY
             Some(f) => {
                 d.dwFileAttributes = 0x80; // FILE_ATTRIBUTE_NORMAL
-                // An export's size isn't known before it's made.
-                if let (Some(n), None) = (f.size, export_format(&f.mime)) {
+                if let Some(n) = f.size {
                     d.dwFlags |= FD_FILESIZE.0 as u32;
                     d.nFileSizeHigh = (n >> 32) as u32;
                     d.nFileSizeLow = n as u32;
@@ -534,8 +581,8 @@ impl IDataObject_Impl for Data_Impl {
             };
             // This file's bytes if they came ahead, and the next ones start coming.
             let slot = self.ahead.take(i);
-            self.ahead.plan(&self.drive, &items, i);
-            let stream: IStream = Stream { drive: self.drive.clone(), file, state: Mutex::new((0, None)), ahead: slot.map(|s| (s, self.ahead.clone())) }.into();
+            self.ahead.plan(&self.source, &items, i);
+            let stream: IStream = Stream { source: self.source.clone(), file, state: Mutex::new((0, None)), ahead: slot.map(|s| (s, self.ahead.clone())) }.into();
             return Ok(STGMEDIUM { tymed: TYMED_ISTREAM.0 as u32, u: STGMEDIUM_0 { pstm: std::mem::ManuallyDrop::new(Some(stream)) }, pUnkForRelease: std::mem::ManuallyDrop::new(None) });
         }
         let extra = self.extra.lock().unwrap();
@@ -644,12 +691,12 @@ impl IDataObjectAsyncCapability_Impl for Data_Impl {
 // ---------------------------------------------------------------------------------------------
 // One file's bytes
 
-/// A Drive file as the target reads it: from the bytes fetched ahead when there are some, else
-/// straight from Drive, asking again from where it got to after a dropped connection.
+/// A file as the target reads it: from the bytes fetched ahead when there are some, else
+/// straight from where it is, asking again from where it got to after a dropped connection.
 #[implement(IStream)]
 struct Stream {
-    drive: Arc<Drive>,
-    file: DriveFile,
+    source: Arc<dyn Files>,
+    file: File,
     state: Mutex<(u64, Option<Box<dyn Read + Send>>)>,
     /// The file fetched ahead, while it's still to be used.
     ahead: Option<(Arc<Slot>, Arc<Ahead>)>,
@@ -697,7 +744,7 @@ impl ISequentialStream_Impl for Stream_Impl {
         let mut failures = 0;
         while filled < buf.len() {
             if st.1.is_none() {
-                match self.drive.open_media(&self.file, st.0) {
+                match self.source.open(&self.file, st.0) {
                     Ok(r) => st.1 = Some(r),
                     Err(e) => {
                         failures += 1;
@@ -792,7 +839,7 @@ impl IStream_Impl for Stream_Impl {
             s.mtime = filetime(t);
         }
         if flags.0 & STATFLAG_NONAME.0 == 0 {
-            let name: Vec<u16> = local_name(&self.file).encode_utf16().chain([0]).collect();
+            let name: Vec<u16> = self.file.name.encode_utf16().chain([0]).collect();
             // SAFETY: a CoTaskMem block for the name, which the caller frees.
             unsafe {
                 let p = CoTaskMemAlloc(name.len() * 2).cast::<u16>();
@@ -816,8 +863,10 @@ impl IStream_Impl for Stream_Impl {
 mod tests {
     use super::*;
 
-    fn file(name: &str, size: Option<u64>, mime: &str) -> DriveFile {
-        DriveFile { id: "x".into(), name: name.into(), is_dir: false, size, modified: None, mime: mime.into(), target: None, md5: None, starred: false }
+    fn file(name: &str, size: Option<u64>, mime: &str) -> File {
+        let f = DriveFile { id: "x".into(), name: name.into(), is_dir: false, size, modified: None, mime: mime.into(), target: None, md5: None, starred: false };
+        let size = if export_format(&f.mime).is_some() { None } else { f.size };
+        File { name: local_name(&f), size, modified: None, fetch: Fetch::Drive(f) }
     }
 
     #[test]
@@ -872,7 +921,7 @@ mod tests {
         let mut top: Vec<DriveFile> = pick.cloned().into_iter().collect();
         top.extend(root.iter().find(|f| f.mime == "application/vnd.google-apps.document").cloned());
         assert!(!top.is_empty(), "nada pequeno para testar na raiz");
-        let data: IDataObject = Data::new(d.clone(), top).into();
+        let data: IDataObject = Data::new(Arc::new(DriveSource { drive: d.clone(), files: top })).into();
         let fmt = |cf: u16, tymed: u32, lindex: i32| FORMATETC { cfFormat: cf, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex, tymed };
         // SAFETY: COM calls on the object just made; media released after use.
         unsafe {
@@ -939,7 +988,7 @@ mod tests {
             return;
         };
         let t = std::time::Instant::now();
-        let data: IDataObject = Data::new(d.clone(), vec![folder]).into();
+        let data: IDataObject = Data::new(Arc::new(DriveSource { drive: d.clone(), files: vec![folder] })).into();
         let fmt = |cf: u16, tymed: u32, lindex: i32| FORMATETC { cfFormat: cf, ptd: std::ptr::null_mut(), dwAspect: DVASPECT_CONTENT.0, lindex, tymed };
         // SAFETY: COM calls on the object just made; media released after use.
         unsafe {

@@ -38,16 +38,25 @@ preenchido.
 - SFTP aceita senha, uma chave (a senha vira a da chave) ou, sem nenhuma das duas, as chaves de
   `~/.ssh`. A chave do servidor é guardada na primeira conexão; se ela mudar, o app recusa
   conectar (remova e adicione o servidor de novo se a mudança for esperada).
-- FTPS e WebDAV com https exigem um certificado válido: servidores com certificado próprio
-  ainda não são aceitos.
+- FTPS (explícito ou implícito) e WebDAV com https aceitam um certificado de autoridade
+  conhecida; um certificado próprio (comum em NAS) aparece com a impressão digital SHA-256 e só
+  é aceito com **Confiar e salvar**. Se depois ele mudar, o app recusa conectar até você editar o
+  servidor e confiar no novo.
+- **Conexões simultâneas** (1 a 10, 4 se vazio) limita quantas conexões o app abre com o
+  servidor; envios e downloads usam todas menos uma, que fica para as listagens.
 - Servidores não têm lixeira: Excluir apaga para sempre, depois de perguntar.
-- Dá para abrir arquivos, copiar e recortar entre o servidor e o computador, mover dentro do
-  servidor, renomear, criar pastas e pesquisar pelo nome (lendo as pastas, enquanto você digita).
-  Ainda não: copiar dentro do mesmo servidor, entre servidores ou entre servidor e Google Drive,
-  e arrastar de um painel de servidor para fora.
+- Dá para abrir arquivos, copiar e recortar entre o servidor e o computador, entre servidores,
+  dentro do mesmo servidor e entre servidor e Google Drive, renomear, criar pastas, pesquisar pelo
+  nome (lendo as pastas, enquanto você digita) e arrastar do painel do servidor para o Explorer
+  ou para o outro painel. Entre servidores os dados passam direto, sem tocar o disco; o WebDAV
+  copia dentro de si mesmo sozinho; de e para o Google Drive cada arquivo passa por um arquivo
+  temporário.
 
-Testes contra servidores de verdade (precisam do [rclone](https://rclone.org) no `PATH`):
-`cargo test -p openexplorer-remote -- --ignored` e `cargo test -p openexplorer -- --ignored real::`.
+Testes contra servidores de verdade (precisam do [rclone](https://rclone.org) e do `openssl` no
+`PATH`): `cargo test -p openexplorer-remote -- --ignored` e
+`cargo test -p openexplorer -- --ignored real::`. O teste de FTPS explícito usa um servidor
+pyftpdlib (`crates/remote/tests/ftps_server.py`): `OE_FTPS_PYTHON` aponta para um Python com
+`pyftpdlib` e `pyopenssl` instalados (num venv, por exemplo).
 
 ## Pesquisar no computador
 
@@ -93,7 +102,9 @@ servidor WebDAV local (`rclone serve webdav <pasta> --addr 127.0.0.1:28095`).
 - `crates/gdrive`: login OAuth (PKCE com redirecionamento para 127.0.0.1), contas e tokens,
   chamadas da Drive API v3. `cargo test -p openexplorer-gdrive` testa o login sem rede.
 - `crates/remote`: FTP/FTPS (suppaftp), SFTP (russh) e WebDAV (ureq): uma conexão comum aos três,
-  as conexões reaproveitadas (até 4 por servidor) e a lista de servidores com as senhas no cofre.
+  as conexões reaproveitadas (no máximo as que o servidor permite), a confiança em certificados
+  próprios e a lista de servidores com as senhas no cofre. `crates/app/src/relay.rs`: cópias entre
+  servidores e Google Drive, e o arrastar de servidor para fora.
 
 ## O que o protótipo testa
 

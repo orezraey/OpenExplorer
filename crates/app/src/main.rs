@@ -19,6 +19,7 @@ mod ops;
 mod settings;
 mod sharing;
 mod places;
+mod relay;
 mod servers;
 mod sysicons;
 mod transfers;
@@ -52,7 +53,7 @@ enum Msg {
     TreeKids { id: tree::NodeId, result: Result<Vec<tree::Node>, String> },
     /// The Adicionar servidor dialog's login check `attempt` ended; `secret` is the password to
     /// keep with the server (`None`: the one stored).
-    ServerChecked { attempt: u64, result: Result<openexplorer_remote::Server, String>, secret: Option<String> },
+    ServerChecked { attempt: u64, result: Result<openexplorer_remote::Server, openexplorer_remote::Refusal>, secret: Option<String> },
     /// Computers for Rede; `done` once the network search ended.
     Servers { found: Vec<String>, done: bool },
     /// A file operation finished: reload the panes showing `reload`, and say how it went.
@@ -1098,9 +1099,10 @@ fn dragged_ids(pane: &Pane, id: &str) -> Vec<String> {
 }
 
 fn drag_item(s: &State, p: usize, id: &str) -> Option<DragItem> {
-    // Drive items go out as virtual files through a drag of our own; Rune's needs files on disk.
+    // Drive and server items go out as virtual files through a drag of our own; Rune's needs
+    // files on disk.
     #[cfg(windows)]
-    if matches!(s.panes[p].loc, Location::Drive { .. }) {
+    if matches!(s.panes[p].loc, Location::Drive { .. } | Location::Server { .. }) {
         start_drive_drag(s, p, dragged_ids(&s.panes[p], id));
         return None;
     }
@@ -1142,16 +1144,27 @@ fn paths_for(s: &State, p: usize, ids: &[String], materialize: bool) -> Vec<Path
     }
 }
 
-/// Starts dragging the Drive items `ids` of pane `p` out as virtual files (see [`dragout`]):
-/// nothing is fetched until the drop, so any number and size of files and folders go.
+/// Starts dragging the Drive (or server) items `ids` of pane `p` out as virtual files (see
+/// [`dragout`]): nothing is fetched until the drop, so any number and size of files and folders
+/// go.
 #[cfg(windows)]
 fn start_drive_drag(s: &State, p: usize, ids: Vec<String>) {
-    let Location::Drive { email, .. } = &s.panes[p].loc else { return };
-    let Some(drive) = s.drives.get(email).cloned() else { return };
-    let files: Vec<DriveFile> = ids.iter().filter_map(|id| s.panes[p].entry(id)).map(actions::drive_file).collect();
-    if files.is_empty() {
+    let pane = &s.panes[p];
+    let items: Vec<&Entry> = ids.iter().filter_map(|id| pane.entry(id)).collect();
+    if items.is_empty() {
         return;
     }
+    let source: Arc<dyn dragout::Files> = match &pane.loc {
+        Location::Drive { email, .. } => {
+            let Some(drive) = s.drives.get(email).cloned() else { return };
+            Arc::new(dragout::DriveSource { drive, files: items.iter().map(|e| actions::drive_file(e)).collect() })
+        }
+        Location::Server { server, .. } => {
+            let top = items.iter().filter_map(|e| servers::path_of(&pane.loc, e).map(|path| (path, (*e).clone()))).collect();
+            Arc::new(relay::ServerFiles { pool: s.servers.pool.clone(), server: (**server).clone(), top })
+        }
+        _ => return,
+    };
     // SAFETY: plain Win32 queries; the window pressed on is in front, and is this process's.
     let hwnd = unsafe {
         let w = windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
@@ -1165,8 +1178,7 @@ fn start_drive_drag(s: &State, p: usize, ids: Vec<String>) {
     let (out, wake) = (s.outbox.clone(), s.waker.clone());
     dragout::start(
         hwnd,
-        drive,
-        files,
+        source,
         Box::new(move |ended| {
             let _ = out.send(Msg::DragEnded { from: p, ids, ended });
             if let Some(w) = &wake {
@@ -1336,6 +1348,9 @@ fn server_scene(s: &mut State, find: Option<&str>) {
         root: "/".into(),
         key: None,
         host_key: None,
+        cert: None,
+        connections: 4,
+        implicit: false,
     };
     s.servers.list = vec![server.clone()];
     let loc = Location::Server { server: Box::new(server), path: Vec::new(), find: find.map(str::to_string) };
@@ -1419,6 +1434,18 @@ fn main() {
                 f.protocol = openexplorer_remote::Protocol::Ftp;
                 f.host = rune::TextEdit::new("192.168.0.10");
                 f.error = Some("192.168.0.10 recusou o usuário ou a senha.".into());
+                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+            }),
+            // A NAS's own certificate, turned down: the dialog shows it and asks to trust it.
+            ("add-server-cert", |s| {
+                let mut f = servers::Form::new();
+                f.protocol = openexplorer_remote::Protocol::Davs;
+                f.host = rune::TextEdit::new("nas.local");
+                f.user = rune::TextEdit::new("ana");
+                f.untrusted = Some(openexplorer_remote::Rejected {
+                    fingerprint: "75:25:66:B8:60:50:B3:6B:5E:1A:58:FE:38:DE:1A:DB:F5:D6:86:41:DC:8C:9F:50:75:A6:E5:33:69:5A:A6:36".into(),
+                    why: "não foi emitido por uma autoridade conhecida (é um certificado próprio)".into(),
+                });
                 s.dialog = Some(actions::Dialog::Server(Box::new(f)));
             }),
             // Opções open.
