@@ -19,6 +19,7 @@ mod ops;
 mod settings;
 mod sharing;
 mod places;
+mod servers;
 mod sysicons;
 mod transfers;
 mod tree;
@@ -49,6 +50,9 @@ enum Msg {
     Opened { email: String, drive: Arc<Drive> },
     /// The folders of tree node `id`, read on a thread or from Drive.
     TreeKids { id: tree::NodeId, result: Result<Vec<tree::Node>, String> },
+    /// The Adicionar servidor dialog's login check `attempt` ended; `secret` is the password to
+    /// keep with the server (`None`: the one stored).
+    ServerChecked { attempt: u64, result: Result<openexplorer_remote::Server, String>, secret: Option<String> },
     /// Computers for Rede; `done` once the network search ended.
     Servers { found: Vec<String>, done: bool },
     /// A file operation finished: reload the panes showing `reload`, and say how it went.
@@ -138,6 +142,8 @@ struct State {
     cache: cache::Cache,
     mock: MockDrive,
     accounts: Vec<StoredAccount>,
+    /// The FTP, SFTP and WebDAV servers added.
+    servers: servers::Servers,
     /// Connected accounts by e-mail, made on first use.
     drives: HashMap<String, Arc<Drive>>,
     /// Each account's storage, asked for when its pane first opens and again after changes
@@ -211,6 +217,7 @@ fn init() -> State {
         cache: Default::default(),
         mock,
         accounts,
+        servers: servers::Servers::load(),
         drives: HashMap::new(),
         quotas: HashMap::new(),
         login: None,
@@ -322,9 +329,14 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             tx.wake_at(now + TYPING_PAUSE);
         } else if s.typed[p].1 > 0.0 && now >= s.typed[p].1 {
             s.typed[p].1 = 0.0;
-            if s.panes[p].loc.is_local() && s.search[p].text != s.searched[p] {
-                actions::search_computer(s, p);
-                changed = true;
+            if s.search[p].text != s.searched[p] {
+                if s.panes[p].loc.is_local() {
+                    actions::search_computer(s, p);
+                    changed = true;
+                } else if let Location::Server { .. } = s.panes[p].loc {
+                    actions::search_server(s, p);
+                    changed = true;
+                }
             }
         }
         if s.found_again[p] > 0.0 && now >= s.found_again[p] {
@@ -357,6 +369,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             Msg::Opened { email, drive } => keep_drive(s, email, drive),
             Msg::TreeKids { id, result } => tree::arrived(s, id, result),
             Msg::Servers { found, done } => tree::servers_found(s, found, done),
+            Msg::ServerChecked { attempt, result, secret } => servers::checked(s, attempt, result, secret),
             Msg::Listed { pane, request, part, result } => {
                 if s.live[pane].load(Ordering::Relaxed) != request {
                     continue;
@@ -725,6 +738,9 @@ fn load(s: &mut State, p: usize) {
         });
         return;
     }
+    if let Location::Server { .. } = &s.panes[p].loc {
+        return servers::load(s, p, request);
+    }
     let Location::Drive { email, space, path } = s.panes[p].loc.clone() else {
         let State { panes, mock, .. } = s;
         panes[p].load_now(mock);
@@ -879,6 +895,11 @@ fn open(s: &mut State, p: usize, id: &str) {
         Location::Mock(segs) => segs.push(e.name.clone()),
         Location::Drive { space: space @ Space::SharedDrives, .. } => *space = Space::Shared { id: e.id.clone(), name: e.name.clone() },
         Location::Drive { path, .. } => path.push((e.target.clone().unwrap_or_else(|| e.id.clone()), e.name.clone())),
+        // A folder found opens where it is.
+        Location::Server { server, .. } => {
+            let segs = servers::segs_of(&pane.loc, &e);
+            loc = servers::folder(server, segs);
+        }
     }
     navigate(s, p, loc);
 }
@@ -896,6 +917,12 @@ fn go_up(s: &mut State, p: usize) {
         }
         Location::Mock(segs) => segs.pop(),
         Location::Found(_) => None,
+        // From a search's results back to the folder searched.
+        Location::Server { find: find @ Some(_), .. } => {
+            *find = None;
+            return navigate(s, p, loc);
+        }
+        Location::Server { path, .. } => path.pop(),
         Location::Drive { space, path, .. } => match (path.pop(), &*space) {
             (Some((id, _)), _) => Some(id),
             // From the top of a shared drive up to the list of shared drives.
@@ -1091,7 +1118,7 @@ fn paths_for(s: &State, p: usize, ids: &[String], materialize: bool) -> Vec<Path
     let pane = &s.panes[p];
     match &pane.loc {
         Location::Local(_) | Location::Found(_) => ids.iter().filter_map(|id| pane.entry(id)).filter_map(|e| pane.loc.local_path(e)).collect(),
-        Location::Drive { .. } => Vec::new(),
+        Location::Drive { .. } | Location::Server { .. } => Vec::new(),
         Location::Mock(segs) => {
             let dir = s.temp.join(if segs.is_empty() { "Meu Drive".to_string() } else { segs.join("_") });
             if materialize && std::fs::create_dir_all(&dir).is_err() {
@@ -1201,6 +1228,19 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
             s.status = "Aqui estão as pastas compartilhadas do computador: solte os arquivos numa delas.".into();
             return;
         }
+        Location::Server { find: Some(_), .. } => {
+            s.status = "Os resultados da pesquisa não são uma pasta: solte os arquivos numa pasta.".into();
+            return;
+        }
+        Location::Server { .. } => {
+            let real: Vec<PathBuf> = files.iter().filter(|f| !f.starts_with(&s.temp)).cloned().collect();
+            if real.is_empty() {
+                s.status = "Nada para enviar: arraste arquivos ou pastas do computador.".into();
+                return;
+            }
+            servers::upload(s, real, &loc, false, vec![loc.clone()]);
+            return;
+        }
         Location::Drive { .. } => {
             // Files and folders from Explorer (or the other pane) go up to this Drive folder;
             // the simulated drive's items are placeholders in the temp folder and stay out.
@@ -1284,6 +1324,29 @@ fn clash_scene(s: &mut State, all: bool) {
     s.dialog = Some(actions::Dialog::Clash(Box::new(actions::ClashAsk { up, existing, clashes: vec![0, 1, 2], chosen, all })));
 }
 
+/// The scenes' server: `rclone serve webdav <folder> --addr 127.0.0.1:28095`.
+fn server_scene(s: &mut State, find: Option<&str>) {
+    let server = openexplorer_remote::Server {
+        id: "cena".into(),
+        name: "NAS de teste".into(),
+        protocol: openexplorer_remote::Protocol::Dav,
+        host: "127.0.0.1".into(),
+        port: 28095,
+        user: String::new(),
+        root: "/".into(),
+        key: None,
+        host_key: None,
+    };
+    s.servers.list = vec![server.clone()];
+    let loc = Location::Server { server: Box::new(server), path: Vec::new(), find: find.map(str::to_string) };
+    if let Some(text) = find {
+        s.search[0] = rune::TextEdit::new(text);
+        s.searched[0] = text.to_string();
+        s.typed[0] = (text.to_string(), 0.0);
+    }
+    switch(s, 0, loc);
+}
+
 /// A few Drive items for the scenes of Drive's views.
 fn view_sample() -> Vec<Entry> {
     let ago = |days: u64| Some(SystemTime::now() - std::time::Duration::from_secs(days * 86_400));
@@ -1337,6 +1400,26 @@ fn main() {
             ("network", |s| {
                 switch(s, 0, Location::Local(network::server_path("localhost")));
                 switch(s, 1, Location::Local(network::server_path(network::WSL)));
+            }),
+            // A WebDAV server on this computer (`rclone serve webdav` on 127.0.0.1:28095, no
+            // login) in the left pane, its tree open; nothing is saved to the user's list.
+            ("server", |s| server_scene(s, None)),
+            // The same server searched for "praia".
+            ("server-search", |s| server_scene(s, Some("praia"))),
+            // Adicionar servidor, filled in for SFTP; and for plain FTP, with its warning.
+            ("add-server", |s| {
+                let mut f = servers::Form::new();
+                f.host = rune::TextEdit::new("nas.local");
+                f.user = rune::TextEdit::new("ana");
+                f.password = rune::TextEdit::new("segredo").secure();
+                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+            }),
+            ("add-server-ftp", |s| {
+                let mut f = servers::Form::new();
+                f.protocol = openexplorer_remote::Protocol::Ftp;
+                f.host = rune::TextEdit::new("192.168.0.10");
+                f.error = Some("192.168.0.10 recusou o usuário ou a senha.".into());
+                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
             }),
             // Opções open.
             ("options", |s| s.dialog = Some(actions::Dialog::Options)),

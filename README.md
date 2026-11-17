@@ -24,6 +24,31 @@ O token de renovação fica no Gerenciador de Credenciais do Windows (nunca em a
 `%APPDATA%\OpenExplorer\accounts.json` guarda só e-mail e nome. Em modo Teste, o Google expira
 o acesso a cada 7 dias: o app pede para conectar de novo.
 
+## Servidores FTP, SFTP e WebDAV
+
+**Adicionar servidor**, na barra de cima, pede o protocolo (SFTP, FTPS, FTP, WebDAV com https ou
+http), o endereço, a porta, o usuário, a senha e a pasta inicial; colar um endereço inteiro
+(`sftp://ana@nas:2222/home/ana`) no campo Servidor preenche o resto. O app faz o login antes de
+guardar: o servidor só entra na lista (em **Servidores**, na árvore) quando ele funcionou. Digitar
+na barra de endereço o endereço de um servidor que ainda não está na lista abre esse diálogo
+preenchido.
+
+- A lista fica em `%APPDATA%\OpenExplorer\servers.json`, sem senha; a senha fica no Gerenciador
+  de Credenciais do Windows.
+- SFTP aceita senha, uma chave (a senha vira a da chave) ou, sem nenhuma das duas, as chaves de
+  `~/.ssh`. A chave do servidor é guardada na primeira conexão; se ela mudar, o app recusa
+  conectar (remova e adicione o servidor de novo se a mudança for esperada).
+- FTPS e WebDAV com https exigem um certificado válido: servidores com certificado próprio
+  ainda não são aceitos.
+- Servidores não têm lixeira: Excluir apaga para sempre, depois de perguntar.
+- Dá para abrir arquivos, copiar e recortar entre o servidor e o computador, mover dentro do
+  servidor, renomear, criar pastas e pesquisar pelo nome (lendo as pastas, enquanto você digita).
+  Ainda não: copiar dentro do mesmo servidor, entre servidores ou entre servidor e Google Drive,
+  e arrastar de um painel de servidor para fora.
+
+Testes contra servidores de verdade (precisam do [rclone](https://rclone.org) no `PATH`):
+`cargo test -p openexplorer-remote -- --ignored` e `cargo test -p openexplorer -- --ignored real::`.
+
 ## Pesquisar no computador
 
 O campo de pesquisa de um painel local procura pelo nome em todos os discos NTFS fixos enquanto
@@ -56,7 +81,9 @@ mostrar outra versão, há um Rust instalado fora do rustup antes dele no `PATH`
 `%USERPROFILE%\.cargo\bin` primeiro ou desinstale o outro.
 
 Para ver a interface sem abrir janela: `cargo run -- --snap tela.png --scene stress` (abre a pasta
-de 50.000 arquivos) ou `--scene account` (uma conta de exemplo, sem rede).
+de 50.000 arquivos) ou `--scene account` (uma conta de exemplo, sem rede). `--scene add-server`
+mostra o diálogo de adicionar servidor; `--scene server` e `--scene server-search` abrem um
+servidor WebDAV local (`rclone serve webdav <pasta> --addr 127.0.0.1:28095`).
 
 ## Código
 
@@ -65,6 +92,8 @@ de 50.000 arquivos) ou `--scene account` (uma conta de exemplo, sem rede).
   USN, pipe).
 - `crates/gdrive`: login OAuth (PKCE com redirecionamento para 127.0.0.1), contas e tokens,
   chamadas da Drive API v3. `cargo test -p openexplorer-gdrive` testa o login sem rede.
+- `crates/remote`: FTP/FTPS (suppaftp), SFTP (russh) e WebDAV (ureq): uma conexão comum aos três,
+  as conexões reaproveitadas (até 4 por servidor) e a lista de servidores com as senhas no cofre.
 
 ## O que o protótipo testa
 

@@ -36,6 +36,8 @@ pub enum NodeId {
     Drive(String, String),
     /// The simulated drive's folders, from its top.
     Mock(Vec<String>),
+    /// A server added, by id, and its folders from its root.
+    Server(String, Vec<String>),
 }
 
 impl NodeId {
@@ -50,6 +52,7 @@ impl NodeId {
             NodeId::Account(e) => format!("a:{e}"),
             NodeId::Drive(e, id) => format!("d:{e}:{id}"),
             NodeId::Mock(segs) => format!("m:{}", segs.join("/")),
+            NodeId::Server(id, segs) => format!("s:{id}:{}", segs.join("/")),
         }
     }
 }
@@ -103,7 +106,7 @@ pub enum Line {
         /// under C: › Users › …) gets its id's key, then that key and `#2`.
         key: String,
         depth: usize,
-        node: Node,
+        node: Box<Node>,
         open: bool,
         /// Opened and holds no folders: no arrow.
         empty: bool,
@@ -145,6 +148,16 @@ impl Tree {
         self.kids.retain(|id, _| !of(id));
         for open in &mut self.open {
             open.retain(|id| !of(id));
+        }
+        self.version += 1;
+    }
+
+    /// Drops what the trees read and opened of a server changed or removed.
+    pub fn server_changed(&mut self, id: &str) {
+        let of = |n: &NodeId| matches!(n, NodeId::Server(s, _) if s == id);
+        self.kids.retain(|n, _| !of(n));
+        for open in &mut self.open {
+            open.retain(|n| !of(n));
         }
         self.version += 1;
     }
@@ -257,6 +270,16 @@ fn mock_node(segs: Vec<String>) -> Node {
     Node { id: NodeId::Mock(segs.clone()), label, icon, fallback, to: Some(Location::Mock(segs)), opens: true }
 }
 
+/// A server's folder at `path` under its root; the server itself with an empty `path`.
+fn remote_node(server: &openexplorer_remote::Server, path: Vec<String>) -> Node {
+    let (label, icon, fallback): (String, Option<IconKey>, &'static Icon) = match path.last() {
+        Some(name) => (name.clone(), Some(IconKey::Folder), &icons::FOLDER),
+        None => (server.name.clone(), None, &icons::SERVER),
+    };
+    let to = crate::servers::folder(server, path.clone());
+    Node { id: NodeId::Server(server.id.clone(), path), label, icon, fallback, to: Some(to), opens: true }
+}
+
 fn sorted(mut nodes: Vec<Node>) -> Vec<Node> {
     nodes.sort_by(|a, b| rune_kit::natural_cmp(&a.label.to_lowercase(), &b.label.to_lowercase()));
     nodes
@@ -316,6 +339,13 @@ fn load(s: &mut State, node: &Node) {
             };
             drive_task(s, &email.clone(), "ler as pastas do Drive", work, done);
         }
+        (NodeId::Server(_, path), Some(Location::Server { server, .. })) => {
+            let (pool, server, path) = (s.servers.pool.clone(), server.clone(), path.clone());
+            background(s, move |emit| {
+                let result = crate::catch_panic("ler as pastas do servidor", || crate::servers::folders(&pool, &server, &path));
+                emit(done(result.map(|names| sorted(names.into_iter().map(|n| remote_node(&server, extend_segs(&path, &n))).collect()))));
+            });
+        }
         _ => return,
     }
     s.tree.kids.insert(id, Kids::Loading);
@@ -348,6 +378,10 @@ pub fn servers_found(s: &mut State, found: Vec<String>, done: bool) {
         s.tree.searching = false;
     }
     s.tree.version += 1;
+}
+
+fn extend_segs(path: &[String], name: &str) -> Vec<String> {
+    path.iter().cloned().chain([name.to_string()]).collect()
 }
 
 fn extend(path: &[(String, String)], id: &str, name: &str) -> Vec<(String, String)> {
@@ -442,6 +476,7 @@ pub fn learn(s: &mut State, p: usize) {
         (NodeId::Local(at), Location::Local(_)) => dirs.map(|e| local_node(&s.places, at.join(&e.name))).collect(),
         (NodeId::Drive(email, _), Location::Drive { space: Space::SharedDrives, .. }) => dirs.map(|e| shared_drive_node(email, e.id.clone(), e.name.clone())).collect(),
         (NodeId::Drive(email, _), Location::Drive { space, path, .. }) => dirs.map(|e| drive_folder_node(email, space.clone(), extend(path, opened(e), &e.name))).collect(),
+        (NodeId::Server(..), Location::Server { server, path, find: None }) => dirs.map(|e| remote_node(server, extend_segs(path, &e.name))).collect(),
         _ => return,
     };
     s.tree.kids.insert(node.id, Kids::Ready(sorted(kids)));
@@ -478,6 +513,7 @@ fn chain(s: &State, loc: &Location) -> Vec<Node> {
         Location::Local(path) => local_chain(s, path),
         Location::Found(f) => f.within.as_ref().map(|w| local_chain(s, w)).unwrap_or_default(),
         Location::Mock(segs) => (0..=segs.len()).map(|i| mock_node(segs[..i].to_vec())).collect(),
+        Location::Server { server, path, .. } => (0..=path.len()).map(|i| remote_node(server, path[..i].to_vec())).collect(),
         Location::Drive { email, space, path } => {
             let mut out = vec![account_node(email)];
             match space {
@@ -592,6 +628,12 @@ pub fn lines(s: &State, p: usize) -> Vec<Line> {
     for a in &s.accounts {
         w.node(account_node(&a.email), 0);
     }
+    if !s.servers.list.is_empty() {
+        w.out.push(Line::Heading("Servidores"));
+    }
+    for server in &s.servers.list {
+        w.node(remote_node(server, Vec::new()), 0);
+    }
     w.out.push(Line::Heading("Testes"));
     w.node(mock_node(Vec::new()), 0);
     w.out
@@ -629,7 +671,7 @@ impl Walk<'_> {
             Kids::Ready(k) if network && k.is_empty() => Some(note(r"Nenhum computador encontrado. Digite \\nome na barra de endereço.".into(), false)),
             Kids::Ready(_) | Kids::Unknown => None,
         };
-        self.out.push(Line::Node { key, depth, node, open, empty, on });
+        self.out.push(Line::Node { key, depth, node: Box::new(node), open, empty, on });
         if let Kids::Ready(kids) = &*kids {
             for k in kids {
                 self.node(k.clone(), depth + 1);

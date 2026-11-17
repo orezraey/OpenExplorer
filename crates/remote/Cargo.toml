@@ -1,0 +1,21 @@
+[package]
+name = "openexplorer-remote"
+version = "0.0.1"
+edition.workspace = true
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
+quick-xml = "0.38"
+russh = { version = "0.65", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh-sftp = "3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+suppaftp = { version = "13", features = ["rustls-ring"] }
+tokio = { version = "1", features = ["rt", "net", "time", "io-util"] }
+ureq = "3"
+percent-encoding = "2"
+webpki-roots = "1"

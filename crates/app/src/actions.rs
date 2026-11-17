@@ -47,6 +47,8 @@ pub enum Dialog {
     Share(Box<crate::sharing::Share>),
     /// Copiar link on a private item: open it to anyone with the link first?
     MakePublic(Box<crate::sharing::MakePublic>),
+    /// Adicionar servidor, or Editar servidor.
+    Server(Box<crate::servers::Form>),
 }
 
 pub fn selected(s: &State, p: usize) -> Vec<Entry> {
@@ -85,6 +87,7 @@ pub fn editable(loc: &Location) -> bool {
         Location::Local(dir) => !crate::network::is_server(dir),
         Location::Mock(_) | Location::Found(_) => false,
         Location::Drive { .. } => drive_folder(loc).is_some(),
+        Location::Server { find, .. } => find.is_none(),
     }
 }
 
@@ -94,7 +97,7 @@ pub fn editable(loc: &Location) -> bool {
 pub fn items_editable(loc: &Location) -> bool {
     match loc {
         Location::Drive { space: Space::SharedDrives | Space::Trash, .. } => false,
-        Location::Drive { .. } | Location::Found(_) => true,
+        Location::Drive { .. } | Location::Found(_) | Location::Server { .. } => true,
         _ => editable(loc),
     }
 }
@@ -118,7 +121,7 @@ fn why_not(loc: &Location) -> String {
             format!("{} é uma lista do Google Drive, não uma pasta: abra uma pasta para colar, criar pastas ou recortar.", space.label())
         }
         Location::Mock(_) => "O drive simulado só serve para testar a interface; abra o disco local ou o Google Drive.".into(),
-        Location::Found(_) => "Os resultados da pesquisa não são uma pasta: abra uma pasta para colar, criar pastas ou recortar.".into(),
+        Location::Found(_) | Location::Server { find: Some(_), .. } => "Os resultados da pesquisa não são uma pasta: abra uma pasta para colar, criar pastas ou recortar.".into(),
         Location::Local(dir) if crate::network::is_server(dir) => "Aqui estão as pastas compartilhadas do computador: abra uma delas para mexer no que tem dentro.".into(),
         _ => "Não dá para fazer isso aqui.".into(),
     }
@@ -213,13 +216,14 @@ pub fn open_file(s: &mut State, p: usize, item: &Entry) {
             let _ = std::fs::remove_file(&ready);
             download(s, &loc, vec![item.clone()], dir, Then::Open, Vec::new());
         }
+        Location::Server { .. } => crate::servers::open_file(s, p, item),
         Location::Mock(_) => not_here(s, p),
     }
 }
 
 /// Whether `loc` lists search results, whose items Mostrar na pasta takes to their folder.
 pub fn shows_results(loc: &Location) -> bool {
-    matches!(loc, Location::Found(_)) || matches!(loc, Location::Drive { space: Space::Search(_), path, .. } if path.is_empty())
+    matches!(loc, Location::Found(_) | Location::Server { find: Some(_), .. }) || matches!(loc, Location::Drive { space: Space::Search(_), path, .. } if path.is_empty())
 }
 
 /// Mostrar na pasta: goes from a search's results to the folder the selected item sits in, and
@@ -243,6 +247,11 @@ pub fn show_in_folder(s: &mut State, p: usize, _: &mut Tx) {
             let (account, item) = (email.clone(), (item.id.clone(), item.name.clone()));
             let find = move |d: &Drive| d.place(&item.0).map(|place| Reached { loc: address::place_location(account, place), reveal: Some(item) });
             reach(s, p, email, "achar a pasta", find);
+        }
+        Location::Server { server, .. } => {
+            let mut segs = crate::servers::segs_of(&loc, item);
+            let name = segs.pop().unwrap_or_default();
+            arrive(s, p, Reached { loc: crate::servers::folder(server, segs), reveal: Some((name.clone(), name)) });
         }
         _ => {}
     }
@@ -280,6 +289,26 @@ pub fn edit_address(s: &mut State, p: usize) {
 /// Looking it up can take a while (a network drive, Drive), so it runs in the background.
 /// `false` when `typed` can't be read at all: the address field, if open, stays to fix it.
 pub fn go_to_address(s: &mut State, p: usize, typed: &str) -> bool {
+    // A server's address (sftp://…, ftp://…, https://…): one of the servers added, or the
+    // dialog to add it, filled in.
+    if !address::is_drive_link(typed)
+        && let Some(a) = crate::servers::parse_address(typed.trim().trim_matches('"'))
+    {
+        match crate::servers::reach(&s.servers.list, &a) {
+            Ok(loc) => crate::navigate(s, p, loc),
+            Err(e) if e.is_empty() => {
+                s.dialog = Some(Dialog::Server(Box::new(crate::servers::Form::of_address(&a))));
+                s.status = "Esse servidor ainda não foi adicionado: confira os dados e clique em Salvar.".into();
+            }
+            // The field stays, to fix what was typed.
+            Err(e) => {
+                s.status = e;
+                return false;
+            }
+        }
+        s.address[p] = None;
+        return true;
+    }
     let accounts: Vec<String> = s.accounts.iter().map(|a| a.email.clone()).collect();
     let target = match address::parse(typed, &s.panes[p].loc, &accounts) {
         Ok(t) => t,
@@ -352,6 +381,9 @@ fn fits(from: &Location, to: &Location) -> bool {
         // except the shared drives list and Lixeira.
         (Location::Drive { .. }, Location::Local(_)) => items_editable(from),
         (Location::Drive { email: a, .. }, Location::Drive { email: b, .. }) => a == b && drive_folder(to).is_some(),
+        (Location::Local(_) | Location::Found(_), Location::Server { .. }) => crate::servers::target(to).is_some(),
+        (Location::Server { .. }, Location::Local(dst)) => !crate::network::is_server(dst),
+        (Location::Server { server: a, .. }, Location::Server { server: b, .. }) => a.id == b.id && crate::servers::target(to).is_some(),
         _ => false,
     }
 }
@@ -392,13 +424,17 @@ pub fn paste(s: &mut State, p: usize) {
 /// Copies or moves `items` of `from` into the folder pane `p` shows, or says why it can't.
 fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p: usize) {
     let to = s.panes[p].loc.clone();
-    if matches!(to, Location::Drive { .. }) && drive_folder(&to).is_none() {
+    if (matches!(to, Location::Drive { .. }) && drive_folder(&to).is_none()) || (matches!(to, Location::Server { .. }) && !editable(&to)) {
         return not_here(s, p);
     }
     if !fits(&from, &to) {
         s.status = match (&from, &to) {
             (Location::Local(_) | Location::Found(_), Location::Drive { .. }) => "Abra uma pasta do Drive (ou um drive compartilhado) para enviar para ela.".into(),
             (Location::Drive { .. }, Location::Drive { .. }) if drive_folder(&to).is_some() => "Colar entre contas diferentes do Google Drive ainda não é possível.".into(),
+            (Location::Server { .. }, Location::Server { .. }) => "Colar entre servidores diferentes ainda não é possível: copie para o computador e de lá para o outro servidor.".into(),
+            (Location::Server { .. }, Location::Drive { .. }) | (Location::Drive { .. }, Location::Server { .. }) => {
+                "Colar entre o Google Drive e um servidor ainda não é possível: copie para o computador e de lá para o destino.".into()
+            }
             _ => "Não dá para colar aqui.".into(),
         };
         return;
@@ -418,6 +454,19 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
             let then = if mode == ClipMode::Cut { Then::Trash } else { Then::Nothing };
             download(s, &from, items, dst.clone(), then, reload);
         }
+        (Location::Local(_) | Location::Found(_), Location::Server { .. }) => {
+            let sources = items.iter().filter_map(|e| from.local_path(e)).collect();
+            crate::servers::upload(s, sources, &to, mode == ClipMode::Cut, reload);
+        }
+        // Recortar takes the items off the server once they arrived.
+        (Location::Server { .. }, Location::Local(dst)) => {
+            let then = if mode == ClipMode::Cut { Then::Trash } else { Then::Nothing };
+            crate::servers::download(s, &from, items, dst.clone(), then, reload);
+        }
+        (Location::Server { .. }, Location::Server { .. }) if mode == ClipMode::Copy => {
+            s.status = "Copiar dentro do mesmo servidor ainda não é possível: use Recortar para mover, ou copie pelo computador.".into();
+        }
+        (Location::Server { .. }, Location::Server { .. }) => crate::servers::move_within(s, &from, items, &to, reload),
         _ => {
             // Copied out of a view (Com estrela...), the items have no one folder they come from.
             let src = drive_folder(&from).map(|(_, id)| id).unwrap_or_default();
@@ -684,6 +733,9 @@ pub fn search(s: &mut State, p: usize) {
     if s.panes[p].loc.is_local() {
         return search_computer(s, p);
     }
+    if let Location::Server { .. } = s.panes[p].loc {
+        return search_server(s, p);
+    }
     if let Some(to) = search_from(&s.panes[p].loc, &s.search[p].text) {
         crate::navigate(s, p, to);
     }
@@ -716,6 +768,31 @@ pub fn search_computer(s: &mut State, p: usize) {
     }
     let to = Location::Found(Box::new(crate::finder::found(&text, within)));
     if matches!(loc, Location::Found(_)) {
+        crate::switch(s, p, to);
+    } else {
+        crate::navigate(s, p, to);
+    }
+}
+
+/// Searches the server folder pane `p` shows (or where its results looked) for the words in
+/// its field, reading the folders below it; as on the computer, typing replaces the results in
+/// place and an emptied field goes back to the folder.
+pub fn search_server(s: &mut State, p: usize) {
+    let text = s.search[p].text.split_whitespace().collect::<Vec<_>>().join(" ");
+    s.searched[p] = s.search[p].text.clone();
+    let Location::Server { server, path, find } = s.panes[p].loc.clone() else { return };
+    let results = find.is_some();
+    if text.is_empty() {
+        if results {
+            match s.panes[p].back.last() {
+                Some(Location::Server { find: None, .. }) => crate::go_back(s, p),
+                _ => crate::switch(s, p, crate::servers::folder(&server, path)),
+            }
+        }
+        return;
+    }
+    let to = Location::Server { server, path, find: Some(text) };
+    if results {
         crate::switch(s, p, to);
     } else {
         crate::navigate(s, p, to);
@@ -817,7 +894,7 @@ pub fn ask_delete(s: &mut State, p: usize) {
     // The network and WSL have no Lixeira: Del deletes for good there, after asking (as
     // Explorer does). By the items' own paths, so a search's results there count too.
     let loc = &s.panes[p].loc;
-    if items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_remote(&path)) {
+    if matches!(loc, Location::Server { .. }) || items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_remote(&path)) {
         s.dialog = Some(Dialog::Purge { pane: p, items });
         return;
     }
@@ -842,6 +919,7 @@ pub fn delete(s: &mut State) {
                 Ok(format!("Movido para a lixeira do Google Drive: {}.", count(n)))
             });
         }
+        Location::Server { .. } => crate::servers::delete(s, &loc, items, vec![loc.clone()]),
         Location::Mock(_) => return not_here(s, pane),
     }
     s.status = format!("Excluindo {}…", count(n));
@@ -881,6 +959,11 @@ pub fn purge(s: &mut State) {
     if loc.is_local() {
         let paths: Vec<PathBuf> = items.iter().filter_map(|e| loc.local_path(e)).collect();
         local_job(s, vec![loc.clone()], move || ops::delete_forever(&paths).map(|_| format!("Excluído permanentemente: {}.", count(n))));
+        s.status = format!("Excluindo permanentemente {}…", count(n));
+        return;
+    }
+    if let Location::Server { .. } = &loc {
+        crate::servers::delete(s, &loc, items, vec![loc.clone()]);
         s.status = format!("Excluindo permanentemente {}…", count(n));
         return;
     }
@@ -975,6 +1058,8 @@ fn stem_len(name: &str, is_dir: bool) -> usize {
 fn name_problem(loc: &Location, name: &str) -> Option<String> {
     match loc {
         Location::Local(_) | Location::Found(_) => ops::invalid_name(name),
+        Location::Server { .. } if name.contains('/') => Some("O nome não pode ter /.".into()),
+        Location::Server { .. } if matches!(name.trim(), "." | "..") => Some("Esse nome não pode ser usado.".into()),
         _ if name.trim().is_empty() => Some("O nome não pode ficar vazio.".into()),
         _ => None,
     }
@@ -1047,7 +1132,9 @@ pub fn apply_name(s: &mut State, pane: usize, item: Option<Entry>, name: String)
             let Some((email, folder)) = drive_folder(&loc) else { return not_here(s, pane) };
             drive_job(s, &email, vec![loc.clone()], move |d| d.create_folder(&name, &folder).map(|_| format!("Pasta \"{shown_name}\" criada.")));
         }
-        (Location::Mock(_) | Location::Found(_), _) => not_here(s, pane),
+        (Location::Server { find: None, .. }, None) => crate::servers::name(s, &loc, None, name),
+        (Location::Server { .. }, Some(item)) => crate::servers::name(s, &loc, Some(item), name),
+        (Location::Mock(_) | Location::Found(_) | Location::Server { .. }, _) => not_here(s, pane),
     }
 }
 

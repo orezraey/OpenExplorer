@@ -108,7 +108,13 @@ pub fn text(loc: &Location) -> String {
             parts.extend(path.iter().map(|(_, name)| shown(name)));
             parts.join("/")
         }
+        Location::Server { .. } => crate::servers::address_text(loc),
     }
+}
+
+/// Whether `typed` is a Google Drive link, which opens in Drive rather than as a WebDAV server.
+pub fn is_drive_link(typed: &str) -> bool {
+    link(typed.trim().trim_matches('"').trim()).is_some()
 }
 
 /// The drive.google.com link of the Drive place `loc` shows: a folder, a shared drive or one

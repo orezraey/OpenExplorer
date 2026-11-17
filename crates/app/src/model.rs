@@ -120,6 +120,10 @@ pub enum Location {
     /// A folder in a connected account: the (id, name) of each folder from the top of `space`
     /// down.
     Drive { email: String, space: Space, path: Vec<(String, String)> },
+    /// A folder on an FTP, SFTP or WebDAV server the user added: the server, and the folders
+    /// from its root down. With `find`, the search for those words in that folder and below,
+    /// each result's id its path from the folder searched (see [`crate::servers`]).
+    Server { server: Box<openexplorer_remote::Server>, path: Vec<String>, find: Option<String> },
 }
 
 /// A search of the computer: its words, the folder it looks under (everywhere when `None`), and
@@ -205,6 +209,12 @@ impl Location {
             Location::Found(_) => Some(PathBuf::from(&e.id)),
             _ => None,
         }
+    }
+
+    /// Whether this lists a search's results read from folders (the computer's, a server's):
+    /// each entry's id is its path, and the Tipo column shows the folder it's in.
+    pub fn finds(&self) -> bool {
+        matches!(self, Location::Found(_) | Location::Server { find: Some(_), .. })
     }
 
     pub fn home() -> Location {
@@ -323,7 +333,7 @@ impl Pane {
         let entries = match &self.loc {
             Location::Local(dir) => read_local(dir).map_err(|e| format!("{}: {e}", dir.display())),
             Location::Mock(segs) => Ok(mock.list(segs)),
-            Location::Drive { .. } | Location::Found(_) => return,
+            Location::Drive { .. } | Location::Found(_) | Location::Server { .. } => return,
         };
         self.set_entries(entries);
     }
@@ -356,7 +366,7 @@ impl Pane {
     pub fn append_entries(&mut self, more: Vec<Entry>) {
         let (col, asc) = self.sort;
         // By Tipo, a new entry's label is built once, not at each comparison.
-        let found = matches!(self.loc, Location::Found(_));
+        let found = self.loc.finds();
         let label = |e: &Entry| (col == SortCol::Kind).then(|| kind_key(found, e));
         let cmp = |a: &Entry, ka: &Option<String>, b: &Entry, kb: &Option<String>| {
             let by = match (ka, kb) {
@@ -393,7 +403,7 @@ impl Pane {
         let (col, asc) = self.sort;
         if col == SortCol::Kind {
             // The label is built once per entry rather than twice per comparison.
-            let found = matches!(self.loc, Location::Found(_));
+            let found = self.loc.finds();
             let mut keyed: Vec<(String, Entry)> = std::mem::take(&mut self.entries).into_iter().map(|e| (kind_key(found, &e), e)).collect();
             keyed.sort_by(|(ka, a), (kb, b)| order(asc, a, b, ka.cmp(kb)));
             self.entries = keyed.into_iter().map(|(_, e)| e).collect();
@@ -415,6 +425,13 @@ impl Pane {
                 };
                 parts.extend(path.iter().map(|(_, n)| n.as_str()));
                 parts.join("/")
+            }
+            Location::Server { server, path, find } => {
+                let place = std::iter::once(server.name.as_str()).chain(path.iter().map(String::as_str)).collect::<Vec<_>>().join("/");
+                match find {
+                    Some(text) => format!("“{text}” em {place}"),
+                    None => place,
+                }
             }
         }
     }
@@ -681,6 +698,18 @@ pub fn crumbs(loc: &Location) -> Vec<Crumb> {
             out.push(Crumb { label, to: Location::drive(email.clone(), space.clone()) });
             for i in 0..path.len() {
                 out.push(Crumb { label: shown(&path[i].1), to: Location::Drive { email: email.clone(), space: space.clone(), path: path[..=i].to_vec() } });
+            }
+            out
+        }
+        Location::Server { server, path, find } => {
+            let at = |path: &[String]| Location::Server { server: server.clone(), path: path.to_vec(), find: None };
+            let mut out = vec![Crumb { label: server.name.clone(), to: at(&[]) }];
+            for i in 0..path.len() {
+                out.push(Crumb { label: path[i].clone(), to: at(&path[..=i]) });
+            }
+            if let Some(text) = find {
+                let place = path.last().unwrap_or(&server.name);
+                out.push(Crumb { label: format!("“{text}” em {place}"), to: loc.clone() });
             }
             out
         }

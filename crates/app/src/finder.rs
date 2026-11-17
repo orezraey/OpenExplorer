@@ -170,7 +170,7 @@ pub fn elsewhere(within: &Path) -> bool {
 }
 
 /// The words of a search, folded as the index folds them: each must be in a name.
-fn words(text: &str) -> Vec<Vec<u8>> {
+pub(crate) fn words(text: &str) -> Vec<Vec<u8>> {
     let mut words: Vec<Vec<u8>> = text.split_whitespace().map(openexplorer_index::fold::fold).filter(|w| !w.is_empty()).collect();
     words.sort();
     words.dedup();
@@ -183,7 +183,7 @@ fn name_matches(words: &[Vec<u8>], name: &str) -> bool {
 
 /// [`name_matches`], folding into `buf` (kept between calls, where names come by the hundred
 /// thousand).
-fn matches_in(words: &[Vec<u8>], name: &str, buf: &mut Vec<u8>) -> bool {
+pub(crate) fn matches_in(words: &[Vec<u8>], name: &str, buf: &mut Vec<u8>) -> bool {
     buf.clear();
     openexplorer_index::fold::fold_into(name, buf);
     words.iter().all(|w| buf.windows(w.len()).any(|part| part == w.as_slice()))
@@ -191,29 +191,33 @@ fn matches_in(words: &[Vec<u8>], name: &str, buf: &mut Vec<u8>) -> bool {
 
 /// Hands results over in pages as they're found: a few hundred at a time, or what came in the
 /// last moment, so the list fills while a slow search goes on.
-struct Pager<'a> {
+pub(crate) struct Pager<'a> {
     page: &'a mut dyn FnMut(Vec<Entry>, bool),
     buf: Vec<Entry>,
     since: std::time::Instant,
     sent: usize,
 }
 
-impl Pager<'_> {
-    fn push(&mut self, e: Entry) {
+impl<'a> Pager<'a> {
+    pub(crate) fn new(page: &'a mut dyn FnMut(Vec<Entry>, bool)) -> Pager<'a> {
+        Pager { page, buf: Vec::new(), since: std::time::Instant::now(), sent: 0 }
+    }
+
+    pub(crate) fn push(&mut self, e: Entry) {
         self.buf.push(e);
         if self.buf.len() >= 500 || self.since.elapsed() > Duration::from_millis(250) {
             self.flush(true);
         }
     }
 
-    fn flush(&mut self, more: bool) {
+    pub(crate) fn flush(&mut self, more: bool) {
         self.sent += self.buf.len();
         (self.page)(std::mem::take(&mut self.buf), more);
         self.since = std::time::Instant::now();
     }
 
     /// Whether [`LIMIT`] results were found.
-    fn full(&self) -> bool {
+    pub(crate) fn full(&self) -> bool {
         self.sent + self.buf.len() >= LIMIT
     }
 }
@@ -226,7 +230,7 @@ pub fn search_elsewhere(f: &Found, alive: &dyn Fn() -> bool, page: &mut dyn FnMu
     use crate::network::{is_wsl, share_path, shares, unc};
     let within = f.within.as_deref().ok_or("Pesquisa sem pasta.")?;
     let words = words(&f.text);
-    let mut pager = Pager { page, buf: Vec::new(), since: std::time::Instant::now(), sent: 0 };
+    let mut pager = Pager::new(page);
     match unc(within) {
         // Linux: every distribution, one after the other (each starts if it isn't running).
         Some((server, distro)) if is_wsl(&server) && distro.is_empty() => {
@@ -557,15 +561,11 @@ mod tests {
         // The folder searched is itself named "relatorio": it isn't among the results.
         let f = found("relatorio", Some(root.clone()));
         let (mut got, mut ends) = (Vec::new(), Vec::new());
-        let mut pager = Pager {
-            page: &mut |page: Vec<Entry>, more: bool| {
-                got.extend(page);
-                ends.push(more);
-            },
-            buf: Vec::new(),
-            since: std::time::Instant::now(),
-            sent: 0,
+        let mut page = |page: Vec<Entry>, more: bool| {
+            got.extend(page);
+            ends.push(more);
         };
+        let mut pager = Pager::new(&mut page);
         walk(std::slice::from_ref(&root), &words(&f.text), &|| true, &mut pager).unwrap();
         pager.flush(false);
         drop(pager);
@@ -593,7 +593,8 @@ mod tests {
         // Reading the folders through `\\wsl.localhost`, as a shared folder is read, finds the same.
         let mut walked = Vec::new();
         let started = std::time::Instant::now();
-        let mut pager = Pager { page: &mut |page: Vec<Entry>, _| walked.extend(page), buf: Vec::new(), since: std::time::Instant::now(), sent: 0 };
+        let mut page = |page: Vec<Entry>, _| walked.extend(page);
+        let mut pager = Pager::new(&mut page);
         walk(&[PathBuf::from(r"\\wsl.localhost\archlinux\etc")], &words("passwd"), &|| true, &mut pager).unwrap();
         pager.flush(false);
         drop(pager);

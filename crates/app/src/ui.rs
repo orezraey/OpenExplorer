@@ -434,6 +434,8 @@ fn dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
             };
             let note = if s.panes[*pane].loc.is_local() {
                 "Aqui não há Lixeira: os itens serão apagados para sempre. Isso não pode ser desfeito."
+            } else if let Location::Server { server, .. } = &s.panes[*pane].loc {
+                &format!("Servidores não têm lixeira: os itens serão apagados para sempre de {}. Isso não pode ser desfeito.", server.name)
             } else {
                 "Os itens serão apagados para sempre do Google Drive. Isso não pode ser desfeito."
             };
@@ -494,7 +496,72 @@ fn dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
         Dialog::Clash(ask) => clash_dialog(s, k, ask, layer),
         Dialog::Share(sh) => crate::sharing::share_dialog(s, k, sh, layer),
         Dialog::MakePublic(m) => crate::sharing::public_dialog(k, m, layer),
+        Dialog::Server(f) => server_dialog(k, f, layer),
     }
+}
+
+/// Adicionar servidor (or Editar servidor): the protocol, the address, the login and the folder
+/// to open in. Salvar logs in first; the server is kept only once that worked.
+fn server_dialog(k: &Kit, f: &crate::servers::Form, layer: &mut Vec<El>) {
+    use openexplorer_remote::Protocol;
+    use crate::servers::Form;
+    // Each field edits its own part of the form; a closed dialog leaves them nowhere to go.
+    fn part(s: &mut State, pick: fn(&mut Form) -> &mut rune::TextEdit) -> &mut rune::TextEdit {
+        match &mut s.dialog {
+            Some(Dialog::Server(f)) => pick(f),
+            _ => &mut s.name_edit,
+        }
+    }
+    let field = |key: &'static str, label: &str, edit: &rune::TextEdit, placeholder: &str, pick: fn(&mut Form) -> &mut rune::TextEdit| {
+        let input = rune_kit::TextInput::new(edit).width(None).label(label).placeholder(placeholder).on_edit(move |s: &mut State| part(s, pick)).on_submit(|s: &mut State, _: &mut Tx| crate::servers::submit(s));
+        col().key(key).w_full().gap(4.0).child(text(label.to_string()).font(k.ty.text_small_medium).color(k.c.text_base)).child(input.build(k))
+    };
+    let protocols = Protocol::ALL;
+    let picked = protocols.iter().position(|p| *p == f.protocol);
+    let protocol = rune_kit::SegmentedControl::new(&protocols.map(Protocol::short), picked)
+        .width(None)
+        .label("Protocolo")
+        .on_pick(|s: &mut State, i: usize, _: &mut Tx| {
+            if let Some(Dialog::Server(f)) = &mut s.dialog {
+                f.protocol = Protocol::ALL[i];
+            }
+        })
+        .build(k);
+    let muted = |t: String| text(t).font(k.ty.text_xsmall).color(k.c.text_muted).wrap().w_full().min_w(0.0);
+    let port_hint = f.protocol.default_port().to_string();
+    let half = |a: El, b: El| row().w_full().gap(10.0).child(a.grow(1.0).w(0.0)).child(b.grow(1.0).w(0.0));
+    let folder_hint = match f.protocol {
+        Protocol::Dav | Protocol::Davs => "/remote.php/dav/files/usuario (o caminho do endereço WebDAV)",
+        Protocol::Sftp => "a pasta pessoal, se vazio",
+        _ => "a pasta do login, se vazio",
+    };
+    let password_label = if f.editing.is_some() { "Senha (vazio: manter a salva)" } else { "Senha" };
+    let mut body = col()
+        .key("content")
+        .w_full()
+        .px(16.0)
+        .pb(16.0)
+        .gap(10.0)
+        .child(protocol)
+        .child(row().w_full().gap(10.0).child(field("host", "Servidor", &f.host, "nas.local, 192.168.0.10 ou sftp://usuario@host", |f| &mut f.host).grow(3.0).w(0.0)).child(field("port", "Porta", &f.port, &port_hint, |f| &mut f.port).grow(1.0).w(0.0)))
+        .child(half(field("user", "Usuário", &f.user, if matches!(f.protocol, Protocol::Ftp | Protocol::Ftps) { "anonymous, se vazio" } else { "" }, |f| &mut f.user), field("password", password_label, &f.password, "", |f| &mut f.password)))
+        .child(field("folder", "Pasta inicial", &f.folder, folder_hint, |f| &mut f.folder));
+    if f.protocol == Protocol::Sftp {
+        body = body.child(field("key", "Chave SSH (opcional)", &f.key, "C:\\Users\\voce\\.ssh\\id_ed25519 (a senha vira a da chave)", |f| &mut f.key));
+        body = body.child(muted("Sem senha nem chave, as chaves de ~/.ssh são tentadas. Na primeira conexão a chave do servidor é guardada; se ela mudar depois, o app recusa conectar.".into()));
+    }
+    body = body.child(field("name", "Nome na árvore (opcional)", &f.name, "o endereço do servidor, se vazio", |f| &mut f.name));
+    if f.protocol.plain() {
+        body = body.child(text(format!("{} não usa criptografia: a senha e os arquivos passam pela rede sem proteção. Prefira {} se o servidor aceitar.", f.protocol.label(), if f.protocol == Protocol::Ftp { "FTPS ou SFTP" } else { "WebDAV (https)" })).font(k.ty.text_xsmall).color(k.c.warning.fg).wrap().w_full().min_w(0.0));
+    }
+    if let Some(e) = &f.error {
+        body = body.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0));
+    }
+    let checking = f.checking.is_some();
+    let save = Button::new(if checking { "Conectando…" } else { "Salvar" }).variant(ButtonVariant::Submit).on_press(crate::servers::submit);
+    body = body.child(actions_row(k, "Cancelar", save));
+    let title = if f.editing.is_some() { "Editar servidor" } else { "Adicionar servidor" };
+    Modal::new("server", title).open(true).child(body).width(560.0).fit().on_close(close).build(k, layer);
 }
 
 /// Names an upload would repeat in its Drive folder, as Air Explorer asks: all at once with
@@ -666,6 +733,10 @@ fn place_of(s: &State, p: &actions::Props) -> String {
         (loc @ (Location::Local(_) | Location::Found(_)), Some(e)) => loc.local_path(e).map(|p| p.display().to_string()).unwrap_or_default(),
         (Location::Local(dir), None) => dir.display().to_string(),
         (Location::Found(f), None) => format!("Resultados de “{}” em {}", f.text, f.place),
+        (loc @ Location::Server { server, path, .. }, single) => match single {
+            Some(e) => format!("{}{}", server.address(), crate::servers::path_of(loc, e).unwrap_or_default()),
+            None => format!("{}{}", server.address(), server.path(path)),
+        },
         (loc, single) => {
             let mut parts: Vec<String> = crumbs(loc).into_iter().skip(1).map(|c| c.label).collect();
             if let Some(e) = single {
@@ -967,10 +1038,14 @@ fn toolbar(s: &State, k: &Kit) -> El {
         Location::Drive { email, .. } => Some(email.clone()),
         _ => None,
     };
+    let server = match &s.panes[p].loc {
+        Location::Server { server, .. } => Some((server.id.clone(), server.name.clone())),
+        _ => None,
+    };
     let connecting = s.login.is_some();
     let sep = || el().w(1.0).h(20.0).mx(4.0).fill(k.c.border_weak);
     let signed_in = account.clone();
-    row()
+    let bar = row()
         .key("toolbar")
         .w_full()
         .h(40.0)
@@ -991,6 +1066,16 @@ fn toolbar(s: &State, k: &Kit) -> El {
             .help(if account.is_some() { "Remove a conta do painel ativo: o acesso e o cache dela" } else { "O painel ativo não mostra uma conta" }),
         )
         .child(sep())
+        .child(tool(k, "add-server", &icons::ADD_SERVER, "Adicionar servidor", true, |s: &mut State, _| crate::servers::ask_add(s)).help("FTP, SFTP ou WebDAV"));
+    let bar = match server {
+        Some((id, name)) => {
+            let edit = id.clone();
+            bar.child(tool(k, "edit-server", &icons::M_RENAME, "Editar servidor", true, move |s: &mut State, _| crate::servers::ask_edit(s, &edit)).help(format!("Muda o endereço, o login ou a pasta de {name}")))
+                .child(tool(k, "remove-server", &icons::SIGN_OUT, "Remover servidor", true, move |s: &mut State, _| crate::servers::remove(s, &id)).help(format!("Tira {name} da lista e esquece a senha dele")))
+        }
+        None => bar,
+    };
+    bar.child(sep())
         .child(tool(k, "reload-all", &icons::REFRESH, "Atualizar", true, |s: &mut State, _| load(s, s.active)))
         .child(el().grow(1.0))
         .child(tool(k, "options", &icons::SETTINGS, "Opções", true, |s: &mut State, _| s.dialog = Some(Dialog::Options)))
@@ -1269,6 +1354,7 @@ fn search_box(s: &State, k: &Kit, p: usize) -> El {
     let place = match loc {
         Location::Local(dir) => crate::finder::place_of(dir),
         Location::Found(f) => f.place.clone(),
+        Location::Server { server, path, .. } => path.last().unwrap_or(&server.name).clone(),
         _ => match actions::search_scope(loc) {
             Some((_, place)) => place,
             None => return el().key("search"),
@@ -1365,6 +1451,27 @@ fn search_bar(s: &State, k: &Kit, p: usize) -> El {
     if let Location::Found(f) = &s.panes[p].loc {
         return found_bar(s, k, p, f);
     }
+    if let Location::Server { server, path, find: Some(words) } = &s.panes[p].loc {
+        let text_ = words;
+        let pane = &s.panes[p];
+        let n = pane.entries.len();
+        let results = format!("{} {}", ui_count(n), if n == 1 { "resultado" } else { "resultados" });
+        let place = path.last().unwrap_or(&server.name);
+        let said = match (pane.loading, n) {
+            (true, 0) => format!("“{text_}” em {place} · Pesquisando…"),
+            (true, _) => format!("“{text_}” em {place} · Pesquisando… {results} até agora"),
+            _ => format!("“{text_}” em {place} e nas pastas dentro · {results}"),
+        };
+        return row()
+            .key("search-bar")
+            .w_full()
+            .h(28.0)
+            .px(10.0)
+            .center_y()
+            .fill(k.c.bg_base)
+            .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+            .child(text(said).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0));
+    }
     let Location::Drive { space: Space::Search(q), path, .. } = &s.panes[p].loc else { return el().key("search-bar") };
     if !path.is_empty() {
         return el().key("search-bar");
@@ -1400,6 +1507,7 @@ fn can_go_up(loc: &Location) -> bool {
         Location::Found(_) => false,
         Location::Mock(segs) => !segs.is_empty(),
         Location::Drive { space, path, .. } => !path.is_empty() || matches!(space, Space::Shared { .. }),
+        Location::Server { path, find, .. } => !path.is_empty() || find.is_some(),
     }
 }
 
@@ -1571,7 +1679,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .child(head(0, "h-name", "Nome", SortCol::Name, false))
         .child(head(1, "h-size", "Tamanho", SortCol::Size, true))
         .child(head(2, "h-mod", "Data", SortCol::Modified, false))
-        .child(head(3, "h-kind", if matches!(pane.loc, Location::Found(_)) { "Pasta" } else { "Tipo" }, SortCol::Kind, false))
+        .child(head(3, "h-kind", if pane.loc.finds() { "Pasta" } else { "Tipo" }, SortCol::Kind, false))
         .children(grips);
 
     let selected = k.alpha(k.c.text_accent, if k.dark { 0.26 } else { 0.18 });
@@ -1584,7 +1692,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         let pane = &s.panes[p];
         let e = &pane.entries[i];
         let is_sel = pane.selected.contains(&e.id);
-        let found = matches!(pane.loc, Location::Found(_));
+        let found = pane.loc.finds();
         let mut r = row().key(row_key(&e.id)).role("row").label(shown(&e.name)).focus_selected(is_sel).w_full().h(ROW_H).center_y();
         r = if is_sel { r.fill(selected) } else { r.hover(hover) };
         if s.active == p && pane.cursor.as_deref() == Some(e.id.as_str()) {
@@ -1662,7 +1770,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let body = if let Some(err) = &pane.error {
         notice(err.clone(), k.c.danger.fg)
     } else if pane.loading && n == 0 {
-        let searching = matches!(&pane.loc, Location::Found(_)) || matches!(&pane.loc, Location::Drive { space: Space::Search(_), path, .. } if path.is_empty());
+        let searching = actions::shows_results(&pane.loc);
         notice(if searching { "Pesquisando…" } else { "Carregando…" }.into(), k.c.text_muted)
     } else if let (0, Location::Drive { space: Space::Search(q), path, .. }) = (n, &pane.loc)
         && path.is_empty()
@@ -1670,6 +1778,8 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         notice(format!("Nada com “{}” no nome em {}.", q.text, q.place), k.c.text_faint)
     } else if let (0, Location::Found(f)) = (n, &pane.loc) {
         notice(format!("Nada com “{}” no nome em {}.", f.text, f.place), k.c.text_faint)
+    } else if let (0, Location::Server { server, path, find: Some(text) }) = (n, &pane.loc) {
+        notice(format!("Nada com “{text}” no nome em {} nem nas pastas dentro.", path.last().unwrap_or(&server.name)), k.c.text_faint)
     } else if n == 0 && matches!(pane.loc, Location::Drive { space: Space::SharedDrives, .. }) {
         notice("Esta conta não participa de nenhum drive compartilhado.".into(), k.c.text_muted)
     } else if let (0, Location::Drive { space, path, .. }) = (n, &pane.loc)
