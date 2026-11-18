@@ -54,7 +54,7 @@ Name: "{autodesktop}\Open Explorer"; Filename: "{app}\openexplorer.exe"; Tasks: 
 [Run]
 ; An update brings the search service, a copy of the app, up to the new version.
 Filename: "{app}\openexplorer.exe"; Parameters: "index install"; Flags: runhidden waituntilterminated; Check: SearchServiceInstalled
-Filename: "{app}\openexplorer.exe"; Description: "{cm:LaunchProgram,Open Explorer}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\openexplorer.exe"; Description: "{cm:LaunchProgram,Open Explorer}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
 ; The search service goes with the app. It may have been installed after the app, so this runs
