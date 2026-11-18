@@ -22,11 +22,17 @@ use crate::transfers::{self, End, Op};
 use crate::undo;
 use crate::{Msg, Part, State, background, catch_panic};
 
-/// The servers added, and their idle connections.
+/// The servers added (and the MEGA accounts, which open like one), and their idle connections.
 pub struct Servers {
     pub list: Vec<Server>,
     pub pool: Arc<Pool>,
     pub store: Store,
+    /// The MEGA accounts' own list (see `mega.rs`).
+    pub mega: openexplorer_mega::Store,
+    /// Each MEGA account's storage, by server id: `None` while the answer is on its way.
+    pub mega_quotas: std::collections::HashMap<String, Option<openexplorer_mega::Quota>>,
+    /// When each MEGA account a pane shows is next asked what changed.
+    pub mega_watch: std::collections::HashMap<String, crate::mega::Watch>,
     /// Counts the add dialog's connection checks, to drop a stale answer.
     pub attempts: u64,
 }
@@ -34,7 +40,10 @@ pub struct Servers {
 impl Servers {
     pub fn load() -> Servers {
         let store = Store::at(openexplorer_gdrive::config_dir().join("servers.json"));
-        Servers { list: store.servers(), pool: Arc::default(), store, attempts: 0 }
+        let mega = crate::mega::store();
+        let mut list = store.servers();
+        list.extend(crate::mega::servers(&mega));
+        Servers { list, pool: Arc::default(), store, mega, mega_quotas: Default::default(), mega_watch: Default::default(), attempts: 0 }
     }
 }
 
@@ -87,6 +96,12 @@ pub fn with<T>(pool: &Pool, server: &Server, work: impl FnOnce(&mut dyn Conn) ->
     let out = work(&mut *conn);
     conn.done();
     out
+}
+
+/// The paths of a batch's items as [`Conn::pin`] keeps them, looked up before any of them
+/// changes. One that can't be (gone already) stays as it is, so only its own row fails.
+pub(crate) fn pin_all(c: &mut dyn Conn, paths: &[String]) -> Vec<String> {
+    paths.iter().map(|p| c.pin(p).unwrap_or_else(|_| p.clone())).collect()
 }
 
 /// A cancelled transfer says so in the app's words.
@@ -292,10 +307,12 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
         for (p, (is_dir, size, path)) in batch.rows().iter().zip(&sizes) {
             p.size(if *is_dir { measure(c, path, &|| p.cancelled()) } else { size.unwrap_or(0) });
         }
+        // Each item as it is now, whatever Recortar does to the others meanwhile.
+        let paths = pin_all(c, &paths);
         // The names the rows took in `dst`, before their files are made.
-        Ok(std::sync::Mutex::new(HashSet::<PathBuf>::new()))
+        Ok((std::sync::Mutex::new(HashSet::<PathBuf>::new()), paths))
     };
-    let step = move |c: &mut dyn Conn, claimed: &std::sync::Mutex<HashSet<PathBuf>>, i: usize, p: &Progress| {
+    let step = move |c: &mut dyn Conn, (claimed, paths): &(std::sync::Mutex<HashSet<PathBuf>>, Vec<String>), i: usize, p: &Progress| {
         let e = &items[i];
         let local = {
             let mut claimed = claimed.lock().unwrap_or_else(|e| e.into_inner());
@@ -448,6 +465,7 @@ pub fn move_within(s: &mut State, from: &Location, items: Vec<Entry>, to: &Locat
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Move, items.iter().map(|e| (end(from, Some(&e.name)), end(to, None))));
     let at = server.clone();
     undo::server_job(s, &server, reload, |n| tr!("mover {}", "move {}", undo::items(n)), move |c, rec| {
+        let pinned = pin_all(c, &paths);
         batch.run(|i, _| {
             let (e, path) = (&items[i], &paths[i]);
             let into = child(&dst, &e.name);
@@ -457,7 +475,7 @@ pub fn move_within(s: &mut State, from: &Location, items: Vec<Entry>, to: &Locat
             if e.is_dir && (dst == *path || dst.starts_with(&format!("{path}/"))) {
                 return Err(tr!("Não dá para mover a pasta \"{}\" para dentro dela mesma.", "Can't move the folder \"{}\" into itself.", e.name));
             }
-            c.rename(path, &into)?;
+            c.rename(&pinned[i], &into)?;
             rec.add([undo::Step::ServerMove { server: at.clone(), from: into, to: path.clone() }]);
             Ok(())
         })
@@ -470,8 +488,9 @@ pub fn delete(s: &mut State, loc: &Location, items: Vec<Entry>, reload: Vec<Loca
     let paths: Vec<(String, bool)> = items.iter().filter_map(|e| path_of(loc, e).map(|p| (p, e.is_dir))).collect();
     let n = paths.len();
     job(s, server, reload, move |c| {
-        for (i, (path, is_dir)) in paths.iter().enumerate() {
-            c.remove(path, *is_dir).map_err(|e| {
+        let pinned = pin_all(c, &paths.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>());
+        for (i, ((path, is_dir), at)) in paths.iter().zip(&pinned).enumerate() {
+            c.remove(at, *is_dir).map_err(|e| {
                 let done = if i == 0 { String::new() } else { tr!(" (já excluídos para sempre: {i})", " (already deleted for good: {i})") };
                 tr!("Não consegui excluir {path}: {e}{done}", "Couldn't delete {path}: {e}{done}")
             })?;
@@ -546,6 +565,7 @@ impl Category {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
     GoogleDrive,
+    Mega,
     Nextcloud,
     OwnCloud,
     Sftp,
@@ -554,8 +574,9 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub const ALL: [Provider; 6] = [
+    pub const ALL: [Provider; 7] = [
         Provider::GoogleDrive,
+        Provider::Mega,
         Provider::Nextcloud,
         Provider::OwnCloud,
         Provider::Sftp,
@@ -566,6 +587,7 @@ impl Provider {
     pub fn label(self) -> &'static str {
         match self {
             Provider::GoogleDrive => "Google Drive",
+            Provider::Mega => "MEGA",
             Provider::Nextcloud => "Nextcloud",
             Provider::OwnCloud => "ownCloud",
             Provider::Sftp => "SFTP",
@@ -577,6 +599,7 @@ impl Provider {
     pub fn subtitle(self) -> &'static str {
         match self {
             Provider::GoogleDrive => t("OAuth no navegador", "OAuth in the browser"),
+            Provider::Mega => t("E-mail e senha · criptografia de ponta a ponta", "E-mail and password · end-to-end encrypted"),
             Provider::Nextcloud => t("Nuvem via WebDAV", "Cloud via WebDAV"),
             Provider::OwnCloud => t("Nuvem via WebDAV", "Cloud via WebDAV"),
             Provider::Sftp => t("SSH seguro · porta 22", "Secure SSH · port 22"),
@@ -588,6 +611,7 @@ impl Provider {
     pub fn icon(self) -> &'static Icon {
         match self {
             Provider::GoogleDrive => &crate::icons::PROVIDER_GDRIVE,
+            Provider::Mega => &crate::icons::PROVIDER_MEGA,
             Provider::Nextcloud => &crate::icons::PROVIDER_NEXTCLOUD,
             Provider::OwnCloud => &crate::icons::PROVIDER_OWNCLOUD,
             Provider::Sftp => &crate::icons::PROVIDER_SFTP,
@@ -599,7 +623,7 @@ impl Provider {
     pub fn in_category(self, category: Category) -> bool {
         match category {
             Category::All => true,
-            Category::Cloud => matches!(self, Provider::GoogleDrive | Provider::Nextcloud | Provider::OwnCloud),
+            Category::Cloud => matches!(self, Provider::GoogleDrive | Provider::Mega | Provider::Nextcloud | Provider::OwnCloud),
             Category::Nas => matches!(self, Provider::Nextcloud | Provider::OwnCloud | Provider::Sftp | Provider::Ftp | Provider::WebDav),
             Category::Protocols => matches!(self, Provider::Sftp | Provider::Ftp | Provider::WebDav),
         }
@@ -612,6 +636,7 @@ impl Provider {
         }
         let keywords = match self {
             Provider::GoogleDrive => "google drive gdrive nuvem workspace oauth gmail cloud",
+            Provider::Mega => "mega mega.nz nuvem cloud criptografia encrypted 2fa",
             Provider::Nextcloud => "nextcloud webdav dav https nas nuvem cloud",
             Provider::OwnCloud => "owncloud webdav dav https nas nuvem cloud",
             Provider::Sftp => "sftp ssh servidor linux nas chave 22 server key secure",
@@ -624,6 +649,7 @@ impl Provider {
     pub fn default_protocol(self) -> Protocol {
         match self {
             Provider::GoogleDrive | Provider::Sftp => Protocol::Sftp,
+            Provider::Mega => Protocol::Mega,
             Provider::Ftp => Protocol::Ftp,
             Provider::Nextcloud | Provider::OwnCloud | Provider::WebDav => Protocol::Davs,
         }
@@ -644,6 +670,7 @@ impl Provider {
             (_, Protocol::Sftp) => Provider::Sftp,
             (_, Protocol::Ftp | Protocol::Ftps) => Provider::Ftp,
             (_, Protocol::Dav | Protocol::Davs) => Provider::WebDav,
+            (_, Protocol::Mega) => Provider::Mega,
         }
     }
 
@@ -652,6 +679,7 @@ impl Provider {
             Protocol::Sftp => Provider::Sftp,
             Protocol::Ftp | Protocol::Ftps => Provider::Ftp,
             Protocol::Dav | Protocol::Davs => Provider::WebDav,
+            Protocol::Mega => Provider::Mega,
         }
     }
 }
@@ -680,6 +708,9 @@ pub struct Form {
     pub user: TextEdit,
     pub password: TextEdit,
     pub reveal_password: bool,
+    /// MEGA: the authenticator's code, shown once the account turns out to ask for one.
+    pub code: TextEdit,
+    pub needs_code: bool,
     pub folder: TextEdit,
     pub key: TextEdit,
     /// Conexões simultâneas; empty for the usual number.
@@ -719,6 +750,8 @@ impl Form {
             user: blank(),
             password: TextEdit::new("").secure(),
             reveal_password: false,
+            code: blank(),
+            needs_code: false,
             folder: blank(),
             key: blank(),
             connections: blank(),
@@ -755,6 +788,13 @@ impl Form {
         if changed_provider && self.editing.is_none() {
             self.port = TextEdit::new("");
             self.folder = TextEdit::new("");
+        }
+        if provider == Provider::Mega {
+            self.host = TextEdit::new("mega.nz");
+            self.user.focused = true;
+            self.needs_code = false;
+            self.code = TextEdit::new("");
+            return;
         }
         if provider == Provider::GoogleDrive {
             let missing = openexplorer_gdrive::ClientConfig::load().is_err();
@@ -822,6 +862,12 @@ impl Form {
         f.user = TextEdit::new(a.user.clone());
         if let Some(p) = &a.password {
             f.password = TextEdit::new(p.clone()).secure();
+        }
+        // The MEGA step shows no host: the e-mail came with the address, the password is next.
+        if provider == Provider::Mega {
+            f.host.focused = false;
+            f.user.focused = false;
+            f.password.focused = true;
         }
         // Nextcloud and ownCloud serve WebDAV under `/remote.php/…`: an install's own address
         // (`https://host/nextcloud` or a copied `/index.php/apps/files/` URL) gets it normalized.
@@ -1041,6 +1087,10 @@ pub fn ask_add(s: &mut State) {
 }
 
 pub fn ask_edit(s: &mut State, id: &str) {
+    if id.starts_with("mega:") {
+        s.status = t("Contas MEGA não têm o que editar: para trocar de conta, remova e conecte de novo.", "MEGA accounts have nothing to edit: to switch accounts, remove it and connect again.").into();
+        return;
+    }
     if let Some(server) = s.servers.list.iter().find(|sv| sv.id == id) {
         s.dialog = Some(Dialog::Server(Box::new(Form::of(server))));
     }
@@ -1104,7 +1154,7 @@ pub fn toggle_tls(s: &mut State) {
             Protocol::Ftps => Protocol::Ftp,
             Protocol::Dav => Protocol::Davs,
             Protocol::Davs => Protocol::Dav,
-            Protocol::Sftp => Protocol::Sftp,
+            p @ (Protocol::Sftp | Protocol::Mega) => p,
         };
         let trimmed = f.host.text.trim_start();
         if let Some((scheme, rest)) = trimmed.split_once("://") {
@@ -1310,9 +1360,14 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
     }
 }
 
-/// Forgets a server and its password; panes on it go home.
+/// Forgets a server and its password (a MEGA account and its session); panes on it go home.
 pub fn remove(s: &mut State, id: &str) {
-    if let Err(e) = s.servers.store.remove(id) {
+    let mega = s.servers.list.iter().find(|sv| sv.id == id && sv.is_mega()).cloned();
+    if let Some(sv) = &mega {
+        if !crate::mega::remove(s, sv) {
+            return;
+        }
+    } else if let Err(e) = s.servers.store.remove(id) {
         crate::fail(s, e);
         return;
     }
@@ -1331,7 +1386,7 @@ pub fn remove(s: &mut State, id: &str) {
             crate::switch(s, p, Location::home());
         }
     }
-    s.status = tr!("Servidor removido: {name}", "Server removed: {name}");
+    s.status = if mega.is_some() { tr!("Conta MEGA removida: {name}", "MEGA account removed: {name}") } else { tr!("Servidor removido: {name}", "Server removed: {name}") };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1370,6 +1425,17 @@ fn decode(s: &str) -> String {
 /// Reads `scheme://[user[:password]@]host[:port][/path]`; `None` for any other text.
 pub fn parse_address(text: &str) -> Option<Address> {
     let (scheme, rest) = text.trim().split_once("://")?;
+    // A MEGA account's own address (`mega://ana@exemplo.com/Drive na nuvem`), which only
+    // reaches an account already connected: the e-mail is the whole authority.
+    if scheme.eq_ignore_ascii_case("mega") {
+        let (email, path) = rest.split_once('/').map_or((rest, "/"), |(e, p)| (e, p));
+        let email = decode(email).trim().to_lowercase();
+        if !email.contains('@') {
+            return None;
+        }
+        let path = format!("/{}", decode(path).trim_start_matches('/'));
+        return Some(Address { protocol: Protocol::Mega, user: email, password: None, host: "mega.nz".into(), port: None, path });
+    }
     let protocol = Protocol::from_scheme(scheme)?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -1478,6 +1544,14 @@ mod tests {
         let loc = folder(&list[0], vec!["Fotos".into()]);
         assert_eq!(address_text(&loc), "sftp://ana@nas/home/ana/Fotos");
         assert_eq!(reach(&list, &parse_address(&address_text(&loc)).unwrap()), Ok(loc));
+        // A MEGA account's folder goes there and back too.
+        let mega = Server::mega("ana@exemplo.com");
+        let at = folder(&mega, vec!["Drive na nuvem".into(), "Fotos 2024".into()]);
+        assert_eq!(address_text(&at), "mega://ana@exemplo.com/Drive na nuvem/Fotos 2024");
+        let list = [list.to_vec(), vec![mega]].concat();
+        assert_eq!(reach(&list, &parse_address(&address_text(&at)).unwrap()), Ok(at));
+        assert_eq!(reach(&list, &parse_address("mega://bia@exemplo.com/").unwrap()), Err(String::new()), "an account not connected");
+        assert!(parse_address("mega://semarroba/x").is_none());
     }
 
     #[test]
@@ -1495,9 +1569,9 @@ mod tests {
     fn unified_catalog_filters_and_configures_presets() {
         let mut f = Form::new();
         assert_eq!(f.step, Step::Pick);
-        assert_eq!(f.visible_providers().len(), 6);
+        assert_eq!(f.visible_providers().len(), 7);
         f.category = Category::Cloud;
-        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::Nextcloud, Provider::OwnCloud]);
+        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::Mega, Provider::Nextcloud, Provider::OwnCloud]);
         f.category = Category::Protocols;
         assert_eq!(f.visible_providers(), [Provider::Sftp, Provider::Ftp, Provider::WebDav]);
         f.category = Category::All;

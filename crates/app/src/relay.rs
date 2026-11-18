@@ -19,7 +19,7 @@ use openexplorer_remote::{Conn, store};
 use crate::actions::drive_folder;
 use crate::model::{Entry, Location, Space};
 use crate::ops::{CANCELLED, Progress};
-use crate::servers::{child, end, free_name, measure, path_of, target, with};
+use crate::servers::{child, end, free_name, measure, path_of, pin_all, target, with};
 use crate::transfers::{self, End, Op};
 use crate::{Msg, State, background, catch_panic, drive_task};
 
@@ -192,17 +192,18 @@ pub fn between_servers(s: &mut State, from: &Location, items: Vec<Entry>, to: &L
             // A server allowing a single connection relays each file through the disk, which
             // the bar counts twice: down, then up.
             let one = same && a.limit() < 2;
-            with(&pool, &a, |c| {
+            // Each item as it is now, whatever Recortar does to the others meanwhile.
+            let pinned = with(&pool, &a, |c| {
                 for ((p, e), path) in batch.rows().iter().zip(&items).zip(&paths) {
                     let size = if e.is_dir { measure(c, path, &|| p.cancelled()) } else { e.size.unwrap_or(0) };
                     p.size(if one { size * 2 } else { size });
                 }
-                Ok(())
+                Ok(pin_all(c, &paths))
             })?;
             let mut taken: HashSet<String> = with(&pool, &b, |c| c.list(&dir))?.into_iter().map(|i| i.name.to_lowercase()).collect();
             let (secret_a, secret_b) = (|| store::secret(&a.id), || store::secret(&b.id));
             batch.run(|i, p| {
-                let (e, path) = (&items[i], &paths[i]);
+                let (e, path, at) = (&items[i], &paths[i], &pinned[i]);
                 if e.is_dir && same && (dir == *path || dir.starts_with(&format!("{path}/"))) {
                     return Err(tr!("Não dá para copiar a pasta \"{}\" para dentro dela mesma.", "Can't copy the folder \"{}\" into itself.", e.name));
                 }
@@ -212,7 +213,7 @@ pub fn between_servers(s: &mut State, from: &Location, items: Vec<Entry>, to: &L
                 let size = if e.is_dir { 0 } else { e.size.unwrap_or(0) };
                 if one {
                     let mut lease = pool.take(&a, secret_a)?;
-                    let done = copy_tree(&mut Ends::One(&mut *lease), path, &to, e.is_dir, size, p, 0);
+                    let done = copy_tree(&mut Ends::One(&mut *lease), at, &to, e.is_dir, size, p, 0);
                     if done.is_err() {
                         let _ = lease.remove(&to, e.is_dir);
                     }
@@ -222,21 +223,21 @@ pub fn between_servers(s: &mut State, from: &Location, items: Vec<Entry>, to: &L
                     let (mut la, mut lb) = pool.take_two((&a, &secret_a), (&b, &secret_b))?;
                     // Within one WebDAV server, the server copies by itself.
                     let done = match same && !cut {
-                        true => match la.copy(path, &to) {
+                        true => match la.copy(at, &to) {
                             Ok(true) => {
                                 p.add_bytes(p.total.load(std::sync::atomic::Ordering::Relaxed));
                                 Ok(())
                             }
-                            Ok(false) => copy_tree(&mut Ends::Two(&mut *la, &mut *lb), path, &to, e.is_dir, size, p, 0),
+                            Ok(false) => copy_tree(&mut Ends::Two(&mut *la, &mut *lb), at, &to, e.is_dir, size, p, 0),
                             Err(e) => Err(e),
                         },
-                        false => copy_tree(&mut Ends::Two(&mut *la, &mut *lb), path, &to, e.is_dir, size, p, 0),
+                        false => copy_tree(&mut Ends::Two(&mut *la, &mut *lb), at, &to, e.is_dir, size, p, 0),
                     };
                     if done.is_err() {
                         let _ = lb.remove(&to, e.is_dir);
                     }
                     // Recortar: the original goes once all of it arrived.
-                    let done = done.and_then(|_| if cut { la.remove(path, e.is_dir) } else { Ok(()) });
+                    let done = done.and_then(|_| if cut { la.remove(at, e.is_dir) } else { Ok(()) });
                     la.done();
                     lb.done();
                     done
@@ -305,6 +306,8 @@ pub fn server_to_drive(s: &mut State, from: &Location, items: Vec<Entry>, to: &L
                 p.size(2 * if e.is_dir { measure(c, path, &|| p.cancelled()) } else { e.size.unwrap_or(0) });
             }
             let mut taken: HashSet<String> = drive_list(d, &parent, shared.as_deref())?.into_iter().map(|f| f.name.to_lowercase()).collect();
+            // Each item as it is now, whatever Recortar does to the others meanwhile.
+            let paths = pin_all(c, &paths);
             batch.run(|i, p| {
                 let e = &items[i];
                 let name = free_name(&e.name, e.is_dir, &taken);

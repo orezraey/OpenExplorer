@@ -21,6 +21,7 @@ mod icons;
 mod keyboard;
 mod lasso;
 mod layout;
+mod mega;
 mod model;
 mod network;
 mod ops;
@@ -91,6 +92,8 @@ enum Msg {
     Reached { pane: usize, moves: u64, result: Result<address::Reached, String> },
     /// An action that can be undone ended, or an undo did (see [`undo::arrived`]).
     Undo(undo::Answer),
+    /// Something background work on a MEGA account brought back.
+    Mega(mega::Answer),
     /// Installing the search service ended: search again in the panes `reload` shows.
     Installed { reload: Vec<Location>, result: Result<String, String> },
     /// A drag of Drive items `ids` out of pane `from` ended.
@@ -508,8 +511,15 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                 for email in touched {
                     ask_quota(s, email);
                 }
+                let mut megas: Vec<openexplorer_remote::Server> = reload.iter().filter_map(|l| mega::at(l).map(|(sv, _)| sv.clone())).collect();
+                let mut seen = std::collections::HashSet::new();
+                megas.retain(|sv| seen.insert(sv.id.clone()));
+                for sv in megas {
+                    mega::ask_quota(s, &sv);
+                }
             }
             Msg::Undo(answer) => undo::arrived(s, answer),
+            Msg::Mega(answer) => mega::arrived(s, answer, tx, now),
             Msg::Changes { email, result } => watch::arrived(s, email, result, now),
             Msg::Quota { email, result } => {
                 if s.accounts.iter().any(|a| a.email == email) {
@@ -599,6 +609,10 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     // Accounts on screen are asked what changed elsewhere, every few seconds; after the
     // messages, so a listing that just ended is read again here if changes came during it.
     changed |= watch::tick(s, now);
+    mega::tick(s, now);
+    if let Some(at) = mega::next_ask(s) {
+        tx.wake_at(at);
+    }
     for p in 0..2 {
         // The address field closes when the keyboard leaves it (a click elsewhere).
         if s.address[p].as_ref().is_some_and(|a| !a.focused) {
@@ -832,7 +846,12 @@ fn load(s: &mut State, p: usize) {
         });
         return;
     }
-    if let Location::Server { .. } = &s.panes[p].loc {
+    if let Location::Server { server, .. } = &s.panes[p].loc {
+        // A MEGA account's storage, the first time one of its folders opens.
+        if server.is_mega() && !s.servers.mega_quotas.contains_key(&server.id) {
+            let sv = (**server).clone();
+            mega::ask_quota(s, &sv);
+        }
         return servers::load(s, p, request);
     }
     let Location::Drive { email, space, path } = s.panes[p].loc.clone() else {
@@ -1576,6 +1595,7 @@ fn main() {
         std::process::exit(openexplorer_index::cli::run(&args[1..]));
     }
     let initial = settings::Settings::load();
+    openexplorer_mega::set_log(openexplorer_gdrive::log);
     rune::App::new(AppSpec::<State> {
         min_size: Some((900.0, 420.0)),
         families: initial.font.families(),
@@ -1792,6 +1812,24 @@ fn main() {
                 s.quotas.insert("voce@gmail.com".into(), Some(Quota { limit: Some(16_106_127_360), usage: 2_898_000_000, in_drive: 2_100_000_000, in_trash: 12_000_000 }));
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::MyDrive));
                 s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
+            }),
+            // A MEGA account's Cloud Drive with its storage, without a network.
+            ("mega", |s| {
+                let sv = openexplorer_remote::Server::mega("voce@exemplo.com");
+                s.servers.list.push(sv.clone());
+                s.servers.mega_quotas.insert(sv.id.clone(), Some(openexplorer_mega::Quota { total: 21_474_836_480, used: 5_798_205_849, in_rubbish: 1_073_741_824 }));
+                s.panes[1].go(mega::cloud(&sv));
+                s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
+                s.active = 1;
+            }),
+            // Adding a MEGA account that asks for its two-factor code.
+            ("mega-add", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::Mega);
+                f.user = rune::TextEdit::new("voce@exemplo.com");
+                f.password = rune::TextEdit::new("segredo").secure();
+                f.needs_code = true;
+                f.error = Some(openexplorer_mega::Refused::NeedsCode.text());
+                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
             }),
             // Compartilhar on a file shared with a few people and the link, without a network.
             ("share", |s| {

@@ -3041,6 +3041,7 @@ dependencies = [
  "openexplorer-gdrive",
  "openexplorer-i18n",
  "openexplorer-index",
+ "openexplorer-mega",
  "openexplorer-remote",
  "rune",
  "rune-kit",
@@ -3091,6 +3092,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "openexplorer-mega"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "base64 0.22.1",
+ "getrandom 0.3.4",
+ "hkdf",
+ "keyring",
+ "num-bigint",
+ "openexplorer-i18n",
+ "pbkdf2",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "ureq",
+]
+
+[[package]]
 name = "openexplorer-remote"
 version = "0.1.0"
 dependencies = [
@@ -3098,6 +3118,7 @@ dependencies = [
  "chrono",
  "keyring",
  "openexplorer-i18n",
+ "openexplorer-mega",
  "percent-encoding",
  "quick-xml 0.38.4",
  "russh",

@@ -173,6 +173,14 @@ impl Tree {
         self.version += 1;
     }
 
+    /// A newly connected MEGA account shows open, with its three areas.
+    pub fn server_opened(&mut self, id: &str) {
+        for open in &mut self.open {
+            open.insert(NodeId::Server(id.to_string(), Vec::new()));
+        }
+        self.version += 1;
+    }
+
     /// Adds a computer to Rede, unless it's there by another spelling.
     fn saw_server(&mut self, server: &str) {
         if !self.servers.iter().any(|s| s.eq_ignore_ascii_case(server)) {
@@ -284,6 +292,9 @@ fn mock_node(segs: Vec<String>) -> Node {
 /// A server's folder at `path` under its root; the server itself with an empty `path`.
 fn remote_node(server: &openexplorer_remote::Server, path: Vec<String>) -> Node {
     let (label, icon, fallback): (String, Option<IconKey>, &'static Icon) = match path.last() {
+        // A MEGA account's Rubbish Bin and Incoming shares, with icons of their own.
+        Some(name) if server.is_mega() && path.len() == 1 && crate::mega::area_of(&path) == Some(openexplorer_mega::Area::Rubbish) => (name.clone(), None, &icons::TRASH),
+        Some(name) if server.is_mega() && path.len() == 1 && crate::mega::area_of(&path) == Some(openexplorer_mega::Area::Incoming) => (name.clone(), None, &icons::SHARED_WITH_ME),
         Some(name) => (name.clone(), Some(IconKey::Folder), &icons::FOLDER),
         None => (server.name.clone(), None, crate::servers::Provider::of_server(server).icon()),
     };
@@ -516,6 +527,29 @@ pub fn drive_changed(s: &mut State, email: &str, changes: &[openexplorer_gdrive:
     s.tree.version += 1;
     for node in again {
         load(s, &node);
+    }
+}
+
+/// Takes in what changed in a MEGA account (see `mega::tick`): the folders of server `id` that
+/// `stale` says may differ are dropped, and read again where a tree has them open.
+pub fn server_folders_changed(s: &mut State, id: &str, stale: &dyn Fn(&[String]) -> bool) {
+    let gone: Vec<Vec<String>> = s.tree.kids.keys().filter_map(|n| match n {
+        NodeId::Server(sid, segs) if sid == id && stale(segs) => Some(segs.clone()),
+        _ => None,
+    }).collect();
+    if gone.is_empty() {
+        return;
+    }
+    let opened: HashSet<NodeId> = s.tree.open[0].iter().chain(s.tree.open[1].iter()).cloned().collect();
+    for segs in &gone {
+        s.tree.kids.remove(&NodeId::Server(id.to_string(), segs.clone()));
+    }
+    s.tree.version += 1;
+    let Some(server) = s.servers.list.iter().find(|sv| sv.id == id).cloned() else { return };
+    for segs in gone {
+        if opened.contains(&NodeId::Server(id.to_string(), segs.clone())) {
+            load(s, &remote_node(&server, segs));
+        }
     }
 }
 

@@ -1069,6 +1069,13 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             .item(item(t("Copiar link", "Copy link"), &icons::M_LINK, "", true, crate::sharing::copy_link))
             .item(item(t("Compartilhar…", "Share…"), &icons::M_SHARE, "", true, crate::sharing::ask_share));
     }
+    // Public links, for one MEGA item.
+    if n == 1 && changeable && crate::mega::at(&s.panes[p].loc).is_some() && !crate::mega::in_bin(&s.panes[p].loc) {
+        menu = menu
+            .separator()
+            .item(item(t("Copiar link", "Copy link"), &icons::M_LINK, "", true, crate::mega::copy_link))
+            .item(item(t("Remover link", "Remove link"), &icons::M_LINK, "", true, crate::mega::remove_link));
+    }
     menu = menu.separator().item(item(t("Nova pasta", "New folder"), &icons::M_NEW_FOLDER, "Ctrl+Shift+N", editable, actions::ask_new_folder));
     if n > 0 {
         menu = menu.separator().item(item(t("Propriedades", "Properties"), &icons::M_PROPERTIES, "Alt+Enter", true, |s, p, _| actions::properties(s, p)));
@@ -1107,6 +1114,8 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
             };
             let where_to = if local {
                 t("Os itens vão para a Lixeira do Windows, de onde podem ser restaurados.", "The items go to the Windows Recycle Bin, where they can be restored.")
+            } else if crate::mega::at(&s.panes[*pane].loc).is_some() {
+                t("Os itens vão para a Lixeira do MEGA, de onde podem ser restaurados.", "The items go to the MEGA Rubbish Bin, where they can be restored.")
             } else {
                 t(
                     "Os itens vão para a lixeira do Google Drive, onde ficam 30 dias antes de serem apagados de vez.",
@@ -1133,6 +1142,10 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 .into()
             } else if s.panes[*pane].loc.is_local() {
                 t("Aqui não há Lixeira: os itens serão apagados para sempre. Isso não pode ser desfeito.", "There's no Recycle Bin here: the items will be deleted for good. This can't be undone.").into()
+            } else if crate::mega::at(&s.panes[*pane].loc).is_some() && !crate::mega::in_bin(&s.panes[*pane].loc) {
+                t("Itens de uma pasta compartilhada com você pertencem a quem compartilhou: serão apagados para sempre, sem passar pela Lixeira. Isso não pode ser desfeito.", "Items in a folder shared with you belong to whoever shared it: they'll be deleted for good, skipping the Rubbish Bin. This can't be undone.").into()
+            } else if crate::mega::in_bin(&s.panes[*pane].loc) {
+                t("Os itens serão apagados para sempre da Lixeira do MEGA. Isso não pode ser desfeito.", "The items will be deleted from the MEGA Rubbish Bin for good. This can't be undone.").into()
             } else if let Location::Server { server, .. } = &s.panes[*pane].loc {
                 tr!(
                     "Servidores não têm lixeira: os itens serão apagados para sempre de {}. Isso não pode ser desfeito.",
@@ -1150,6 +1163,19 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 .child(item_list(s, k, *pane, items))
                 .child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Excluir permanentemente", "Delete permanently")).variant(ButtonVariant::Danger).on_press(actions::purge)));
             Modal::new("purge", title).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
+        }
+        Dialog::EmptyTrash { email } if email.starts_with("mega:") => {
+            let note = tr!(
+                "Todos os itens da Lixeira do MEGA de {} serão apagados para sempre. Isso não pode ser desfeito.",
+                "Everything in the MEGA Rubbish Bin of {} will be deleted for good. This can't be undone.",
+                email.trim_start_matches("mega:")
+            );
+            let body = col()
+                .w_full()
+                .gap(12.0)
+                .child(text(note).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
+                .child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Esvaziar lixeira", "Empty trash")).variant(ButtonVariant::Danger).on_press(actions::empty_trash)));
+            Modal::new("empty-trash", t("Esvaziar a Lixeira do MEGA?", "Empty the MEGA Rubbish Bin?")).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
         }
         Dialog::EmptyTrash { email } => {
             let note = tr!(
@@ -1201,6 +1227,7 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
         Dialog::Clash(ask) => clash_dialog(s, k, ask, layer),
         Dialog::Share(sh) => crate::sharing::share_dialog(s, k, sh, layer),
         Dialog::MakePublic(m) => crate::sharing::public_dialog(k, m, layer),
+        Dialog::MegaLink(m) => crate::mega::link_dialog(k, m, layer),
         Dialog::Server(f) => account_dialog(s, k, f, window_h, layer),
     }
 }
@@ -1441,6 +1468,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
     let proto = f.effective_protocol();
     let (summary, badge_text) = match (f.provider, proto) {
         (Provider::GoogleDrive, _) => (t("Autorização segura OAuth 2.0 pelo navegador padrão", "Secure OAuth 2.0 sign-in through the default browser"), "OAuth 2.0"),
+        (Provider::Mega, _) => (t("Criptografia de ponta a ponta · os arquivos são decifrados neste computador", "End-to-end encryption · files are decrypted on this computer"), "E2EE"),
         (Provider::Nextcloud, Protocol::Davs) => (t("Servidor Nextcloud · conexão criptografada", "Nextcloud server · encrypted connection"), "HTTPS"),
         (Provider::Nextcloud, _) => (t("Servidor Nextcloud · conexão sem criptografia", "Nextcloud server · unencrypted connection"), "HTTP"),
         (Provider::OwnCloud, Protocol::Davs) => (t("Servidor ownCloud · conexão criptografada", "ownCloud server · encrypted connection"), "HTTPS"),
@@ -1648,6 +1676,91 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         return;
     }
 
+    // MEGA step: e-mail and password, then the two-factor code once the account asks for it.
+    if f.provider == Provider::Mega {
+        let labeled = |key: &'static str, label: &'static str, input: El| col().key(key).w_full().gap(4.0).child(text(label).font(k.ty.text_small_medium).color(k.c.text_base)).child(input);
+        let email_input = rune_kit::TextInput::new(&f.user)
+            .width(None)
+            .label(t("E-mail", "E-mail"))
+            .placeholder(t("voce@exemplo.com", "you@example.com"))
+            .on_edit(|s: &mut State| part(s, |f| &mut f.user))
+            .on_submit(|s: &mut State, _: &mut Tx| crate::mega::submit(s))
+            .build(k);
+        let pass_eye = eye_toggle("pass-eye", f.reveal_password, |s| {
+            if let Some(Dialog::Server(f)) = &mut s.dialog {
+                f.reveal_password = !f.reveal_password;
+            }
+        });
+        let pass_input = rune_kit::TextInput::new(&f.password)
+            .width(None)
+            .label(t("Senha", "Password"))
+            .revealed(f.reveal_password)
+            .trailing(pass_eye)
+            .on_edit(|s: &mut State| part(s, |f| &mut f.password))
+            .on_submit(|s: &mut State, _: &mut Tx| crate::mega::submit(s))
+            .build(k);
+        let mut inner = col()
+            .w_full()
+            .px(16.0)
+            .pb(4.0)
+            .gap(12.0)
+            .child(banner)
+            .child(
+                text(t(
+                    "O Open Explorer guarda só a sessão, no cofre de credenciais do sistema; a senha não fica salva em lugar nenhum.",
+                    "Open Explorer keeps only the session, in the system's credential store; the password isn't saved anywhere.",
+                ))
+                .font(k.ty.text_small)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full()
+                .min_w(0.0),
+            )
+            .child(labeled("mega-email", t("E-mail", "E-mail"), email_input))
+            .child(labeled("mega-password", t("Senha", "Password"), pass_input));
+        if f.needs_code {
+            let code_input = rune_kit::TextInput::new(&f.code)
+                .width(None)
+                .label(t("Código de verificação", "Verification code"))
+                .placeholder("123456")
+                .on_edit(|s: &mut State| part(s, |f| &mut f.code))
+                .on_submit(|s: &mut State, _: &mut Tx| crate::mega::submit(s))
+                .build(k);
+            inner = inner.child(labeled("mega-code", t("Código de verificação (app autenticador)", "Verification code (authenticator app)"), code_input));
+        }
+        let checking = f.checking.is_some();
+        if checking {
+            let wait = t(
+                "Conectando… o MEGA pede uma verificação de segurança e a conta é lida inteira, o que leva alguns segundos.",
+                "Connecting… MEGA asks for a security check and the whole account is read, which takes a few seconds.",
+            );
+            inner = inner.child(text(wait).key("mega-wait").font(k.ty.text_xsmall).color(k.c.text_muted).wrap().w_full().min_w(0.0));
+        }
+        if let Some(e) = &f.error {
+            inner = inner.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0));
+        }
+        let connect = if checking {
+            Button::new(t("Conectando…", "Connecting…")).variant(ButtonVariant::Submit).disabled(true).build(k)
+        } else {
+            Button::new(t("Conectar", "Connect")).variant(ButtonVariant::Submit).on_press(crate::mega::submit).build(k).default_button()
+        };
+        let actions = row()
+            .key("actions")
+            .w_full()
+            .px(16.0)
+            .pt(12.0)
+            .pb(16.0)
+            .gap(8.0)
+            .center_y()
+            .child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(crate::servers::back_to_pick).build(k))
+            .child(el().grow(1.0))
+            .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k))
+            .child(connect);
+        let body = col().key("mega-content").w_full().child(account_scroll(k, "mega-scroll", window_h, inner)).child(actions);
+        Modal::new("server", t("Conectar MEGA", "Connect MEGA")).open(true).child(body).width(520.0).fit().on_close(close).build(k, layer);
+        return;
+    }
+
     // Server credentials step (FTP, SFTP, WebDAV, Nextcloud, ownCloud).
     let field = |key: &'static str, label: &str, edit: &rune::TextEdit, placeholder: &str, pick: fn(&mut Form) -> &mut rune::TextEdit| {
         let input = rune_kit::TextInput::new(edit).width(None).label(label).placeholder(placeholder).on_edit(move |s: &mut State| part(s, pick)).on_submit(|s: &mut State, _: &mut Tx| crate::servers::submit(s));
@@ -1688,13 +1801,13 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         Provider::OwnCloud => t("owncloud.exemplo.com ou https://owncloud.exemplo.com", "owncloud.example.com or https://owncloud.example.com"),
         Provider::Sftp => t("nas.local, 192.168.0.10 ou sftp://usuario@host", "nas.local, 192.168.0.10 or sftp://user@host"),
         Provider::Ftp => t("ftp.exemplo.com, 192.168.0.10 ou ftp://usuario@host", "ftp.example.com, 192.168.0.10 or ftp://user@host"),
-        Provider::WebDav | Provider::GoogleDrive => t("dav.exemplo.com, 192.168.0.10 ou https://host/dav", "dav.example.com, 192.168.0.10 or https://host/dav"),
+        Provider::WebDav | Provider::GoogleDrive | Provider::Mega => t("dav.exemplo.com, 192.168.0.10 ou https://host/dav", "dav.example.com, 192.168.0.10 or https://host/dav"),
     };
     let folder_hint = match f.provider {
         Provider::Nextcloud | Provider::OwnCloud => t("/remote.php/webdav (automático, se vazio)", "/remote.php/webdav (automatic if empty)"),
         Provider::WebDav => t("/dav ou /remote.php/dav/files/usuario (raiz /, se vazio)", "/dav or /remote.php/dav/files/user (root / if empty)"),
         Provider::Sftp => t("a pasta pessoal, se vazio", "the home folder if empty"),
-        Provider::Ftp | Provider::GoogleDrive => t("a pasta do login, se vazio", "the login folder if empty"),
+        Provider::Ftp | Provider::GoogleDrive | Provider::Mega => t("a pasta do login, se vazio", "the login folder if empty"),
     };
     let name_hint = match f.provider {
         Provider::Nextcloud => t("Nextcloud (servidor), se vazio", "Nextcloud (server) if empty"),
@@ -1740,7 +1853,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
                     .key("tls-toggle"),
             );
         }
-        Provider::Sftp | Provider::GoogleDrive => {}
+        Provider::Sftp | Provider::GoogleDrive | Provider::Mega => {}
     }
 
     inner = inner.child(field("folder", t("Pasta inicial", "Start folder"), &f.folder, folder_hint, |f| &mut f.folder));
@@ -2389,7 +2502,7 @@ fn toolbar(s: &State, k: &Kit) -> El {
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
         .child(
             tool(k, "add-account", &icons::ADD_ACCOUNT, add_label, true, |s: &mut State, _| crate::servers::ask_add(s))
-                .help(t("Conectar Google Drive, Nextcloud, ownCloud, SFTP, FTP ou WebDAV", "Connect Google Drive, Nextcloud, ownCloud, SFTP, FTP or WebDAV")),
+                .help(t("Conectar Google Drive, MEGA, Nextcloud, ownCloud, SFTP, FTP ou WebDAV", "Connect Google Drive, MEGA, Nextcloud, ownCloud, SFTP, FTP or WebDAV")),
         );
     let bar = match (account, server) {
         (Some(email), _) => {
@@ -2404,6 +2517,10 @@ fn toolbar(s: &State, k: &Kit) -> El {
                     .help(tr!("Desconectar {email}: remove o acesso e o cache desta conta", "Disconnect {email}: removes this account's access and cache")),
             )
         }
+        (None, Some((id, name))) if id.starts_with("mega:") => bar.child(
+            tool(k, "remove-server", &icons::SIGN_OUT, t("Remover conta", "Remove account"), true, move |s: &mut State, _| crate::servers::remove(s, &id))
+                .help(tr!("Tira {name} da lista e encerra a sessão do MEGA", "Removes {name} from the list and ends the MEGA session")),
+        ),
         (None, Some((id, name))) => {
             let edit = id.clone();
             bar.child(
@@ -3292,11 +3409,15 @@ fn statusbar(s: &State, k: &Kit, p: usize) -> El {
     // A Drive account's storage, beside My Drive's folders (a shared drive's files count
     // against its organisation, not the account).
     let quota = match &pane.loc {
-        Location::Drive { email, space: Space::MyDrive, .. } => s.quotas.get(email).copied().flatten(),
-        _ => None,
+        Location::Drive { email, space: Space::MyDrive, .. } => s.quotas.get(email).copied().flatten().map(|q| (quota_label(&q), q.limit.filter(|l| *l > 0).map(|l| q.usage as f64 / l as f64), quota_help(q))),
+        // A MEGA account's storage, anywhere in it.
+        loc => crate::mega::quota_of(s, loc).map(|q| (crate::mega::quota_label(&q), (q.total > 0).then(|| q.used as f64 / q.total as f64), crate::mega::quota_help(q))),
     };
-    let right = quota.map(|q| quota_label(&q)).unwrap_or(right);
-    let meter = quota.and_then(|q| q.limit.filter(|l| *l > 0).map(|l| (q.usage as f64 / l as f64).min(1.0) as f32)).map(|used| {
+    let (right, used, help) = match quota {
+        Some((label, used, help)) => (label, used, help),
+        None => (right, None, String::new()),
+    };
+    let meter = used.map(|u| u.min(1.0) as f32).map(|used| {
         let fill = if used >= 0.9 { k.c.danger.fg } else { k.c.text_accent };
         row()
             .key("quota-meter")
@@ -3308,7 +3429,6 @@ fn statusbar(s: &State, k: &Kit, p: usize) -> El {
             .clip_soft(3.0)
             .child(el().w(64.0 * used).h_full().radius(3.0).fill(fill))
     });
-    let help = quota.map(quota_help).unwrap_or_default();
     let mut bar = row()
         .key("statusbar")
         .w_full()
@@ -3349,7 +3469,7 @@ Gmail and Photos: {}", format_size(q.usage.saturating_sub(q.in_drive))));
 }
 
 /// A plan's size without a needless ",0": "15 GB", "2 TB", but "1,5 TB".
-fn whole_size(b: u64) -> String {
+pub(crate) fn whole_size(b: u64) -> String {
     let s = format_size(b);
     match s.split_once(' ') {
         Some((n, unit)) if n.ends_with(",0") || n.ends_with(".0") => format!("{} {unit}", &n[..n.len() - 2]),

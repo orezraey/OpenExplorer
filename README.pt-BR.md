@@ -1,6 +1,6 @@
 # Open Explorer
 
-Gerenciador de arquivos de dois painéis para Windows, com Google Drive, SFTP, FTP e WebDAV
+Gerenciador de arquivos de dois painéis para Windows, com Google Drive, MEGA, SFTP, FTP e WebDAV
 integrados. Escrito em Rust.
 
 [English](README.md)
@@ -10,10 +10,13 @@ integrados. Escrito em Rust.
 * Dois painéis, cada um com sua árvore de pastas.
 * Google Drive: várias contas, drives compartilhados, compartilhamento, estrela, lixeira. As
   pastas abertas se atualizam quando algo muda na web.
+* MEGA: várias contas (com login em duas etapas também), Drive na nuvem, Lixeira com restaurar,
+  pastas compartilhadas com você e links públicos de arquivos. Tudo cifrado e decifrado no seu
+  computador; as pastas abertas se atualizam quando algo muda em outro lugar.
 * SFTP, FTP/FTPS, WebDAV, Nextcloud e ownCloud.
 * Copiar e mover entre qualquer um deles, com fila de transferências.
 * Pesquisa instantânea por nome nos discos NTFS locais, parecida com o Everything. Também dá para
-  pesquisar no Drive e nos servidores.
+  pesquisar no Drive, no MEGA e nos servidores.
 * Arrastar e soltar de e para o Explorer do Windows.
 * Desfazer e refazer renomear, mover, excluir e copiar.
 * Inglês e português.
