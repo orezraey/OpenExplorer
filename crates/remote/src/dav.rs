@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn addresses_escape_each_segment() {
-        let server = Server { id: "x".into(), name: "x".into(), protocol: Protocol::Davs, host: "h".into(), port: 443, user: String::new(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
+        let server = Server { id: "x".into(), name: "x".into(), protocol: Protocol::Davs, brand: None, host: "h".into(), port: 443, user: String::new(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
         let dav = Dav { agent: Agent::new_with_defaults(), origin: "https://h".into(), host: server.host.clone(), auth: None };
         assert_eq!(dav.url("/a b/c#d%", false), "https://h/a%20b/c%23d%25");
         assert_eq!(dav.url("/a", true), "https://h/a/");

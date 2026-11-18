@@ -9,6 +9,12 @@ macro_rules! icon {
     };
 }
 
+macro_rules! icon32 {
+    ($id:ident, $name:literal, $body:expr) => {
+        pub static $id: Icon = Icon { name: concat!("oe-", $name), view: 32.0, body: $body };
+    };
+}
+
 // The copy arrows between the panes, in `currentColor`.
 icon!(COPY_RIGHT, "copy-right", r##"<path d="M4.5 1.5L11.5 8L4.5 14.5Z" fill="currentColor"/>"##);
 icon!(COPY_LEFT, "copy-left", r##"<path d="M11.5 1.5L4.5 8L11.5 14.5Z" fill="currentColor"/>"##);
@@ -16,8 +22,14 @@ icon!(COPY_LEFT, "copy-left", r##"<path d="M11.5 1.5L4.5 8L11.5 14.5Z" fill="cur
 // The search field's magnifier, in `currentColor`.
 icon!(SEARCH, "search", r##"<circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10.4 10.4L14 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>"##);
 
-// Opções, in the toolbar: a gear, in `currentColor`.
+// Opções, in the toolbar and sidebar: gear, transfers, logs and theme icons, in `currentColor`.
 icon!(SETTINGS, "settings", r##"<circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 1.5V3.2M8 12.8V14.5M1.5 8H3.2M12.8 8H14.5M3.4 3.4L4.6 4.6M11.4 11.4L12.6 12.6M3.4 12.6L4.6 11.4M11.4 4.6L12.6 3.4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="8" r="4.6" fill="none" stroke="currentColor" stroke-width="1.3"/>"##);
+icon!(OPT_TRANSFERS, "opt-transfers", r##"<path d="M5.2 13V3M2.8 5.4L5.2 3L7.6 5.4M10.8 3V13M8.4 10.6L10.8 13L13.2 10.6" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>"##);
+icon!(OPT_LOGS, "opt-logs", r##"<rect x="2.5" y="1.8" width="11" height="12.4" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5.2 5.2H10.8M5.2 8H10.8M5.2 10.8H8.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>"##);
+icon!(OPT_EXPERIMENTAL, "opt-experimental", r##"<path d="M6 2.2H10M6.8 2.2V6L3.1 12.2C2.7 12.9 3.2 13.8 4 13.8H12C12.8 13.8 13.3 12.9 12.9 12.2L9.2 6V2.2" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><path d="M4.6 10.2H11.4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>"##);
+icon!(THEME_AUTO, "theme-auto", r##"<rect x="1.8" y="2.8" width="12.4" height="8.4" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 2.8V11.2" stroke="currentColor" stroke-width="1.1"/><path d="M5.2 13.4H10.8M8 11.2V13.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>"##);
+icon!(THEME_LIGHT, "theme-light", r##"<circle cx="8" cy="8" r="3" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 1.8V3.2M8 12.8V14.2M1.8 8H3.2M12.8 8H14.2M3.6 3.6L4.6 4.6M11.4 11.4L12.4 12.4M3.6 12.4L4.6 11.4M11.4 4.6L12.4 3.6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>"##);
+icon!(THEME_DARK, "theme-dark", r##"<path d="M12.8 9.9A5.4 5.4 0 0 1 6.1 3.2A5.5 5.5 0 1 0 12.8 9.9Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>"##);
 
 // An upload, in the transfer queue: an arrow up out of a tray.
 icon!(UPLOAD, "upload", r##"<path d="M8 10.5V2.5M4.75 5.5L8 2.25L11.25 5.5M2.5 10V13.5H13.5V10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>"##);
@@ -32,10 +44,6 @@ icon!(DESKTOP, "desktop", r##"<rect x="1.5" y="2.5" width="13" height="8.5" rx="
 icon!(COMPUTER, "computer", r##"<rect x="1.5" y="2.5" width="13" height="8.5" rx="1" fill="#3B6FD8"/><rect x="2.5" y="3.5" width="11" height="6.5" fill="#8EC5FF"/><rect x="6.5" y="11" width="3" height="1.5" fill="#8A94A6"/><rect x="4.5" y="12.5" width="7" height="1.2" rx="0.6" fill="#8A94A6"/>"##);
 icon!(NETWORK, "network", r##"<rect x="5.5" y="1.5" width="5" height="4" rx="0.8" fill="#3B6FD8"/><rect x="1" y="10.5" width="5" height="4" rx="0.8" fill="#3B6FD8"/><rect x="10" y="10.5" width="5" height="4" rx="0.8" fill="#3B6FD8"/><path d="M8 5.5V8M3.5 10.5V8H12.5V10.5" stroke="#8A94A6" stroke-width="1.2" fill="none" stroke-linejoin="round"/>"##);
 icon!(LINUX, "linux", r##"<path d="M8 1.5C5.9 1.5 4.6 3.2 4.6 5.6C4.6 7 4 8 3.2 9.3C2.5 10.5 2.6 12 3.6 12.9C4.6 13.8 6.2 14.5 8 14.5C9.8 14.5 11.4 13.8 12.4 12.9C13.4 12 13.5 10.5 12.8 9.3C12 8 11.4 7 11.4 5.6C11.4 3.2 10.1 1.5 8 1.5Z" fill="#2B2F36"/><path d="M8 6.8C6.6 6.8 5.6 8.4 5.6 10.4C5.6 12.2 6.6 13.6 8 13.6C9.4 13.6 10.4 12.2 10.4 10.4C10.4 8.4 9.4 6.8 8 6.8Z" fill="#FFFFFF"/><circle cx="6.9" cy="4.6" r="0.7" fill="#FFFFFF"/><circle cx="9.1" cy="4.6" r="0.7" fill="#FFFFFF"/><path d="M6.9 5.9L8 6.7L9.1 5.9Z" fill="#F2B233"/><path d="M3.2 13.2L5.4 12.6L5.8 14.4L3.6 14.6ZM12.8 13.2L10.6 12.6L10.2 14.4L12.4 14.6Z" fill="#F2B233"/>"##);
-// A server added (FTP, SFTP, WebDAV): a rack unit with its lights.
-icon!(SERVER, "server", r##"<rect x="2" y="2" width="12" height="5" rx="1" fill="#5A6B86"/><rect x="2" y="9" width="12" height="5" rx="1" fill="#5A6B86"/><circle cx="11.5" cy="4.5" r="0.9" fill="#7CE38B"/><circle cx="11.5" cy="11.5" r="0.9" fill="#7CE38B"/><path d="M4 4.5H8.5M4 11.5H8.5" stroke="#C9D3E3" stroke-width="1.1" stroke-linecap="round"/>"##);
-// Adicionar servidor, in the toolbar, in `currentColor`: a server with a plus.
-icon!(ADD_SERVER, "add-server", r##"<rect x="1.5" y="2.5" width="9" height="4" rx="0.8" fill="none" stroke="currentColor" stroke-width="1.2"/><rect x="1.5" y="9.5" width="7" height="4" rx="0.8" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M12.5 8.5V14.5M9.5 11.5H15.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>"##);
 icon!(DISK, "disk", r##"<rect x="1.5" y="5" width="13" height="6.5" rx="1.5" fill="#8A94A6"/><rect x="1.5" y="9" width="13" height="2.5" rx="1" fill="#6B7487"/><circle cx="12.3" cy="10.25" r="0.75" fill="#7CE38B"/>"##);
 icon!(CLOUD, "cloud", r##"<path d="M4.5 13C2.6 13 1 11.6 1 9.8C1 8.2 2.2 6.9 3.8 6.7C4.3 4.6 6.1 3 8.3 3C10.6 3 12.5 4.7 12.8 6.9C14.1 7.2 15 8.3 15 9.7C15 11.5 13.6 13 11.8 13Z" fill="#4C8BF5"/>"##);
 icon!(SHARED, "shared", r##"<path d="M4.5 13C2.6 13 1 11.6 1 9.8C1 8.2 2.2 6.9 3.8 6.7C4.3 4.6 6.1 3 8.3 3C10.6 3 12.5 4.7 12.8 6.9C14.1 7.2 15 8.3 15 9.7C15 11.5 13.6 13 11.8 13Z" fill="#3BA676"/><circle cx="6.3" cy="8" r="1.3" fill="#FFFFFF"/><circle cx="9.7" cy="8" r="1.3" fill="#FFFFFF"/><path d="M4 11.6C4.3 10.4 5.2 9.8 6.3 9.8C7.4 9.8 8.3 10.4 8.6 11.6ZM7.4 11.6C7.7 10.4 8.6 9.8 9.7 9.8C10.8 9.8 11.7 10.4 12 11.6Z" fill="#FFFFFF"/>"##);
@@ -85,6 +93,45 @@ icon!(CHEVRON_DOWN, "chevron-down", r#"<path d="M4 6L8 10L12 6" stroke="currentC
 icon!(CHEVRON, "chevron", r#"<path d="M6 4L10 8L6 12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
 icon!(ADD_ACCOUNT, "add-account", r##"<path d="M3.5 12.5C2 12.5 0.8 11.4 0.8 10C0.8 8.8 1.7 7.8 2.9 7.6C3.3 6 4.7 4.8 6.4 4.8C8.2 4.8 9.6 6.1 9.9 7.8C10.9 8 11.6 8.9 11.6 9.9C11.6 11.3 10.5 12.5 9.1 12.5Z" fill="#4C8BF5"/><circle cx="12.3" cy="4.2" r="3.2" fill="#1E8E50"/><path d="M12.3 2.6V5.8M10.7 4.2H13.9" stroke="#FFFFFF" stroke-width="1.1" stroke-linecap="round"/>"##);
 icon!(SIGN_OUT, "sign-out", r#"<path d="M6.5 2.5H3.5C2.95 2.5 2.5 2.95 2.5 3.5V12.5C2.5 13.05 2.95 13.5 3.5 13.5H6.5M10 5L13 8L10 11M13 8H6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
+icon!(EXTERNAL_LINK, "external-link", r#"<path d="M9.5 2.5H13.5V6.5M13.2 2.8L7.5 8.5M6.5 4H3.5C2.95 4 2.5 4.45 2.5 5V12.5C2.5 13.05 2.95 13.5 3.5 13.5H11C11.55 13.5 12 13.05 12 12.5V9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
+
+// Category tabs in the unified "Adicionar conta" picker, in `currentColor`.
+icon!(CAT_ALL, "cat-all", r#"<rect x="2" y="2" width="5" height="5" rx="1.2" stroke="currentColor" stroke-width="1.3" fill="none"/><rect x="9" y="2" width="5" height="5" rx="1.2" stroke="currentColor" stroke-width="1.3" fill="none"/><rect x="2" y="9" width="5" height="5" rx="1.2" stroke="currentColor" stroke-width="1.3" fill="none"/><rect x="9" y="9" width="5" height="5" rx="1.2" stroke="currentColor" stroke-width="1.3" fill="none"/>"#);
+icon!(CAT_CLOUD, "cat-cloud", r#"<path d="M4.5 12.8C2.7 12.8 1.3 11.5 1.3 9.8C1.3 8.3 2.4 7 3.9 6.8C4.4 4.8 6.1 3.3 8.3 3.3C10.5 3.3 12.4 4.9 12.7 7C13.9 7.3 14.7 8.4 14.7 9.7C14.7 11.4 13.4 12.8 11.7 12.8Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" fill="none"/>"#);
+icon!(CAT_NAS, "cat-nas", r#"<rect x="2" y="2" width="5.2" height="12" rx="1" stroke="currentColor" stroke-width="1.3" fill="none"/><rect x="8.8" y="2" width="5.2" height="12" rx="1" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M3.6 4.8H5.6M3.6 7.2H5.6M10.4 4.8H12.4M10.4 7.2H12.4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><circle cx="4.6" cy="11.4" r="0.8" fill="currentColor"/><circle cx="11.4" cy="11.4" r="0.8" fill="currentColor"/>"#);
+icon!(CAT_PROTO, "cat-proto", r#"<rect x="2" y="2.5" width="12" height="4.5" rx="1" stroke="currentColor" stroke-width="1.3" fill="none"/><rect x="2" y="9" width="12" height="4.5" rx="1" stroke="currentColor" stroke-width="1.3" fill="none"/><circle cx="4.5" cy="4.75" r="0.8" fill="currentColor"/><circle cx="4.5" cy="11.25" r="0.8" fill="currentColor"/><path d="M7.2 4.75H11.5M7.2 11.25H11.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>"#);
+
+// Providers in the unified "Adicionar conta" picker and tree (32-point canvas).
+icon32!(
+    PROVIDER_GDRIVE,
+    "provider-gdrive",
+    r##"<path d="M11.6 4.5L16 12.1L7.2 12.1Z" fill="#00832D"/><path d="M7.2 12.1L16 12.1L11.6 19.7L2.8 19.7Z" fill="#00AC47"/><path d="M2.8 19.7L11.6 19.7L7.2 27.3Z" fill="#0066DA"/><path d="M11.6 19.7L20.4 19.7L24.8 27.3L7.2 27.3Z" fill="#2684FC"/><path d="M20.4 19.7L29.2 19.7L24.8 27.3Z" fill="#EA4335"/><path d="M11.6 4.5L20.4 4.5L29.2 19.7L20.4 19.7Z" fill="#FFBA00"/>"##
+);
+icon32!(
+    PROVIDER_NEXTCLOUD,
+    "provider-nextcloud",
+    r##"<rect x="2" y="2" width="28" height="28" rx="7" fill="#0082C9"/><circle cx="8.2" cy="16" r="2.9" fill="none" stroke="#FFFFFF" stroke-width="2.2"/><circle cx="23.8" cy="16" r="2.9" fill="none" stroke="#FFFFFF" stroke-width="2.2"/><circle cx="16" cy="16" r="4.5" fill="none" stroke="#FFFFFF" stroke-width="2.4"/>"##
+);
+icon32!(
+    PROVIDER_OWNCLOUD,
+    "provider-owncloud",
+    r##"<rect x="2" y="2" width="28" height="28" rx="7" fill="#1D2D44"/><circle cx="11.8" cy="14.5" r="3.4" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="16.8" cy="12.6" r="4.2" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="21.4" cy="15.4" r="3.1" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="9.2" cy="18.2" r="2.9" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="23.2" cy="18.5" r="2.7" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="19.2" cy="18.6" r="3.4" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="14.2" cy="18" r="4" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/>"##
+);
+icon32!(
+    PROVIDER_SFTP,
+    "provider-sftp",
+    r##"<rect x="2" y="2" width="28" height="28" rx="7" fill="#4F46E5"/><path d="M6.5 10.5L11.2 14.8L6.5 19.1" fill="none" stroke="#FFFFFF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M12.2 19.1H16.2" stroke="#A5B4FC" stroke-width="2.2" stroke-linecap="round"/><rect x="18.5" y="16.5" width="7.2" height="6.3" rx="1.6" fill="#6EE7B7"/><path d="M20.2 16.5V14.7C20.2 13.6 21.1 12.7 22.1 12.7C23.1 12.7 24 13.6 24 14.7V16.5" fill="none" stroke="#6EE7B7" stroke-width="1.8" stroke-linecap="round"/><circle cx="22.1" cy="19.6" r="1" fill="#1E1B4B"/>"##
+);
+icon32!(
+    PROVIDER_FTP,
+    "provider-ftp",
+    r##"<rect x="2" y="2" width="28" height="28" rx="7" fill="#0284C7"/><path d="M6.5 9.5C6.5 8.4 7.4 7.5 8.5 7.5H13L15 9.8H23.5C24.6 9.8 25.5 10.7 25.5 11.8V22.5C25.5 23.6 24.6 24.5 23.5 24.5H8.5C7.4 24.5 6.5 23.6 6.5 22.5Z" fill="#BAE6FD" fill-opacity="0.22"/><path d="M9.5 14H22M18.8 11L22 14L18.8 17" fill="none" stroke="#FFFFFF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M22.5 19.5H10M13.2 16.5L10 19.5L13.2 22.5" fill="none" stroke="#7DD3FC" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>"##
+);
+icon32!(
+    PROVIDER_WEBDAV,
+    "provider-webdav",
+    r##"<rect x="2" y="2" width="28" height="28" rx="7" fill="#0D9488"/><circle cx="16" cy="16" r="8.5" fill="none" stroke="#99F6E4" stroke-width="1.8"/><ellipse cx="16" cy="16" rx="4.2" ry="8.5" fill="none" stroke="#99F6E4" stroke-width="1.6"/><path d="M8 13.2H24M8 18.8H24" stroke="#99F6E4" stroke-width="1.5" stroke-linecap="round"/><path d="M11.5 23.8C9.6 23.8 8.2 22.5 8.2 20.8C8.2 19.3 9.3 18.1 10.7 17.9C11.2 16.1 12.8 14.8 14.8 14.8C16.9 14.8 18.6 16.2 19 18.1C20.2 18.4 21 19.4 21 20.7C21 22.4 19.7 23.8 18 23.8Z" fill="#FFFFFF"/>"##
+);
 
 // Context menu, in the text colour.
 icon!(M_OPEN, "m-open", r#"<path d="M1.5 13.5V3.5H6L7.5 5H13.5V7.5" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" fill="none"/><path d="M1.5 13.5L3.5 7.5H15L13 13.5H1.5Z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" fill="none"/>"#);

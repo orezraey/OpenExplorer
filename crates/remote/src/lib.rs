@@ -100,6 +100,15 @@ impl Protocol {
     }
 }
 
+/// A known cloud/NAS software preset running on top of a server protocol (such as WebDAV),
+/// kept so the tree and edit dialog show its own icon and defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Brand {
+    Nextcloud,
+    OwnCloud,
+}
+
 /// A server the user added. Its password, if any, is in the credential store under `id`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Server {
@@ -107,6 +116,8 @@ pub struct Server {
     /// What the tree shows.
     pub name: String,
     pub protocol: Protocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brand: Option<Brand>,
     pub host: String,
     pub port: u16,
     #[serde(default)]
@@ -536,7 +547,7 @@ mod tests {
     use super::*;
 
     fn server(protocol: Protocol, port: u16) -> Server {
-        Server { id: "x".into(), name: "x".into(), protocol, host: "nas".into(), port, user: "ana@casa".into(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false }
+        Server { id: "x".into(), name: "x".into(), protocol, brand: None, host: "nas".into(), port, user: "ana@casa".into(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false }
     }
 
     #[test]

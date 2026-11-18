@@ -50,7 +50,8 @@ enum Msg {
     /// An account a background job had to open, for `poll` to keep (see [`AccountRef::open`]).
     Opened { email: String, drive: Arc<Drive> },
     /// The folders of tree node `id`, read on a thread or from Drive.
-    TreeKids { id: tree::NodeId, result: Result<Vec<tree::Node>, String> },
+    /// `hidden`: the Exibir arquivos ocultos the folders were read with, where it matters.
+    TreeKids { id: tree::NodeId, hidden: Option<bool>, result: Result<Vec<tree::Node>, String> },
     /// The Adicionar servidor dialog's login check `attempt` ended; `secret` is the password to
     /// keep with the server (`None`: the one stored).
     ServerChecked { attempt: u64, result: Result<openexplorer_remote::Server, openexplorer_remote::Refusal>, secret: Option<String> },
@@ -186,10 +187,11 @@ struct State {
 
 fn init() -> State {
     let (outbox, inbox) = channel();
+    let settings = settings::Settings::load();
     let mock = MockDrive::new();
     let mut panes = [Pane::new(Location::home()), Pane::new(Location::Mock(Vec::new()))];
     for p in &mut panes {
-        p.load_now(&mock);
+        p.load_now(&mock, settings.show_hidden);
     }
     let accounts = store::accounts();
     let tree = tree::Tree::new(accounts.iter().map(|a| a.email.clone()));
@@ -233,7 +235,7 @@ fn init() -> State {
         inbox,
         outbox,
         waker: None,
-        settings: settings::Settings::load(),
+        settings,
         transfers: Vec::new(),
         transfer_menu: None,
         transfers_live: 0,
@@ -347,11 +349,13 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
         }
     }
-    // Rows done leave the queue (the status line says how the job went); cancelled and failed
-    // ones stay to be seen. While any runs, its thread wakes the window a few times a second.
+    // Rows done leave the queue when Opções says so (the status line says how the job went);
+    // cancelled and failed ones stay to be seen. While any runs, its thread wakes the window a few times a second.
     // A redraw is due while any row moves, and once more when the last one stops.
     let rows = s.transfers.len();
-    s.transfers.retain(|t| t.progress.stage() != ops::Stage::Done);
+    if s.settings.clear_completed {
+        s.transfers.retain(|t| t.progress.stage() != ops::Stage::Done);
+    }
     // The queue's menu goes with its row, and with the queue when that empties and hides.
     let gone = match &s.transfer_menu {
         Some((Some(row), _)) => !s.transfers.iter().any(|t| Arc::ptr_eq(&t.progress, row)),
@@ -368,7 +372,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         changed = true;
         match msg {
             Msg::Opened { email, drive } => keep_drive(s, email, drive),
-            Msg::TreeKids { id, result } => tree::arrived(s, id, result),
+            Msg::TreeKids { id, hidden, result } => tree::arrived(s, id, hidden, result),
             Msg::Servers { found, done } => tree::servers_found(s, found, done),
             Msg::ServerChecked { attempt, result, secret } => servers::checked(s, attempt, result, secret),
             Msg::Listed { pane, request, part, result } => {
@@ -409,6 +413,13 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                 }
             }
             Msg::Done { reload, result } => {
+                match &result {
+                    Ok(msg) => openexplorer_gdrive::log(&format!("operação: {msg}")),
+                    Err(msg) => openexplorer_gdrive::log(&format!("erro: {msg}")),
+                }
+                if let Some(actions::Dialog::Options(opt)) = &mut s.dialog {
+                    opt.refresh_logs();
+                }
                 match result {
                     Ok(msg) | Err(msg) => s.status = msg,
                 }
@@ -475,6 +486,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                 }
                 match result {
                     Ok((account, drive)) => {
+                        openexplorer_gdrive::log(&format!("conta Google conectada: {}", account.email));
                         s.status = format!("Conta conectada: {}", account.email);
                         s.drives.insert(account.email.clone(), drive);
                         s.tree.account_added(&account.email);
@@ -485,7 +497,10 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                         }
                         navigate(s, pane, Location::drive(email, Space::MyDrive));
                     }
-                    Err(e) => s.status = e,
+                    Err(e) => {
+                        openexplorer_gdrive::log(&format!("erro login Google: {e}"));
+                        s.status = e;
+                    }
                 }
             }
             Msg::Reached { pane, moves, result } => {
@@ -616,25 +631,9 @@ fn drive_task<T>(
     });
 }
 
-fn connect(s: &mut State, p: usize, tx: &mut Tx) {
-    let cfg = match ClientConfig::load() {
-        Ok(c) => c,
-        Err(e) => {
-            s.status = e;
-            return;
-        }
-    };
-    let pending = match oauth::begin(&cfg) {
-        Ok(l) => l,
-        Err(e) => {
-            s.status = e;
-            return;
-        }
-    };
-    if let Err(e) = tx.open_url(&pending.url) {
-        s.status = format!("Não consegui abrir o navegador: {e:?}");
-        return;
-    }
+pub(crate) fn connect_with(s: &mut State, p: usize, cfg: ClientConfig, tx: &mut Tx) -> Result<(), String> {
+    let pending = oauth::begin(&cfg)?;
+    tx.open_url(&pending.url).map_err(|e| format!("Não consegui abrir o navegador: {e:?}"))?;
     s.logins += 1;
     let attempt = s.logins;
     s.login = Some(attempt);
@@ -650,6 +649,7 @@ fn connect(s: &mut State, p: usize, tx: &mut Tx) {
         });
         emit(Msg::LoggedIn { pane: p, attempt, result });
     });
+    Ok(())
 }
 
 fn disconnect(s: &mut State, email: &str) {
@@ -695,7 +695,7 @@ fn load(s: &mut State, p: usize) {
     let request = s.live[p].fetch_add(1, Ordering::Relaxed) + 1;
     // A search of the computer asks the index service, on a thread: milliseconds.
     if let Location::Found(f) = &s.panes[p].loc {
-        let f = (**f).clone();
+        let (f, show_hidden) = ((**f).clone(), s.settings.show_hidden);
         let pane = &mut s.panes[p];
         pane.loading = true;
         pane.error = None;
@@ -708,7 +708,7 @@ fn load(s: &mut State, p: usize) {
             background(s, move |emit| {
                 let alive = || live.load(Ordering::Relaxed) == request;                let mut first = true;
                 let result = catch_panic("pesquisar", || {
-                    finder::search_elsewhere(&f, &alive, &mut |entries, more| {                        emit(Msg::Listed { pane: p, request, part: Part::Page { first, more }, result: Ok(entries) });                        first = false;
+                    finder::search_elsewhere(&f, show_hidden, &alive, &mut |entries, more| {                        emit(Msg::Listed { pane: p, request, part: Part::Page { first, more }, result: Ok(entries) });                        first = false;
                     })
                 });
                 if let Err(e) = result {
@@ -718,7 +718,7 @@ fn load(s: &mut State, p: usize) {
             return;
         }
         background(s, move |emit| {
-            let (result, info) = finder::search(&f);
+            let (result, info) = finder::search(&f, show_hidden);
             emit(Msg::Found { pane: p, request, result, info });
         });
         return;
@@ -728,13 +728,13 @@ fn load(s: &mut State, p: usize) {
     if let Location::Local(dir) = &s.panes[p].loc
         && network::is_remote(dir)
     {
-        let dir = dir.clone();
+        let (dir, show_hidden) = (dir.clone(), s.settings.show_hidden);
         let pane = &mut s.panes[p];
         pane.loading = true;
         pane.error = None;
         pane.free = None;
         background(s, move |emit| {
-            let result = catch_panic("listar", || model::read_local(&dir).map_err(|e| format!("{}: {e}", dir.display())));
+            let result = catch_panic("listar", || model::read_local(&dir, show_hidden).map_err(|e| format!("{}: {e}", dir.display())));
             emit(Msg::Listed { pane: p, request, part: Part::WHOLE, result });
         });
         return;
@@ -743,8 +743,9 @@ fn load(s: &mut State, p: usize) {
         return servers::load(s, p, request);
     }
     let Location::Drive { email, space, path } = s.panes[p].loc.clone() else {
+        let show_hidden = s.settings.show_hidden;
         let State { panes, mock, .. } = s;
-        panes[p].load_now(mock);
+        panes[p].load_now(mock, show_hidden);
         drop_stale_rename(s, p);
         return;
     };
@@ -1342,6 +1343,7 @@ fn server_scene(s: &mut State, find: Option<&str>) {
         id: "cena".into(),
         name: "NAS de teste".into(),
         protocol: openexplorer_remote::Protocol::Dav,
+        brand: None,
         host: "127.0.0.1".into(),
         port: 28095,
         user: String::new(),
@@ -1385,8 +1387,10 @@ fn view_sample() -> Vec<Entry> {
 }
 
 fn main() {
+    let initial = settings::Settings::load();
     rune::App::new(AppSpec::<State> {
         min_size: Some((900.0, 420.0)),
+        families: initial.font.families(),
         setup: Some(setup),
         poll: Some(poll),
         scenes: &[
@@ -1421,16 +1425,34 @@ fn main() {
             ("server", |s| server_scene(s, None)),
             // The same server searched for "praia".
             ("server-search", |s| server_scene(s, Some("praia"))),
-            // Adicionar servidor, filled in for SFTP; and for plain FTP, with its warning.
-            ("add-server", |s| {
+            // Unified Adicionar conta picker, plus provider-specific steps.
+            ("add-account", |s| servers::ask_add(s)),
+            ("add-account-nas", |s| {
                 let mut f = servers::Form::new();
+                f.category = servers::Category::Nas;
+                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+            }),
+            ("add-gdrive", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::GoogleDrive);
+                f.custom_oauth = true;
+                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+            }),
+            ("add-nextcloud", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::Nextcloud);
+                f.host = rune::TextEdit::new("cloud.exemplo.com");
+                f.user = rune::TextEdit::new("ana");
+                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+            }),
+            // Adicionar conta, filled in for SFTP; and for plain FTP, with its warning.
+            ("add-server", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::Sftp);
                 f.host = rune::TextEdit::new("nas.local");
                 f.user = rune::TextEdit::new("ana");
                 f.password = rune::TextEdit::new("segredo").secure();
                 s.dialog = Some(actions::Dialog::Server(Box::new(f)));
             }),
             ("add-server-ftp", |s| {
-                let mut f = servers::Form::new();
+                let mut f = servers::Form::for_provider(servers::Provider::Ftp);
                 f.protocol = openexplorer_remote::Protocol::Ftp;
                 f.host = rune::TextEdit::new("192.168.0.10");
                 f.error = Some("192.168.0.10 recusou o usuário ou a senha.".into());
@@ -1438,7 +1460,7 @@ fn main() {
             }),
             // A NAS's own certificate, turned down: the dialog shows it and asks to trust it.
             ("add-server-cert", |s| {
-                let mut f = servers::Form::new();
+                let mut f = servers::Form::for_provider(servers::Provider::WebDav);
                 f.protocol = openexplorer_remote::Protocol::Davs;
                 f.host = rune::TextEdit::new("nas.local");
                 f.user = rune::TextEdit::new("ana");
@@ -1448,8 +1470,24 @@ fn main() {
                 });
                 s.dialog = Some(actions::Dialog::Server(Box::new(f)));
             }),
-            // Opções open.
-            ("options", |s| s.dialog = Some(actions::Dialog::Options)),
+            // Opções open on each sidebar tab.
+            ("options", |s| s.dialog = Some(actions::Dialog::Options(Box::new(settings::OptionsView::open(settings::OptionsTab::General))))),
+            ("options-transfers", |s| s.dialog = Some(actions::Dialog::Options(Box::new(settings::OptionsView::open(settings::OptionsTab::Transfers))))),
+            ("options-experimental", |s| s.dialog = Some(actions::Dialog::Options(Box::new(settings::OptionsView::open(settings::OptionsTab::Experimental))))),
+            ("options-logs", |s| {
+                let mut v = settings::OptionsView::open(settings::OptionsTab::Logs);
+                if v.log_lines.is_empty() {
+                    v.log_lines = vec![
+                        "22:14:03.118 conta Google conectada: voce@gmail.com".into(),
+                        "22:14:04.402 list root: 248 ms (42 itens)".into(),
+                        "22:15:19.084 servidor salvo: Nextcloud (cloud.exemplo.com) (https://ana@cloud.exemplo.com)".into(),
+                        "22:16:40.911 operação: Enviado: 3 itens.".into(),
+                        "22:18:02.330 erro: 192.168.0.10 recusou o usuário ou a senha.".into(),
+                    ];
+                    v.log_bytes = 412;
+                }
+                s.dialog = Some(actions::Dialog::Options(Box::new(v)));
+            }),
             // The address being edited, all selected.
             ("address", |s| actions::edit_address(s, 0)),
             // Drive names holding `/`, shown with `／` in the path bar, the list and the rename
@@ -1597,6 +1635,7 @@ fn main() {
         ],
         ..AppSpec::new("Open Explorer", (1280.0, 760.0), init, ui::view)
     })
+    .font_smoothing(initial.text_render.smoothing())
     .args(rune_args(std::env::args().skip(1)))
     .run();
 }

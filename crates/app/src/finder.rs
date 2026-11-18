@@ -87,9 +87,9 @@ fn service() -> Service {
 
 /// Asks the service for `f`'s words. Without it, an error saying why, and how it is.
 #[cfg(windows)]
-pub fn search(f: &Found) -> (Result<Vec<Entry>, String>, Info) {
+pub fn search(f: &Found, show_hidden: bool) -> (Result<Vec<Entry>, String>, Info) {
     use openexplorer_index::proto::Request;
-    let req = Request { text: f.text.clone(), within: f.within.as_ref().map(|w| w.display().to_string()), limit: LIMIT, skip_hidden: false };
+    let req = Request { text: f.text.clone(), within: f.within.as_ref().map(|w| w.display().to_string()), limit: LIMIT, skip_hidden: !show_hidden };
     match openexplorer_index::pipe::ask(&req) {
         Ok(a) => {
             let info = Info {
@@ -116,9 +116,9 @@ pub fn search(f: &Found) -> (Result<Vec<Entry>, String>, Info) {
 
 /// Asks the user's own service, which is started when it isn't running.
 #[cfg(target_os = "linux")]
-pub fn search(f: &Found) -> (Result<Vec<Entry>, String>, Info) {
+pub fn search(f: &Found, show_hidden: bool) -> (Result<Vec<Entry>, String>, Info) {
     use openexplorer_index::proto::Request;
-    let req = Request { text: f.text.clone(), within: f.within.as_ref().map(|w| w.display().to_string()), limit: LIMIT, skip_hidden: false };
+    let req = Request { text: f.text.clone(), within: f.within.as_ref().map(|w| w.display().to_string()), limit: LIMIT, skip_hidden: !show_hidden };
     match openexplorer_index::unix::ask(&req) {
         Ok(a) => {
             let info = Info { total: a.header.total, shown: a.rows.len(), indexing: a.header.volumes.iter().filter(|v| v.indexing).map(|v| v.root.clone()).collect(), service: Service::Running };
@@ -130,7 +130,7 @@ pub fn search(f: &Found) -> (Result<Vec<Entry>, String>, Info) {
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-pub fn search(_: &Found) -> (Result<Vec<Entry>, String>, Info) {
+pub fn search(_: &Found, _: bool) -> (Result<Vec<Entry>, String>, Info) {
     (Err("A pesquisa no computador só existe no Windows e no Linux.".into()), Info { total: 0, shown: 0, indexing: Vec::new(), service: Service::Missing })
 }
 
@@ -226,7 +226,7 @@ impl<'a> Pager<'a> {
 /// inside the distribution, which reads its own disk in a second or two; on the network by
 /// reading the folders, several at a time. Results come to `page` as they're found, the last
 /// page with `more` false; it stops early once `alive` says the search was left.
-pub fn search_elsewhere(f: &Found, alive: &dyn Fn() -> bool, page: &mut dyn FnMut(Vec<Entry>, bool)) -> Result<(), String> {
+pub fn search_elsewhere(f: &Found, show_hidden: bool, alive: &dyn Fn() -> bool, page: &mut dyn FnMut(Vec<Entry>, bool)) -> Result<(), String> {
     use crate::network::{is_wsl, share_path, shares, unc};
     let within = f.within.as_deref().ok_or("Pesquisa sem pasta.")?;
     let words = words(&f.text);
@@ -244,8 +244,8 @@ pub fn search_elsewhere(f: &Found, alive: &dyn Fn() -> bool, page: &mut dyn FnMu
                 if !alive() || pager.full() {
                     break;
                 }
-                match wsl_find(&distro, "/", &share_path(&server, &distro), &words, alive, &mut pager, true) {
-                    Err(Find::NoPrintf) => wsl_find(&distro, "/", &share_path(&server, &distro), &words, alive, &mut pager, false),
+                match wsl_find(&distro, "/", &share_path(&server, &distro), &words, show_hidden, alive, &mut pager, true) {
+                    Err(Find::NoPrintf) => wsl_find(&distro, "/", &share_path(&server, &distro), &words, show_hidden, alive, &mut pager, false),
                     done => done,
                 }
                 .map_or_else(|e| failed = failed.take().or(Some(e)), |_| any = true);
@@ -266,15 +266,15 @@ pub fn search_elsewhere(f: &Found, alive: &dyn Fn() -> bool, page: &mut dyn FnMu
                 pager.push(entry(share_path(&server, name).display().to_string(), true, 0, 0));
             }
             let all: Vec<PathBuf> = names.iter().map(|n| share_path(&server, n)).collect();
-            walk(&all, &words, alive, &mut pager)?;
+            walk(&all, &words, show_hidden, alive, &mut pager)?;
         }
         Some((server, distro)) if is_wsl(&server) => {
             // As `within` spells it, so results read as it does.
             let top = share_path(&server, &distro);
             let rest = within.strip_prefix(&top).map_err(|_| format!("Não entendi o caminho “{}”.", within.display()))?;
             let linux = format!("/{}", rest.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/"));
-            match wsl_find(&distro, &linux, &top, &words, alive, &mut pager, true) {
-                Err(Find::NoPrintf) => wsl_find(&distro, &linux, &top, &words, alive, &mut pager, false),
+            match wsl_find(&distro, &linux, &top, &words, show_hidden, alive, &mut pager, true) {
+                Err(Find::NoPrintf) => wsl_find(&distro, &linux, &top, &words, show_hidden, alive, &mut pager, false),
                 done => done,
             }
             .map_err(|e| match e {
@@ -282,7 +282,7 @@ pub fn search_elsewhere(f: &Found, alive: &dyn Fn() -> bool, page: &mut dyn FnMu
                 Find::NoPrintf => "O find desta distribuição não lista os arquivos como a pesquisa precisa.".into(),
             })?;
         }
-        _ => walk(&[within.to_path_buf()], &words, alive, &mut pager)?,
+        _ => walk(&[within.to_path_buf()], &words, show_hidden, alive, &mut pager)?,
     }
     pager.flush(false);
     Ok(())
@@ -297,7 +297,8 @@ enum Find {
 /// Runs `find` inside `distro` over the Linux folder `linux` and keeps what matches. With
 /// `printf` each line brings the type, size and date; without it (BusyBox) only the path,
 /// and each match is looked up through `\\wsl.localhost`.
-fn wsl_find(distro: &str, linux: &str, top: &Path, words: &[Vec<u8>], alive: &dyn Fn() -> bool, pager: &mut Pager, printf: bool) -> Result<(), Find> {
+#[allow(clippy::too_many_arguments)]
+fn wsl_find(distro: &str, linux: &str, top: &Path, words: &[Vec<u8>], show_hidden: bool, alive: &dyn Fn() -> bool, pager: &mut Pager, printf: bool) -> Result<(), Find> {
     use std::io::{BufRead, Read};
     use std::process::{Command, Stdio};
     // `-xdev` keeps to the distribution's own disk: not /proc, nor Windows' disks in /mnt.
@@ -377,6 +378,10 @@ fn wsl_find(distro: &str, linux: &str, top: &Path, words: &[Vec<u8>], alive: &dy
         if name.is_empty() || !matches_in(words, &name, &mut folded) || path == linux.as_bytes() {
             continue;
         }
+        // Dotfiles, and what dot folders below the one searched hold, as its listing hides them.
+        if !show_hidden && path.strip_prefix(linux.as_bytes()).unwrap_or(path).split(|&b| b == b'/').any(|part| part.first() == Some(&b'.')) {
+            continue;
+        }
         let path = String::from_utf8_lossy(path);
         let number = |f: Option<&[u8]>| -> u64 { f.and_then(|f| std::str::from_utf8(f).ok()).and_then(|t| t.split('.').next()?.parse().ok()).unwrap_or(0) };
         let (kind, size, when) = (kind == Some(b"d".as_slice()), number(size), number(when) as u32);
@@ -426,7 +431,7 @@ fn prefilter(words: &[Vec<u8>]) -> Vec<String> {
 /// Reads the folders under `roots` (on the network, where each folder is a round trip),
 /// several at a time, and keeps what matches. Links to folders aren't followed, so a loop of
 /// them ends. A root that can't be read is skipped, unless none can.
-fn walk(roots: &[PathBuf], words: &[Vec<u8>], alive: &dyn Fn() -> bool, pager: &mut Pager) -> Result<(), String> {
+fn walk(roots: &[PathBuf], words: &[Vec<u8>], show_hidden: bool, alive: &dyn Fn() -> bool, pager: &mut Pager) -> Result<(), String> {
     use std::collections::VecDeque;
     use std::sync::{Condvar, Mutex, mpsc};
     const READERS: usize = 8;
@@ -475,13 +480,17 @@ fn walk(roots: &[PathBuf], words: &[Vec<u8>], alive: &dyn Fn() -> bool, pager: &
                     for item in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
                         // A link to a folder isn't `is_dir`: it isn't gone into.
                         let is_dir = item.file_type().is_ok_and(|t| t.is_dir());
+                        let name = item.file_name().to_string_lossy().into_owned();
+                        // Windows' listing already holds the attributes, size and date.
+                        let meta = item.metadata().ok();
+                        // A hidden item isn't a result, nor is a hidden folder gone into.
+                        if !show_hidden && crate::model::is_hidden(&name, meta.as_ref()) {
+                            continue;
+                        }
                         if is_dir {
                             inside.push(item.path());
                         }
-                        let name = item.file_name().to_string_lossy().into_owned();
                         if name_matches(words, &name) {
-                            // Windows' listing already holds the size and date.
-                            let meta = item.metadata().ok();
                             let secs = meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs() as u32);
                             let _ = tx.send(entry(item.path().display().to_string(), is_dir, meta.map_or(0, |m| m.len()), secs));
                         }
@@ -558,6 +567,10 @@ mod tests {
         for f in ["a/b/c/Relatório final.pdf", "x/relatorio.txt", "x/outro.txt"] {
             std::fs::write(root.join(f), "12345").unwrap();
         }
+        // Hidden: a dotfile and what a dot folder holds.
+        std::fs::create_dir_all(root.join(".oculta")).unwrap();
+        std::fs::write(root.join(".oculta/relatorio.md"), "1").unwrap();
+        std::fs::write(root.join(".relatorio"), "1").unwrap();
         // The folder searched is itself named "relatorio": it isn't among the results.
         let f = found("relatorio", Some(root.clone()));
         let (mut got, mut ends) = (Vec::new(), Vec::new());
@@ -566,16 +579,26 @@ mod tests {
             ends.push(more);
         };
         let mut pager = Pager::new(&mut page);
-        walk(std::slice::from_ref(&root), &words(&f.text), &|| true, &mut pager).unwrap();
+        walk(std::slice::from_ref(&root), &words(&f.text), false, &|| true, &mut pager).unwrap();
         pager.flush(false);
         drop(pager);
         let mut names: Vec<(&str, bool, Option<u64>)> = got.iter().map(|e| (e.name.as_str(), e.is_dir, e.size)).collect();
         names.sort();
         assert_eq!(names, [("Relatório final.pdf", false, Some(5)), ("Relatórios", true, None), ("relatorio.txt", false, Some(5))]);
         assert_eq!(ends.last(), Some(&false));
+        // Showing hidden files, the dotfile and the dot folder's file are found too.
+        let mut all = Vec::new();
+        let mut keep = |page: Vec<Entry>, _: bool| all.extend(page);
+        let mut pager = Pager::new(&mut keep);
+        walk(std::slice::from_ref(&root), &words(&f.text), true, &|| true, &mut pager).unwrap();
+        pager.flush(false);
+        drop(pager);
+        let mut names: Vec<&str> = all.iter().map(|e| e.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, [".relatorio", "Relatório final.pdf", "Relatórios", "relatorio.md", "relatorio.txt"]);
         // A search left at once reads nothing more.
         let mut left = Vec::new();
-        search_elsewhere(&f, &|| false, &mut |page, _| left.extend(page)).ok();
+        search_elsewhere(&f, true, &|| false, &mut |page, _| left.extend(page)).ok();
         assert!(left.len() <= 3);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
@@ -587,7 +610,7 @@ mod tests {
         let f = found("passwd", Some(PathBuf::from(r"\\wsl.localhost\archlinux\etc")));
         let mut got = Vec::new();
         let started = std::time::Instant::now();
-        search_elsewhere(&f, &|| true, &mut |page, _| got.extend(page)).unwrap();
+        search_elsewhere(&f, true, &|| true, &mut |page, _| got.extend(page)).unwrap();
         println!("{} results in {:?}: {:?}", got.len(), started.elapsed(), got.iter().map(|e| (&e.id, e.is_dir, e.size)).collect::<Vec<_>>());
         assert!(got.iter().any(|e| e.id == r"\\wsl.localhost\archlinux\etc\passwd" && !e.is_dir && e.size.is_some()));
         // Reading the folders through `\\wsl.localhost`, as a shared folder is read, finds the same.
@@ -595,7 +618,7 @@ mod tests {
         let started = std::time::Instant::now();
         let mut page = |page: Vec<Entry>, _| walked.extend(page);
         let mut pager = Pager::new(&mut page);
-        walk(&[PathBuf::from(r"\\wsl.localhost\archlinux\etc")], &words("passwd"), &|| true, &mut pager).unwrap();
+        walk(&[PathBuf::from(r"\\wsl.localhost\archlinux\etc")], &words("passwd"), true, &|| true, &mut pager).unwrap();
         pager.flush(false);
         drop(pager);
         println!("walked in {:?}", started.elapsed());
@@ -603,27 +626,27 @@ mod tests {
         assert_eq!(ids(&walked), ids(&got));
         // A spelling of its own stays in the results, and an unknown distribution says so.
         let mut upper = Vec::new();
-        search_elsewhere(&found("passwd", Some(PathBuf::from(r"\\WSL.LOCALHOST\archlinux\etc"))), &|| true, &mut |page, _| upper.extend(page)).unwrap();
+        search_elsewhere(&found("passwd", Some(PathBuf::from(r"\\WSL.LOCALHOST\archlinux\etc"))), true, &|| true, &mut |page, _| upper.extend(page)).unwrap();
         assert!(upper.iter().all(|e| e.id.starts_with(r"\\WSL.LOCALHOST\archlinux\etc\")) && upper.len() == got.len());
-        let missing = search_elsewhere(&found("x", Some(PathBuf::from(r"\\wsl.localhost\naoexiste"))), &|| true, &mut |_, _| {});
+        let missing = search_elsewhere(&found("x", Some(PathBuf::from(r"\\wsl.localhost\naoexiste"))), true, &|| true, &mut |_, _| {});
         println!("unknown distribution: {missing:?}");
         assert!(missing.is_err_and(|e| e.contains("naoexiste") && e.contains("distribuição") && !e.contains('\0')));
         // Linux searches every distribution, its names included; a computer, every shared
         // folder, the folders themselves included.
         let mut linux = Vec::new();
         let started = std::time::Instant::now();
-        search_elsewhere(&found("passwd", Some(PathBuf::from(r"\\wsl.localhost"))), &|| true, &mut |page, _| linux.extend(page)).unwrap();
+        search_elsewhere(&found("passwd", Some(PathBuf::from(r"\\wsl.localhost"))), true, &|| true, &mut |page, _| linux.extend(page)).unwrap();
         println!("Linux: {} results in {:?}", linux.len(), started.elapsed());
         assert!(linux.iter().any(|e| e.id == r"\\wsl.localhost\archlinux\etc\passwd") && linux.iter().any(|e| e.id.starts_with(r"\\wsl.localhost\docker-desktop\")));
         let mut named = Vec::new();
-        search_elsewhere(&found("arch", Some(PathBuf::from(r"\\wsl.localhost"))), &|| false, &mut |page, _| named.extend(page)).unwrap();
+        search_elsewhere(&found("arch", Some(PathBuf::from(r"\\wsl.localhost"))), true, &|| false, &mut |page, _| named.extend(page)).unwrap();
         assert!(named.iter().any(|e| e.id == r"\\wsl.localhost\archlinux" && e.is_dir), "{named:?}");
         let mut shared = Vec::new();
-        search_elsewhere(&found("vods", Some(PathBuf::from(r"\\localhost"))), &|| true, &mut |page, _| shared.extend(page)).unwrap();
+        search_elsewhere(&found("vods", Some(PathBuf::from(r"\\localhost"))), true, &|| true, &mut |page, _| shared.extend(page)).unwrap();
         assert!(shared.iter().any(|e| e.id == r"\\localhost\Vods" && e.is_dir), "{shared:?}");
         let f = found("hosts", Some(PathBuf::from(r"\\wsl.localhost\docker-desktop\etc")));
         let mut busybox = Vec::new();
-        let r = search_elsewhere(&f, &|| true, &mut |page, _| busybox.extend(page));
+        let r = search_elsewhere(&f, true, &|| true, &mut |page, _| busybox.extend(page));
         println!("busybox: {r:?} {:?}", busybox.iter().map(|e| (&e.id, e.is_dir, e.size)).collect::<Vec<_>>());
     }
 }

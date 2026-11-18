@@ -15,21 +15,25 @@ usa o próprio cliente OAuth (gratuito):
    modo **Teste** e adicione o seu e-mail em **Usuários de teste**.
 3. Em **Clientes** (Credenciais), crie um ID do cliente OAuth do tipo **App para computador** e
    baixe o JSON.
-4. Salve o JSON como `%APPDATA%\OpenExplorer\google-client.json`. Ou defina
-   `OPENEXPLORER_GOOGLE_CLIENT_ID` e `OPENEXPLORER_GOOGLE_CLIENT_SECRET`.
-5. No app, clique em **+ Google Drive**: o navegador abre, você autoriza e a conta aparece no
-   painel. Dá para conectar várias contas.
+4. Salve o JSON como `%APPDATA%\OpenExplorer\google-client.json`, defina
+   `OPENEXPLORER_GOOGLE_CLIENT_ID` e `OPENEXPLORER_GOOGLE_CLIENT_SECRET`, ou cole o JSON/credenciais
+   diretamente na etapa do Google Drive dentro de **Adicionar conta**.
+5. No app, clique em **Adicionar conta** → **Google Drive**: o navegador abre, você autoriza e a
+   conta aparece em **Contas**, na árvore. Dá para conectar várias contas.
 
 O token de renovação fica no Gerenciador de Credenciais do Windows (nunca em arquivo);
 `%APPDATA%\OpenExplorer\accounts.json` guarda só e-mail e nome. Em modo Teste, o Google expira
 o acesso a cada 7 dias: o app pede para conectar de novo.
 
-## Servidores FTP, SFTP e WebDAV
+## Contas e servidores (Nextcloud, ownCloud, SFTP, FTP/FTPS e WebDAV)
 
-**Adicionar servidor**, na barra de cima, pede o protocolo (SFTP, FTPS, FTP, WebDAV com https ou
-http), o endereço, a porta, o usuário, a senha e a pasta inicial; colar um endereço inteiro
+**Adicionar conta**, na barra de cima, unifica os provedores em categorias (**Todos**, **Nuvem**,
+**NAS** e **Protocolos**), com busca rápida e suporte a colar o endereço completo logo na busca.
+Ao escolher **Nextcloud**, **ownCloud**, **SFTP**, **FTP** ou **WebDAV**, abre o formulário
+específico com endereço, porta, usuário, senha, opção de criptografia SSL/TLS (FTPS / HTTPS) e
+pasta inicial (`/remote.php/webdav` automático no Nextcloud e ownCloud); colar um endereço inteiro
 (`sftp://ana@nas:2222/home/ana`) no campo Servidor preenche o resto. O app faz o login antes de
-guardar: o servidor só entra na lista (em **Servidores**, na árvore) quando ele funcionou. Digitar
+guardar: a conta só entra na lista (em **Contas**, na árvore) quando funcionou. Digitar
 na barra de endereço o endereço de um servidor que ainda não está na lista abre esse diálogo
 preenchido.
 
@@ -90,9 +94,10 @@ mostrar outra versão, há um Rust instalado fora do rustup antes dele no `PATH`
 `%USERPROFILE%\.cargo\bin` primeiro ou desinstale o outro.
 
 Para ver a interface sem abrir janela: `cargo run -- --snap tela.png --scene stress` (abre a pasta
-de 50.000 arquivos) ou `--scene account` (uma conta de exemplo, sem rede). `--scene add-server`
-mostra o diálogo de adicionar servidor; `--scene server` e `--scene server-search` abrem um
-servidor WebDAV local (`rclone serve webdav <pasta> --addr 127.0.0.1:28095`).
+de 50.000 arquivos) ou `--scene account` (uma conta de exemplo, sem rede). `--scene add-account`
+mostra o catálogo unificado de provedores (e `--scene add-server`, `--scene add-server-ftp`,
+`--scene add-nextcloud` e `--scene add-gdrive` cada etapa de configuração); `--scene server` e
+`--scene server-search` abrem um servidor WebDAV local (`rclone serve webdav <pasta> --addr 127.0.0.1:28095`).
 
 ## Código
 

@@ -15,7 +15,7 @@ pub mod upload;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub use api::{Account, Details, Drive, DriveFile, Place, Revision, SharedDrive, Top, View, valid_id};
 pub use quota::Quota;
@@ -27,7 +27,7 @@ pub type Result<T> = std::result::Result<T, String>;
 /// The OAuth client the app logs in with. Google only lets an app reach every file in a Drive
 /// (the `drive` scope) once it passes a security review, so until then each person creates their
 /// own client in Google Cloud and points the app at it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ClientConfig {
     pub client_id: String,
     pub client_secret: String,
@@ -51,7 +51,7 @@ impl ClientConfig {
         ClientConfig::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    fn parse(text: &str) -> Result<ClientConfig> {
+    pub fn parse(text: &str) -> Result<ClientConfig> {
         #[derive(Deserialize)]
         struct Inner {
             client_id: String,
@@ -64,11 +64,24 @@ impl ClientConfig {
             client_secret: Option<String>,
         }
         let f: File = serde_json::from_str(text).map_err(|e| format!("não é um JSON válido: {e}"))?;
-        match (f.installed, f.client_id, f.client_secret) {
-            (Some(i), _, _) => Ok(ClientConfig { client_id: i.client_id, client_secret: i.client_secret }),
-            (None, Some(id), Some(secret)) => Ok(ClientConfig { client_id: id, client_secret: secret }),
-            _ => Err("não tem client_id e client_secret de um app para computador (um cliente \"web\" não serve).".into()),
+        let (id, secret) = match (f.installed, f.client_id, f.client_secret) {
+            (Some(i), _, _) => (i.client_id, i.client_secret),
+            (None, Some(id), Some(secret)) => (id, secret),
+            _ => return Err("não tem client_id e client_secret de um app para computador (um cliente \"web\" não serve).".into()),
+        };
+        if id.trim().is_empty() || secret.trim().is_empty() {
+            return Err("client_id e client_secret não podem estar vazios.".into());
         }
+        Ok(ClientConfig { client_id: id.trim().to_string(), client_secret: secret.trim().to_string() })
+    }
+
+    /// Saves the OAuth client credentials to [`client_file`].
+    pub fn save(&self) -> Result<()> {
+        let dir = config_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("Não consegui criar {}: {e}", dir.display()))?;
+        let path = client_file();
+        let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        std::fs::write(&path, text).map_err(|e| format!("Não consegui salvar {}: {e}", path.display()))
     }
 }
 
@@ -88,11 +101,15 @@ pub fn local_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("OpenExplorer")).unwrap_or_else(config_dir)
 }
 
+pub fn log_file() -> PathBuf {
+    local_dir().join("openexplorer.log")
+}
+
 /// Appends a timestamped line to `openexplorer.log` in [`local_dir`]: request timings, to tell a
 /// slow network from a slow app. Starts over past 1 MB. Never fails the caller.
 pub fn log(line: &str) {
     use std::io::Write;
-    let path = local_dir().join("openexplorer.log");
+    let path = log_file();
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > 1 << 20) {
         let _ = std::fs::remove_file(&path);
     }
@@ -100,6 +117,26 @@ pub fn log(line: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "{} {line}", chrono::Local::now().format("%H:%M:%S%.3f"));
     }
+}
+
+/// Reads the last `max_lines` lines of [`log_file`], along with its total size in bytes.
+pub fn read_log(max_lines: usize) -> (Vec<String>, u64) {
+    let path = log_file();
+    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let Ok(text) = std::fs::read_to_string(&path) else { return (Vec::new(), 0) };
+    let all: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let skip = all.len().saturating_sub(max_lines);
+    let tail = all.into_iter().skip(skip).map(str::to_string).collect();
+    (tail, bytes)
+}
+
+/// Empties [`log_file`].
+pub fn clear_log() -> Result<()> {
+    let path = log_file();
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("Não consegui limpar {}: {e}", path.display()))?;
+    }
+    Ok(())
 }
 
 pub fn client_file() -> PathBuf {

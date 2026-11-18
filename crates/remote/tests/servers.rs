@@ -60,7 +60,7 @@ fn serve_with(kind: &str, port: u16, tls: bool) -> Served {
 }
 
 fn server(protocol: Protocol, port: u16) -> Server {
-    Server { id: format!("t-{port}"), name: "teste".into(), protocol, host: "127.0.0.1".into(), port, user: "ana".into(), root: String::new(), key: None, host_key: None, cert: None, connections: 4, implicit: false }
+    Server { id: format!("t-{port}"), name: "teste".into(), protocol, brand: None, host: "127.0.0.1".into(), port, user: "ana".into(), root: String::new(), key: None, host_key: None, cert: None, connections: 4, implicit: false }
 }
 
 /// Everything the panes do with a server, start to end.

@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
-use openexplorer_remote::{self as remote, Conn, Item, Pool, Protocol, Refusal, Rejected, Server, Store};
-use rune::TextEdit;
+use openexplorer_remote::{self as remote, Brand, Conn, Item, Pool, Protocol, Refusal, Rejected, Server, Store};
+use rune::{Icon, TextEdit, Tx};
 
 use crate::actions::{Dialog, Then};
 use crate::model::{Entry, Location};
@@ -102,6 +102,7 @@ pub(crate) fn child(dir: &str, name: &str) -> String {
 /// Lists pane `p`'s server folder, or searches it, on a thread; search results come in pages.
 pub fn load(s: &mut State, p: usize, request: u64) {
     let Location::Server { server, path, find } = s.panes[p].loc.clone() else { return };
+    let show_hidden = s.settings.show_hidden;
     let pool = s.servers.pool.clone();
     let live = s.live[p].clone();
     let pane = &mut s.panes[p];
@@ -112,14 +113,16 @@ pub fn load(s: &mut State, p: usize, request: u64) {
         let listed = |part, result| Msg::Listed { pane: p, request, part, result };
         let dir = server.path(&path);
         let Some(text) = find else {
-            let result = catch_panic("listar", || with(&pool, &server, |c| c.list(&dir)).map(|v| v.into_iter().map(entry).collect()));
+            let result = catch_panic("listar", || {
+                with(&pool, &server, |c| c.list(&dir)).map(|v| v.into_iter().filter(|i| show_hidden || !i.name.starts_with('.')).map(entry).collect())
+            });
             return emit(listed(Part::WHOLE, result));
         };
         let alive = || live.load(Ordering::Relaxed) == request;
         let mut first = true;
         let result = catch_panic("pesquisar", || {
             with(&pool, &server, |c| {
-                search(c, &dir, &text, &alive, &mut |entries, more| {
+                search(c, &dir, &text, show_hidden, &alive, &mut |entries, more| {
                     emit(listed(Part::Page { first, more }, Ok(entries)));
                     first = false;
                 })
@@ -133,7 +136,7 @@ pub fn load(s: &mut State, p: usize, request: u64) {
 
 /// Searches `dir` and every folder below it for names holding all of `text`'s words, folder by
 /// folder, the nearest first. Each result's id is its path from `dir`.
-fn search(c: &mut dyn Conn, dir: &str, text: &str, alive: &dyn Fn() -> bool, page: &mut dyn FnMut(Vec<Entry>, bool)) -> Result<(), String> {
+fn search(c: &mut dyn Conn, dir: &str, text: &str, show_hidden: bool, alive: &dyn Fn() -> bool, page: &mut dyn FnMut(Vec<Entry>, bool)) -> Result<(), String> {
     let words = crate::finder::words(text);
     let mut pager = crate::finder::Pager::new(page);
     let mut todo = VecDeque::from([String::new()]);
@@ -149,6 +152,9 @@ fn search(c: &mut dyn Conn, dir: &str, text: &str, alive: &dyn Fn() -> bool, pag
             Err(_) => continue,
         };
         for it in items {
+            if !show_hidden && it.name.starts_with('.') {
+                continue;
+            }
             let id = if rel.is_empty() { it.name.clone() } else { format!("{rel}/{}", it.name) };
             // Links aren't followed: one back up would go round forever.
             if it.is_dir && !it.link {
@@ -164,9 +170,9 @@ fn search(c: &mut dyn Conn, dir: &str, text: &str, alive: &dyn Fn() -> bool, pag
 }
 
 /// The folders in `path` of `server`, for the tree.
-pub fn folders(pool: &Pool, server: &Server, path: &[String]) -> Result<Vec<String>, String> {
+pub fn folders(pool: &Pool, server: &Server, path: &[String], show_hidden: bool) -> Result<Vec<String>, String> {
     let dir = server.path(path);
-    with(pool, server, |c| c.list(&dir)).map(|v| v.into_iter().filter(|i| i.is_dir).map(|i| i.name).collect())
+    with(pool, server, |c| c.list(&dir)).map(|v| v.into_iter().filter(|i| i.is_dir && (show_hidden || !i.name.starts_with('.'))).map(|i| i.name).collect())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -487,10 +493,169 @@ pub fn name(s: &mut State, loc: &Location, item: Option<Entry>, name: String) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Adding, changing and removing servers
+// Adding, changing and removing accounts and servers
 
-/// The Adicionar servidor dialog (or Editar servidor, with `editing`).
+/// Category filter tabs in the unified "Adicionar conta" picker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Category {
+    #[default]
+    All,
+    Cloud,
+    Nas,
+    Protocols,
+}
+
+impl Category {
+    pub const ALL: [Category; 4] = [Category::All, Category::Cloud, Category::Nas, Category::Protocols];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Category::All => "Todos",
+            Category::Cloud => "Nuvem",
+            Category::Nas => "NAS",
+            Category::Protocols => "Protocolos",
+        }
+    }
+
+    pub fn icon(self) -> &'static Icon {
+        match self {
+            Category::All => &crate::icons::CAT_ALL,
+            Category::Cloud => &crate::icons::CAT_CLOUD,
+            Category::Nas => &crate::icons::CAT_NAS,
+            Category::Protocols => &crate::icons::CAT_PROTO,
+        }
+    }
+}
+
+/// Every cloud or server provider offered in the unified "Adicionar conta" dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provider {
+    GoogleDrive,
+    Nextcloud,
+    OwnCloud,
+    Sftp,
+    Ftp,
+    WebDav,
+}
+
+impl Provider {
+    pub const ALL: [Provider; 6] = [
+        Provider::GoogleDrive,
+        Provider::Nextcloud,
+        Provider::OwnCloud,
+        Provider::Sftp,
+        Provider::Ftp,
+        Provider::WebDav,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Provider::GoogleDrive => "Google Drive",
+            Provider::Nextcloud => "Nextcloud",
+            Provider::OwnCloud => "ownCloud",
+            Provider::Sftp => "SFTP",
+            Provider::Ftp => "FTP",
+            Provider::WebDav => "WebDAV",
+        }
+    }
+
+    pub fn subtitle(self) -> &'static str {
+        match self {
+            Provider::GoogleDrive => "OAuth no navegador",
+            Provider::Nextcloud => "Nuvem via WebDAV",
+            Provider::OwnCloud => "Nuvem via WebDAV",
+            Provider::Sftp => "SSH seguro · porta 22",
+            Provider::Ftp => "FTP / FTPS · porta 21",
+            Provider::WebDav => "HTTPS / HTTP",
+        }
+    }
+
+    pub fn icon(self) -> &'static Icon {
+        match self {
+            Provider::GoogleDrive => &crate::icons::PROVIDER_GDRIVE,
+            Provider::Nextcloud => &crate::icons::PROVIDER_NEXTCLOUD,
+            Provider::OwnCloud => &crate::icons::PROVIDER_OWNCLOUD,
+            Provider::Sftp => &crate::icons::PROVIDER_SFTP,
+            Provider::Ftp => &crate::icons::PROVIDER_FTP,
+            Provider::WebDav => &crate::icons::PROVIDER_WEBDAV,
+        }
+    }
+
+    pub fn in_category(self, category: Category) -> bool {
+        match category {
+            Category::All => true,
+            Category::Cloud => matches!(self, Provider::GoogleDrive | Provider::Nextcloud | Provider::OwnCloud),
+            Category::Nas => matches!(self, Provider::Nextcloud | Provider::OwnCloud | Provider::Sftp | Provider::Ftp | Provider::WebDav),
+            Category::Protocols => matches!(self, Provider::Sftp | Provider::Ftp | Provider::WebDav),
+        }
+    }
+
+    pub fn matches_query(self, query: &str) -> bool {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return true;
+        }
+        let keywords = match self {
+            Provider::GoogleDrive => "google drive gdrive nuvem workspace oauth gmail",
+            Provider::Nextcloud => "nextcloud webdav dav https nas nuvem",
+            Provider::OwnCloud => "owncloud webdav dav https nas nuvem",
+            Provider::Sftp => "sftp ssh servidor linux nas chave 22",
+            Provider::Ftp => "ftp ftps tls ssl servidor nas 21 990",
+            Provider::WebDav => "webdav dav davs http https servidor nas",
+        };
+        q.split_whitespace().all(|w| self.label().to_lowercase().contains(w) || self.subtitle().to_lowercase().contains(w) || keywords.contains(w))
+    }
+
+    pub fn default_protocol(self) -> Protocol {
+        match self {
+            Provider::GoogleDrive | Provider::Sftp => Protocol::Sftp,
+            Provider::Ftp => Protocol::Ftp,
+            Provider::Nextcloud | Provider::OwnCloud | Provider::WebDav => Protocol::Davs,
+        }
+    }
+
+    pub fn brand(self) -> Option<Brand> {
+        match self {
+            Provider::Nextcloud => Some(Brand::Nextcloud),
+            Provider::OwnCloud => Some(Brand::OwnCloud),
+            _ => None,
+        }
+    }
+
+    pub fn of_server(server: &Server) -> Provider {
+        match (server.brand, server.protocol) {
+            (Some(Brand::Nextcloud), _) => Provider::Nextcloud,
+            (Some(Brand::OwnCloud), _) => Provider::OwnCloud,
+            (_, Protocol::Sftp) => Provider::Sftp,
+            (_, Protocol::Ftp | Protocol::Ftps) => Provider::Ftp,
+            (_, Protocol::Dav | Protocol::Davs) => Provider::WebDav,
+        }
+    }
+
+    pub fn of_protocol(protocol: Protocol) -> Provider {
+        match protocol {
+            Protocol::Sftp => Provider::Sftp,
+            Protocol::Ftp | Protocol::Ftps => Provider::Ftp,
+            Protocol::Dav | Protocol::Davs => Provider::WebDav,
+        }
+    }
+}
+
+/// Which view of the unified account dialog is open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Step 1: The categorized grid of cloud and server providers.
+    Pick,
+    /// Step 2: Provider-specific OAuth or credentials form.
+    Configure,
+}
+
+/// The unified Adicionar conta dialog (or Editar conta/servidor, with `editing`).
 pub struct Form {
+    pub step: Step,
+    pub category: Category,
+    pub filter: TextEdit,
+    pub provider: Provider,
     /// The id of the server being changed.
     pub editing: Option<String>,
     pub protocol: Protocol,
@@ -499,10 +664,16 @@ pub struct Form {
     pub port: TextEdit,
     pub user: TextEdit,
     pub password: TextEdit,
+    pub reveal_password: bool,
     pub folder: TextEdit,
     pub key: TextEdit,
     /// Conexões simultâneas; empty for the usual number.
     pub connections: TextEdit,
+    /// Google Drive OAuth client configuration inside the modal.
+    pub custom_oauth: bool,
+    pub client_id: TextEdit,
+    pub client_secret: TextEdit,
+    pub reveal_secret: bool,
     /// The fingerprint of the certificate the user trusts for this server (FTPS, https).
     pub trusted: Option<String>,
     /// A certificate the last check turned down, waiting for the user to trust it or not.
@@ -513,21 +684,31 @@ pub struct Form {
 }
 
 impl Form {
+    /// Starts on the unified provider catalog (`Step::Pick`), with the search bar focused.
     pub fn new() -> Form {
         let blank = || TextEdit::new("");
-        let mut host = blank();
-        host.focused = true;
+        let mut filter = blank();
+        filter.focused = true;
         Form {
+            step: Step::Pick,
+            category: Category::All,
+            filter,
+            provider: Provider::Sftp,
             editing: None,
             protocol: Protocol::Sftp,
             name: blank(),
-            host,
+            host: blank(),
             port: blank(),
             user: blank(),
             password: TextEdit::new("").secure(),
+            reveal_password: false,
             folder: blank(),
             key: blank(),
             connections: blank(),
+            custom_oauth: false,
+            client_id: blank(),
+            client_secret: TextEdit::new("").secure(),
+            reveal_secret: false,
             trusted: None,
             untrusted: None,
             error: None,
@@ -535,13 +716,46 @@ impl Form {
         }
     }
 
+    /// Opens directly on `provider`'s configuration step.
+    pub fn for_provider(provider: Provider) -> Form {
+        let mut f = Form::new();
+        f.filter.focused = false;
+        f.apply_provider(provider);
+        f
+    }
+
+    pub fn apply_provider(&mut self, provider: Provider) {
+        self.step = Step::Configure;
+        self.provider = provider;
+        self.protocol = provider.default_protocol();
+        self.error = None;
+        self.untrusted = None;
+        self.filter.focused = false;
+        if provider == Provider::GoogleDrive {
+            let missing = openexplorer_gdrive::ClientConfig::load().is_err();
+            self.custom_oauth = missing;
+            if missing {
+                self.client_id.focused = true;
+            }
+        } else {
+            self.host.focused = true;
+        }
+    }
+
+    /// Providers matching both the selected category tab and search text.
+    pub fn visible_providers(&self) -> Vec<Provider> {
+        Provider::ALL.into_iter().filter(|p| p.in_category(self.category) && p.matches_query(&self.filter.text)).collect()
+    }
+
     /// The form filled with `server`, to change it; the password stays as stored unless typed.
     pub fn of(server: &Server) -> Form {
-        let mut f = Form::new();
+        let provider = Provider::of_server(server);
+        let mut f = Form::for_provider(provider);
         f.editing = Some(server.id.clone());
         f.protocol = server.protocol;
         f.name = TextEdit::new(server.name.clone());
         f.host = TextEdit::new(server.host.clone());
+        f.host.focused = true;
         if server.port != server.protocol.default_port() {
             f.port = TextEdit::new(server.port.to_string());
         }
@@ -557,9 +771,17 @@ impl Form {
 
     /// The form filled with what an address typed says (`sftp://ana@nas:2222/home`).
     pub fn of_address(a: &Address) -> Form {
-        let mut f = Form::new();
+        let provider = if matches!(a.protocol, Protocol::Dav | Protocol::Davs) && a.path.to_lowercase().contains("nextcloud") {
+            Provider::Nextcloud
+        } else if matches!(a.protocol, Protocol::Dav | Protocol::Davs) && a.path.to_lowercase().contains("owncloud") {
+            Provider::OwnCloud
+        } else {
+            Provider::of_protocol(a.protocol)
+        };
+        let mut f = Form::for_provider(provider);
         f.protocol = a.protocol;
         f.host = TextEdit::new(a.host.clone());
+        f.host.focused = true;
         if let Some(port) = a.port {
             f.port = TextEdit::new(port.to_string());
         }
@@ -567,7 +789,12 @@ impl Form {
         if let Some(p) = &a.password {
             f.password = TextEdit::new(p.clone()).secure();
         }
-        if a.path != "/" {
+        // Nextcloud and ownCloud serve WebDAV under `/remote.php/…`: an install's own address
+        // (`https://host/nextcloud`) gets it appended, as the Servidor field does.
+        let branded = matches!(provider, Provider::Nextcloud | Provider::OwnCloud);
+        if branded && !a.path.contains("/remote.php/") {
+            f.folder = TextEdit::new(format!("{}/remote.php/webdav", a.path.trim_end_matches('/')));
+        } else if a.path != "/" {
             f.folder = TextEdit::new(a.path.clone());
         }
         f
@@ -579,9 +806,11 @@ impl Form {
         let mut protocol = self.protocol;
         let mut host = self.host.text.trim().to_string();
         let mut user = self.user.text.trim().to_string();
+        let explicit_folder = !self.folder.text.trim().is_empty();
         let mut root = self.folder.text.trim().to_string();
         let mut port = None;
         let mut pasted = None;
+        let mut pasted_path = None;
         // A whole address pasted in the Servidor field fills the rest.
         if host.contains("://")
             && let Some(a) = parse_address(&host)
@@ -592,8 +821,8 @@ impl Form {
             if user.is_empty() {
                 user = a.user;
             }
-            if root.is_empty() && a.path != "/" {
-                root = a.path;
+            if !explicit_folder && a.path != "/" {
+                pasted_path = Some(a.path);
             }
             pasted = a.password;
         }
@@ -603,6 +832,20 @@ impl Form {
         if host.contains('/') || host.contains(' ') {
             return Err("O servidor é só o nome ou o IP, sem pastas: a pasta vai em Pasta inicial.".into());
         }
+        // Nextcloud and ownCloud speak WebDAV under `/remote.php/webdav` (which maps to the
+        // authenticated user's root even when logging in by e-mail), unless a full `/remote.php/…`
+        // URL was pasted or a custom initial folder was typed.
+        if !explicit_folder {
+            if matches!(self.provider, Provider::Nextcloud | Provider::OwnCloud) && matches!(protocol, Protocol::Dav | Protocol::Davs) {
+                root = match pasted_path {
+                    Some(p) if p.contains("/remote.php/") => p,
+                    Some(p) => format!("{}/remote.php/webdav", p.trim_end_matches('/')),
+                    None => "/remote.php/webdav".into(),
+                };
+            } else if let Some(p) = pasted_path {
+                root = p;
+            }
+        }
         let port = match (self.port.text.trim(), port) {
             ("", Some(p)) => p,
             ("", None) => protocol.default_port(),
@@ -611,8 +854,13 @@ impl Form {
         if !root.is_empty() && !root.starts_with('/') {
             root.insert(0, '/');
         }
+        let brand = self.provider.brand().filter(|_| matches!(protocol, Protocol::Dav | Protocol::Davs));
         let name = match self.name.text.trim() {
-            "" => host.clone(),
+            "" => match brand {
+                Some(Brand::Nextcloud) => format!("Nextcloud ({host})"),
+                Some(Brand::OwnCloud) => format!("ownCloud ({host})"),
+                None => host.clone(),
+            },
             n => n.to_string(),
         };
         let key = match self.key.text.trim() {
@@ -634,7 +882,7 @@ impl Form {
         let id = self.editing.clone().unwrap_or_else(remote::store::new_id);
         // The host key seen before stays, unless the server is another one now.
         let host_key = self.editing.as_ref().and_then(|id| s.servers.list.iter().find(|sv| sv.id == *id)).filter(|old| old.host == host && old.port == port && old.protocol == protocol).and_then(|old| old.host_key.clone());
-        Ok((Server { id, name, protocol, host, port, user, root, key, host_key, cert, connections, implicit: false }, pasted))
+        Ok((Server { id, name, protocol, brand, host, port, user, root, key, host_key, cert, connections, implicit: false }, pasted))
     }
 }
 
@@ -648,7 +896,116 @@ pub fn ask_edit(s: &mut State, id: &str) {
     }
 }
 
-/// Salvar in the dialog: checks the login on a thread; the server is kept once it worked.
+pub fn pick_provider(s: &mut State, provider: Provider) {
+    if let Some(Dialog::Server(f)) = &mut s.dialog {
+        f.apply_provider(provider);
+    }
+}
+
+pub fn back_to_pick(s: &mut State) {
+    if let Some(Dialog::Server(f)) = &mut s.dialog
+        && f.editing.is_none()
+        && f.checking.is_none()
+    {
+        f.step = Step::Pick;
+        f.error = None;
+        f.untrusted = None;
+        f.filter.focused = true;
+    }
+}
+
+pub fn set_category(s: &mut State, category: Category) {
+    if let Some(Dialog::Server(f)) = &mut s.dialog {
+        f.category = category;
+    }
+}
+
+pub fn clear_filter(s: &mut State) {
+    if let Some(Dialog::Server(f)) = &mut s.dialog {
+        f.filter = TextEdit::new("");
+        f.filter.focused = true;
+    }
+}
+
+/// Pressing Enter in the search box of Step 1: opens a pasted `scheme://…` address at once,
+/// or picks the first matching provider.
+pub fn submit_filter(s: &mut State) {
+    let Some(Dialog::Server(f)) = &mut s.dialog else { return };
+    let typed = f.filter.text.trim().trim_matches('"').to_string();
+    if !typed.is_empty()
+        && let Some(a) = parse_address(&typed)
+    {
+        **f = Form::of_address(&a);
+        return;
+    }
+    if let Some(&first) = f.visible_providers().first() {
+        f.apply_provider(first);
+    }
+}
+
+/// Toggles SSL/TLS on FTP (`Ftp` ↔ `Ftps`) or WebDAV (`Dav` ↔ `Davs`).
+pub fn toggle_tls(s: &mut State) {
+    if let Some(Dialog::Server(f)) = &mut s.dialog {
+        f.protocol = match f.protocol {
+            Protocol::Ftp => Protocol::Ftps,
+            Protocol::Ftps => Protocol::Ftp,
+            Protocol::Dav => Protocol::Davs,
+            Protocol::Davs => Protocol::Dav,
+            Protocol::Sftp => Protocol::Sftp,
+        };
+    }
+}
+
+/// Connects a Google Drive account from the unified modal, saving custom OAuth credentials
+/// first if typed or pasted.
+pub fn submit_google(s: &mut State, tx: &mut Tx) {
+    let cfg = {
+        let Some(Dialog::Server(f)) = &mut s.dialog else { return };
+        f.error = None;
+        let id = f.client_id.text.trim();
+        let secret = f.client_secret.text.trim();
+        if f.custom_oauth || !id.is_empty() || !secret.is_empty() {
+            let parsed = if id.starts_with('{') {
+                openexplorer_gdrive::ClientConfig::parse(id)
+            } else if id.is_empty() || secret.is_empty() {
+                Err("Informe o Client ID e o Client Secret (ou cole o JSON completo no campo Client ID).".into())
+            } else {
+                Ok(openexplorer_gdrive::ClientConfig { client_id: id.to_string(), client_secret: secret.to_string() })
+            };
+            let cfg = match parsed {
+                Ok(c) => c,
+                Err(e) => {
+                    f.error = Some(e);
+                    return;
+                }
+            };
+            if let Err(e) = cfg.save() {
+                f.error = Some(e);
+                return;
+            }
+            cfg
+        } else {
+            match openexplorer_gdrive::ClientConfig::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    f.custom_oauth = true;
+                    f.error = Some(e);
+                    return;
+                }
+            }
+        }
+    };
+    match crate::connect_with(s, s.active, cfg, tx) {
+        Ok(()) => s.dialog = None,
+        Err(e) => {
+            if let Some(Dialog::Server(f)) = &mut s.dialog {
+                f.error = Some(e);
+            }
+        }
+    }
+}
+
+/// Conectar / Salvar in the dialog: checks the login on a thread; the server is kept once it worked.
 pub fn submit(s: &mut State) {
     let Some(Dialog::Server(form)) = &s.dialog else { return };
     let (server, pasted) = match form.server(s) {
@@ -710,6 +1067,7 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
             return;
         }
         Err(Refusal::Failed(e)) => {
+            openexplorer_gdrive::log(&format!("falha ao conectar servidor: {e}"));
             form.error = Some(e);
             return;
         }
@@ -718,6 +1076,7 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
         form.error = Some(e);
         return;
     }
+    openexplorer_gdrive::log(&format!("servidor salvo: {} ({})", server.name, server.address()));
     let edited = form.editing.is_some();
     s.dialog = None;
     s.servers.pool.forget(&server.id);
@@ -897,7 +1256,7 @@ mod tests {
     use super::*;
 
     fn server(protocol: Protocol, host: &str, root: &str) -> Server {
-        Server { id: format!("{host}{root}"), name: host.into(), protocol, host: host.into(), port: protocol.default_port(), user: "ana".into(), root: root.into(), key: None, host_key: None, cert: None, connections: 4, implicit: false }
+        Server { id: format!("{host}{root}"), name: host.into(), protocol, brand: None, host: host.into(), port: protocol.default_port(), user: "ana".into(), root: root.into(), key: None, host_key: None, cert: None, connections: 4, implicit: false }
     }
 
     #[test]
@@ -941,6 +1300,45 @@ mod tests {
         assert_eq!(path_of(&folder(&sv, vec!["a".into()]), &e("x.txt")).as_deref(), Some("/srv/a/x.txt"));
         assert!(target(&found).is_none());
         assert_eq!(target(&folder(&sv, vec![])).map(|(_, d)| d), Some("/srv".into()));
+    }
+
+    #[test]
+    fn unified_catalog_filters_and_configures_presets() {
+        let mut f = Form::new();
+        assert_eq!(f.step, Step::Pick);
+        assert_eq!(f.visible_providers().len(), 6);
+        f.category = Category::Cloud;
+        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::Nextcloud, Provider::OwnCloud]);
+        f.category = Category::Protocols;
+        assert_eq!(f.visible_providers(), [Provider::Sftp, Provider::Ftp, Provider::WebDav]);
+        f.category = Category::All;
+        f.filter = TextEdit::new("ftps");
+        assert_eq!(f.visible_providers(), [Provider::Ftp]);
+
+        let s = crate::init();
+        let mut nc = Form::for_provider(Provider::Nextcloud);
+        assert_eq!((nc.step, nc.protocol), (Step::Configure, Protocol::Davs));
+        nc.host = TextEdit::new("cloud.exemplo.com");
+        nc.user = TextEdit::new("ana");
+        let (sv, _) = nc.server(&s).unwrap();
+        assert_eq!((sv.brand, sv.protocol, sv.root.as_str(), sv.name.as_str()), (Some(Brand::Nextcloud), Protocol::Davs, "/remote.php/webdav", "Nextcloud (cloud.exemplo.com)"));
+
+        // Subfolder install pasted without /remote.php gets /remote.php/webdav appended.
+        nc.host = TextEdit::new("https://exemplo.com/nc");
+        let (sv, _) = nc.server(&s).unwrap();
+        assert_eq!((sv.host.as_str(), sv.root.as_str()), ("exemplo.com", "/nc/remote.php/webdav"));
+
+        // Full Nextcloud WebDAV URL pasted keeps its exact path.
+        nc.host = TextEdit::new("https://cloud.exemplo.com/remote.php/dav/files/ana");
+        let (sv, _) = nc.server(&s).unwrap();
+        assert_eq!(sv.root, "/remote.php/dav/files/ana");
+
+        // An install's address typed in the picker or the address bar reaches its WebDAV too.
+        let typed = Form::of_address(&parse_address("https://exemplo.com/nextcloud/").unwrap());
+        let (sv, _) = typed.server(&s).unwrap();
+        assert_eq!((typed.provider, sv.brand, sv.root.as_str()), (Provider::Nextcloud, Some(Brand::Nextcloud), "/nextcloud/remote.php/webdav"));
+        let typed = Form::of_address(&parse_address("https://exemplo.com/nextcloud/remote.php/dav/files/ana").unwrap());
+        assert_eq!(typed.folder.text, "/nextcloud/remote.php/dav/files/ana");
     }
 }
 
@@ -1002,7 +1400,7 @@ mod real {
         while std::net::TcpStream::connect(("127.0.0.1", 28097)).is_err() {
             std::thread::sleep(Duration::from_millis(100));
         }
-        let server = Server { id: "teste-app".into(), name: "Teste".into(), protocol: Protocol::Dav, host: "127.0.0.1".into(), port: 28097, user: String::new(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
+        let server = Server { id: "teste-app".into(), name: "Teste".into(), protocol: Protocol::Dav, brand: None, host: "127.0.0.1".into(), port: 28097, user: String::new(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
         let mut s = crate::init();
         s.cache = crate::cache::Cache::memory_only();
         s.servers.list = vec![server.clone()];
@@ -1267,6 +1665,7 @@ mod real {
             id: id.into(),
             name: id.into(),
             protocol,
+            brand: None,
             host: "127.0.0.1".into(),
             port,
             user: "ana".into(),
@@ -1352,7 +1751,7 @@ mod real {
         std::fs::write(base.join("Fotos/2024/praia.jpg"), b"0123456789").unwrap();
         std::fs::write(base.join("Fotos/capa.txt"), b"capa").unwrap();
         let _guard = Served(rclone("sftp", &base, 28520), base.clone());
-        let server = Server { id: "drag".into(), name: "drag".into(), protocol: Protocol::Sftp, host: "127.0.0.1".into(), port: 28520, user: "ana".into(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
+        let server = Server { id: "drag".into(), name: "drag".into(), protocol: Protocol::Sftp, brand: None, host: "127.0.0.1".into(), port: 28520, user: "ana".into(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
         let store = Store::at(base.join("servers.json"));
         store.save(server.clone(), Some("s3nh@")).unwrap();
         let pool = std::sync::Arc::new(Pool::default());
@@ -1399,7 +1798,7 @@ mod real {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let _guard = Served(rclone("webdav", &base, 28530), base.clone());
-        let server = Server { id: "do-drive".into(), name: "do-drive".into(), protocol: Protocol::Dav, host: "127.0.0.1".into(), port: 28530, user: "ana".into(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
+        let server = Server { id: "do-drive".into(), name: "do-drive".into(), protocol: Protocol::Dav, brand: None, host: "127.0.0.1".into(), port: 28530, user: "ana".into(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
         s.servers.store = Store::at(base.join("servers.json"));
         s.servers.store.save(server.clone(), Some("s3nh@")).unwrap();
         let from = Location::Drive { email: email.clone(), space: crate::model::Space::MyDrive, path: Vec::new() };

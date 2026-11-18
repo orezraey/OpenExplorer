@@ -325,13 +325,13 @@ impl Pane {
 
     /// Lists a local or simulated folder in place. Drive folders, and the network's, load in the
     /// background instead.
-    pub fn load_now(&mut self, mock: &MockDrive) {
+    pub fn load_now(&mut self, mock: &MockDrive, show_hidden: bool) {
         self.free = match &self.loc {
             Location::Local(dir) => free_space(dir),
             _ => None,
         };
         let entries = match &self.loc {
-            Location::Local(dir) => read_local(dir).map_err(|e| format!("{}: {e}", dir.display())),
+            Location::Local(dir) => read_local(dir, show_hidden).map_err(|e| format!("{}: {e}", dir.display())),
             Location::Mock(segs) => Ok(mock.list(segs)),
             Location::Drive { .. } | Location::Found(_) | Location::Server { .. } => return,
         };
@@ -437,9 +437,27 @@ impl Pane {
     }
 }
 
+/// Whether `name` or its OS metadata marks it as hidden (`.` dotfiles, or Windows'
+/// `FILE_ATTRIBUTE_HIDDEN`).
+pub fn is_hidden(name: &str, meta: Option<&std::fs::Metadata>) -> bool {
+    if name.starts_with('.') {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.is_some_and(|m| m.file_attributes() & 0x2 != 0) {
+            return true;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = meta;
+    false
+}
+
 /// What a folder on the computer holds; a computer on the network (`\\servidor`) holds its
 /// shared folders.
-pub fn read_local(dir: &Path) -> std::io::Result<Vec<Entry>> {
+pub fn read_local(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>> {
     if let Some((server, _)) = crate::network::unc(dir).filter(|(_, share)| share.is_empty()) {
         let folder = |name: String| Entry { id: name.clone(), name, is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
         return Ok(crate::network::shares(&server)?.into_iter().map(folder).collect());
@@ -447,9 +465,12 @@ pub fn read_local(dir: &Path) -> std::io::Result<Vec<Entry>> {
     let mut out = Vec::new();
     for item in std::fs::read_dir(dir)? {
         let Ok(item) = item else { continue };
-        let meta = item.metadata().ok();
-        let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
         let name = item.file_name().to_string_lossy().into_owned();
+        let meta = item.metadata().ok();
+        if !show_hidden && is_hidden(&name, meta.as_ref()) {
+            continue;
+        }
+        let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
         out.push(Entry {
             id: name.clone(),
             name,
@@ -937,5 +958,22 @@ mod tests {
             assert_eq!(labels, [r"C:\", "Users", "Ana"]);
             assert_eq!(c[1].to, Location::Local(PathBuf::from(r"C:\Users")));
         }
+    }
+
+    #[test]
+    fn hidden_entries_follow_show_hidden() {
+        let dir = std::env::temp_dir().join(format!("oe-hidden-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".segredo")).unwrap();
+        std::fs::write(dir.join("visivel.txt"), "oi").unwrap();
+        std::fs::write(dir.join(".oculto"), "x").unwrap();
+        let names = |show: bool| -> Vec<String> {
+            let mut v: Vec<String> = read_local(&dir, show).unwrap().into_iter().map(|e| e.name).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(false), ["visivel.txt"]);
+        assert_eq!(names(true), [".oculto", ".segredo", "visivel.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -39,8 +39,8 @@ pub enum Dialog {
     /// The name being typed is `State::name_edit`.
     NewFolder { pane: usize, error: Option<String> },
     Properties(Box<Props>),
-    /// Opções: the theme and transfers at once, applied as they change.
-    Options,
+    /// Opções: appearance, file behaviour, transfers and logs, applied as they change.
+    Options(Box<crate::settings::OptionsView>),
     /// Names an upload would repeat in its Drive folder: Substituir, Pular or Manter os dois.
     Clash(Box<ClashAsk>),
     /// Compartilhar: who has access to a Drive item.
@@ -896,7 +896,7 @@ pub fn ask_delete(s: &mut State, p: usize) {
     // The network and WSL have no Lixeira: Del deletes for good there, after asking (as
     // Explorer does). By the items' own paths, so a search's results there count too.
     let loc = &s.panes[p].loc;
-    if matches!(loc, Location::Server { .. }) || items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_remote(&path)) {
+    if (loc.is_local() && s.settings.skip_recycle_bin) || matches!(loc, Location::Server { .. }) || items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_remote(&path)) {
         s.dialog = Some(Dialog::Purge { pane: p, items });
         return;
     }
@@ -1548,7 +1548,7 @@ mod tests {
         s.panes[0] = crate::model::Pane::new(Location::Local(a.clone()));
         s.panes[1] = crate::model::Pane::new(Location::Local(b.clone()));
         for p in &mut s.panes {
-            p.load_now(&s.mock);
+            p.load_now(&s.mock, s.settings.show_hidden);
         }
         s.clip = Some(Clip { mode: ClipMode::Cut, from: Location::Local(b.clone()), items: Vec::new() });
 

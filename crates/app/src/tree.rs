@@ -232,7 +232,7 @@ fn disk_node(path: &Path, kind: DriveKind) -> Node {
 }
 
 fn account_node(email: &str) -> Node {
-    Node { id: NodeId::Account(email.into()), label: email.into(), icon: None, fallback: &icons::CLOUD, to: Some(Location::drive(email, Space::MyDrive)), opens: true }
+    Node { id: NodeId::Account(email.into()), label: email.into(), icon: None, fallback: &icons::PROVIDER_GDRIVE, to: Some(Location::drive(email, Space::MyDrive)), opens: true }
 }
 
 /// One of an account's spaces: Meu Drive and Drives compartilhados open; Drive's lists don't.
@@ -274,7 +274,7 @@ fn mock_node(segs: Vec<String>) -> Node {
 fn remote_node(server: &openexplorer_remote::Server, path: Vec<String>) -> Node {
     let (label, icon, fallback): (String, Option<IconKey>, &'static Icon) = match path.last() {
         Some(name) => (name.clone(), Some(IconKey::Folder), &icons::FOLDER),
-        None => (server.name.clone(), None, &icons::SERVER),
+        None => (server.name.clone(), None, crate::servers::Provider::of_server(server).icon()),
     };
     let to = crate::servers::folder(server, path.clone());
     Node { id: NodeId::Server(server.id.clone(), path), label, icon, fallback, to: Some(to), opens: true }
@@ -309,19 +309,22 @@ fn load(s: &mut State, node: &Node) {
         return;
     }
     let id = node.id.clone();
+    // Folders read from disk or a server follow Exibir arquivos ocultos: an answer read with the
+    // setting since changed is dropped (see `arrived`).
+    let hidden = matches!(node.id, NodeId::Desktop | NodeId::Local(_) | NodeId::Server(..)).then_some(s.settings.show_hidden);
     let done = {
         let id = id.clone();
-        move |result| Msg::TreeKids { id, result }
+        move |result| Msg::TreeKids { id, hidden, result }
     };
     match (&node.id, node.to.clone()) {
         (NodeId::Network, _) => return search_network(s),
         (NodeId::Desktop, _) => {
-            let places = s.places.clone();
-            background(s, move |emit| emit(done(crate::catch_panic("ler a área de trabalho", || Ok(desktop_kids(&places))))));
+            let (places, show_hidden) = (s.places.clone(), s.settings.show_hidden);
+            background(s, move |emit| emit(done(crate::catch_panic("ler a área de trabalho", || Ok(desktop_kids(&places, show_hidden))))));
         }
         (NodeId::Local(path), _) => {
-            let (places, path) = (s.places.clone(), path.clone());
-            background(s, move |emit| emit(done(crate::catch_panic("ler as pastas", || local_kids(&places, &path)))));
+            let (places, path, show_hidden) = (s.places.clone(), path.clone(), s.settings.show_hidden);
+            background(s, move |emit| emit(done(crate::catch_panic("ler as pastas", || local_kids(&places, &path, show_hidden)))));
         }
         (NodeId::Drive(email, _), Some(Location::Drive { space, path, .. })) => {
             let (email2, space2) = (email.clone(), space.clone());
@@ -340,9 +343,9 @@ fn load(s: &mut State, node: &Node) {
             drive_task(s, &email.clone(), "ler as pastas do Drive", work, done);
         }
         (NodeId::Server(_, path), Some(Location::Server { server, .. })) => {
-            let (pool, server, path) = (s.servers.pool.clone(), server.clone(), path.clone());
+            let (pool, server, path, show_hidden) = (s.servers.pool.clone(), server.clone(), path.clone(), s.settings.show_hidden);
             background(s, move |emit| {
-                let result = crate::catch_panic("ler as pastas do servidor", || crate::servers::folders(&pool, &server, &path));
+                let result = crate::catch_panic("ler as pastas do servidor", || crate::servers::folders(&pool, &server, &path, show_hidden));
                 emit(done(result.map(|names| sorted(names.into_iter().map(|n| remote_node(&server, extend_segs(&path, &n))).collect()))));
             });
         }
@@ -390,12 +393,12 @@ fn extend(path: &[(String, String)], id: &str, name: &str) -> Vec<(String, Strin
 
 /// Área de Trabalho's folders: the desktop's own (the user's and the shared one), the user's
 /// folders, the home folder and Este Computador, by name.
-fn desktop_kids(places: &Places) -> Vec<Node> {
+fn desktop_kids(places: &Places, show_hidden: bool) -> Vec<Node> {
     let mut seen = HashSet::new();
     let mut nodes = Vec::new();
     let on_desktop = places.desktop.iter().map(|(p, _)| p.clone()).chain(places.desktop_also.iter().cloned());
     for dir in on_desktop {
-        for path in subfolders(&dir).unwrap_or_default() {
+        for path in subfolders(&dir, show_hidden).unwrap_or_default() {
             if seen.insert(path.clone()) {
                 nodes.push(local_node(places, path));
             }
@@ -415,30 +418,70 @@ fn beside_computer(places: &Places) -> Vec<Node> {
     [computer_node(), network_node()].into_iter().chain((!places.wsl.is_empty()).then(linux_node)).collect()
 }
 
-fn local_kids(places: &Places, dir: &Path) -> Result<Vec<Node>, String> {
-    let folders = subfolders(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+fn local_kids(places: &Places, dir: &Path, show_hidden: bool) -> Result<Vec<Node>, String> {
+    let folders = subfolders(dir, show_hidden).map_err(|e| format!("{}: {e}", dir.display()))?;
     Ok(sorted(folders.into_iter().map(|p| local_node(places, p)).collect()))
 }
 
 /// The folders in `dir` (links to folders included). The listing already says which entries
 /// are folders; only a link is looked up, so a folder of thousands of files costs no more.
-fn folders_in(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let folder = |e: &std::fs::DirEntry| e.file_type().is_ok_and(|t| t.is_dir() || (t.is_symlink() && e.path().is_dir()));
+fn folders_in(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<PathBuf>> {
+    let folder = |e: &std::fs::DirEntry| {
+        if !e.file_type().is_ok_and(|t| t.is_dir() || (t.is_symlink() && e.path().is_dir())) {
+            return false;
+        }
+        if show_hidden {
+            return true;
+        }
+        let name = e.file_name().to_string_lossy().into_owned();
+        !crate::model::is_hidden(&name, e.metadata().ok().as_ref())
+    };
     Ok(std::fs::read_dir(dir)?.filter_map(Result::ok).filter(folder).map(|e| e.path()).collect())
 }
 
 /// The folders in `dir`; in a computer on the network, its shared folders.
-fn subfolders(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+fn subfolders(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<PathBuf>> {
     if let Some((server, share)) = network::unc(dir)
         && share.is_empty()
     {
         return Ok(network::shares(&server)?.into_iter().map(|name| share_path(&server, &name)).collect());
     }
-    folders_in(dir)
+    folders_in(dir, show_hidden)
 }
 
-/// `id`'s folders arrived.
-pub fn arrived(s: &mut State, id: NodeId, result: Result<Vec<Node>, String>) {
+/// Re-reads open local and server nodes in the tree after `show_hidden` changes.
+pub fn refresh_hidden(s: &mut State) {
+    s.tree.kids.retain(|id, _| !matches!(id, NodeId::Desktop | NodeId::Local(_) | NodeId::Server(..)));
+    s.tree.version += 1;
+    let opened: HashSet<NodeId> = s.tree.open[0].iter().chain(s.tree.open[1].iter()).cloned().collect();
+    if opened.contains(&NodeId::Desktop)
+        && let Some(d) = desktop_node(&s.places)
+    {
+        load(s, &d);
+    }
+    for id in opened {
+        match id {
+            NodeId::Local(path) => {
+                let n = local_node(&s.places, path);
+                load(s, &n);
+            }
+            NodeId::Server(sv_id, segs) => {
+                if let Some(sv) = s.servers.list.iter().find(|sv| sv.id == sv_id).cloned() {
+                    load(s, &remote_node(&sv, segs));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `id`'s folders arrived, read with Exibir arquivos ocultos as `hidden` says (`None` where it
+/// doesn't matter). Read before the setting changed, they're dropped: `refresh_hidden` asked for
+/// them again.
+pub fn arrived(s: &mut State, id: NodeId, hidden: Option<bool>, result: Result<Vec<Node>, String>) {
+    if hidden.is_some_and(|h| h != s.settings.show_hidden) {
+        return;
+    }
     s.tree.kids.insert(id, result.map_or_else(Kids::Failed, Kids::Ready));
     s.tree.version += 1;
 }
@@ -622,14 +665,11 @@ pub fn lines(s: &State, p: usize) -> Vec<Line> {
             }
         }
     }
-    if !s.accounts.is_empty() {
-        w.out.push(Line::Heading("Google Drive"));
+    if !s.accounts.is_empty() || !s.servers.list.is_empty() {
+        w.out.push(Line::Heading("Contas"));
     }
     for a in &s.accounts {
         w.node(account_node(&a.email), 0);
-    }
-    if !s.servers.list.is_empty() {
-        w.out.push(Line::Heading("Servidores"));
     }
     for server in &s.servers.list {
         w.node(remote_node(server, Vec::new()), 0);
@@ -756,9 +796,9 @@ mod tests {
     fn the_desktop_and_a_folder_list_their_folders() {
         let (s, root) = scene("lists");
         let labels = |nodes: Vec<Node>| nodes.into_iter().map(|n| n.label).collect::<Vec<_>>();
-        assert_eq!(labels(desktop_kids(&s.places)), ["Downloads", "Este Computador", "Linux", "Pessoal", "Projeto", "Rede"]);
-        assert_eq!(labels(local_kids(&s.places, &root.join("Home")).unwrap()), ["Downloads", "Notas"]);
-        assert!(local_kids(&s.places, &root.join("não existe")).is_err());
+        assert_eq!(labels(desktop_kids(&s.places, true)), ["Downloads", "Este Computador", "Linux", "Pessoal", "Projeto", "Rede"]);
+        assert_eq!(labels(local_kids(&s.places, &root.join("Home"), true).unwrap()), ["Downloads", "Notas"]);
+        assert!(local_kids(&s.places, &root.join("não existe"), true).is_err());
     }
 
     /// A folder on the network hangs from Rede › its computer (as Rede spells it) › its shared
@@ -836,7 +876,7 @@ mod tests {
         s.tree.kids.insert(dados.clone(), Kids::Ready(Vec::new()));
         std::fs::create_dir_all(root.join("Disco/Dados/2025")).unwrap();
         let State { panes, mock, .. } = &mut s;
-        panes[0].load_now(mock);
+        panes[0].load_now(mock, true);
         learn(&mut s, 0);
         let Some(Kids::Ready(kids)) = s.tree.kids.get(&dados) else { panic!("not read") };
         assert_eq!(kids.iter().map(|k| k.label.as_str()).collect::<Vec<_>>(), ["2024", "2025"]);
@@ -865,5 +905,21 @@ mod tests {
         s.tree.open[1].insert(NodeId::Account("a@b".into()));
         s.tree.forget("a@b");
         assert!(s.tree.kids.keys().all(|id| !matches!(id, NodeId::Drive(..))) && !s.tree.open[1].contains(&NodeId::Account("a@b".into())));
+    }
+
+    /// Folders read before Exibir arquivos ocultos changed don't land over the ones read after.
+    #[test]
+    fn folders_read_with_the_old_hidden_setting_are_dropped() {
+        let (mut s, root) = scene("hidden-race");
+        let home = NodeId::Local(root.join("Home"));
+        s.settings.show_hidden = true;
+        arrived(&mut s, home.clone(), Some(false), Ok(Vec::new()));
+        assert!(!s.tree.kids.contains_key(&home));
+        arrived(&mut s, home.clone(), Some(true), Ok(Vec::new()));
+        assert!(matches!(s.tree.kids.get(&home), Some(Kids::Ready(_))));
+        // Drive's folders don't depend on it.
+        let drive = NodeId::Account("a@b".into());
+        arrived(&mut s, drive.clone(), None, Ok(Vec::new()));
+        assert!(matches!(s.tree.kids.get(&drive), Some(Kids::Ready(_))));
     }
 }

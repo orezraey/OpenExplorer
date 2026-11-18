@@ -288,7 +288,7 @@ mod tests {
         while TcpStream::connect(("127.0.0.1", 21250)).is_err() {
             std::thread::sleep(Duration::from_millis(100));
         }
-        let server = Server { id: "x".into(), name: "x".into(), protocol: Protocol::Ftp, host: "127.0.0.1".into(), port: 21250, user: "u".into(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
+        let server = Server { id: "x".into(), name: "x".into(), protocol: Protocol::Ftp, brand: None, host: "127.0.0.1".into(), port: 21250, user: "u".into(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
         let mut c = Ftp::connect(&server, "p", &crate::tls::Trust::default()).unwrap();
         let offered = c.mlsd;
         for mlsd in [true, false] {
