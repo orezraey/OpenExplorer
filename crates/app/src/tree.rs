@@ -822,11 +822,9 @@ pub fn fixed_icons(places: &Places, drives: &[(PathBuf, DriveKind)]) -> Vec<Icon
 // ---------------------------------------------------------------------------------------------
 // Keyboard
 
-/// How long typing may pause before the next letter starts a new name, in seconds.
-const TYPE_PAUSE: f64 = 0.8;
-
-/// Rows Page Up and Page Down move by.
-const PAGE: isize = 20;
+/// How long typing may pause before the next letter starts a new name, in seconds: the file
+/// list's own pause, so a name is typed at one speed everywhere.
+const TYPE_PAUSE: f64 = crate::keyboard::PAUSE;
 
 /// What a key does in a pane's tree.
 #[derive(Clone, Debug, PartialEq)]
@@ -906,6 +904,8 @@ fn resolve(lines: &[Line], cursor: Option<&str>) -> Option<(usize, bool)> {
 /// Does `m` in pane `p`'s tree at `now` (app clock, seconds): moves the keyboard's row, opens or
 /// closes a node, or goes to a node's place. The key of the keyboard's row, to bring into view.
 pub fn press(s: &mut State, p: usize, m: Move, now: f64) -> Option<String> {
+    // A page is the rows the tree shows, as in the file list.
+    let page = crate::keyboard::page((s.edges[p].tree.height() / crate::ROW_H).floor() as usize) as isize;
     let all = lines(s, p);
     let (at, kept) = resolve(&all, s.tree.cursor[p].as_deref())?;
     if !matches!(m, Move::Type(_)) {
@@ -920,8 +920,8 @@ pub fn press(s: &mut State, p: usize, m: Move, now: f64) -> Option<String> {
         Move::Up | Move::Down if !kept => at,
         Move::Up => step(-1),
         Move::Down => step(1),
-        Move::PageUp => step(-PAGE),
-        Move::PageDown => step(PAGE),
+        Move::PageUp => step(-page),
+        Move::PageDown => step(page),
         Move::First => rows[0].0,
         Move::Last => rows[rows.len() - 1].0,
         Move::Open if node.opens && !*empty && !*open => {
@@ -967,17 +967,14 @@ fn find_typed(s: &mut State, p: usize, all: &[Line], here: usize, t: &str, now: 
     }
     *at = now;
     typed.push_str(t);
-    let typed = String::from_utf8(fold(typed)).unwrap_or_default();
-    let first = typed.chars().next()?;
-    let repeated = typed.chars().all(|c| c == first);
-    let (wanted, from) = if repeated { (first.to_string().into_bytes(), here + 1) } else { (typed.into_bytes(), here) };
     let rows: Vec<usize> = nodes(all).map(|(i, _)| i).collect();
-    let n = rows.len();
-    (0..n).map(|k| rows[(from + k) % n]).find(|&i| matches!(&all[i], Line::Node { node, .. } if fold(&node.label).starts_with(&wanted)))
-}
-
-fn fold(text: &str) -> Vec<u8> {
-    openexplorer_index::fold::fold(text)
+    // Matched as the file list matches: the same folding, cycling and continuing.
+    let k = crate::keyboard::find_by(rows.len(), Some(here), typed, |k, out| {
+        if let Line::Node { node, .. } = &all[rows[k]] {
+            openexplorer_index::fold::fold_into(&node.label, out);
+        }
+    })?;
+    Some(rows[k])
 }
 
 /// Keys while pane `p`'s tree has focus. The tree takes those it moves by, and those that would

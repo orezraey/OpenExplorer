@@ -48,6 +48,11 @@ impl Typeahead {
 /// cursor, coming round to the top; a longer start may be the cursor's own name, so typing on
 /// ("d", "do", "doc") stays on "Documentos" while it still fits.
 pub fn find(entries: &[Entry], from: Option<usize>, query: &str) -> Option<usize> {
+    find_by(entries.len(), from, query, |i, out| openexplorer_index::fold::fold_into(&shown(&entries[i].name), out))
+}
+
+/// [`find`] over any `n` names (the tree's rows too), `name` folding the `i`th into its buffer.
+pub fn find_by(n: usize, from: Option<usize>, query: &str, mut name: impl FnMut(usize, &mut Vec<u8>)) -> Option<usize> {
     let folded = String::from_utf8(openexplorer_index::fold::fold(query)).ok()?;
     let mut chars = folded.chars();
     let first = chars.next()?;
@@ -58,12 +63,11 @@ pub fn find(entries: &[Entry], from: Option<usize>, query: &str) -> Option<usize
     } else {
         (folded.as_bytes(), from.unwrap_or(0))
     };
-    let n = entries.len();
-    let mut name = Vec::new();
+    let mut buf = Vec::new();
     (0..n).map(|k| (start + k) % n).find(|&i| {
-        name.clear();
-        openexplorer_index::fold::fold_into(&shown(&entries[i].name), &mut name);
-        name.starts_with(want)
+        buf.clear();
+        name(i, &mut buf);
+        buf.starts_with(want)
     })
 }
 

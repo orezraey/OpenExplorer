@@ -164,7 +164,18 @@ fn count(n: usize) -> String {
 // ---------------------------------------------------------------------------------------------
 // Open
 
+/// A result of pane `p`'s search is being opened: the words found it, so ↑ in the search field
+/// brings them back, though the search ran as they were typed rather than with Enter.
+pub fn remember_search(s: &mut State, p: usize) {
+    let results = s.panes[p].loc.finds() || matches!(&s.panes[p].loc, Location::Drive { space: Space::Search(_), path, .. } if path.is_empty());
+    if results {
+        let words = s.search[p].text.clone();
+        s.history.add_search(&words);
+    }
+}
+
 pub fn open(s: &mut State, p: usize, _: &mut Tx) {
+    remember_search(s, p);
     let items = selected(s, p);
     let [item] = items.as_slice() else {
         if !items.is_empty() {

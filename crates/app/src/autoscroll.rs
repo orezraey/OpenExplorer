@@ -63,6 +63,11 @@ impl Default for Watch {
 }
 
 impl Watch {
+    /// The viewport's height as last drawn (0 before it was).
+    pub fn height(&self) -> f32 {
+        self.rect.get()[3]
+    }
+
     /// Has the scroll viewport `scroll` report where it draws and how far it scrolled here.
     pub fn on(&self, scroll: El) -> El {
         let pos = self.pos.clone();

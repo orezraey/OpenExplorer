@@ -182,15 +182,27 @@ pub fn moved(s: &mut State, p: usize, at: [f32; 2]) -> bool {
     beyond(at[1], s.views[p].scroll.get().h) != 0.0
 }
 
-/// Pane `p`'s lasso ended; `cancelled` (Escape) puts back what was selected before it.
+/// Pane `p`'s lasso ended; `cancelled` (Escape) puts back what was selected before it. Else the
+/// keyboard goes on from the rectangle, as in Explorer: the cursor on the touched row where the
+/// drag ended, the anchor (for Shift) on the one where it started.
 pub fn released(s: &mut State, p: usize, cancelled: bool) {
     let Some(l) = s.lasso.take_if(|l| l.pane == p) else { return };
+    let scroll = s.views[p].scroll.get();
+    let pane = &mut s.panes[p];
     if cancelled {
-        let pane = &mut s.panes[p];
         pane.selected = l.before;
         pane.anchor = l.anchor;
         pane.cursor = l.cursor;
+        return;
     }
+    let rows = hits(l.rect(scroll), pane.entries.len(), f32::MAX);
+    if !l.moved || rows.is_empty() {
+        return;
+    }
+    let down = content(l.pointer, scroll)[1] >= l.start[1];
+    let (from, to) = if down { (rows.start, rows.end - 1) } else { (rows.end - 1, rows.start) };
+    pane.anchor = Some(pane.entries[from].id.clone());
+    pane.cursor = Some(pane.entries[to].id.clone());
 }
 
 /// From `poll`: while the pointer rests past the list's top or bottom edge, scrolls it a step
@@ -344,6 +356,26 @@ mod tests {
         assert!(press(&mut s, 1, [30.0, 200.0], false));
         released(&mut s, 1, false);
         assert!(s.panes[1].selected.is_empty());
+    }
+
+    /// After a rectangle, the keyboard goes on from it: the cursor on the row where the drag
+    /// ended, the anchor where it started, whichever way it went.
+    #[test]
+    fn the_keyboard_goes_on_from_the_rectangle() {
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        s.panes[1].set_entries(Ok((0..20).map(|i| crate::model::Entry { id: format!("f{i}"), name: format!("arquivo {i:02}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false }).collect()));
+        s.views[1].scroll.set(Scroll { x: 0.0, y: 0.0, max_y: 0.0, h: 600.0 });
+        s.panes[1].cursor = Some("f15".into());
+        press(&mut s, 1, [30.0, HEADER_H + 2.5 * ROW_H], false);
+        moved(&mut s, 1, [60.0, HEADER_H + 5.5 * ROW_H]);
+        released(&mut s, 1, false);
+        assert_eq!((s.panes[1].anchor.as_deref(), s.panes[1].cursor.as_deref()), (Some("f2"), Some("f5")));
+        // Drawn upward, the other way round.
+        press(&mut s, 1, [30.0, HEADER_H + 8.5 * ROW_H], false);
+        moved(&mut s, 1, [60.0, HEADER_H + 6.5 * ROW_H]);
+        released(&mut s, 1, false);
+        assert_eq!((s.panes[1].anchor.as_deref(), s.panes[1].cursor.as_deref()), (Some("f8"), Some("f6")));
     }
 
     /// The keyboard's menu opens under the row it's for, scrolling it into view first when

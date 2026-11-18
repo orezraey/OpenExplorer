@@ -968,6 +968,7 @@ fn go_forward(s: &mut State, p: usize) {
 }
 
 fn open(s: &mut State, p: usize, id: &str) {
+    actions::remember_search(s, p);
     let pane = &mut s.panes[p];
     let Some(e) = pane.entry(id).cloned() else { return };
     if !e.is_dir {
