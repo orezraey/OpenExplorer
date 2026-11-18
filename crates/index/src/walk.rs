@@ -110,7 +110,7 @@ mod tests {
         let t = walk(&root);
         assert_eq!(t.len(), 3);
         let mut out = Vec::new();
-        assert_eq!(t.search(&Query::new("relatorio").unwrap(), None, 10, 2, &mut out), 1);
+        assert_eq!(t.search(&Query::new("relatorio").unwrap(), None, false, 10, 2, &mut out), 1);
         let row = t.row(out[0]).unwrap();
         assert_eq!(row.path, format!("{root}Sub Pasta{sep}Relatório.txt"));
         assert_eq!((row.is_dir, row.size), (false, 3));

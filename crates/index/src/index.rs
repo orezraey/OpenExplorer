@@ -113,7 +113,7 @@ impl Index {
             };
             searched = true;
             let mut found = Vec::new();
-            total += tree.search(&query, within, req.limit.min(MAX_ROWS).saturating_sub(rows.len()), self.threads, &mut found);
+            total += tree.search(&query, within, req.skip_hidden, req.limit.min(MAX_ROWS).saturating_sub(rows.len()), self.threads, &mut found);
             rows.extend(found.into_iter().filter_map(|r| tree.row(r)));
         }
         let took_us = t.elapsed().as_micros() as u64;
@@ -187,7 +187,7 @@ mod tests {
         let c = vol("C:\\", &[(30, ROOT, "Projetos", DIR), (31, 30, "plano.txt", 0), (32, ROOT, "plano velho.txt", 0)]);
         let d = vol("D:\\", &[(30, ROOT, "Backup", DIR), (31, 30, "plano.txt", 0)]);
         let index = Index::new(vec![c, d]);
-        let ask = |text: &str, within: Option<&str>, limit| index.answer(&Request { text: text.into(), within: within.map(Into::into), limit });
+        let ask = |text: &str, within: Option<&str>, limit| index.answer(&Request { text: text.into(), within: within.map(Into::into), limit, ..Request::default() });
         let a = ask("PLANO", None, 100);
         assert_eq!((a.header.total, a.rows.len()), (3, 3));
         assert_eq!(a.header.volumes.iter().map(|v| (v.root.as_str(), v.files, v.indexing)).collect::<Vec<_>>(), [("C:\\", 3, false), ("D:\\", 2, false)]);

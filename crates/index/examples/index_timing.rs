@@ -29,7 +29,7 @@ fn main() {
                 let mut rows = 0;
                 for tree in &trees {
                     let mut out = Vec::new();
-                    total += tree.search(&query, None, 1000, threads, &mut out);
+                    total += tree.search(&query, None, false, 1000, threads, &mut out);
                     rows += out.iter().filter_map(|r| tree.row(*r)).count();
                 }
                 assert!(rows <= 1000 * trees.len());

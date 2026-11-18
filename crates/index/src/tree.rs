@@ -388,9 +388,14 @@ impl Tree {
         None
     }
 
-    /// Whether `record` sits somewhere under the folder `dir`, and reaches the root.
-    fn is_under(&self, record: u32, dir: u32) -> bool {
-        let mut r = self.nodes.get(record as usize).map_or(NONE, |n| n.parent);
+    /// Whether `record` sits somewhere under the folder `dir`, and reaches the root; with
+    /// `skip_hidden`, also that neither it nor a folder between it and `dir` is hidden.
+    fn is_under(&self, record: u32, dir: u32, skip_hidden: bool) -> bool {
+        let Some(n) = self.nodes.get(record as usize) else { return false };
+        if skip_hidden && self.hidden(n) {
+            return false;
+        }
+        let mut r = n.parent;
         for _ in 0..MAX_DEPTH {
             if r == dir {
                 return true;
@@ -399,11 +404,16 @@ impl Tree {
                 return false;
             }
             match self.nodes.get(r as usize) {
-                Some(n) if n.slot != NONE => r = n.parent,
+                Some(n) if n.slot != NONE && !(skip_hidden && self.hidden(n)) => r = n.parent,
                 _ => return false,
             }
         }
         false
+    }
+
+    /// Hidden by its attribute, or a dotfile.
+    fn hidden(&self, n: &Node) -> bool {
+        n.slot != NONE && (n.flags & HIDDEN != 0 || self.name_of(n.slot).starts_with('.'))
     }
 
     pub fn row(&self, record: u32) -> Option<Row> {
@@ -436,11 +446,13 @@ impl Tree {
 
     /// Records whose name holds every word of `q`, under the folder `within` when given: up to
     /// `limit` of them in `out`; returns how many there are in all. Runs on `threads` threads.
-    pub fn search(&self, q: &Query, within: Option<u32>, limit: usize, threads: usize, out: &mut Vec<u32>) -> usize {
+    /// With `skip_hidden`, hidden files and what's inside hidden folders below `within` are left
+    /// out, as a listing without hidden files would.
+    pub fn search(&self, q: &Query, within: Option<u32>, skip_hidden: bool, limit: usize, threads: usize, out: &mut Vec<u32>) -> usize {
         let n = self.slots.len();
         let threads = threads.clamp(1, 64).min(n / 20_000 + 1);
         let parts: Vec<(usize, Vec<u32>)> = std::thread::scope(|scope| {
-            let jobs: Vec<_> = (0..threads).map(|t| (n * t / threads, n * (t + 1) / threads)).map(|(a, b)| scope.spawn(move || self.search_slots(q, within, limit, a, b))).collect();
+            let jobs: Vec<_> = (0..threads).map(|t| (n * t / threads, n * (t + 1) / threads)).map(|(a, b)| scope.spawn(move || self.search_slots(q, within, skip_hidden, limit, a, b))).collect();
             jobs.into_iter().map(|j| j.join().unwrap_or_default()).collect()
         });
         let mut total = 0;
@@ -453,7 +465,7 @@ impl Tree {
     }
 
     /// [`Tree::search`] over the slots `a..b`.
-    fn search_slots(&self, q: &Query, within: Option<u32>, limit: usize, a: usize, b: usize) -> (usize, Vec<u32>) {
+    fn search_slots(&self, q: &Query, within: Option<u32>, skip_hidden: bool, limit: usize, a: usize, b: usize) -> (usize, Vec<u32>) {
         if a >= b {
             return (0, Vec::new());
         }
@@ -479,7 +491,7 @@ impl Tree {
                 continue;
             }
             let name = &self.folded[s.folded as usize..skip];
-            if !others.iter().all(|f| f.find(name).is_some()) || !self.is_under(s.record, within.unwrap_or(ROOT)) {
+            if !others.iter().all(|f| f.find(name).is_some()) || !self.is_under(s.record, within.unwrap_or(ROOT), skip_hidden) {
                 continue;
             }
             count += 1;
@@ -614,7 +626,7 @@ mod tests {
 
     fn found(t: &Tree, text: &str, within: Option<u32>) -> Vec<String> {
         let mut out = Vec::new();
-        let total = t.search(&Query::new(text).unwrap(), within, usize::MAX, 4, &mut out);
+        let total = t.search(&Query::new(text).unwrap(), within, false, usize::MAX, 4, &mut out);
         assert_eq!(total, out.len());
         let mut paths: Vec<String> = out.into_iter().map(|r| t.path(r).unwrap()).collect();
         paths.sort();
@@ -643,6 +655,27 @@ mod tests {
         assert_eq!(t.find("C:\\Nada"), None);
         assert_eq!(t.find("D:\\Docs"), None);
         assert_eq!(found(&t, "relatorio", Some(docs)), ["C:\\Docs\\Fotos\\relatorio.jpg", "C:\\Docs\\Relatório 2025.pdf"]);
+    }
+
+    #[test]
+    fn hidden_files_and_what_hidden_folders_hold_can_be_left_out() {
+        let mut t = sample();
+        t.set(60, ROOT, "AppData", DIR | HIDDEN, 0, 0);
+        t.set(61, 60, "relatorio.log", 0, 1, 1);
+        t.set(62, 30, ".relatorio", 0, 1, 1);
+        t.set(63, 30, "relatorio oculto.txt", HIDDEN, 1, 1);
+        let paths = |within: Option<u32>, skip: bool| {
+            let mut out = Vec::new();
+            let total = t.search(&Query::new("relatorio").unwrap(), within, skip, usize::MAX, 2, &mut out);
+            assert_eq!(total, out.len());
+            let mut v: Vec<String> = out.into_iter().map(|r| t.path(r).unwrap()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(paths(None, false).len(), 6);
+        assert_eq!(paths(None, true), ["C:\\Docs\\Fotos\\relatorio.jpg", "C:\\Docs\\Relatório 2025.pdf", "C:\\Outros\\Relatórios"]);
+        // From inside a hidden folder, what it holds still shows.
+        assert_eq!(paths(Some(60), true), ["C:\\AppData\\relatorio.log"]);
     }
 
     #[test]
@@ -714,11 +747,11 @@ mod tests {
             t.set(100 + i, ROOT, &format!("arquivo {i} aa.txt"), 0, 0, 0);
         }
         let mut out = Vec::new();
-        assert_eq!(t.search(&Query::new("aa").unwrap(), None, 10, 8, &mut out), 100_000);
+        assert_eq!(t.search(&Query::new("aa").unwrap(), None, false, 10, 8, &mut out), 100_000);
         assert_eq!(out.len(), 10);
         out.clear();
         let sevens = (0..100_000u32).filter(|i| i.to_string().contains("777")).count();
-        assert_eq!(t.search(&Query::new("arquivo 777").unwrap(), None, usize::MAX, 8, &mut out), sevens);
+        assert_eq!(t.search(&Query::new("arquivo 777").unwrap(), None, false, usize::MAX, 8, &mut out), sevens);
         assert_eq!(out.len(), sevens);
     }
 }

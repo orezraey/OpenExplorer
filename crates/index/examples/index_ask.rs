@@ -9,7 +9,7 @@ fn main() {
         use openexplorer_index::proto::Request;
         let mut args = std::env::args().skip(1);
         let text = args.next().unwrap_or_default();
-        let req = Request { text, within: args.next(), limit: 100_000 };
+        let req = Request { text, within: args.next(), limit: 100_000, ..Request::default() };
         for _ in 0..3 {
             let t = std::time::Instant::now();
             #[cfg(windows)]

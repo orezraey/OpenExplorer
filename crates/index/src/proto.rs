@@ -22,6 +22,10 @@ pub struct Request {
     pub within: Option<String>,
     /// The most rows to send.
     pub limit: usize,
+    /// Leaves out hidden files and dotfiles, and whatever is inside hidden folders below
+    /// `within`. Absent (an older app): everything, as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_hidden: bool,
 }
 
 /// One volume's state.
@@ -106,7 +110,7 @@ mod tests {
 
     #[test]
     fn requests_and_answers_round_trip() {
-        let req = Request { text: "relatório 2025".into(), within: Some("C:\\Users\\Ana Maria".into()), limit: 100 };
+        let req = Request { text: "relatório 2025".into(), within: Some("C:\\Users\\Ana Maria".into()), limit: 100, skip_hidden: true };
         let mut buf = Vec::new();
         write_request(&mut buf, &req).unwrap();
         assert_eq!(read_request(&mut buf.as_slice()).unwrap(), req);
