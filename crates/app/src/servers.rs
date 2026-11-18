@@ -853,6 +853,12 @@ impl Form {
         if let Some(p) = &a.password {
             f.password = TextEdit::new(p.clone()).secure();
         }
+        // The MEGA step shows no host: the e-mail came with the address, the password is next.
+        if provider == Provider::Mega {
+            f.host.focused = false;
+            f.user.focused = false;
+            f.password.focused = true;
+        }
         // Nextcloud and ownCloud serve WebDAV under `/remote.php/…`: an install's own address
         // (`https://host/nextcloud` or a copied `/index.php/apps/files/` URL) gets it normalized.
         if matches!(provider, Provider::Nextcloud | Provider::OwnCloud) {
@@ -1348,8 +1354,7 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
 pub fn remove(s: &mut State, id: &str) {
     let mega = s.servers.list.iter().find(|sv| sv.id == id && sv.is_mega()).cloned();
     if let Some(sv) = &mega {
-        crate::mega::remove(s, sv);
-        if !s.servers.mega.accounts().iter().all(|a| a.email != sv.user) {
+        if !crate::mega::remove(s, sv) {
             return;
         }
     } else if let Err(e) = s.servers.store.remove(id) {

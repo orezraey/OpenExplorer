@@ -127,6 +127,12 @@ impl Session {
     }
 }
 
+/// The session id in a text [`Session::save`] made.
+pub fn sid_of(saved: &str) -> Option<String> {
+    let raw = unb64(saved).ok()?;
+    (raw.len() >= 1 + 16 + 32 && raw[0] == 1).then(|| b64(&raw[17..]))
+}
+
 /// Resumes a session kept by [`Session::save`]: MEGA gives back its session key, which opens the
 /// master key. Fails with MEGA's `ESID` once the session was closed (on the website, say).
 pub fn resume(api: &Api, saved: &str) -> std::result::Result<Session, Fail> {
@@ -201,6 +207,8 @@ mod tests {
         ecb_decrypt(&sek, &mut back);
         assert_eq!(back, master);
         assert_eq!(b64(&saved[17..]), s.sid);
+        assert_eq!(sid_of(&s.save()), Some(s.sid.clone()));
+        assert_eq!(sid_of("AAAA"), None);
         assert!(!format!("{s:?}").contains(&format!("{:?}", master)));
     }
 

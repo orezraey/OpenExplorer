@@ -88,16 +88,18 @@ fn sees_changes_made_elsewhere() {
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let dir = format!("{cloud}/OpenExplorer-outro-{stamp}");
     let made = b.mkdir(&dir).unwrap();
-    let mut seen = false;
-    for _ in 0..10 {
-        if a.poll().unwrap().touches(&root) {
-            seen = true;
-            break;
+    let seen = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for _ in 0..10 {
+            if a.poll().unwrap().touches(&root) {
+                return a.stat(&dir).is_some();
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-    assert!(seen && a.stat(&dir).is_some(), "the other session's new folder arrives");
+        false
+    }));
+    // Gone for good, whatever happened above.
     b.delete(&made).unwrap();
+    assert!(seen.unwrap_or(false), "the other session's new folder arrives");
     let mut gone = false;
     for _ in 0..10 {
         a.poll().unwrap();

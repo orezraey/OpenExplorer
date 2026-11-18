@@ -38,7 +38,7 @@ impl Store {
         // MEGA accounts live in the MEGA crate's store; one here would make an older app read
         // the whole list as empty.
         if server.is_mega() {
-            return Err("MEGA accounts aren't kept in servers.json.".into());
+            return Err(openexplorer_i18n::t("Contas MEGA não ficam na lista de servidores.", "MEGA accounts aren't kept in the list of servers.").into());
         }
         match secret {
             Some("") => forget_secret(&server.id),

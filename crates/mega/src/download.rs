@@ -45,7 +45,8 @@ impl Account {
         while done < size {
             let ranged = if done == 0 { url.clone() } else { format!("{url}/{done}-{}", size - 1) };
             let why = match agent.get(&ranged).call() {
-                Ok(mut resp) if resp.status().as_u16() == 200 => {
+                // A ranged request may answer 206 Partial Content.
+                Ok(mut resp) if matches!(resp.status().as_u16(), 200 | 206) => {
                     let mut ctr = Ctr::new(&key, &nonce, done);
                     let mut body = resp.body_mut().as_reader();
                     loop {
@@ -81,7 +82,8 @@ impl Account {
                 std::thread::sleep(Duration::from_secs(2));
             }
         }
-        if check.finish() != mac {
+        // An empty file has nothing to check, and clients disagree on its MAC.
+        if size > 0 && check.finish() != mac {
             return Err(tr!("“{}” chegou corrompido (a verificação do MEGA não confere).", "“{}” arrived corrupted (MEGA's check doesn't match).", n.name));
         }
         Ok(())

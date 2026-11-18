@@ -511,9 +511,9 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                 for email in touched {
                     ask_quota(s, email);
                 }
-                let megas: Vec<openexplorer_remote::Server> = reload.iter().filter_map(|l| mega::at(l).map(|(sv, _)| sv.clone())).collect();
+                let mut megas: Vec<openexplorer_remote::Server> = reload.iter().filter_map(|l| mega::at(l).map(|(sv, _)| sv.clone())).collect();
+                megas.dedup_by(|a, b| a.id == b.id);
                 for sv in megas {
-                    s.servers.mega_quotas.remove(&sv.id);
                     mega::ask_quota(s, &sv);
                 }
             }

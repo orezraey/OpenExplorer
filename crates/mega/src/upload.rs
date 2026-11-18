@@ -76,8 +76,11 @@ impl Account {
         attrs.insert("n".into(), name.clone().into());
         let node = json!({"h": token, "t": 0, "a": encrypt_attrs(&key, &attrs), "k": self.wrap(&merged)});
         let made = self.put_nodes(&parent.handle, vec![node], &[merged.to_vec()])?.pop().ok_or_else(|| tr!("O MEGA não criou “{name}”.", "MEGA didn't create “{name}”."))?;
+        // The file it replaces goes where a delete would send it (inside a share, for good).
         for n in old {
-            let _ = self.trash(&n);
+            if let Err(e) = self.discard(&n) {
+                crate::api::log(&format!("MEGA: o arquivo substituído ficou: {e}"));
+            }
         }
         Ok(made)
     }

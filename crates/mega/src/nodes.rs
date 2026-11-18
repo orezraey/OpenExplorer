@@ -167,7 +167,10 @@ pub fn decode(keys: &Keys, n: &Value) -> Option<Node> {
 pub struct Tree {
     pub nodes: HashMap<String, Node>,
     /// Each folder's items, by handle.
-    kids: HashMap<String, Vec<String>>,
+    kids: HashMap<String, HashSet<String>>,
+    /// Each folder's items by their own names (twins share one), so a path finds its item
+    /// without going through the folder.
+    names: HashMap<String, HashMap<String, Vec<String>>>,
     pub root: Option<String>,
     pub rubbish: Option<String>,
     pub vault: Option<String>,
@@ -217,7 +220,34 @@ impl Tree {
         self.locked.len() < before
     }
 
-    /// Adds or replaces `n`, keeping its link and moving it in the index of folders.
+    /// Whether any node no key opens hangs from one of `folders`.
+    pub fn locked_within(&self, folders: &HashSet<&str>) -> bool {
+        self.locked.iter().any(|raw| raw.get("p").and_then(Value::as_str).is_some_and(|p| folders.contains(p)))
+    }
+
+    fn index(&mut self, n: &Node) {
+        self.kids.entry(n.parent.clone()).or_default().insert(n.handle.clone());
+        let same = self.names.entry(n.parent.clone()).or_default().entry(n.name.clone()).or_default();
+        if !same.contains(&n.handle) {
+            same.push(n.handle.clone());
+        }
+    }
+
+    fn unindex(&mut self, n: &Node) {
+        if let Some(set) = self.kids.get_mut(&n.parent) {
+            set.remove(&n.handle);
+        }
+        if let Some(by_name) = self.names.get_mut(&n.parent)
+            && let Some(same) = by_name.get_mut(&n.name)
+        {
+            same.retain(|h| *h != n.handle);
+            if same.is_empty() {
+                by_name.remove(&n.name);
+            }
+        }
+    }
+
+    /// Adds or replaces `n`, keeping its link and moving it in the indexes of folders.
     pub fn put(&mut self, mut n: Node) {
         match n.kind {
             Kind::Root => self.root = Some(n.handle.clone()),
@@ -225,34 +255,25 @@ impl Tree {
             Kind::Vault => self.vault = Some(n.handle.clone()),
             _ => {}
         }
-        if let Some(old) = self.nodes.get(&n.handle) {
+        if let Some(old) = self.nodes.remove(&n.handle) {
             if n.link.is_none() {
                 n.link = old.link.clone();
             }
             if n.inshare.is_none() {
                 n.inshare = old.inshare.clone();
             }
-            let old_parent = old.parent.clone();
-            if old_parent != n.parent
-                && let Some(v) = self.kids.get_mut(&old_parent)
-            {
-                v.retain(|h| *h != n.handle);
-            }
+            self.unindex(&old);
         }
-        let list = self.kids.entry(n.parent.clone()).or_default();
-        if !list.contains(&n.handle) {
-            list.push(n.handle.clone());
-        }
+        self.index(&n);
         self.nodes.insert(n.handle.clone(), n);
     }
 
     /// Takes a node out, and with `subtree` all it holds.
     pub fn remove(&mut self, handle: &str, subtree: bool) {
         let Some(n) = self.nodes.remove(handle) else { return };
-        if let Some(v) = self.kids.get_mut(&n.parent) {
-            v.retain(|h| h != handle);
-        }
+        self.unindex(&n);
         if subtree {
+            self.names.remove(handle);
             for kid in self.kids.remove(handle).unwrap_or_default() {
                 self.remove(&kid, true);
             }
@@ -276,6 +297,35 @@ impl Tree {
         let mut nodes: Vec<&Node> = self.kids.get(handle).into_iter().flatten().filter_map(|h| self.nodes.get(h)).collect();
         nodes.sort_by(|a, b| (a.created, &a.handle).cmp(&(b.created, &b.handle)));
         unique_names(nodes)
+    }
+
+    /// The items of folder `handle`, unordered and under their own names.
+    pub fn kids_of<'a>(&'a self, handle: &str) -> impl Iterator<Item = &'a Node> + 'a {
+        self.kids.get(handle).into_iter().flatten().filter_map(|h| self.nodes.get(h))
+    }
+
+    /// The item of folder `parent` the panes call `name`. A name no twin shares is the item's
+    /// own, found without ordering the folder; only twins' names need [`Tree::children`].
+    pub fn child_named(&self, parent: &str, name: &str) -> Option<&Node> {
+        match self.same_name(parent, name) {
+            [one] => return self.nodes.get(one),
+            [] if !twin_name(name) => return None,
+            _ => {}
+        }
+        self.children(parent).into_iter().find(|(shown, _)| shown == name).map(|(_, n)| n)
+    }
+
+    /// The items of folder `parent` whose own name is `name`.
+    pub fn same_name(&self, parent: &str, name: &str) -> &[String] {
+        self.names.get(parent).and_then(|m| m.get(name)).map_or(&[], Vec::as_slice)
+    }
+
+    /// The name node `n` shows with among its folder's items.
+    pub fn shown_name(&self, n: &Node) -> String {
+        if self.same_name(&n.parent, &n.name).len() < 2 {
+            return n.name.clone();
+        }
+        self.children(&n.parent).into_iter().find(|(_, x)| x.handle == n.handle).map_or_else(|| n.name.clone(), |(name, _)| name)
     }
 
     /// The incoming shares' top folders, with unique names.
@@ -357,6 +407,14 @@ impl Tree {
     pub fn bytes_in(&self, handle: &str) -> u64 {
         self.subtree(handle).iter().filter(|n| n.kind == Kind::File).map(|n| n.size).sum()
     }
+}
+
+/// Whether `name` could be a twin's shown name: "stem (k)" before any extension.
+fn twin_name(name: &str) -> bool {
+    let Some(open) = name.rfind(" (") else { return false };
+    let rest = &name[open + 2..];
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && rest[digits..].starts_with(')')
 }
 
 /// Each node's name, a later twin getting "name (2).ext" (the first free number, never another
@@ -470,6 +528,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn twins_are_found_by_their_shown_names_and_others_directly() {
+        let k = keys();
+        let own = (k.user.as_str(), k.master);
+        let mut tree = Tree::default();
+        let mut a = raw(&k, "AAAAAAAA", "ROOT0000", 0, "a.txt", own);
+        let mut b = raw(&k, "BBBBBBBB", "ROOT0000", 0, "a.txt", own);
+        a["ts"] = 5.into();
+        b["ts"] = 9.into();
+        for n in [b, a, raw(&k, "CCCCCCCC", "ROOT0000", 0, "c (1).txt", own)] {
+            tree.put_raw(&k, n);
+        }
+        let h = |n: Option<&Node>| n.map(|n| n.handle.clone());
+        assert_eq!(h(tree.child_named("ROOT0000", "a.txt")), Some("AAAAAAAA".into()));
+        assert_eq!(h(tree.child_named("ROOT0000", "a (2).txt")), Some("BBBBBBBB".into()));
+        assert_eq!(h(tree.child_named("ROOT0000", "c (1).txt")), Some("CCCCCCCC".into()));
+        assert_eq!(h(tree.child_named("ROOT0000", "b.txt")), None);
+        assert_eq!(h(tree.child_named("ROOT0000", "a (9).txt")), None);
+        assert_eq!(tree.shown_name(tree.get("BBBBBBBB").unwrap()), "a (2).txt");
+        assert_eq!(tree.shown_name(tree.get("CCCCCCCC").unwrap()), "c (1).txt");
+        assert!(twin_name("x (2)") && twin_name("x (12).tar.gz") && !twin_name("x (a)") && !twin_name("x"));
+    }
+
+    #[test]
     fn shared_items_open_with_their_share_key_once_it_comes() {
         let mut k = keys();
         let share_key = [9u8; 16];
@@ -503,6 +584,12 @@ pub(crate) mod tests {
         assert_eq!(tree.children("ROOT0000").len(), 1);
         assert_eq!(tree.children("FOLDER01").len(), 2);
         assert_eq!(tree.get("FILE0002").unwrap().link.as_deref(), Some("PUBH0001"), "a link stays through a move");
+        // A rename moves the item in the index of names.
+        let mut renamed = tree.get("FILE0002").unwrap().clone();
+        renamed.name = "novo.txt".into();
+        tree.put(renamed);
+        assert!(tree.child_named("FOLDER01", "nota.txt").is_none());
+        assert_eq!(tree.child_named("FOLDER01", "novo.txt").map(|n| n.handle.as_str()), Some("FILE0002"));
         tree.remove("FOLDER01", true);
         assert!(tree.get("FILE0001").is_none() && tree.get("FILE0002").is_none());
         assert!(tree.children("ROOT0000").is_empty());

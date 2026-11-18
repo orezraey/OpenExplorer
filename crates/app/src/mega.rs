@@ -233,16 +233,18 @@ fn connected(s: &mut State, attempt: u64, result: Result<String, Refused>) {
     crate::navigate(s, p, cloud(&server));
 }
 
-/// Remover conta: the session ends on MEGA's side and leaves the credential store.
-pub fn remove(s: &mut State, server: &Server) {
+/// Remover conta: the session ends on MEGA's side and leaves the credential store. Whether the
+/// account left the list.
+pub fn remove(s: &mut State, server: &Server) -> bool {
     if let Err(e) = s.servers.mega.remove(&server.user) {
         crate::fail(s, e);
-        return;
+        return false;
     }
     let email = server.user.clone();
     std::thread::spawn(move || mega::disconnect(&email));
     s.servers.mega_quotas.remove(&server.id);
     s.servers.mega_watch.remove(&server.id);
+    true
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -260,6 +262,12 @@ fn node_of(a: &Account, loc: &Location, e: &Entry) -> Result<Node, String> {
     Ok(n)
 }
 
+/// The nodes the selected items are, all found before any changes: twins' names shift as
+/// one of them goes, so a name looked up after that could name another node.
+fn nodes_of(a: &Account, loc: &Location, items: &[Entry]) -> Result<Vec<Node>, String> {
+    items.iter().map(|e| node_of(a, loc, e)).collect()
+}
+
 /// Excluir outside the Rubbish Bin: the items go to it, as on the website.
 pub fn trash(s: &mut State, loc: &Location, items: Vec<Entry>) {
     let Some((server, _)) = at(loc) else { return };
@@ -268,8 +276,8 @@ pub fn trash(s: &mut State, loc: &Location, items: Vec<Entry>) {
     let n = items.len();
     let (at_server, loc) = (server.clone(), loc.clone());
     undo::mega_job(s, &server, reload, move |n| tr!("mover {} para a Lixeira do MEGA", "move {} to the MEGA Rubbish Bin", crate::actions::count(n)), move |a, rec| {
-        for (i, e) in items.iter().enumerate() {
-            let node = node_of(a, &loc, e).and_then(|node| a.trash(&node).map(|_| node)).map_err(|err| if i == 0 { err } else { tr!("{err} (já na Lixeira: {i})", "{err} (already in the Rubbish Bin: {i})") })?;
+        for (i, node) in nodes_of(a, &loc, &items)?.into_iter().enumerate() {
+            a.trash(&node).map_err(|err| if i == 0 { err } else { tr!("{err} (já na Lixeira: {i})", "{err} (already in the Rubbish Bin: {i})") })?;
             rec.add([Step::MegaRestore { server: at_server.clone(), node: node.handle, name: node.name }]);
         }
         Ok(tr!("Movido para a Lixeira do MEGA: {}.", "Moved to the MEGA Rubbish Bin: {}.", crate::actions::count(n)))
@@ -286,10 +294,10 @@ pub fn purge(s: &mut State, loc: &Location, items: Vec<Entry>) {
     task(
         s,
         &server,
-        "excluir do MEGA",
+        t("excluir do MEGA", "delete from MEGA"),
         move |a| {
-            for (i, e) in items.iter().enumerate() {
-                node_of(a, &loc, e).and_then(|node| a.delete(&node)).map_err(|err| if i == 0 { err } else { tr!("{err} (já excluídos para sempre: {i})", "{err} (already deleted for good: {i})") })?;
+            for (i, node) in nodes_of(a, &loc, &items)?.iter().enumerate() {
+                a.delete(node).map_err(|err| if i == 0 { err } else { tr!("{err} (já excluídos para sempre: {i})", "{err} (already deleted for good: {i})") })?;
             }
             Ok(tr!("Excluído para sempre: {}.", "Deleted for good: {}.", crate::actions::count(n)))
         },
@@ -308,8 +316,7 @@ pub fn restore(s: &mut State, p: usize) {
     let n = items.len();
     let at_server = server.clone();
     undo::mega_job(s, &server, reload, move |n| tr!("restaurar {}", "restore {}", crate::actions::count(n)), move |a, rec| {
-        for e in &items {
-            let node = node_of(a, &loc, e)?;
+        for node in nodes_of(a, &loc, &items)? {
             a.restore(&node)?;
             rec.add([Step::MegaTrash { server: at_server.clone(), node: node.handle, name: node.name }]);
         }
@@ -325,12 +332,12 @@ pub fn empty_bin(s: &mut State, id: &str) {
     task(
         s,
         &server,
-        "esvaziar a Lixeira do MEGA",
+        t("esvaziar a Lixeira do MEGA", "empty the MEGA Rubbish Bin"),
         |a| {
-            let bin = format!("/{}", Area::Rubbish.label());
-            let items = a.list(&bin)?;
-            for it in &items {
-                a.remove(&format!("{bin}/{}", it.name))?;
+            // By handle: twins' shown names shift as one of them goes.
+            let items = a.list(&format!("/{}", Area::Rubbish.label()))?;
+            for h in items.iter().filter_map(|it| it.handle.as_deref()) {
+                a.delete(&a.node(&mega::handle_path(h))?)?;
             }
             Ok(tr!("Lixeira do MEGA esvaziada: {}.", "MEGA Rubbish Bin emptied: {}.", crate::actions::count(items.len())))
         },
@@ -371,7 +378,7 @@ pub fn copy_link(s: &mut State, p: usize, _: &mut Tx) {
     let Some((server, path, item)) = one_item(s, p) else { return };
     s.status = tr!("Buscando o link de \"{}\"…", "Getting the link for \"{}\"…", item.name);
     let (sv, at_path, it) = (server.clone(), path.clone(), item.clone());
-    task(s, &server, "copiar o link", move |a| Ok(a.link_of(&a.node(&path)?)), move |result| Msg::Mega(Answer::Link { server: Box::new(sv), path: at_path, item: it, result }));
+    task(s, &server, t("copiar o link", "copy the link"), move |a| Ok(a.link_of(&a.node(&path)?)), move |result| Msg::Mega(Answer::Link { server: Box::new(sv), path: at_path, item: it, result }));
 }
 
 /// Criar link e copiar, from the question.
@@ -380,14 +387,14 @@ pub fn make_link(s: &mut State) {
     let MakeLink { server, path, item } = *m;
     s.status = tr!("Criando o link de \"{}\"…", "Making the link for \"{}\"…", item.name);
     let name = item.name.clone();
-    task(s, &server, "criar o link", move |a| a.create_link(&a.node(&path)?).map(Some), move |result| Msg::Mega(Answer::Linked { name, result }));
+    task(s, &server, t("criar o link", "make the link"), move |a| a.create_link(&a.node(&path)?).map(Some), move |result| Msg::Mega(Answer::Linked { name, result }));
 }
 
 /// Remover link: whoever has the link can't open the item any more.
 pub fn remove_link(s: &mut State, p: usize, _: &mut Tx) {
     let Some((server, path, item)) = one_item(s, p) else { return };
     let name = item.name.clone();
-    task(s, &server, "remover o link", move |a| a.remove_link(&a.node(&path)?).map(|_| None), move |result| Msg::Mega(Answer::Linked { name, result }));
+    task(s, &server, t("remover o link", "remove the link"), move |a| a.remove_link(&a.node(&path)?).map(|_| None), move |result| Msg::Mega(Answer::Linked { name, result }));
 }
 
 pub fn link_dialog(k: &Kit, m: &MakeLink, layer: &mut Vec<El>) {
@@ -420,14 +427,18 @@ pub fn link_dialog(k: &Kit, m: &MakeLink, layer: &mut Vec<El>) {
 // ---------------------------------------------------------------------------------------------
 // Storage
 
-/// Asks for account `server`'s storage, unless it's on its way.
+/// Asks for account `server`'s storage (unless the first answer is still on its way); the
+/// status bar keeps showing the last answer meanwhile.
 pub fn ask_quota(s: &mut State, server: &Server) {
-    if s.servers.mega_quotas.get(&server.id).is_some_and(Option::is_none) {
-        return;
+    match s.servers.mega_quotas.get(&server.id) {
+        Some(None) => return,
+        Some(Some(_)) => {}
+        None => {
+            s.servers.mega_quotas.insert(server.id.clone(), None);
+        }
     }
-    s.servers.mega_quotas.insert(server.id.clone(), None);
     let id = server.id.clone();
-    task(s, server, "ler a cota", |a| a.quota(), move |result| Msg::Mega(Answer::Quota { id, result }));
+    task(s, server, t("ler a cota", "read the storage quota"), |a| a.quota(), move |result| Msg::Mega(Answer::Quota { id, result }));
 }
 
 /// The storage the status bar shows beside a MEGA location.
@@ -467,6 +478,9 @@ pub struct Watch {
 
 /// Asks each MEGA account a pane shows what changed, once its time has come.
 pub fn tick(s: &mut State, now: f64) {
+    if s.servers.mega_watch.is_empty() && !s.panes.iter().any(|p| at(&p.loc).is_some()) {
+        return;
+    }
     let mut shown: Vec<Server> = s.panes.iter().filter_map(|p| at(&p.loc).map(|(sv, _)| sv.clone())).collect();
     shown.dedup_by(|a, b| a.id == b.id);
     s.servers.mega_watch.retain(|id, _| shown.iter().any(|sv| sv.id == *id));
@@ -481,7 +495,7 @@ pub fn tick(s: &mut State, now: f64) {
         }
         w.busy = true;
         let id = server.id.clone();
-        task(s, &server, "ver o que mudou no MEGA", |a| a.poll(), move |result| Msg::Mega(Answer::Changes { id, result }));
+        task(s, &server, t("ver o que mudou no MEGA", "see what changed on MEGA"), |a| a.poll(), move |result| Msg::Mega(Answer::Changes { id, result }));
     }
 }
 
@@ -522,7 +536,6 @@ fn changes_arrived(s: &mut State, id: String, result: Result<Changes, String>, n
     }
     crate::tree::server_folders_changed(s, &id, &stale);
     // What changed may change what the account uses.
-    s.servers.mega_quotas.remove(&id);
     ask_quota(s, &server);
 }
 

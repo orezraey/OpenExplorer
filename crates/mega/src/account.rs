@@ -268,10 +268,16 @@ impl Account {
         if inner.tree.in_rubbish(&parent.handle) {
             return Err(t("A Lixeira do MEGA não recebe itens novos: exclua para mandar algo para ela.", "The MEGA Rubbish Bin doesn't take new items: delete something to send it there.").into());
         }
-        if let Some((_, access)) = inner.tree.top_of(&parent.handle).and_then(|t| t.inshare.clone())
-            && access == 0
+        if let Some(top) = inner.tree.top_of(&parent.handle)
+            && let Some((_, access)) = &top.inshare
         {
-            return Err(t("Esta pasta foi compartilhada com você só para leitura.", "This folder was shared with you as read-only.").into());
+            if *access == 0 {
+                return Err(t("Esta pasta foi compartilhada com você só para leitura.", "This folder was shared with you as read-only.").into());
+            }
+            // Without the share's key, whoever shares it couldn't open what goes in.
+            if !inner.keys.shares.contains_key(&top.handle) {
+                return Err(t("O Open Explorer não tem a chave desta pasta compartilhada, então quem compartilhou não conseguiria abrir o que fosse colocado nela. Use o site do MEGA para isso.", "Open Explorer doesn't have this shared folder's key, so whoever shared it couldn't open what goes in. Use the MEGA website for this.").into());
+            }
         }
         Ok(())
     }
@@ -280,7 +286,7 @@ impl Account {
     /// tell the two apart).
     fn free(&self, parent: &str, name: &str, except: Option<&str>) -> Result<()> {
         let inner = self.lock();
-        if inner.tree.children(parent).iter().any(|(_, n)| n.name == name && Some(n.handle.as_str()) != except) {
+        if inner.tree.same_name(parent, name).iter().any(|h| Some(h.as_str()) != except) {
             return Err(tr!("Já existe “{name}” nessa pasta do MEGA.", "“{name}” already exists in that MEGA folder."));
         }
         Ok(())
@@ -500,7 +506,12 @@ impl Account {
         if n.parent.is_empty() || n.inshare.is_some() {
             return Err(tr!("“{}” não pode ser excluído daqui.", "“{}” can't be deleted from here.", n.name));
         }
-        if self.lock().tree.in_rubbish(&n.handle) || self.in_share(&n.handle) { self.delete(&n) } else { self.trash(&n) }
+        self.discard(&n)
+    }
+
+    /// Node `n` to the Rubbish Bin, or deleted for good where it can't go there.
+    pub(crate) fn discard(&self, n: &Node) -> Result<()> {
+        if self.lock().tree.in_rubbish(&n.handle) || self.in_share(&n.handle) { self.delete(n) } else { self.trash(n) }
     }
 
     /// Deletes the empty folder at `path` for good (undoing a new folder).
@@ -526,6 +537,11 @@ impl Account {
         }
         let (nodes, keys) = {
             let inner = self.lock();
+            // Items no key here opens can't be copied: the copy would come out short.
+            let folders: std::collections::HashSet<&str> = inner.tree.subtree(&src.handle).into_iter().filter(|n| n.kind.is_dir()).map(|n| n.handle.as_str()).collect();
+            if inner.tree.locked_within(&folders) {
+                return Err(tr!("Alguns itens de “{}” não podem ser abertos por esta conta, e a cópia sairia incompleta.", "Some items in “{}” can't be opened by this account, so the copy would be incomplete.", src.name));
+            }
             let mut nodes = Vec::new();
             let mut keys = Vec::new();
             for n in inner.tree.subtree(&src.handle) {
@@ -566,7 +582,7 @@ pub(crate) fn resolve(tree: &Tree, path: &str) -> Option<Place> {
                 Area::Incoming => Place::Shares,
             },
             Place::Shares => Place::Node(tree.inshares().into_iter().find(|(name, _)| name == seg)?.1.handle.clone()),
-            Place::Node(h) => Place::Node(tree.children(&h).into_iter().find(|(name, _)| name == seg)?.1.handle.clone()),
+            Place::Node(h) => Place::Node(tree.child_named(&h, seg)?.handle.clone()),
         };
     }
     Some(at)
@@ -578,7 +594,7 @@ fn shown_name(tree: &Tree, n: &Node) -> String {
         Kind::Root => Area::Cloud.label().into(),
         Kind::Rubbish => Area::Rubbish.label().into(),
         _ if n.inshare.is_some() => tree.inshares().into_iter().find(|(_, x)| x.handle == n.handle).map_or_else(|| n.name.clone(), |(name, _)| name),
-        _ => tree.children(&n.parent).into_iter().find(|(_, x)| x.handle == n.handle).map_or_else(|| n.name.clone(), |(name, _)| name),
+        _ => tree.shown_name(n),
     }
 }
 
@@ -659,8 +675,16 @@ pub fn connect(email: &str, password: &str, code: Option<&str>) -> std::result::
 pub fn disconnect(email: &str) {
     let email = session::normal_email(email);
     let open = OPEN.lock().unwrap_or_else(|e| e.into_inner()).remove(&email);
-    if let Some(a) = open {
-        a.logout();
+    match open {
+        Some(a) => a.logout(),
+        // Not opened this run: the kept session's id alone ends it.
+        None => {
+            if let Some(sid) = store::session(&email).ok().and_then(|saved| session::sid_of(&saved)) {
+                let api = Api::default();
+                api.set_sid(Some(sid));
+                let _ = api.call(json!({"a": "sml"}));
+            }
+        }
     }
     store::forget_session(&email);
 }
@@ -742,6 +766,27 @@ mod tests {
         assert!(a.rename("/Drive na nuvem/nota.txt", "/Compartilhados comigo/Deles/nota.txt").unwrap_err().contains("copie"));
     }
 
+    /// A share whose key this account doesn't hold takes nothing new (its owner couldn't open
+    /// it), and a folder with items no key opens isn't copied short.
+    #[test]
+    fn writes_needing_a_missing_key_are_refused() {
+        let mut k = keys();
+        let mut l = listing(&k);
+        let sk = [4u8; 16];
+        k.shares.insert("INSHARE1".into(), sk);
+        let mut top = crate::nodes::tests::raw(&k, "INSHARE1", "", 1, "Deles", ("INSHARE1", sk));
+        top["su"] = "OTHERUSER01".into();
+        top["r"] = 1.into();
+        l["f"].as_array_mut().unwrap().push(top);
+        // An item in Fotos under a share key this account never got.
+        l["f"].as_array_mut().unwrap().push(crate::nodes::tests::raw(&k, "LOCKED01", "FOLDER01", 0, "segredo.txt", ("SOMESHARE", [8u8; 16])));
+        let tree = Tree::from_listing(&mut k, &l);
+        k.shares.remove("INSHARE1");
+        let a = Account::offline(k, tree);
+        assert!(a.mkdir("/Compartilhados comigo/Deles/Nova").unwrap_err().contains("chave"));
+        assert!(a.copy("/Drive na nuvem/Fotos", "/Drive na nuvem/Fotos 2").unwrap_err().contains("incompleta"));
+    }
+
     #[test]
     fn new_nodes_in_a_shared_folder_carry_the_share_key() {
         let mut k = keys();
@@ -754,6 +799,30 @@ mod tests {
         ecb_encrypt(&[5u8; 16], &mut want);
         assert_eq!(cr, json!([["FOLDER01"], [], [0, 0, b64(&want)]]));
         assert_eq!(a.share_keys_for("ROOT0000", &[node_key]), None);
+    }
+
+    /// Benchmark (`cargo test -p openexplorer-mega --release -- --ignored --nocapture big_folder`):
+    /// every item of a 5 000-item folder looked up by path and stat'ed, as a download of the
+    /// folder does, plus one twin.
+    #[test]
+    #[ignore = "benchmark"]
+    fn resolving_every_item_of_a_big_folder() {
+        let mut tree = Tree::default();
+        let node = |h: String, p: &str, kind: Kind, name: String, created: i64| Node { handle: h, parent: p.into(), kind, name, size: 1, created, modified: None, key: vec![0; 32], attrs: Map::new(), owner: String::new(), inshare: None, link: None };
+        tree.put(node("ROOT0000".into(), "", Kind::Root, String::new(), 0));
+        for i in 0..5000 {
+            tree.put(node(format!("H{i:07}"), "ROOT0000", Kind::File, format!("foto {i}.jpg"), i));
+        }
+        tree.put(node("TWIN0000".into(), "ROOT0000", Kind::File, "foto 7.jpg".into(), 9999));
+        let a = Account::offline(keys(), tree);
+        let started = std::time::Instant::now();
+        for i in 0..5000 {
+            let path = format!("/Drive na nuvem/foto {i}.jpg");
+            assert_eq!(a.resolve(&path), Some(Place::Node(format!("H{i:07}"))));
+            assert!(a.stat(&path).is_some());
+        }
+        assert_eq!(a.resolve("/Drive na nuvem/foto 7 (2).jpg"), Some(Place::Node("TWIN0000".into())));
+        eprintln!("5000 lookups + stats: {} ms", started.elapsed().as_millis());
     }
 
     #[test]
