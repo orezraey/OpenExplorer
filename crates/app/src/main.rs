@@ -1596,6 +1596,8 @@ fn main() {
     }
     let initial = settings::Settings::load();
     openexplorer_mega::set_log(openexplorer_gdrive::log);
+    // Each MEGA account's tree, sealed, so a start reads only what changed since.
+    openexplorer_mega::set_cache_dir(Some(openexplorer_gdrive::local_dir().join("mega")));
     rune::App::new(AppSpec::<State> {
         min_size: Some((900.0, 420.0)),
         families: initial.font.families(),
@@ -1876,6 +1878,9 @@ fn main() {
     })
     .font_smoothing(initial.text_render.smoothing())
     .args(rune_args(std::env::args().skip(1)))
+    // The app ends without returning from `run`: what MEGA changed since its trees were last
+    // kept is kept here, so the next start has less to catch up on.
+    .on_quit(|_, _| openexplorer_mega::save_caches())
     .run();
 }
 

@@ -28,7 +28,7 @@ impl Account {
         let ph = n.link.as_ref()?;
         match n.kind {
             Kind::File => Some(link_url(Kind::File, ph, &n.key)),
-            Kind::Folder => inner.keys.shares.get(&n.handle).map(|k| link_url(Kind::Folder, ph, k)),
+            Kind::Folder => inner.keys.shares.get(n.handle.as_str()).map(|k| link_url(Kind::Folder, ph, k)),
             _ => None,
         }
     }
