@@ -5,6 +5,7 @@
 
 mod dav;
 mod ftp;
+mod mega;
 mod sftp;
 pub mod store;
 mod tls;
@@ -41,6 +42,9 @@ pub enum Protocol {
     Dav,
     /// WebDAV over HTTPS.
     Davs,
+    /// A MEGA account (see `mega.rs`). Never written to `servers.json`: MEGA accounts are kept
+    /// apart, so an older app reading that list doesn't meet a protocol it can't read.
+    Mega,
 }
 
 impl Protocol {
@@ -53,6 +57,7 @@ impl Protocol {
             Protocol::Sftp => "SFTP",
             Protocol::Dav => "WebDAV (http)",
             Protocol::Davs => "WebDAV (https)",
+            Protocol::Mega => "MEGA",
         }
     }
 
@@ -73,6 +78,7 @@ impl Protocol {
             Protocol::Sftp => "sftp",
             Protocol::Dav => "http",
             Protocol::Davs => "https",
+            Protocol::Mega => "mega",
         }
     }
 
@@ -92,7 +98,7 @@ impl Protocol {
             Protocol::Ftp | Protocol::Ftps => 21,
             Protocol::Sftp => 22,
             Protocol::Dav => 80,
-            Protocol::Davs => 443,
+            Protocol::Davs | Protocol::Mega => 443,
         }
     }
 
@@ -166,8 +172,35 @@ fn usual_connections() -> u8 {
 }
 
 impl Server {
+    /// The server a MEGA account shows as in the panes: its e-mail is the user, its session in
+    /// the MEGA crate's own store.
+    pub fn mega(email: &str) -> Server {
+        Server {
+            id: format!("mega:{email}"),
+            name: email.to_string(),
+            protocol: Protocol::Mega,
+            brand: None,
+            host: "mega.nz".into(),
+            port: 443,
+            user: email.to_string(),
+            root: "/".into(),
+            key: None,
+            host_key: None,
+            cert: None,
+            connections: 6,
+            implicit: false,
+        }
+    }
+
+    pub fn is_mega(&self) -> bool {
+        self.protocol == Protocol::Mega
+    }
+
     /// `sftp://ana@host:2222`, the port only when it isn't the usual one. Never the password.
     pub fn address(&self) -> String {
+        if self.is_mega() {
+            return format!("mega://{}", self.user);
+        }
         let user = if self.user.is_empty() { String::new() } else { format!("{}@", encode_user(&self.user)) };
         let host = if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() };
         let port = if self.port == self.protocol.default_port() { String::new() } else { format!(":{}", self.port) };
@@ -283,6 +316,7 @@ fn open(server: &Server, secret: &str, trust: &tls::Trust) -> Result<Box<dyn Con
         Protocol::Ftp | Protocol::Ftps => Ok(Box::new(ftp::Ftp::connect(server, secret, trust)?)),
         Protocol::Sftp => Ok(Box::new(sftp::Sftp::connect(server, secret)?)),
         Protocol::Dav | Protocol::Davs => Ok(Box::new(dav::Dav::connect(server, secret, trust)?)),
+        Protocol::Mega => Ok(Box::new(mega::Mega::connect(server)?)),
     }
 }
 

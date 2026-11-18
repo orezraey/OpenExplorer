@@ -35,6 +35,11 @@ impl Store {
     /// Adds or replaces `server`, and its password: `None` keeps the one stored, `Some("")`
     /// forgets it.
     pub fn save(&self, server: Server, secret: Option<&str>) -> Result<()> {
+        // MEGA accounts live in the MEGA crate's store; one here would make an older app read
+        // the whole list as empty.
+        if server.is_mega() {
+            return Err("MEGA accounts aren't kept in servers.json.".into());
+        }
         match secret {
             Some("") => forget_secret(&server.id),
             Some(s) => entry(&server.id)?.set_password(s).map_err(|e| tr!("Não consegui guardar a senha no cofre do sistema: {e}", "Couldn't keep the password in the system's credential store: {e}"))?,
