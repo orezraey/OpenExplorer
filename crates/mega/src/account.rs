@@ -127,7 +127,7 @@ impl Account {
     #[cfg(test)]
     pub(crate) fn offline(keys: Keys, tree: Tree) -> Account {
         let session = Session { user: keys.user.clone(), master: keys.master, sek: [0; 16], sid: String::new(), rsa: None };
-        Account { email: "ana@exemplo.com".into(), api: Api::new("http://127.0.0.1:9"), session, inner: Mutex::new(Inner { keys, tree, refetch: false }) }
+        Account { email: "ana@exemplo.com".into(), api: Api::unreachable(), session, inner: Mutex::new(Inner { keys, tree, refetch: false }) }
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -433,6 +433,10 @@ impl Account {
             let inner = self.lock();
             inner.tree.in_rubbish(&parent.handle) && !inner.tree.in_rubbish(&n.handle)
         };
+        // Moved under the name the panes show a twin by ("Fotos (2)"), it keeps its own name:
+        // the twin it's told apart from isn't where it goes (or it's a twin again there).
+        let keep_own = parent.handle != n.parent && (name == n.name || crate::nodes::twin_of(&name, &n.name, n.kind == Kind::File));
+        let name = if keep_own { n.name.clone() } else { name };
         if into_bin {
             self.trash(&n)?;
             let n = self.lock().tree.get(&n.handle).cloned().unwrap_or(n);
@@ -452,7 +456,9 @@ impl Account {
                 return Err(tr!("O MEGA não move “{}” entre uma pasta compartilhada com você e as suas: copie e depois exclua.", "MEGA doesn't move “{}” between a folder shared with you and your own: copy it, then delete.", n.name));
             }
             self.writable(&parent)?;
-            self.free(&parent.handle, &name, Some(&n.handle))?;
+            if !keep_own {
+                self.free(&parent.handle, &name, Some(&n.handle))?;
+            }
             self.move_node(&n, &parent)?;
         }
         let n = self.lock().tree.get(&n.handle).cloned().unwrap_or(n);
@@ -685,23 +691,26 @@ pub fn connect(email: &str, password: &str, code: Option<&str>) -> std::result::
     Ok(account)
 }
 
-/// Forgets account `email`: its session ends on MEGA's side (when it's open) and leaves the
-/// credential store.
+/// Forgets account `email`: it leaves the credential store at once, and its session ends on
+/// MEGA's side on a thread of its own (an account added again meanwhile keeps its new session).
 pub fn disconnect(email: &str) {
     let email = session::normal_email(email);
     let open = OPEN.lock().unwrap_or_else(|e| e.into_inner()).remove(&email);
-    match open {
-        Some(a) => a.logout(),
-        // Not opened this run: the kept session's id alone ends it.
-        None => {
-            if let Some(sid) = store::session(&email).ok().and_then(|saved| session::sid_of(&saved)) {
-                let api = Api::default();
-                api.set_sid(Some(sid));
-                let _ = api.call(json!({"a": "sml"}));
-            }
-        }
-    }
+    // Not opened this run: the kept session's id alone ends it.
+    let sid = match &open {
+        Some(_) => None,
+        None => store::session(&email).ok().and_then(|saved| session::sid_of(&saved)),
+    };
     store::forget_session(&email);
+    std::thread::spawn(move || match (open, sid) {
+        (Some(a), _) => a.logout(),
+        (None, Some(sid)) => {
+            let api = Api::default();
+            api.set_sid(Some(sid));
+            let _ = api.call(json!({"a": "sml"}));
+        }
+        (None, None) => {}
+    });
 }
 
 #[cfg(test)]
@@ -863,6 +872,26 @@ mod tests {
         assert_eq!(a.resolve(&second), Some(Place::Node("TWIN0001".into())));
         assert_eq!(a.resolve(&format!("{second}/../x")), None);
         assert!(a.pin("/Drive na nuvem/nada").is_err());
+    }
+
+    /// A twin moved by its shown name keeps its own, and comes back a twin when the move is
+    /// undone; any other name given to a move is a rename, which a taken name refuses.
+    #[test]
+    fn twins_keep_their_names_when_moved() {
+        let mut k = keys();
+        let mut l = listing(&k);
+        let own = (k.user.clone(), k.master);
+        let mut twin = crate::nodes::tests::raw(&k, "TWIN0001", "ROOT0000", 0, "nota.txt", (own.0.as_str(), own.1));
+        twin["ts"] = 500.into();
+        l["f"].as_array_mut().unwrap().push(twin);
+        let tree = Tree::from_listing(&mut k, &l);
+        let a = Account::offline(k, tree);
+        // Offline: the move itself fails at the network, after the checks that matter here.
+        let moved = a.rename("/Drive na nuvem/nota (2).txt", "/Drive na nuvem/Fotos/nota (2).txt");
+        assert!(!moved.unwrap_err().contains("Já existe"));
+        assert!(a.rename("/Drive na nuvem/nota (2).txt", "/Drive na nuvem/Fotos/praia.jpg").unwrap_err().contains("Já existe"));
+        assert!(crate::nodes::twin_of("nota (2).txt", "nota.txt", true) && crate::nodes::twin_of("Fotos (3)", "Fotos", false));
+        assert!(!crate::nodes::twin_of("nota (2).txt", "nota.md", true) && !crate::nodes::twin_of("nota.txt (2)", "nota.txt", true));
     }
 
     #[test]

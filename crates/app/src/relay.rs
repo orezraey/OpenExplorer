@@ -198,7 +198,7 @@ pub fn between_servers(s: &mut State, from: &Location, items: Vec<Entry>, to: &L
                     let size = if e.is_dir { measure(c, path, &|| p.cancelled()) } else { e.size.unwrap_or(0) };
                     p.size(if one { size * 2 } else { size });
                 }
-                pin_all(c, &paths)
+                Ok(pin_all(c, &paths))
             })?;
             let mut taken: HashSet<String> = with(&pool, &b, |c| c.list(&dir))?.into_iter().map(|i| i.name.to_lowercase()).collect();
             let (secret_a, secret_b) = (|| store::secret(&a.id), || store::secret(&b.id));
@@ -307,7 +307,7 @@ pub fn server_to_drive(s: &mut State, from: &Location, items: Vec<Entry>, to: &L
             }
             let mut taken: HashSet<String> = drive_list(d, &parent, shared.as_deref())?.into_iter().map(|f| f.name.to_lowercase()).collect();
             // Each item as it is now, whatever Recortar does to the others meanwhile.
-            let paths = pin_all(c, &paths)?;
+            let paths = pin_all(c, &paths);
             batch.run(|i, p| {
                 let e = &items[i];
                 let name = free_name(&e.name, e.is_dir, &taken);

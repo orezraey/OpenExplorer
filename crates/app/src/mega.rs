@@ -36,7 +36,8 @@ pub fn at(loc: &Location) -> Option<(&Server, &[String])> {
     }
 }
 
-fn area_of(path: &[String]) -> Option<Area> {
+/// The area a path below an account's top starts in.
+pub fn area_of(path: &[String]) -> Option<Area> {
     let first = path.first()?;
     Area::ALL.into_iter().find(|a| {
         let both: [&str; 2] = match a {
@@ -226,6 +227,8 @@ fn connected(s: &mut State, attempt: u64, result: Result<String, Refused>) {
     if !s.servers.list.iter().any(|sv| sv.id == server.id) {
         s.servers.list.push(server.clone());
     }
+    // Connections kept from an earlier session of this account (one that ended) go.
+    s.servers.pool.forget(&server.id);
     s.tree.server_changed(&server.id);
     s.tree.server_opened(&server.id);
     s.status = tr!("Conta MEGA conectada: {email}", "MEGA account connected: {email}");
@@ -240,8 +243,7 @@ pub fn remove(s: &mut State, server: &Server) -> bool {
         crate::fail(s, e);
         return false;
     }
-    let email = server.user.clone();
-    std::thread::spawn(move || mega::disconnect(&email));
+    mega::disconnect(&server.user);
     s.servers.mega_quotas.remove(&server.id);
     s.servers.mega_watch.remove(&server.id);
     true

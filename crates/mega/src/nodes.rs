@@ -171,6 +171,8 @@ pub struct Tree {
     /// Each folder's items by their own names (twins share one), so a path finds its item
     /// without going through the folder.
     names: HashMap<String, HashMap<String, Vec<String>>>,
+    /// The incoming shares' top folders, by handle.
+    tops: HashSet<String>,
     pub root: Option<String>,
     pub rubbish: Option<String>,
     pub vault: Option<String>,
@@ -226,6 +228,9 @@ impl Tree {
     }
 
     fn index(&mut self, n: &Node) {
+        if n.inshare.is_some() {
+            self.tops.insert(n.handle.clone());
+        }
         self.kids.entry(n.parent.clone()).or_default().insert(n.handle.clone());
         let same = self.names.entry(n.parent.clone()).or_default().entry(n.name.clone()).or_default();
         if !same.contains(&n.handle) {
@@ -234,6 +239,7 @@ impl Tree {
     }
 
     fn unindex(&mut self, n: &Node) {
+        self.tops.remove(&n.handle);
         if let Some(set) = self.kids.get_mut(&n.parent) {
             set.remove(&n.handle);
         }
@@ -330,7 +336,7 @@ impl Tree {
 
     /// The incoming shares' top folders, with unique names.
     pub fn inshares(&self) -> Vec<(String, &Node)> {
-        let mut nodes: Vec<&Node> = self.nodes.values().filter(|n| n.inshare.is_some()).collect();
+        let mut nodes: Vec<&Node> = self.tops.iter().filter_map(|h| self.nodes.get(h)).collect();
         nodes.sort_by(|a, b| (a.created, &a.handle).cmp(&(b.created, &b.handle)));
         unique_names(nodes)
     }
@@ -407,6 +413,16 @@ impl Tree {
     pub fn bytes_in(&self, handle: &str) -> u64 {
         self.subtree(handle).iter().filter(|n| n.kind == Kind::File).map(|n| n.size).sum()
     }
+}
+
+/// Whether `name` is a shown name a twin of `real` gets: "stem (k).ext".
+pub fn twin_of(name: &str, real: &str, is_file: bool) -> bool {
+    let (stem, ext) = match real.rfind('.') {
+        Some(i) if i > 0 && is_file => real.split_at(i),
+        _ => (real, ""),
+    };
+    let Some(mid) = name.strip_prefix(stem).and_then(|r| r.strip_prefix(" (")).and_then(|r| r.strip_suffix(ext)).and_then(|r| r.strip_suffix(')')) else { return false };
+    !mid.is_empty() && mid.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Whether `name` could be a twin's shown name: "stem (k)" before any extension.

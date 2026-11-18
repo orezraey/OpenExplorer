@@ -512,7 +512,8 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     ask_quota(s, email);
                 }
                 let mut megas: Vec<openexplorer_remote::Server> = reload.iter().filter_map(|l| mega::at(l).map(|(sv, _)| sv.clone())).collect();
-                megas.dedup_by(|a, b| a.id == b.id);
+                let mut seen = std::collections::HashSet::new();
+                megas.retain(|sv| seen.insert(sv.id.clone()));
                 for sv in megas {
                     mega::ask_quota(s, &sv);
                 }

@@ -100,6 +100,8 @@ pub struct Api {
     sid: RwLock<Option<String>>,
     /// Turned on to stop a hashcash search midway (the dialog was closed).
     pub stop: AtomicBool,
+    /// How many times a request that didn't reach MEGA is sent again.
+    retries: u32,
 }
 
 impl Default for Api {
@@ -124,7 +126,13 @@ pub(crate) fn agent(read: Duration) -> ureq::Agent {
 impl Api {
     pub fn new(base: &str) -> Api {
         let seq = u64::from_le_bytes(crate::crypto::random::<8>()) >> 34;
-        Api { agent: agent(Duration::from_secs(180)), base: base.trim_end_matches('/').to_string(), seq: AtomicU64::new(seq), sid: RwLock::new(None), stop: AtomicBool::new(false) }
+        Api { agent: agent(Duration::from_secs(180)), base: base.trim_end_matches('/').to_string(), seq: AtomicU64::new(seq), sid: RwLock::new(None), stop: AtomicBool::new(false), retries: 3 }
+    }
+
+    /// An API that gives up at once when MEGA can't be reached, for tests without a network.
+    #[cfg(test)]
+    pub(crate) fn unreachable() -> Api {
+        Api { retries: 0, ..Api::new("http://127.0.0.1:9") }
     }
 
     pub fn base(&self) -> &str {
@@ -174,7 +182,7 @@ impl Api {
                 Ok(r) => r,
                 Err(e) => {
                     log(&format!("MEGA {what} falhou em {} ms: {e}", started.elapsed().as_millis()));
-                    if attempt < 3 {
+                    if attempt < self.retries {
                         continue;
                     }
                     return Err(Fail::Other(tr!("Sem conexão com o MEGA: {e}", "No connection to MEGA: {e}")));

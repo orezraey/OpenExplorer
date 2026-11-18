@@ -99,9 +99,9 @@ pub fn with<T>(pool: &Pool, server: &Server, work: impl FnOnce(&mut dyn Conn) ->
 }
 
 /// The paths of a batch's items as [`Conn::pin`] keeps them, looked up before any of them
-/// changes.
-pub(crate) fn pin_all(c: &mut dyn Conn, paths: &[String]) -> Result<Vec<String>, String> {
-    paths.iter().map(|p| c.pin(p)).collect()
+/// changes. One that can't be (gone already) stays as it is, so only its own row fails.
+pub(crate) fn pin_all(c: &mut dyn Conn, paths: &[String]) -> Vec<String> {
+    paths.iter().map(|p| c.pin(p).unwrap_or_else(|_| p.clone())).collect()
 }
 
 /// A cancelled transfer says so in the app's words.
@@ -308,7 +308,7 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
             p.size(if *is_dir { measure(c, path, &|| p.cancelled()) } else { size.unwrap_or(0) });
         }
         // Each item as it is now, whatever Recortar does to the others meanwhile.
-        let paths = pin_all(c, &paths)?;
+        let paths = pin_all(c, &paths);
         // The names the rows took in `dst`, before their files are made.
         Ok((std::sync::Mutex::new(HashSet::<PathBuf>::new()), paths))
     };
@@ -465,7 +465,7 @@ pub fn move_within(s: &mut State, from: &Location, items: Vec<Entry>, to: &Locat
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Move, items.iter().map(|e| (end(from, Some(&e.name)), end(to, None))));
     let at = server.clone();
     undo::server_job(s, &server, reload, |n| tr!("mover {}", "move {}", undo::items(n)), move |c, rec| {
-        let pinned = pin_all(c, &paths)?;
+        let pinned = pin_all(c, &paths);
         batch.run(|i, _| {
             let (e, path) = (&items[i], &paths[i]);
             let into = child(&dst, &e.name);
@@ -488,7 +488,7 @@ pub fn delete(s: &mut State, loc: &Location, items: Vec<Entry>, reload: Vec<Loca
     let paths: Vec<(String, bool)> = items.iter().filter_map(|e| path_of(loc, e).map(|p| (p, e.is_dir))).collect();
     let n = paths.len();
     job(s, server, reload, move |c| {
-        let pinned = pin_all(c, &paths.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>())?;
+        let pinned = pin_all(c, &paths.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>());
         for (i, ((path, is_dir), at)) in paths.iter().zip(&pinned).enumerate() {
             c.remove(at, *is_dir).map_err(|e| {
                 let done = if i == 0 { String::new() } else { tr!(" (já excluídos para sempre: {i})", " (already deleted for good: {i})") };

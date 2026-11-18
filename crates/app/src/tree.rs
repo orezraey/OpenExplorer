@@ -293,8 +293,8 @@ fn mock_node(segs: Vec<String>) -> Node {
 fn remote_node(server: &openexplorer_remote::Server, path: Vec<String>) -> Node {
     let (label, icon, fallback): (String, Option<IconKey>, &'static Icon) = match path.last() {
         // A MEGA account's Rubbish Bin and Incoming shares, with icons of their own.
-        Some(name) if server.is_mega() && path.len() == 1 && crate::mega::bin_top(&crate::servers::folder(server, path.clone())) => (name.clone(), None, &icons::TRASH),
-        Some(name) if server.is_mega() && path.len() == 1 && crate::mega::items_fixed(&crate::servers::folder(server, path.clone())) => (name.clone(), None, &icons::SHARED_WITH_ME),
+        Some(name) if server.is_mega() && path.len() == 1 && crate::mega::area_of(&path) == Some(openexplorer_mega::Area::Rubbish) => (name.clone(), None, &icons::TRASH),
+        Some(name) if server.is_mega() && path.len() == 1 && crate::mega::area_of(&path) == Some(openexplorer_mega::Area::Incoming) => (name.clone(), None, &icons::SHARED_WITH_ME),
         Some(name) => (name.clone(), Some(IconKey::Folder), &icons::FOLDER),
         None => (server.name.clone(), None, crate::servers::Provider::of_server(server).icon()),
     };

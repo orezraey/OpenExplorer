@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn a_saved_session_too_short_is_refused_offline() {
-        let api = Api::new("http://127.0.0.1:9");
+        let api = Api::unreachable();
         assert!(matches!(resume(&api, &b64(&[1, 2, 3])), Err(Fail::Other(_))));
     }
 }
