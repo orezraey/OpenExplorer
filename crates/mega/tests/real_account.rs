@@ -56,12 +56,58 @@ fn reads_an_account() {
     a.list(&format!("/{}", Area::Rubbish.label())).unwrap();
     a.list(&format!("/{}", Area::Incoming.label())).unwrap();
     a.poll().unwrap();
+    // The saved session opens again, as the app does at every start, and reads the same tree.
+    let api = Api::default();
+    let resumed = session::resume(&api, &a.saved()).unwrap_or_else(|f| panic!("resume: {}", f.text()));
+    let again = Account::start(&a.email, api, resumed).unwrap();
+    // Same master key under the same session key, same session id.
+    assert!(again.saved() == a.saved(), "the resumed session holds the same keys");
+    assert_eq!(again.list(&cloud).unwrap().len(), items.len());
     // One small file, if the top has one: decrypted and checked against its MAC.
     if let Some(f) = items.iter().find(|i| !i.is_dir && i.size.is_some_and(|s| s < 5 << 20)) {
         let mut out = Vec::new();
         a.download(&format!("{cloud}/{}", f.name), &mut out, &mut |_| true).unwrap();
         assert_eq!(out.len() as u64, f.size.unwrap());
     }
+}
+
+/// A second session (the website, say) makes and deletes a folder; the first one's change
+/// channel brings both.
+#[test]
+#[ignore = "needs a real MEGA account and MEGA_TEST_WRITE=1"]
+fn sees_changes_made_elsewhere() {
+    if std::env::var("MEGA_TEST_WRITE").as_deref() != Ok("1") {
+        eprintln!("MEGA_TEST_WRITE isn't 1: skipped");
+        return;
+    }
+    let (Some(a), Some(b)) = (login(), login()) else { return };
+    let (_end_a, _end_b) = (Logout(a.clone()), Logout(b.clone()));
+    let cloud = format!("/{}", Area::Cloud.label());
+    let root = a.folder_handle(&cloud).unwrap();
+    a.poll().unwrap();
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let dir = format!("{cloud}/OpenExplorer-outro-{stamp}");
+    let made = b.mkdir(&dir).unwrap();
+    let mut seen = false;
+    for _ in 0..10 {
+        if a.poll().unwrap().touches(&root) {
+            seen = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(seen && a.stat(&dir).is_some(), "the other session's new folder arrives");
+    b.delete(&made).unwrap();
+    let mut gone = false;
+    for _ in 0..10 {
+        a.poll().unwrap();
+        if a.stat(&dir).is_none() {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    assert!(gone, "and its deletion");
 }
 
 #[test]
