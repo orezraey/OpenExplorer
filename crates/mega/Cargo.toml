@@ -1,0 +1,23 @@
+[package]
+name = "openexplorer-mega"
+version.workspace = true
+edition.workspace = true
+
+# Our own client for MEGA's JSON API (`g.api.mega.co.nz/cs`), not the `mega` crate nor the
+# official C++ SDK: see the crate docs in `src/lib.rs`. Every version here is one Cargo.lock
+# already had (through russh), so the build stays offline-friendly.
+[dependencies]
+aes = "0.9"
+aes-gcm = "0.11"
+base64 = "0.22"
+getrandom = "0.3"
+hkdf = "0.13"
+# Sessions live in the OS credential store: Credential Manager on Windows. Never the password.
+keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
+num-bigint = "0.5"
+openexplorer-i18n = { path = "../i18n" }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+ureq = "3"
