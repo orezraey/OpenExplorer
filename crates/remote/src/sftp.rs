@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
+use openexplorer_i18n::{t, tr};
 use russh::client::{self, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate};
 use russh::Disconnect;
@@ -58,13 +59,13 @@ fn status(e: &SftpError) -> Option<StatusCode> {
 fn said(e: SftpError) -> String {
     match &e {
         SftpError::Status(s) => match s.status_code {
-            StatusCode::NoSuchFile => "Não existe no servidor.".into(),
-            StatusCode::PermissionDenied => "O servidor negou a permissão.".into(),
-            _ if !s.error_message.is_empty() => format!("O servidor respondeu: {}", s.error_message),
-            _ => format!("O servidor respondeu: {:?}", s.status_code),
+            StatusCode::NoSuchFile => t("Não existe no servidor.", "It doesn't exist on the server.").into(),
+            StatusCode::PermissionDenied => t("O servidor negou a permissão.", "The server denied permission.").into(),
+            _ if !s.error_message.is_empty() => tr!("O servidor respondeu: {}", "The server answered: {}", s.error_message),
+            _ => tr!("O servidor respondeu: {:?}", "The server answered: {:?}", s.status_code),
         },
-        SftpError::Timeout => "O servidor não respondeu a tempo.".into(),
-        _ => format!("Erro de SFTP: {e}"),
+        SftpError::Timeout => t("O servidor não respondeu a tempo.", "The server didn't answer in time.").into(),
+        _ => tr!("Erro de SFTP: {e}", "SFTP error: {e}"),
     }
 }
 
@@ -99,27 +100,28 @@ impl Sftp {
             let cfg = client::Config { inactivity_timeout: None, keepalive_interval: Some(Duration::from_secs(30)), ..Default::default() };
             let socket = tokio::time::timeout(TIMEOUT, tokio::net::TcpStream::connect(addr))
                 .await
-                .map_err(|_| format!("{host} não respondeu a tempo."))?
+                .map_err(|_| tr!("{host} não respondeu a tempo.", "{host} didn't answer in time."))?
                 .map_err(|e| unreachable(&host, &e))?;
             let _ = socket.set_nodelay(true);
             let mut ssh = match tokio::time::timeout(TIMEOUT, client::connect_stream(Arc::new(cfg), socket, handler)).await {
-                Err(_) => return Err(format!("{host} não respondeu a tempo.")),
+                Err(_) => return Err(tr!("{host} não respondeu a tempo.", "{host} didn't answer in time.")),
                 Ok(Err(russh::Error::UnknownKey)) => {
                     let now = saw.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
-                    return Err(format!(
+                    return Err(tr!(
                         "A chave de {host} mudou: era {}, agora é {now}. Pode ser outro computador se passando pelo servidor. Se a mudança é esperada, remova o servidor e adicione de novo.",
+                        "The server key of {host} changed: it was {}, now it is {now}. It may be another computer posing as the server. If the change is expected, remove the server and add it again.",
                         expected.unwrap_or_default()
                     ));
                 }
-                Ok(Err(e)) => return Err(format!("Não consegui falar SSH com {host}: {e}")),
+                Ok(Err(e)) => return Err(tr!("Não consegui falar SSH com {host}: {e}", "Couldn't speak SSH with {host}: {e}")),
                 Ok(Ok(h)) => h,
             };
             if !login(&mut ssh, &user, key.as_deref(), &secret).await? {
-                return Err(format!("{host} recusou o usuário, a senha ou a chave."));
+                return Err(tr!("{host} recusou o usuário, a senha ou a chave.", "{host} refused the user name, password or key."));
             }
-            let channel = ssh.channel_open_session().await.map_err(|e| format!("{host} recusou abrir uma sessão: {e}"))?;
-            channel.request_subsystem(true, "sftp").await.map_err(|e| format!("{host} não oferece SFTP: {e}"))?;
-            let sftp = SftpSession::new(channel.into_stream()).await.map_err(|e| format!("{host} não oferece SFTP: {e}"))?;
+            let channel = ssh.channel_open_session().await.map_err(|e| tr!("{host} recusou abrir uma sessão: {e}", "{host} refused to open a session: {e}"))?;
+            channel.request_subsystem(true, "sftp").await.map_err(|e| tr!("{host} não oferece SFTP: {e}", "{host} doesn't offer SFTP: {e}"))?;
+            let sftp = SftpSession::new(channel.into_stream()).await.map_err(|e| tr!("{host} não oferece SFTP: {e}", "{host} doesn't offer SFTP: {e}"))?;
             Ok::<_, String>((ssh, sftp))
         })?;
         sftp.set_timeout(60);
@@ -131,11 +133,11 @@ impl Sftp {
 /// Logs in with the key given, else the password (also as keyboard-interactive, which many
 /// servers ask for instead), else the usual keys in `~/.ssh`.
 async fn login(ssh: &mut Handle<Client>, user: &str, key: Option<&str>, secret: &str) -> Result<bool> {
-    let failed = |e: russh::Error| format!("O login falhou: {e}");
+    let failed = |e: russh::Error| tr!("O login falhou: {e}", "The login failed: {e}");
     let with_key = async |ssh: &mut Handle<Client>, path: &std::path::Path, pass: Option<&str>| -> Result<bool> {
         let key = russh::keys::load_secret_key(path, pass).map_err(|e| match e {
-            russh::keys::Error::KeyIsEncrypted => format!("A chave {} pede a senha dela: escreva-a no campo Senha.", path.display()),
-            e => format!("Não consegui ler a chave {}: {e}", path.display()),
+            russh::keys::Error::KeyIsEncrypted => tr!("A chave {} pede a senha dela: escreva-a no campo Senha.", "The key {} asks for its password: type it in the Password field.", path.display()),
+            e => tr!("Não consegui ler a chave {}: {e}", "Couldn't read the key {}: {e}", path.display()),
         })?;
         let hash = ssh.best_supported_rsa_hash().await.ok().flatten().flatten();
         Ok(ssh.authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash)).await.map_err(failed)?.success())
@@ -219,7 +221,7 @@ impl Conn for Sftp {
 
     fn rename(&mut self, from: &str, to: &str) -> Result<()> {
         if self.stat(to)?.is_some() {
-            return Err(format!("Já existe um item chamado {}.", to.rsplit('/').next().unwrap_or(to)));
+            return Err(tr!("Já existe um item chamado {}.", "There's already an item named {}.", to.rsplit('/').next().unwrap_or(to)));
         }
         self.rt.block_on(self.sftp.rename(from, to)).map_err(said)
     }
@@ -240,11 +242,11 @@ impl Conn for Sftp {
             let mut done = 0u64;
             let read = async {
                 loop {
-                    let n = file.read(&mut buf).await.map_err(|e| format!("A transferência parou: {e}"))?;
+                    let n = file.read(&mut buf).await.map_err(|e| tr!("A transferência parou: {e}", "The transfer stopped: {e}"))?;
                     if n == 0 {
                         return Ok(());
                     }
-                    out.write_all(&buf[..n]).map_err(|e| format!("A transferência parou: {e}"))?;
+                    out.write_all(&buf[..n]).map_err(|e| tr!("A transferência parou: {e}", "The transfer stopped: {e}"))?;
                     done += n as u64;
                     if !progress(done) {
                         return Err(crate::CANCELLED.to_string());
@@ -256,7 +258,11 @@ impl Conn for Sftp {
             // would stay with it.
             // Not for long, though: after a dropped connection it would wait out the timeout.
             let closed = tokio::time::timeout(Duration::from_secs(5), file.close()).await;
-            read.and(closed.map_err(|_| "A transferência parou: o servidor não respondeu.".to_string())?.map_err(|e| format!("A transferência parou: {e}")))
+            read.and(
+                closed
+                    .map_err(|_| t("A transferência parou: o servidor não respondeu.", "The transfer stopped: the server didn't answer.").to_string())?
+                    .map_err(|e| tr!("A transferência parou: {e}", "The transfer stopped: {e}")),
+            )
         })
     }
 
@@ -271,18 +277,18 @@ impl Conn for Sftp {
             let mut buf = vec![0u8; 256 * 1024];
             let mut done = 0u64;
             loop {
-                let n = src.read(&mut buf).map_err(|e| format!("A transferência parou: {e}"))?;
+                let n = src.read(&mut buf).map_err(|e| tr!("A transferência parou: {e}", "The transfer stopped: {e}"))?;
                 if n == 0 {
                     break;
                 }
-                file.write_all(&buf[..n]).await.map_err(|e| format!("A transferência parou: {e}"))?;
+                file.write_all(&buf[..n]).await.map_err(|e| tr!("A transferência parou: {e}", "The transfer stopped: {e}"))?;
                 done += n as u64;
                 if !progress(done) {
                     return Err(crate::CANCELLED.to_string());
                 }
             }
             // Closed now, not when dropped: until then the server may hold the file open.
-            file.close().await.map_err(|e| format!("A transferência parou: {e}"))
+            file.close().await.map_err(|e| tr!("A transferência parou: {e}", "The transfer stopped: {e}"))
         });
         if result.is_err() && made {
             // What arrived of the file is no use.

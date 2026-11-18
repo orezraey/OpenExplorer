@@ -16,6 +16,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use openexplorer_i18n::t;
 use rune::{Icon, Key, KeyEvent, Tx};
 
 use crate::model::{DriveKind, Entry, Location, Space, shown};
@@ -195,11 +196,11 @@ fn desktop_node(places: &Places) -> Option<Node> {
 }
 
 fn computer_node() -> Node {
-    Node { id: NodeId::Computer, label: "Este Computador".into(), icon: None, fallback: &icons::COMPUTER, to: None, opens: true }
+    Node { id: NodeId::Computer, label: t("Este Computador", "This PC").into(), icon: None, fallback: &icons::COMPUTER, to: None, opens: true }
 }
 
 fn network_node() -> Node {
-    Node { id: NodeId::Network, label: "Rede".into(), icon: None, fallback: &icons::NETWORK, to: None, opens: true }
+    Node { id: NodeId::Network, label: t("Rede", "Network").into(), icon: None, fallback: &icons::NETWORK, to: None, opens: true }
 }
 
 fn linux_node() -> Node {
@@ -274,7 +275,7 @@ fn drive_folder_node(email: &str, space: Space, path: Vec<(String, String)>) -> 
 fn mock_node(segs: Vec<String>) -> Node {
     let (label, fallback): (String, &'static Icon) = match segs.last() {
         Some(name) => (name.clone(), &icons::FOLDER),
-        None => ("Drive simulado".into(), &icons::LAB),
+        None => (t("Drive simulado", "Simulated drive").into(), &icons::LAB),
     };
     let icon = (!segs.is_empty()).then_some(IconKey::Folder);
     Node { id: NodeId::Mock(segs.clone()), label, icon, fallback, to: Some(Location::Mock(segs)), opens: true }
@@ -330,11 +331,11 @@ fn load(s: &mut State, node: &Node) {
         (NodeId::Network, _) => return search_network(s),
         (NodeId::Desktop, _) => {
             let (places, show_hidden) = (s.places.clone(), s.settings.show_hidden);
-            background(s, move |emit| emit(done(crate::catch_panic("ler a área de trabalho", || Ok(desktop_kids(&places, show_hidden))))));
+            background(s, move |emit| emit(done(crate::catch_panic(t("ler a área de trabalho", "read the Desktop"), || Ok(desktop_kids(&places, show_hidden))))));
         }
         (NodeId::Local(path), _) => {
             let (places, path, show_hidden) = (s.places.clone(), path.clone(), s.settings.show_hidden);
-            background(s, move |emit| emit(done(crate::catch_panic("ler as pastas", || local_kids(&places, &path, show_hidden)))));
+            background(s, move |emit| emit(done(crate::catch_panic(t("ler as pastas", "read the folders"), || local_kids(&places, &path, show_hidden)))));
         }
         (NodeId::Drive(email, _), Some(Location::Drive { space, path, .. })) => {
             let (email2, space2) = (email.clone(), space.clone());
@@ -350,12 +351,12 @@ fn load(s: &mut State, node: &Node) {
                 let folders = d.folders(&parent, shared.as_deref())?;
                 Ok(sorted(folders.into_iter().map(|f| drive_folder_node(&email2, space2.clone(), extend(&path, &f.target.unwrap_or(f.id), &f.name))).collect()))
             };
-            drive_task(s, &email.clone(), "ler as pastas do Drive", work, done);
+            drive_task(s, &email.clone(), t("ler as pastas do Drive", "read the Drive folders"), work, done);
         }
         (NodeId::Server(_, path), Some(Location::Server { server, .. })) => {
             let (pool, server, path, show_hidden) = (s.servers.pool.clone(), server.clone(), path.clone(), s.settings.show_hidden);
             background(s, move |emit| {
-                let result = crate::catch_panic("ler as pastas do servidor", || crate::servers::folders(&pool, &server, &path, show_hidden));
+                let result = crate::catch_panic(t("ler as pastas do servidor", "read the server's folders"), || crate::servers::folders(&pool, &server, &path, show_hidden));
                 emit(done(result.map(|names| sorted(names.into_iter().map(|n| remote_node(&server, extend_segs(&path, &n))).collect()))));
             });
         }
@@ -377,7 +378,7 @@ fn search_network(s: &mut State) {
     let drives = s.local_drives.clone();
     background(s, move |emit| {
         emit(Msg::Servers { found: network::mapped_servers(&drives), done: false });
-        let found = crate::catch_panic("procurar computadores na rede", || Ok(network::computers())).unwrap_or_default();
+        let found = crate::catch_panic(t("procurar computadores na rede", "look for computers on the network"), || Ok(network::computers())).unwrap_or_default();
         emit(Msg::Servers { found, done: true });
     });
 }
@@ -735,7 +736,7 @@ pub fn lines(s: &State, p: usize) -> Vec<Line> {
         }
     }
     if !s.accounts.is_empty() || !s.servers.list.is_empty() {
-        w.out.push(Line::Heading("Contas"));
+        w.out.push(Line::Heading(t("Contas", "Accounts")));
     }
     for a in &s.accounts {
         w.node(account_node(&a.email), 0);
@@ -743,7 +744,7 @@ pub fn lines(s: &State, p: usize) -> Vec<Line> {
     for server in &s.servers.list {
         w.node(remote_node(server, Vec::new()), 0);
     }
-    w.out.push(Line::Heading("Testes"));
+    w.out.push(Line::Heading(t("Testes", "Tests")));
     w.node(mock_node(Vec::new()), 0);
     w.out
 }
@@ -773,11 +774,11 @@ impl Walk<'_> {
         let key = if *times == 1 { id } else { format!("{id}#{times}") };
         let note = |text: String, loading| Line::Note { key: format!("note:{key}"), depth: depth + 1, text, loading };
         let after = match &*kids {
-            Kids::Loading => Some(note("Carregando…".into(), true)),
+            Kids::Loading => Some(note(t("Carregando…", "Loading…").into(), true)),
             Kids::Failed(e) => Some(note(e.clone(), false)),
             // Not `loading`: following a computer reached by address needn't wait on the search.
-            Kids::Ready(_) if network && s.tree.searching => Some(note("Procurando computadores…".into(), false)),
-            Kids::Ready(k) if network && k.is_empty() => Some(note(r"Nenhum computador encontrado. Digite \\nome na barra de endereço.".into(), false)),
+            Kids::Ready(_) if network && s.tree.searching => Some(note(t("Procurando computadores…", "Looking for computers…").into(), false)),
+            Kids::Ready(k) if network && k.is_empty() => Some(note(t(r"Nenhum computador encontrado. Digite \\nome na barra de endereço.", r"No computers found. Type \\name in the address bar.").into(), false)),
             Kids::Ready(_) | Kids::Unknown => None,
         };
         self.out.push(Line::Node { key, depth, node: Box::new(node), open, empty, on });

@@ -1,6 +1,7 @@
 //! Connected accounts: their e-mail and name in `accounts.json` under [`crate::config_dir`],
 //! their refresh tokens in the OS credential store, never on disk in the clear.
 
+use openexplorer_i18n::{t, tr};
 use serde::{Deserialize, Serialize};
 
 use crate::{Result, config_dir};
@@ -22,18 +23,18 @@ pub fn accounts() -> Vec<StoredAccount> {
 }
 
 fn write_accounts(list: &[StoredAccount]) -> Result<()> {
-    std::fs::create_dir_all(config_dir()).map_err(|e| format!("Não consegui criar {}: {e}", config_dir().display()))?;
+    std::fs::create_dir_all(config_dir()).map_err(|e| tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", config_dir().display()))?;
     let text = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
-    std::fs::write(accounts_file(), text).map_err(|e| format!("Não consegui salvar a lista de contas: {e}"))
+    std::fs::write(accounts_file(), text).map_err(|e| tr!("Não consegui salvar a lista de contas: {e}", "Couldn't save the list of accounts: {e}"))
 }
 
 fn entry(email: &str) -> Result<keyring::Entry> {
-    keyring::Entry::new(SERVICE, email).map_err(|e| format!("Cofre de credenciais indisponível: {e}"))
+    keyring::Entry::new(SERVICE, email).map_err(|e| tr!("Cofre de credenciais indisponível: {e}", "Credential store unavailable: {e}"))
 }
 
 /// Adds or updates an account and stores its refresh token.
 pub fn save(account: StoredAccount, refresh_token: &str) -> Result<()> {
-    entry(&account.email)?.set_password(refresh_token).map_err(|e| format!("Não consegui guardar o acesso no cofre do sistema: {e}"))?;
+    entry(&account.email)?.set_password(refresh_token).map_err(|e| tr!("Não consegui guardar o acesso no cofre do sistema: {e}", "Couldn't keep the access in the system's credential store: {e}"))?;
     let mut list = accounts();
     match list.iter_mut().find(|a| a.email == account.email) {
         Some(a) => *a = account,
@@ -43,7 +44,7 @@ pub fn save(account: StoredAccount, refresh_token: &str) -> Result<()> {
 }
 
 pub fn refresh_token(email: &str) -> Result<String> {
-    entry(email)?.get_password().map_err(|_| "O acesso desta conta não está no cofre do sistema. Conecte a conta de novo.".to_string())
+    entry(email)?.get_password().map_err(|_| t("O acesso desta conta não está no cofre do sistema. Conecte a conta de novo.", "This account's access isn't in the system's credential store. Connect the account again.").to_string())
 }
 
 /// Forgets an account and deletes its refresh token.

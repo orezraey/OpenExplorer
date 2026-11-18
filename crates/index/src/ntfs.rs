@@ -6,6 +6,8 @@ use std::time::UNIX_EPOCH;
 
 use ntfs_reader::{HistorySize, Journal, JournalOptions, MftScan, NextUsn, NtfsAttributeType, NtfsFile, NtfsReaderError, Reason, UsnRecord, Volume};
 
+use openexplorer_i18n::{t, tr};
+
 use crate::tree::{self, Tree};
 
 const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
@@ -37,12 +39,13 @@ fn flags(attributes: u32, is_dir: bool) -> u8 {
 /// Every file and folder of the volume `letter`, from its MFT. Each file is held under one
 /// name (Windows' own when it has several hard links).
 pub fn scan(letter: char) -> Result<Tree, String> {
-    let volume = Volume::new(device(letter)).map_err(|e| err("Abrir o volume", e))?;
-    let mut scan = MftScan::new(volume).map_err(|e| err("Ler a MFT", e))?;
+    let volume = Volume::new(device(letter)).map_err(|e| err(t("Abrir o volume", "Open the volume"), e))?;
+    let mut scan = MftScan::new(volume).map_err(|e| err(t("Ler a MFT", "Read the MFT"), e))?;
     let mut t = Tree::new(&format!("{letter}:\\"));
     let records = scan.record_count() as usize;
     t.reserve(records, records * 20);
-    while let Some(chunk) = scan.next_chunk().map_err(|e| err("Ler a MFT", e))? {
+    // `t` is the tree here.
+    while let Some(chunk) = scan.next_chunk().map_err(|e| err(openexplorer_i18n::t("Ler a MFT", "Read the MFT"), e))? {
         for file in chunk.files() {
             add(&mut t, &file);
         }
@@ -77,9 +80,9 @@ pub fn journal(letter: char) -> Result<Journal, String> {
     match open() {
         Err(NtfsReaderError::JournalNotActive) => {
             create_journal(letter)?;
-            open().map_err(|e| err("Abrir o diário USN", e))
+            open().map_err(|e| err(t("Abrir o diário USN", "Open the USN journal"), e))
         }
-        other => other.map_err(|e| err("Abrir o diário USN", e)),
+        other => other.map_err(|e| err(t("Abrir o diário USN", "Open the USN journal"), e)),
     }
 }
 
@@ -91,11 +94,11 @@ fn create_journal(letter: char) -> Result<(), String> {
     use windows::Win32::System::Ioctl::{CREATE_USN_JOURNAL_DATA, FSCTL_CREATE_USN_JOURNAL};
     use windows::core::HSTRING;
     unsafe {
-        let h = CreateFileW(&HSTRING::from(device(letter)), (GENERIC_READ | GENERIC_WRITE).0, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, FILE_FLAGS_AND_ATTRIBUTES(0), None).map_err(|e| format!("Abrir o volume: {e}"))?;
+        let h = CreateFileW(&HSTRING::from(device(letter)), (GENERIC_READ | GENERIC_WRITE).0, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, FILE_FLAGS_AND_ATTRIBUTES(0), None).map_err(|e| tr!("Abrir o volume: {e}", "Open the volume: {e}"))?;
         let data = CREATE_USN_JOURNAL_DATA { MaximumSize: 32 << 20, AllocationDelta: 8 << 20 };
         let done = DeviceIoControl(h, FSCTL_CREATE_USN_JOURNAL, Some(&data as *const _ as *const _), size_of::<CREATE_USN_JOURNAL_DATA>() as u32, None, 0, None, None);
         let _ = CloseHandle(h);
-        done.map_err(|e| format!("Criar o diário USN: {e}"))
+        done.map_err(|e| tr!("Criar o diário USN: {e}", "Create the USN journal: {e}"))
     }
 }
 

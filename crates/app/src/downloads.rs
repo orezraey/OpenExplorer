@@ -181,7 +181,7 @@ pub fn run(
 /// Shortcuts to files and Google's formats that can't be exported (Forms, Sites) stay out:
 /// there's nothing to fetch.
 fn read_folder(d: &Drive, row: usize, id: &str, dir: &Path, names: &Names) -> Result<Vec<Work>, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("Não consegui criar a pasta \"{}\": {e}", dir.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| openexplorer_i18n::tr!("Não consegui criar a pasta \"{}\": {e}", "Couldn't create the folder \"{}\": {e}", dir.display()))?;
     let mut children = Vec::new();
     d.list(id, None, |page, _| {
         children.extend(page);
@@ -195,7 +195,7 @@ fn read_folder(d: &Drive, row: usize, id: &str, dir: &Path, names: &Names) -> Re
         }
         let to = names.claim(dir, &f);
         if f.is_dir {
-            std::fs::create_dir_all(&to).map_err(|e| format!("Não consegui criar a pasta \"{}\": {e}", to.display()))?;
+            std::fs::create_dir_all(&to).map_err(|e| openexplorer_i18n::tr!("Não consegui criar a pasta \"{}\": {e}", "Couldn't create the folder \"{}\": {e}", to.display()))?;
             let id = f.target.clone().unwrap_or_else(|| f.id.clone());
             work.push(Work::Folder { row, id, dir: to });
         } else if f.mime != FOLDER_MIME {

@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use openexplorer_i18n::{t, tr};
+
 use crate::model::{Location, crumbs};
 use crate::ops::{CANCELLED, Progress, Stage};
 
@@ -24,20 +26,20 @@ pub enum Op {
 impl Op {
     pub fn label(self) -> &'static str {
         match self {
-            Op::Copy => "Copiar",
-            Op::Move => "Mover",
-            Op::Upload => "Upload",
-            Op::Download => "Download",
+            Op::Copy => t("Copiar", "Copy"),
+            Op::Move => t("Mover", "Move"),
+            Op::Upload => t("Upload", "Upload"),
+            Op::Download => t("Download", "Download"),
         }
     }
 
     /// "Copiado", "Movido": for the line that sums a job up.
     fn done(self) -> &'static str {
         match self {
-            Op::Copy => "Copiado",
-            Op::Move => "Movido",
-            Op::Upload => "Enviado",
-            Op::Download => "Baixado",
+            Op::Copy => t("Copiado", "Copied"),
+            Op::Move => t("Movido", "Moved"),
+            Op::Upload => t("Enviado", "Uploaded"),
+            Op::Download => t("Baixado", "Downloaded"),
         }
     }
 }
@@ -120,7 +122,7 @@ pub struct Batch {
 impl Drop for Batch {
     fn drop(&mut self) {
         for p in self.rows.iter().filter(|p| !p.over()) {
-            p.end(Err("Interrompido.".into()));
+            p.end(Err(t("Interrompido.", "Interrupted.").into()));
         }
     }
 }
@@ -172,14 +174,14 @@ impl Batch {
         match (ok, cancelled, failed.as_slice()) {
             (0, 0, [why]) => Err(why.clone()),
             (_, 0, []) => Ok(format!("{}: {}.", self.op.done(), items(ok))),
-            (_, _, []) => Ok(format!("{}: {} · cancelados: {cancelled}.", self.op.done(), items(ok))),
-            (_, _, [first, ..]) => Err(format!("{}: {} · com erro: {} ({first})", self.op.done(), items(ok), failed.len())),
+            (_, _, []) => Ok(tr!("{0}: {1} · cancelados: {cancelled}.", "{0}: {1} · cancelled: {cancelled}.", self.op.done(), items(ok))),
+            (_, _, [first, ..]) => Err(tr!("{0}: {1} · com erro: {2} ({first})", "{0}: {1} · failed: {2} ({first})", self.op.done(), items(ok), failed.len())),
         }
     }
 }
 
 fn items(n: usize) -> String {
-    if n == 1 { "1 item".into() } else { format!("{n} itens") }
+    if n == 1 { "1 item".into() } else { tr!("{n} itens", "{n} items") }
 }
 
 /// Adds a row per `(from, to)` to `list`, waiting their turn; the job doing them holds the

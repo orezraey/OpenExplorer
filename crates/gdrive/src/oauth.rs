@@ -7,6 +7,7 @@ use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use openexplorer_i18n::{t, tr};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -40,13 +41,13 @@ pub struct PendingLogin {
 
 fn random_token() -> Result<String> {
     let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).map_err(|e| format!("Sem gerador aleatório do sistema: {e}"))?;
+    getrandom::fill(&mut bytes).map_err(|e| tr!("Sem gerador aleatório do sistema: {e}", "No random generator from the system: {e}"))?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
 /// Opens the loopback listener and builds the consent URL.
 pub fn begin(cfg: &ClientConfig) -> Result<PendingLogin> {
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("Não consegui abrir a porta local do login: {e}"))?;
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| tr!("Não consegui abrir a porta local do login: {e}", "Couldn't open the login's local port: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let redirect = format!("http://127.0.0.1:{port}");
     let verifier = random_token()?;
@@ -86,8 +87,8 @@ impl PendingLogin {
                 ("grant_type", "authorization_code"),
                 ("code_verifier", self.verifier.as_str()),
             ])
-            .map_err(|e| format!("Falha ao falar com o Google: {e}"))?;
-        json(resp, "Troca do código de login")
+            .map_err(|e| tr!("Falha ao falar com o Google: {e}", "Couldn't talk to Google: {e}"))?;
+        json(resp, t("Troca do código de login", "Login code exchange"))
     }
 
     fn wait_for_code(&self) -> Result<String> {
@@ -103,11 +104,11 @@ impl PendingLogin {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if Instant::now() > deadline {
-                        return Err("O login expirou: o navegador não voltou em 5 minutos.".into());
+                        return Err(t("O login expirou: o navegador não voltou em 5 minutos.", "The login expired: the browser didn't come back within 5 minutes.").into());
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                Err(e) => return Err(format!("Erro na porta local do login: {e}")),
+                Err(e) => return Err(tr!("Erro na porta local do login: {e}", "Error on the login's local port: {e}")),
             }
         }
     }
@@ -130,15 +131,15 @@ impl PendingLogin {
             return Ok(None);
         }
         let result = if state.as_deref() != Some(self.state.as_str()) {
-            Err("O login voltou com um estado diferente do pedido; tente de novo.".to_string())
+            Err(t("O login voltou com um estado diferente do pedido; tente de novo.", "The login came back with a different state than asked; try again.").to_string())
         } else if let Some(e) = error {
-            Err(if e == "access_denied" { "Login cancelado no navegador.".to_string() } else { format!("O Google recusou o login: {e}") })
+            Err(if e == "access_denied" { t("Login cancelado no navegador.", "Login cancelled in the browser.").to_string() } else { tr!("O Google recusou o login: {e}", "Google refused the login: {e}") })
         } else {
             Ok(code.unwrap_or_default())
         };
         let (title, text) = match &result {
-            Ok(_) => ("Conectado", "Pronto! Pode fechar esta aba e voltar ao Open Explorer."),
-            Err(_) => ("Login não concluído", "O login não foi concluído. Volte ao Open Explorer para ver o motivo."),
+            Ok(_) => (t("Conectado", "Connected"), t("Pronto! Pode fechar esta aba e voltar ao Open Explorer.", "Done! You can close this tab and go back to Open Explorer.")),
+            Err(_) => (t("Login não concluído", "Login not finished"), t("O login não foi concluído. Volte ao Open Explorer para ver o motivo.", "The login wasn't finished. Go back to Open Explorer to see why.")),
         };
         let html = format!(
             "<!doctype html><meta charset=utf-8><title>Open Explorer</title>\
@@ -160,10 +161,10 @@ pub fn refresh(agent: &ureq::Agent, cfg: &ClientConfig, refresh_token: &str) -> 
             ("refresh_token", refresh_token),
             ("grant_type", "refresh_token"),
         ])
-        .map_err(|e| format!("Falha ao falar com o Google: {e}"))?;
-    json(resp, "Renovação do acesso").map_err(|e| {
+        .map_err(|e| tr!("Falha ao falar com o Google: {e}", "Couldn't talk to Google: {e}"))?;
+    json(resp, t("Renovação do acesso", "Access renewal")).map_err(|e| {
         if e.contains("invalid_grant") || e.contains("expired or revoked") {
-            "O acesso a esta conta expirou ou foi revogado. Conecte a conta de novo.".into()
+            t("O acesso a esta conta expirou ou foi revogado. Conecte a conta de novo.", "Access to this account expired or was revoked. Connect the account again.").into()
         } else {
             e
         }

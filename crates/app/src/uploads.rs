@@ -285,7 +285,7 @@ fn open_folder(d: &Drive, row: usize, dir: &Path, name: &str, parent: &str, into
         None => (d.create_folder(name, parent)?.id, Vec::new()),
     };
     let items: Vec<(PathBuf, String, bool)> = std::fs::read_dir(dir)
-        .map_err(|e| format!("Não consegui ler \"{}\": {e}", dir.display()))?
+        .map_err(|e| openexplorer_i18n::tr!("Não consegui ler \"{}\": {e}", "Couldn't read \"{}\": {e}", dir.display()))?
         .flatten()
         .map(|item| {
             let path = item.path();

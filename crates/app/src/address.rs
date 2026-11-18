@@ -10,6 +10,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use openexplorer_gdrive::{Drive, DriveFile, Place, Top, View, valid_id};
+use openexplorer_i18n::{t, tr};
 
 use crate::model::{Location, NAME_SLASH, Space, shown, typed};
 
@@ -37,6 +38,7 @@ const SPACES: &[(&str, &str, Root)] = &[
 
 /// The simulated drive's name in the path bar.
 const MOCK: &str = "Drive simulado";
+const MOCK_EN: &str = "Simulated drive";
 
 /// Where a pane goes, and the entry (id, name) to select there once it's listed.
 #[derive(Clone, Debug, PartialEq)]
@@ -74,7 +76,7 @@ pub enum Root {
 
 impl Root {
     fn label(self) -> &'static str {
-        SPACES.iter().find(|(_, _, r)| *r == self).map_or("", |(pt, _, _)| pt)
+        SPACES.iter().find(|(_, _, r)| *r == self).map_or("", |(pt, en, _)| t(pt, en))
     }
 
     fn space(self) -> Space {
@@ -95,14 +97,17 @@ pub fn text(loc: &Location) -> String {
     match loc {
         Location::Local(dir) => dir.display().to_string(),
         Location::Found(f) => f.within.as_ref().map(|w| w.display().to_string()).unwrap_or_default(),
-        Location::Mock(segs) => std::iter::once(MOCK).chain(segs.iter().map(String::as_str)).collect::<Vec<_>>().join("/"),
+        Location::Mock(segs) => std::iter::once(t(MOCK, MOCK_EN)).chain(segs.iter().map(String::as_str)).collect::<Vec<_>>().join("/"),
         Location::Drive { email, space, path } => {
             let mut parts: Vec<String> = vec![email.clone()];
             match space {
                 Space::MyDrive => parts.push(Root::MyDrive.label().into()),
                 Space::SharedDrives => parts.push(Root::SharedDrives.label().into()),
                 Space::Shared { name, .. } => parts.extend([Root::SharedDrives.label().into(), shown(name)]),
-                Space::SharedWithMe | Space::Starred | Space::Recent | Space::Trash => parts.push(space.label().into()),
+                Space::SharedWithMe => parts.push(Root::View(View::SharedWithMe).label().into()),
+                Space::Starred => parts.push(Root::View(View::Starred).label().into()),
+                Space::Recent => parts.push(Root::View(View::Recent).label().into()),
+                Space::Trash => parts.push(Root::View(View::Trash).label().into()),
                 Space::Search(_) => return email.clone(),
             }
             parts.extend(path.iter().map(|(_, name)| shown(name)));
@@ -143,14 +148,14 @@ pub fn parse(typed: &str, here: &Location, accounts: &[String]) -> Result<Target
     // Explorer's "Copiar como caminho" wraps the path in quotes.
     let typed = typed.trim().trim_matches('"').trim();
     if typed.is_empty() {
-        return Err("Digite um endereço.".into());
+        return Err(t("Digite um endereço.", "Type an address.").into());
     }
     if let Some(way) = link(typed) {
         let email = match here {
             Location::Drive { email, .. } => Some(email.clone()),
             _ => accounts.first().cloned(),
         };
-        let email = email.ok_or("Conecte uma conta do Google Drive para abrir links do Drive.")?;
+        let email = email.ok_or(t("Conecte uma conta do Google Drive para abrir links do Drive.", "Connect a Google Drive account to open Drive links."))?;
         return Ok(Target::Drive { email, way });
     }
     let mut parts = typed.split('/').filter(|p| !p.is_empty());
@@ -159,7 +164,7 @@ pub fn parse(typed: &str, here: &Location, accounts: &[String]) -> Result<Target
         let rest: Vec<String> = parts.map(str::to_string).collect();
         return Ok(Target::Drive { email: email.clone(), way: drive_path(rest) });
     }
-    if first.eq_ignore_ascii_case(MOCK) {
+    if first.eq_ignore_ascii_case(MOCK) || first.eq_ignore_ascii_case(MOCK_EN) {
         return Ok(Target::Mock(parts.map(str::to_string).collect()));
     }
     Ok(Target::Local(local_path(typed, here)))
@@ -286,16 +291,16 @@ pub fn reach_local(path: &Path) -> Result<Reached, String> {
     if let Some((server, share)) = crate::network::unc(path)
         && share.is_empty()
     {
-        crate::network::shares(&server).map_err(|e| format!("Não consegui abrir “{}”: {e}", path.display()))?;
+        crate::network::shares(&server).map_err(|e| tr!("Não consegui abrir “{}”: {e}", "Couldn't open “{}”: {e}", path.display()))?;
         return Ok(Reached { loc: Location::Local(crate::network::server_path(&server)), reveal: None });
     }
-    let meta = std::fs::metadata(path).map_err(|_| format!("Não encontrei “{}”.", path.display()))?;
+    let meta = std::fs::metadata(path).map_err(|_| tr!("Não encontrei “{}”.", "Couldn't find “{}”.", path.display()))?;
     let path = &as_on_disk(path);
     if meta.is_dir() {
         return Ok(Reached { loc: Location::Local(path.to_path_buf()), reveal: None });
     }
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
-        return Err(format!("Não encontrei “{}”.", path.display()));
+        return Err(tr!("Não encontrei “{}”.", "Couldn't find “{}”.", path.display()));
     };
     let name = name.to_string_lossy().into_owned();
     Ok(Reached { loc: Location::Local(dir.to_path_buf()), reveal: Some((name.clone(), name)) })
@@ -352,12 +357,12 @@ fn reach_path(d: &Drive, email: String, root: Root, names: Vec<String>) -> Resul
             Some(name) => {
                 let drives = d.shared_drives()?;
                 let wanted = names_for(&name);
-                let found = drives.into_iter().find(|s| wanted.contains(&s.name)).ok_or_else(|| format!("Não encontrei o drive compartilhado “{name}”."))?;
+                let found = drives.into_iter().find(|s| wanted.contains(&s.name)).ok_or_else(|| tr!("Não encontrei o drive compartilhado “{name}”.", "Couldn't find the shared drive “{name}”."))?;
                 (Space::Shared { id: found.id.clone(), name: found.name }, Some(found.id.clone()), Some(found.id))
             }
         },
         Root::View(View::Recent | View::Trash) if !names.as_slice().is_empty() => {
-            return Err(format!("{} só abre como lista: as pastas dela não abrem pelo endereço.", root.label()));
+            return Err(tr!("{} só abre como lista: as pastas dela não abrem pelo endereço.", "{} opens only as a list: its folders don't open from the address.", root.label()));
         }
         // Drive's lists hold no folders of their own: names are looked for among what they list.
         Root::View(_) => (root.space(), None, None),
@@ -379,12 +384,12 @@ fn reach_path(d: &Drive, email: String, root: Root, names: Vec<String>) -> Resul
         }
         let Some(found) = found else {
             let place = path.last().map_or_else(|| root_place(root, &space), |(_, n)| n.clone());
-            return Err(format!("Não encontrei “{name}” em {place}."));
+            return Err(tr!("Não encontrei “{name}” em {place}.", "Couldn't find “{name}” in {place}."));
         };
         if !found.is_dir {
             // A file names the end of the way: its folder opens with it selected.
             if names.peek().is_some() {
-                return Err(format!("“{name}” é um arquivo, não uma pasta."));
+                return Err(tr!("“{name}” é um arquivo, não uma pasta.", "“{name}” is a file, not a folder."));
             }
             return Ok(Reached { loc: Location::Drive { email, space, path }, reveal: Some((found.id, found.name)) });
         }

@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use openexplorer_gdrive::{Details, Drive, DriveFile, Revision, Sharing};
+use openexplorer_i18n::{t, tr};
 use rune::{TextEdit, Tx};
 
 use crate::address::{self, Reached, Target};
@@ -112,19 +113,33 @@ pub fn in_trash(loc: &Location) -> bool {
 /// Why `loc` doesn't take what was asked (pasting, a new folder, cutting).
 fn why_not(loc: &Location) -> String {
     match loc {
-        Location::Drive { space: Space::SharedDrives, .. } => "Drives compartilhados lista os drives: abra um deles para trabalhar nas pastas.".into(),
-        Location::Drive { space: Space::Trash, path, .. } if path.is_empty() => "A Lixeira não recebe itens: use Restaurar ou Excluir permanentemente.".into(),
-        Location::Drive { space: Space::Trash, .. } => "Esta pasta está na lixeira: restaure-a para mexer no que tem dentro.".into(),
-        Location::Drive { space: Space::Search(_), path, .. } if path.is_empty() => {
-            "Os resultados da pesquisa não são uma pasta: abra uma pasta para colar, criar pastas ou recortar.".into()
+        Location::Drive { space: Space::SharedDrives, .. } => {
+            t("Drives compartilhados lista os drives: abra um deles para trabalhar nas pastas.", "Shared drives lists the drives: open one of them to work in its folders.").into()
         }
-        Location::Drive { space, path, .. } if path.is_empty() => {
-            format!("{} é uma lista do Google Drive, não uma pasta: abra uma pasta para colar, criar pastas ou recortar.", space.label())
+        Location::Drive { space: Space::Trash, path, .. } if path.is_empty() => {
+            t("A Lixeira não recebe itens: use Restaurar ou Excluir permanentemente.", "The Trash doesn't take items: use Restore or Delete forever.").into()
         }
-        Location::Mock(_) => "O drive simulado só serve para testar a interface; abra o disco local ou o Google Drive.".into(),
-        Location::Found(_) | Location::Server { find: Some(_), .. } => "Os resultados da pesquisa não são uma pasta: abra uma pasta para colar, criar pastas ou recortar.".into(),
-        Location::Local(dir) if crate::network::is_server(dir) => "Aqui estão as pastas compartilhadas do computador: abra uma delas para mexer no que tem dentro.".into(),
-        _ => "Não dá para fazer isso aqui.".into(),
+        Location::Drive { space: Space::Trash, .. } => {
+            t("Esta pasta está na lixeira: restaure-a para mexer no que tem dentro.", "This folder is in the trash: restore it to work with what's inside.").into()
+        }
+        Location::Drive { space: Space::Search(_), path, .. } if path.is_empty() => not_a_folder(),
+        Location::Drive { space, path, .. } if path.is_empty() => tr!(
+            "{} é uma lista do Google Drive, não uma pasta: abra uma pasta para colar, criar pastas ou recortar.",
+            "{} is a Google Drive list, not a folder: open a folder to paste, create folders or cut.",
+            space.label()
+        ),
+        Location::Mock(_) => t(
+            "O drive simulado só serve para testar a interface; abra o disco local ou o Google Drive.",
+            "The simulated drive is only for testing the interface; open the local disk or Google Drive.",
+        )
+        .into(),
+        Location::Found(_) | Location::Server { find: Some(_), .. } => not_a_folder(),
+        Location::Local(dir) if crate::network::is_server(dir) => t(
+            "Aqui estão as pastas compartilhadas do computador: abra uma delas para mexer no que tem dentro.",
+            "These are the computer's shared folders: open one of them to work with what's inside.",
+        )
+        .into(),
+        _ => t("Não dá para fazer isso aqui.", "This can't be done here.").into(),
     }
 }
 
@@ -135,7 +150,26 @@ fn holds_a_share(loc: &Location, items: &[Entry]) -> bool {
     items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_share_root(&path))
 }
 
+/// Search results don't take what was asked.
+fn not_a_folder() -> String {
+    t(
+        "Os resultados da pesquisa não são uma pasta: abra uma pasta para colar, criar pastas ou recortar.",
+        "Search results aren't a folder: open a folder to paste, create folders or cut.",
+    )
+    .into()
+}
+
+/// What goes to Drive needs a folder there.
+fn open_drive_folder() -> String {
+    t("Abra uma pasta do Drive (ou um drive compartilhado) para enviar para ela.", "Open a Drive folder (or a shared drive) to upload to it.").into()
+}
+
 const SHARE_STAYS: &str = "Pastas compartilhadas e distribuições não podem ser excluídas nem renomeadas daqui: abra uma delas para mexer no que tem dentro.";
+
+/// [`SHARE_STAYS`] in the interface's language.
+fn share_stays() -> &'static str {
+    t(SHARE_STAYS, "Shared folders and distributions can't be deleted or renamed from here: open one of them to work with what's inside.")
+}
 
 fn not_here(s: &mut State, p: usize) {
     s.status = why_not(&s.panes[p].loc);
@@ -149,16 +183,16 @@ fn account_panes(s: &State, email: &str) -> Vec<Location> {
 
 /// Runs `work` on a background thread with the account's [`Drive`], then reloads `reload`.
 fn drive_job(s: &State, email: &str, reload: Vec<Location>, work: impl FnOnce(&Drive) -> Result<String, String> + Send + 'static) {
-    drive_task(s, email, "operar no Drive", work, move |result| Msg::Done { reload, result });
+    drive_task(s, email, t("operar no Drive", "work in Drive"), work, move |result| Msg::Done { reload, result });
 }
 
 fn local_job(s: &State, reload: Vec<Location>, work: impl FnOnce() -> Result<String, String> + Send + 'static) {
-    background(s, move |emit| emit(Msg::Done { reload, result: crate::catch_panic("operar no disco", work) }));
+    background(s, move |emit| emit(Msg::Done { reload, result: crate::catch_panic(t("operar no disco", "work on the disk"), work) }));
 }
 
 /// How many items, in words: "1 item", "3 itens".
 fn count(n: usize) -> String {
-    if n == 1 { "1 item".into() } else { format!("{n} itens") }
+    if n == 1 { "1 item".into() } else { tr!("{n} itens", "{n} items") }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -179,7 +213,7 @@ pub fn open(s: &mut State, p: usize, _: &mut Tx) {
     let items = selected(s, p);
     let [item] = items.as_slice() else {
         if !items.is_empty() {
-            s.status = "Selecione um item só para abrir.".into();
+            s.status = t("Selecione um item só para abrir.", "Select just one item to open.").into();
         }
         return;
     };
@@ -205,7 +239,7 @@ pub fn open_file(s: &mut State, p: usize, item: &Entry) {
         Location::Drive { .. } if item.mime.as_deref().is_some_and(|m| m.starts_with("application/vnd.google-apps.")) => {
             // ShellExecute opens a URL in the default browser.
             if let Err(e) = ops::open(std::path::Path::new(&format!("https://drive.google.com/open?id={}", item.id))) {
-                crate::fail(s, format!("Não consegui abrir o navegador: {e}"));
+                crate::fail(s, tr!("Não consegui abrir o navegador: {e}", "Couldn't open the browser: {e}"));
             }
         }
         Location::Drive { .. } => {
@@ -221,7 +255,7 @@ pub fn open_file(s: &mut State, p: usize, item: &Entry) {
                 return;
             }
             if let Err(e) = std::fs::create_dir_all(&dir) {
-                crate::fail(s, format!("Não consegui criar a pasta temporária: {e}"));
+                crate::fail(s, tr!("Não consegui criar a pasta temporária: {e}", "Couldn't create the temporary folder: {e}"));
                 return;
             }
             // An older copy goes, so the new one takes its name.
@@ -248,17 +282,17 @@ pub fn show_in_folder(s: &mut State, p: usize, _: &mut Tx) {
         Location::Found(_) => {
             let path = PathBuf::from(&item.id);
             let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
-                s.status = format!("“{}” é a raiz de um disco: não fica em pasta nenhuma.", item.name);
+                s.status = tr!("“{}” é a raiz de um disco: não fica em pasta nenhuma.", "“{}” is the root of a disk: it isn't in any folder.", item.name);
                 return;
             };
             let name = name.to_string_lossy().into_owned();
             arrive(s, p, Reached { loc: Location::Local(dir.to_path_buf()), reveal: Some((name.clone(), name)) });
         }
         Location::Drive { email, .. } if shows_results(&loc) => {
-            s.status = format!("Procurando a pasta de “{}”…", shown(&item.name));
+            s.status = tr!("Procurando a pasta de “{}”…", "Looking for the folder of “{}”…", shown(&item.name));
             let (account, item) = (email.clone(), (item.id.clone(), item.name.clone()));
             let find = move |d: &Drive| d.place(&item.0).map(|place| Reached { loc: address::place_location(account, place), reveal: Some(item) });
-            reach(s, p, email, "achar a pasta", find);
+            reach(s, p, email, t("achar a pasta", "find the folder"), find);
         }
         Location::Server { server, .. } => {
             let mut segs = crate::servers::segs_of(&loc, item);
@@ -314,7 +348,7 @@ pub fn go_to_address(s: &mut State, p: usize, typed: &str) -> bool {
             }
             Err(e) if e.is_empty() => {
                 s.dialog = Some(Dialog::Server(Box::new(crate::servers::Form::of_address(&a))));
-                s.status = "Esse servidor ainda não foi adicionado: confira os dados e clique em Salvar.".into();
+                s.status = t("Esse servidor ainda não foi adicionado: confira os dados e clique em Salvar.", "This server hasn't been added yet: check the details and click Save.").into();
             }
             // The field stays, to fix what was typed.
             Err(e) => {
@@ -343,11 +377,11 @@ pub fn go_to_address(s: &mut State, p: usize, typed: &str) -> bool {
         }
         Target::Local(path) => {
             let moves = s.panes[p].moves;
-            background(s, move |emit| emit(Msg::Reached { pane: p, moves, result: crate::catch_panic("abrir o endereço", || address::reach_local(&path)) }));
+            background(s, move |emit| emit(Msg::Reached { pane: p, moves, result: crate::catch_panic(t("abrir o endereço", "open the address"), || address::reach_local(&path)) }));
         }
         Target::Drive { email, way } => {
             let account = email.clone();
-            reach(s, p, &email, "abrir o endereço", move |d| address::reach_drive(d, account, way));
+            reach(s, p, &email, t("abrir o endereço", "open the address"), move |d| address::reach_drive(d, account, way));
         }
     }
     true
@@ -356,14 +390,14 @@ pub fn go_to_address(s: &mut State, p: usize, typed: &str) -> bool {
 /// Copiar endereço: what the bar shows, as text.
 pub fn copy_address(s: &mut State, p: usize, tx: &mut Tx) {
     tx.copy(address::text(&s.panes[p].loc));
-    s.status = "Endereço copiado.".into();
+    s.status = t("Endereço copiado.", "Address copied.").into();
 }
 
 /// Copiar link do Drive: the drive.google.com link of the place pane `p` shows.
 pub fn copy_drive_link(s: &mut State, p: usize, tx: &mut Tx) {
     if let Some(link) = address::drive_link(&s.panes[p].loc) {
         tx.copy(link);
-        s.status = "Link do Drive copiado.".into();
+        s.status = t("Link do Drive copiado.", "Drive link copied.").into();
     }
 }
 
@@ -388,7 +422,12 @@ pub fn pick_up(s: &mut State, p: usize, mode: ClipMode) {
     if !ok {
         return not_here(s, p);
     }
-    s.status = format!("{} {} — use Colar (Ctrl+V) na pasta de destino.", if mode == ClipMode::Cut { "Recortado:" } else { "Copiado:" }, count(items.len()));
+    let n = count(items.len());
+    s.status = if mode == ClipMode::Cut {
+        tr!("Recortado: {n} — use Colar (Ctrl+V) na pasta de destino.", "Cut: {n} — use Paste (Ctrl+V) in the destination folder.")
+    } else {
+        tr!("Copiado: {n} — use Colar (Ctrl+V) na pasta de destino.", "Copied: {n} — use Paste (Ctrl+V) in the destination folder.")
+    };
     s.clip = Some(Clip { mode, from: loc, items });
 }
 
@@ -422,14 +461,14 @@ pub fn can_paste(s: &State, p: usize) -> bool {
 pub fn copy_across(s: &mut State, from: usize, to: usize) {
     let items = selected(s, from);
     if items.is_empty() {
-        s.status = "Selecione no outro painel o que copiar.".into();
+        s.status = t("Selecione no outro painel o que copiar.", "Select what to copy in the other pane.").into();
         return;
     }
     let loc = s.panes[from].loc.clone();
     if !items_editable(&loc) {
         return match loc {
             Location::Mock(_) => not_here(s, from),
-            _ => s.status = "Não dá para copiar daqui.".into(),
+            _ => s.status = t("Não dá para copiar daqui.", "Can't copy from here.").into(),
         };
     }
     transfer(s, ClipMode::Copy, loc, items, to);
@@ -453,9 +492,11 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
     }
     if !fits(&from, &to) {
         s.status = match (&from, &to) {
-            (Location::Local(_) | Location::Found(_), Location::Drive { .. }) => "Abra uma pasta do Drive (ou um drive compartilhado) para enviar para ela.".into(),
-            (Location::Drive { .. }, Location::Drive { .. }) if drive_folder(&to).is_some() => "Colar entre contas diferentes do Google Drive ainda não é possível.".into(),
-            _ => "Não dá para colar aqui.".into(),
+            (Location::Local(_) | Location::Found(_), Location::Drive { .. }) => open_drive_folder(),
+            (Location::Drive { .. }, Location::Drive { .. }) if drive_folder(&to).is_some() => {
+                t("Colar entre contas diferentes do Google Drive ainda não é possível.", "Pasting between different Google Drive accounts isn't possible yet.").into()
+            }
+            _ => t("Não dá para colar aqui.", "Can't paste here.").into(),
         };
         return;
     }
@@ -516,10 +557,10 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
                         Ok(())
                     };
                     match mode {
-                        ClipMode::Copy if src == dst => copy(&format!("Cópia de {}", e.name)),
+                        ClipMode::Copy if src == dst => copy(&tr!("Cópia de {}", "Copy of {}", e.name)),
                         ClipMode::Copy => copy(&e.name),
                         ClipMode::Cut if src == dst => Ok(()),
-                        ClipMode::Cut if src.is_empty() => Err("Recortar precisa da pasta de origem.".into()),
+                        ClipMode::Cut if src.is_empty() => Err(t("Recortar precisa da pasta de origem.", "Cut needs the source folder.").into()),
                         ClipMode::Cut => {
                             d.move_to(&e.id, &src, &dst)?;
                             rec.add([Step::DriveMove { email: who.clone(), id: e.id.clone(), name: e.name.clone(), from: dst.clone(), to: src.clone() }]);
@@ -569,8 +610,8 @@ pub fn local_transfer(s: &mut State, op: Op, sources: Vec<PathBuf>, dst: PathBuf
 /// Desfazer's words for a copy or a move of `n` items.
 fn transfer_words(op: Op, n: usize) -> String {
     match op {
-        Op::Move => format!("mover {}", count(n)),
-        _ => format!("copiar {}", count(n)),
+        Op::Move => tr!("mover {}", "move {}", count(n)),
+        _ => tr!("copiar {}", "copy {}", count(n)),
     }
 }
 
@@ -594,7 +635,7 @@ pub struct Upload {
 /// before anything starts.
 pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool, reload: Vec<Location>) {
     let Some((email, parent)) = drive_folder(to) else {
-        s.status = "Abra uma pasta do Drive (ou um drive compartilhado) para enviar para ela.".into();
+        s.status = open_drive_folder();
         return;
     };
     let up = Upload { email: email.clone(), parent: parent.clone(), to: to.clone(), sources, remove, reload };
@@ -610,14 +651,14 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
         })?;
         Ok(out)
     };
-    drive_task(s, &email, "listar a pasta", list, move |result| Msg::Clashes { up, result });
+    drive_task(s, &email, t("listar a pasta", "list the folder"), list, move |result| Msg::Clashes { up, result });
 }
 
 /// The Drive folder's listing for an upload arrived.
 pub fn clashes_listed(s: &mut State, up: Upload, result: Result<Vec<Entry>, String>) {
     match result {
         Ok(existing) => ask_clashes(s, up, existing),
-        Err(e) => crate::fail(s, format!("Não consegui ver o que já existe no destino: {e}")),
+        Err(e) => crate::fail(s, tr!("Não consegui ver o que já existe no destino: {e}", "Couldn't see what's already in the destination: {e}")),
     }
 }
 
@@ -681,7 +722,7 @@ pub fn toggle_clash_all(s: &mut State) {
 pub fn answer_clash(s: &mut State, choice: Option<Clash>) {
     let Some(Dialog::Clash(mut ask)) = s.dialog.take() else { return };
     let Some(c) = choice else {
-        s.status = "Envio cancelado.".into();
+        s.status = t("Envio cancelado.", "Upload cancelled.").into();
         return next_clash(s);
     };
     let n = if ask.all { ask.clashes.len() - ask.chosen.len() } else { 1 };
@@ -721,7 +762,11 @@ fn start_upload(s: &mut State, up: Upload, existing: &[Existing], choices: &[(us
         }
     }
     if items.is_empty() {
-        s.status = format!("Nada enviado: {} já existe{} no destino.", count(skipped), if skipped == 1 { "" } else { "m" });
+        s.status = if skipped == 1 {
+            t("Nada enviado: 1 item já existe no destino.", "Nothing uploaded: 1 item already exists in the destination.").into()
+        } else {
+            tr!("Nada enviado: {skipped} itens já existem no destino.", "Nothing uploaded: {skipped} items already exist in the destination.")
+        };
         return;
     }
     let dest = End::drive(&up.to, None);
@@ -731,7 +776,7 @@ fn start_upload(s: &mut State, up: Upload, existing: &[Existing], choices: &[(us
     drive_job(s, &up.email, up.reload, move |d| {
         let summary = crate::uploads::run(d, &batch, &items, &parent, remove, at_once);
         match summary {
-            Ok(line) if skipped > 0 => Ok(format!("{line} Pulados (já existiam): {skipped}.")),
+            Ok(line) if skipped > 0 => Ok(tr!("{line} Pulados (já existiam): {skipped}.", "{line} Skipped (already there): {skipped}.")),
             other => other,
         }
     });
@@ -766,7 +811,7 @@ pub enum Then {
 /// each in the queue; then `then`.
 pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf, then: Then, reload: Vec<Location>) {
     let Some(email) = account(from).map(str::to_string) else {
-        s.status = "Não dá para baixar daqui.".into();
+        s.status = t("Não dá para baixar daqui.", "Can't download from here.").into();
         return;
     };
     let to = End::local(&dst);
@@ -883,7 +928,7 @@ pub fn install_finder(s: &mut State) {
         return;
     }
     s.installing_finder = true;
-    s.status = "Instalando o serviço de pesquisa (o Windows pede permissão)…".into();
+    s.status = t("Instalando o serviço de pesquisa (o Windows pede permissão)…", "Installing the search service (Windows asks for permission)…").into();
     let reload: Vec<Location> = s.panes.iter().map(|p| p.loc.clone()).filter(|l| matches!(l, Location::Found(_))).collect();
     crate::background(s, move |emit| emit(crate::Msg::Installed { reload, result: crate::finder::install() }));
 }
@@ -906,13 +951,18 @@ pub(crate) fn search_scope(loc: &Location) -> Option<(openexplorer_gdrive::searc
     Some(match (space, path.last()) {
         (Space::Search(q), None) => (q.within.clone(), q.place.clone()),
         // A trashed folder's contents aren't searchable on their own.
-        (Space::Trash, _) => (Within::Everything, "todo o Drive".into()),
+        (Space::Trash, _) => (Within::Everything, all_of_drive()),
         (Space::Shared { id, .. }, Some((f, name))) => (Within::Folder { id: f.clone(), shared_drive: Some(id.clone()) }, shown(name)),
         (Space::Shared { id, name }, None) => (Within::SharedDrive(id.clone()), shown(name)),
         (_, Some((f, name))) => (Within::Folder { id: f.clone(), shared_drive: None }, shown(name)),
-        (Space::MyDrive, None) => (Within::MyDrive, "Meu Drive".into()),
-        _ => (Within::Everything, "todo o Drive".into()),
+        (Space::MyDrive, None) => (Within::MyDrive, t("Meu Drive", "My Drive").into()),
+        _ => (Within::Everything, all_of_drive()),
     })
+}
+
+/// A search of the whole account, as its place reads: "“praia” em todo o Drive".
+fn all_of_drive() -> String {
+    t("todo o Drive", "all of Drive").into()
 }
 
 /// Pesquisar em todo o Drive (or the whole computer): the same words, everywhere.
@@ -922,7 +972,7 @@ pub fn search_everywhere(s: &mut State, p: usize) {
         return crate::switch(s, p, to);
     }
     let Location::Drive { email, space: Space::Search(q), .. } = s.panes[p].loc.clone() else { return };
-    let q = crate::model::Search { within: openexplorer_gdrive::search::Within::Everything, place: "todo o Drive".into(), ..*q };
+    let q = crate::model::Search { within: openexplorer_gdrive::search::Within::Everything, place: all_of_drive(), ..*q };
     crate::navigate(s, p, Location::Drive { email, space: Space::Search(Box::new(q)), path: Vec::new() });
 }
 
@@ -965,7 +1015,7 @@ pub fn ask_delete(s: &mut State, p: usize) {
         return not_here(s, p);
     }
     if holds_a_share(&s.panes[p].loc, &items) {
-        s.status = SHARE_STAYS.into();
+        s.status = share_stays().into();
         return;
     }
     // The network and WSL have no Lixeira: Del deletes for good there, after asking (as
@@ -993,29 +1043,34 @@ pub fn delete(s: &mut State) {
                 for path in paths.iter().filter(|p| std::fs::symlink_metadata(p).is_err()) {
                     rec.add([Step::Unrecycle { path: path.clone(), since }]);
                 }
-                sent.map(|_| format!("Movido para a Lixeira: {}.", count(n)))
+                sent.map(|_| tr!("Movido para a Lixeira: {}.", "Moved to the Recycle Bin: {}.", count(n)))
             });
         }
         Location::Drive { email, .. } => {
             // Lixeira, if a pane shows it, gets the items too.
             let who = email.clone();
-            undo::drive_job(s, email, account_panes(s, email), to_the_trash, move |d, rec| {
+            undo::drive_job(s, email, account_panes(s, email), to_the_drive_trash, move |d, rec| {
                 for e in items {
                     d.trash(&e.id)?;
                     rec.add([Step::DriveRestore { email: who.clone(), id: e.id, name: e.name, empty: false }]);
                 }
-                Ok(format!("Movido para a lixeira do Google Drive: {}.", count(n)))
+                Ok(tr!("Movido para a lixeira do Google Drive: {}.", "Moved to the Google Drive trash: {}.", count(n)))
             });
         }
         Location::Server { .. } => crate::servers::delete(s, &loc, items, vec![loc.clone()]),
         Location::Mock(_) => return not_here(s, pane),
     }
-    s.status = format!("Excluindo {}…", count(n));
+    s.status = tr!("Excluindo {}…", "Deleting {}…", count(n));
 }
 
-/// Desfazer's words for sending `n` items to a trash.
+/// Desfazer's words for sending `n` items to the Recycle Bin.
 fn to_the_trash(n: usize) -> String {
-    format!("mover {} para a Lixeira", count(n))
+    tr!("mover {} para a Lixeira", "move {} to the Recycle Bin", count(n))
+}
+
+/// Desfazer's words for sending `n` items to the Drive trash.
+fn to_the_drive_trash(n: usize) -> String {
+    tr!("mover {} para a Lixeira", "move {} to the Trash", count(n))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1031,9 +1086,9 @@ pub fn restore(s: &mut State, p: usize) {
         for e in &items {
             d.restore(&e.id)?;
         }
-        Ok(format!("Restaurado: {}.", count(n)))
+        Ok(tr!("Restaurado: {}.", "Restored: {}.", count(n)))
     });
-    s.status = format!("Restaurando {}…", count(n));
+    s.status = tr!("Restaurando {}…", "Restoring {}…", count(n));
 }
 
 /// Excluir permanentemente: asks first, as it can't be undone.
@@ -1051,24 +1106,24 @@ pub fn purge(s: &mut State) {
     let n = items.len();
     if loc.is_local() {
         let paths: Vec<PathBuf> = items.iter().filter_map(|e| loc.local_path(e)).collect();
-        local_job(s, vec![loc.clone()], move || ops::delete_forever(&paths).map(|_| format!("Excluído permanentemente: {}.", count(n))));
-        s.status = format!("Excluindo permanentemente {}…", count(n));
+        local_job(s, vec![loc.clone()], move || ops::delete_forever(&paths).map(|_| tr!("Excluído permanentemente: {}.", "Deleted forever: {}.", count(n))));
+        s.status = tr!("Excluindo permanentemente {}…", "Deleting forever {}…", count(n));
         return;
     }
     if let Location::Server { .. } = &loc {
         crate::servers::delete(s, &loc, items, vec![loc.clone()]);
-        s.status = format!("Excluindo permanentemente {}…", count(n));
+        s.status = tr!("Excluindo permanentemente {}…", "Deleting forever {}…", count(n));
         return;
     }
     let Some(email) = account(&loc) else { return };
     drive_job(s, email, account_panes(s, email), move |d| {
         for (i, e) in items.iter().enumerate() {
             // Say how far it got: what went before an error is gone for good.
-            d.delete_forever(&e.id).map_err(|err| if i == 0 { err } else { format!("{err} (já excluídos para sempre: {})", count(i)) })?;
+            d.delete_forever(&e.id).map_err(|err| if i == 0 { err } else { tr!("{err} (já excluídos para sempre: {})", "{err} (already deleted forever: {})", count(i)) })?;
         }
-        Ok(format!("Excluído permanentemente: {}.", count(n)))
+        Ok(tr!("Excluído permanentemente: {}.", "Deleted forever: {}.", count(n)))
     });
-    s.status = format!("Excluindo permanentemente {}…", count(n));
+    s.status = tr!("Excluindo permanentemente {}…", "Deleting forever {}…", count(n));
 }
 
 /// Esvaziar lixeira: asks first, as it can't be undone.
@@ -1083,8 +1138,8 @@ pub fn ask_empty_trash(s: &mut State, p: usize) {
 /// trash.
 pub fn empty_trash(s: &mut State) {
     let Some(Dialog::EmptyTrash { email }) = s.dialog.take() else { return };
-    drive_job(s, &email, account_panes(s, &email), |d| d.empty_trash().map(|_| "Lixeira esvaziada.".into()));
-    s.status = "Esvaziando a lixeira…".into();
+    drive_job(s, &email, account_panes(s, &email), |d| d.empty_trash().map(|_| t("Lixeira esvaziada.", "Trash emptied.").into()));
+    s.status = t("Esvaziando a lixeira…", "Emptying the trash…").into();
 }
 
 /// Whether the star item adds stars: unless every selected item has one already.
@@ -1103,7 +1158,8 @@ pub fn star(s: &mut State, p: usize) {
         for e in &items {
             d.set_starred(&e.id, on)?;
         }
-        Ok(format!("{}: {}.", if on { "Estrela adicionada" } else { "Estrela removida" }, count(n)))
+        let n = count(n);
+        Ok(if on { tr!("Estrela adicionada: {n}.", "Star added: {n}.") } else { tr!("Estrela removida: {n}.", "Star removed: {n}.") })
     });
 }
 
@@ -1119,7 +1175,7 @@ pub fn ask_rename(s: &mut State, p: usize, tx: &mut Tx) {
         return not_here(s, p);
     }
     if holds_a_share(&s.panes[p].loc, &items) {
-        s.status = SHARE_STAYS.into();
+        s.status = share_stays().into();
         return;
     }
     s.name_edit = name_field(item);
@@ -1151,9 +1207,9 @@ fn stem_len(name: &str, is_dir: bool) -> usize {
 fn name_problem(loc: &Location, name: &str) -> Option<String> {
     match loc {
         Location::Local(_) | Location::Found(_) => ops::invalid_name(name),
-        Location::Server { .. } if name.contains('/') => Some("O nome não pode ter /.".into()),
-        Location::Server { .. } if matches!(name.trim(), "." | "..") => Some("Esse nome não pode ser usado.".into()),
-        _ if name.trim().is_empty() => Some("O nome não pode ficar vazio.".into()),
+        Location::Server { .. } if name.contains('/') => Some(t("O nome não pode ter /.", "The name can't have /.").into()),
+        Location::Server { .. } if matches!(name.trim(), "." | "..") => Some(t("Esse nome não pode ser usado.", "That name can't be used.").into()),
+        _ if name.trim().is_empty() => Some(t("O nome não pode ficar vazio.", "The name can't be empty.").into()),
         _ => None,
     }
 }
@@ -1179,8 +1235,9 @@ pub fn ask_new_folder(s: &mut State, p: usize, _: &mut Tx) {
     if !editable(&s.panes[p].loc) {
         return not_here(s, p);
     }
-    let mut edit = TextEdit::new("Nova pasta");
-    edit.set_selection(0, "Nova pasta".len());
+    let name = t("Nova pasta", "New folder");
+    let mut edit = TextEdit::new(name);
+    edit.set_selection(0, name.len());
     s.name_edit = edit;
     s.dialog = Some(Dialog::NewFolder { pane: p, error: None });
 }
@@ -1212,39 +1269,39 @@ pub fn apply_name(s: &mut State, pane: usize, item: Option<Entry>, name: String)
     match (&loc, item) {
         (Location::Local(_) | Location::Found(_), Some(item)) => {
             let Some(from) = loc.local_path(&item) else { return };
-            let what = format!("renomear “{}” para “{name}”", item.name);
+            let what = tr!("renomear “{}” para “{name}”", "rename “{}” to “{name}”", item.name);
             undo::local_job(s, vec![loc.clone()], move |_| what, move |rec| {
                 let to = ops::rename(&from, &name)?;
                 rec.add([Step::Move { from: to, to: from }]);
-                Ok(format!("Renomeado para \"{name}\"."))
+                Ok(tr!("Renomeado para \"{name}\".", "Renamed to \"{name}\"."))
             });
         }
         (Location::Local(dir), None) => {
             let dir = dir.clone();
-            let what = format!("criar a pasta “{name}”");
+            let what = tr!("criar a pasta “{name}”", "create the folder “{name}”");
             undo::local_job(s, vec![loc.clone()], move |_| what, move |rec| {
                 let path = ops::new_folder(&dir, &name)?;
                 rec.add([Step::RemoveDir { path }]);
-                Ok(format!("Pasta \"{name}\" criada."))
+                Ok(tr!("Pasta \"{name}\" criada.", "Folder \"{name}\" created."))
             });
         }
         (Location::Drive { email, .. }, Some(item)) => {
-            let what = format!("renomear “{}” para “{shown_name}”", shown(&item.name));
+            let what = tr!("renomear “{}” para “{shown_name}”", "rename “{}” to “{shown_name}”", shown(&item.name));
             let who = email.clone();
             undo::drive_job(s, email, account_panes(s, email), move |_| what, move |d, rec| {
                 let file = d.rename(&item.id, &name)?;
                 rec.add([Step::DriveRename { email: who, id: item.id, from: file.name, to: item.name }]);
-                Ok(format!("Renomeado para \"{shown_name}\"."))
+                Ok(tr!("Renomeado para \"{shown_name}\".", "Renamed to \"{shown_name}\"."))
             });
         }
         (Location::Drive { .. }, None) => {
             let Some((email, folder)) = drive_folder(&loc) else { return not_here(s, pane) };
-            let what = format!("criar a pasta “{shown_name}”");
+            let what = tr!("criar a pasta “{shown_name}”", "create the folder “{shown_name}”");
             let who = email.clone();
             undo::drive_job(s, &email, vec![loc.clone()], move |_| what, move |d, rec| {
                 let made = d.create_folder(&name, &folder)?;
                 rec.add([Step::DriveTrash { email: who, id: made.id, name: made.name, empty: true }]);
-                Ok(format!("Pasta \"{shown_name}\" criada."))
+                Ok(tr!("Pasta \"{shown_name}\" criada.", "Folder \"{shown_name}\" created."))
             });
         }
         (Location::Server { find: None, .. }, None) => crate::servers::name(s, &loc, None, name),
@@ -1337,7 +1394,7 @@ fn props_mut(s: &mut State) -> Option<&mut Props> {
 /// it ends that same task with the error (the hash row stops saying "Calculando…"), through
 /// `failed`.
 fn props_job(s: &State, id: u64, failed: fn(String) -> PropUpdate, work: impl FnOnce() -> PropUpdate + Send + 'static) {
-    background(s, move |emit| emit(Msg::Prop { id, update: crate::catch_panic("ler as propriedades", || Ok(work())).unwrap_or_else(failed) }));
+    background(s, move |emit| emit(Msg::Prop { id, update: crate::catch_panic(t("ler as propriedades", "read the properties"), || Ok(work())).unwrap_or_else(failed) }));
 }
 
 pub fn properties(s: &mut State, p: usize) {
@@ -1374,14 +1431,14 @@ pub fn properties(s: &mut State, p: usize) {
     // One Drive item: its owner, dates, description and checksum from Drive.
     if let ([item], Some(email)) = (items.as_slice(), account(&loc)) {
         let (details_id, sharing_id) = (item.id.clone(), item.id.clone());
-        drive_task(s, email, "ler as propriedades", move |d| d.details(&details_id), move |r| Msg::Prop { id, update: PropUpdate::Details(r) });
-        drive_task(s, email, "ler as propriedades", move |d| d.sharing(&sharing_id), move |r| Msg::Prop { id, update: PropUpdate::Sharing(r) });
+        drive_task(s, email, t("ler as propriedades", "read the properties"), move |d| d.details(&details_id), move |r| Msg::Prop { id, update: PropUpdate::Details(r) });
+        drive_task(s, email, t("ler as propriedades", "read the properties"), move |d| d.sharing(&sharing_id), move |r| Msg::Prop { id, update: PropUpdate::Sharing(r) });
     }
     if let [item] = items.as_slice() {
         s.name_edit = name_field(item);
     }
     let first = items[0].kind_label();
-    let kind = if items.iter().all(|e| e.kind_label() == first) { first } else { "Vários tipos".into() };
+    let kind = if items.iter().all(|e| e.kind_label() == first) { first } else { t("Vários tipos", "Various types").into() };
     let listed_bytes = items.iter().filter_map(|e| e.size).sum();
     s.dialog = Some(Dialog::Properties(Box::new(Props {
         pane: p,
@@ -1428,7 +1485,7 @@ pub fn props_tab(s: &mut State, tab: PropTab) {
     let (id, pane) = (p.id, p.pane);
     let Some(item_id) = p.single().map(|e| e.id.clone()) else { return };
     let Some(email) = account(&s.panes[pane].loc) else { return };
-    drive_task(s, email, "ler as versões", move |d| d.revisions(&item_id), move |r| Msg::Prop { id, update: PropUpdate::Revisions(r) });
+    drive_task(s, email, t("ler as versões", "read the versions"), move |d| d.revisions(&item_id), move |r| Msg::Prop { id, update: PropUpdate::Revisions(r) });
 }
 
 /// Works out a local file's MD5 on request: reading a large file takes a while.

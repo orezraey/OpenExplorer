@@ -14,12 +14,14 @@ use std::collections::HashMap;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use openexplorer_i18n::tr;
 use serde::{Deserialize, Serialize};
 
 pub use store::Store;
 pub use tls::{Rejected, fingerprint};
 
-/// Errors are shown to the user as they are, so they're plain Portuguese sentences.
+/// Errors are shown to the user as they are, so they're plain sentences in the interface's
+/// language (see `openexplorer_i18n`).
 pub type Result<T> = std::result::Result<T, String>;
 
 /// How long connecting, or a stalled answer, may take before giving up.
@@ -302,7 +304,7 @@ pub enum Refusal {
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Refusal::Untrusted(r) => write!(f, "O certificado do servidor não é confiável: {} (impressão digital {}).", r.why, r.fingerprint),
+            Refusal::Untrusted(r) => f.write_str(&tr!("O certificado do servidor não é confiável: {} (impressão digital {}).", "The server's certificate is not trusted: it {} (fingerprint {}).", r.why, r.fingerprint)),
             Refusal::Failed(e) => f.write_str(e),
         }
     }
@@ -345,8 +347,8 @@ pub fn probe(server: &mut Server, secret: Option<&str>) -> std::result::Result<(
     let root = server.root.clone();
     match conn.stat(&root)? {
         Some(i) if i.is_dir => Ok(()),
-        Some(_) => Err(Refusal::Failed(format!("{root} é um arquivo, não uma pasta."))),
-        None => Err(Refusal::Failed(format!("A pasta {root} não existe no servidor."))),
+        Some(_) => Err(Refusal::Failed(tr!("{root} é um arquivo, não uma pasta.", "{root} is a file, not a folder."))),
+        None => Err(Refusal::Failed(tr!("A pasta {root} não existe no servidor.", "The folder {root} doesn't exist on the server."))),
     }
 }
 
@@ -448,7 +450,7 @@ impl Pool {
     /// server need it to allow two.
     pub fn take_two(&self, a: (&Server, &dyn Fn() -> Option<String>), b: (&Server, &dyn Fn() -> Option<String>)) -> Result<(Lease<'_>, Lease<'_>)> {
         if a.0.id == b.0.id && a.0.limit() < 2 {
-            return Err(format!("{} só permite uma conexão por vez.", a.0.name));
+            return Err(tr!("{} só permite uma conexão por vez.", "{} allows only one connection at a time.", a.0.name));
         }
         let mut both = self.take_all(&[a, b])?;
         let second = both.pop().expect("two leases");
@@ -520,9 +522,9 @@ pub(crate) fn pump(src: &mut dyn Read, out: &mut dyn Write, progress: Progress) 
             Ok(0) => return Ok(done),
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(format!("A transferência parou: {e}")),
+            Err(e) => return Err(tr!("A transferência parou: {e}", "The transfer stopped: {e}")),
         };
-        out.write_all(&buf[..n]).map_err(|e| format!("A transferência parou: {e}"))?;
+        out.write_all(&buf[..n]).map_err(|e| tr!("A transferência parou: {e}", "The transfer stopped: {e}"))?;
         done += n as u64;
         if !progress(done) {
             return Err(CANCELLED.into());
@@ -534,10 +536,10 @@ pub(crate) fn pump(src: &mut dyn Read, out: &mut dyn Write, progress: Progress) 
 pub(crate) fn unreachable(host: &str, e: &std::io::Error) -> String {
     use std::io::ErrorKind::*;
     match e.kind() {
-        ConnectionRefused => format!("{host} recusou a conexão: o servidor não está rodando nessa porta."),
-        TimedOut | WouldBlock => format!("{host} não respondeu a tempo."),
-        NotFound => format!("Não encontrei o servidor {host}."),
-        _ => format!("Não consegui conectar a {host}: {e}"),
+        ConnectionRefused => tr!("{host} recusou a conexão: o servidor não está rodando nessa porta.", "{host} refused the connection: the server isn't running on that port."),
+        TimedOut | WouldBlock => tr!("{host} não respondeu a tempo.", "{host} didn't answer in time."),
+        NotFound => tr!("Não encontrei o servidor {host}.", "Couldn't find the server {host}."),
+        _ => tr!("Não consegui conectar a {host}: {e}", "Couldn't connect to {host}: {e}"),
     }
 }
 
@@ -546,9 +548,9 @@ pub(crate) fn resolve(host: &str, port: u16) -> Result<std::net::SocketAddr> {
     use std::net::ToSocketAddrs;
     (host, port)
         .to_socket_addrs()
-        .map_err(|_| format!("Não encontrei o servidor {host}."))?
+        .map_err(|_| tr!("Não encontrei o servidor {host}.", "Couldn't find the server {host}."))?
         .next()
-        .ok_or_else(|| format!("Não encontrei o servidor {host}."))
+        .ok_or_else(|| tr!("Não encontrei o servidor {host}.", "Couldn't find the server {host}."))
 }
 
 #[cfg(test)]

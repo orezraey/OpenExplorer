@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+use openexplorer_i18n::{t, tr};
 use suppaftp::list::ListParser;
 use suppaftp::types::FileType;
 use suppaftp::{FtpError, RustlsConnector, RustlsFtpStream, Status};
@@ -79,7 +80,7 @@ impl Ftp {
         // Anonymous FTP asks for some password, by custom an e-mail; many refuse an empty one.
         let secret = if server.user.is_empty() && secret.is_empty() { "anonymous@" } else { secret };
         s.login(user, secret).map_err(|e| match e {
-            FtpError::UnexpectedResponse(r) if r.status == Status::NotLoggedIn => format!("{host} recusou o usuário ou a senha."),
+            FtpError::UnexpectedResponse(r) if r.status == Status::NotLoggedIn => tr!("{host} recusou o usuário ou a senha.", "{host} refused the user name or password."),
             e => said(host, e),
         })?;
         // Implicit FTPS asks for the data connections to be encrypted too (suppaftp does it only
@@ -87,7 +88,12 @@ impl Ftp {
         if implicit {
             for command in ["PBSZ 0", "PROT P"] {
                 s.custom_command(command, &[Status::CommandOk])
-                    .map_err(|_| format!("{host} usa FTPS, mas não aceita criptografar as transferências (recusou {command}). Tente o servidor como FTP, se ele aceitar."))?;
+                    .map_err(|_| {
+                        tr!(
+                            "{host} usa FTPS, mas não aceita criptografar as transferências (recusou {command}). Tente o servidor como FTP, se ele aceitar.",
+                            "{host} uses FTPS, but won't encrypt the transfers (it refused {command}). Try the server as FTP, if it takes that."
+                        )
+                    })?;
             }
         }
         s.transfer_type(FileType::Binary).map_err(|e| said(host, e))?;
@@ -108,9 +114,14 @@ impl Ftp {
 
 fn secure(host: &str, e: FtpError) -> String {
     match e {
-        FtpError::UnexpectedResponse(_) => format!("{host} não aceita FTPS: tente FTP."),
+        FtpError::UnexpectedResponse(_) => tr!("{host} não aceita FTPS: tente FTP.", "{host} doesn't take FTPS: try FTP."),
         e => said(host, e),
     }
+}
+
+/// What a message calls the server where the host isn't at hand.
+fn server() -> &'static str {
+    t("o servidor", "the server")
 }
 
 /// The message for an FTP error, from the server's own words when it gave some.
@@ -120,21 +131,21 @@ fn said(host: &str, e: FtpError) -> String {
         FtpError::UnexpectedResponse(r) => {
             let text = String::from_utf8_lossy(&r.body).trim().to_string();
             match r.status {
-                Status::NotLoggedIn => format!("{host} recusou o usuário ou a senha."),
-                Status::FileUnavailable => format!("O servidor recusou: {text}"),
-                Status::ExceededStorage => "O servidor está sem espaço.".into(),
-                Status::BadFilename => format!("O servidor não aceita esse nome: {text}"),
-                _ => format!("O servidor respondeu: {text}"),
+                Status::NotLoggedIn => tr!("{host} recusou o usuário ou a senha.", "{host} refused the user name or password."),
+                Status::FileUnavailable => tr!("O servidor recusou: {text}", "The server refused: {text}"),
+                Status::ExceededStorage => t("O servidor está sem espaço.", "The server is out of space.").into(),
+                Status::BadFilename => tr!("O servidor não aceita esse nome: {text}", "The server doesn't take that name: {text}"),
+                _ => tr!("O servidor respondeu: {text}", "The server answered: {text}"),
             }
         }
-        FtpError::SecureError(m) => format!("Erro de TLS com {host}: {m}"),
-        e => format!("Erro de FTP com {host}: {e}"),
+        FtpError::SecureError(m) => tr!("Erro de TLS com {host}: {m}", "TLS error with {host}: {m}"),
+        e => tr!("Erro de FTP com {host}: {e}", "FTP error with {host}: {e}"),
     }
 }
 
 impl Conn for Ftp {
     fn list(&mut self, dir: &str) -> Result<Vec<Item>> {
-        let host = "o servidor";
+        let host = server();
         let mut out = Vec::new();
         let mut links = Vec::new();
         if self.mlsd {
@@ -194,7 +205,7 @@ impl Conn for Ftp {
                     Ok(Some(Item { name: name.into(), is_dir, size: (!is_dir).then_some(f.size() as u64), modified: Some(f.modified()), link: false }))
                 }
                 Err(FtpError::UnexpectedResponse(r)) if r.status == Status::FileUnavailable => Ok(None),
-                Err(e) => Err(said("o servidor", e)),
+                Err(e) => Err(said(server(), e)),
             };
         }
         if self.enters(trimmed) {
@@ -211,28 +222,28 @@ impl Conn for Ftp {
     }
 
     fn mkdir(&mut self, path: &str) -> Result<()> {
-        self.s.mkdir(path).map_err(|e| said("o servidor", e))
+        self.s.mkdir(path).map_err(|e| said(server(), e))
     }
 
     fn rename(&mut self, from: &str, to: &str) -> Result<()> {
         if self.stat(to)?.is_some() {
-            return Err(format!("Já existe um item chamado {}.", to.rsplit('/').next().unwrap_or(to)));
+            return Err(tr!("Já existe um item chamado {}.", "There's already an item named {}.", to.rsplit('/').next().unwrap_or(to)));
         }
-        self.s.rename(from, to).map_err(|e| said("o servidor", e))
+        self.s.rename(from, to).map_err(|e| said(server(), e))
     }
 
     fn remove_file(&mut self, path: &str) -> Result<()> {
-        self.s.rm(path).map_err(|e| said("o servidor", e))
+        self.s.rm(path).map_err(|e| said(server(), e))
     }
 
     fn remove_dir(&mut self, path: &str) -> Result<()> {
-        self.s.rmdir(path).map_err(|e| said("o servidor", e))
+        self.s.rmdir(path).map_err(|e| said(server(), e))
     }
 
     fn download(&mut self, path: &str, out: &mut dyn Write, progress: Progress) -> Result<()> {
-        let mut stream = self.s.retr_as_stream(path).map_err(|e| said("o servidor", e))?;
+        let mut stream = self.s.retr_as_stream(path).map_err(|e| said(server(), e))?;
         match pump(&mut stream, out, progress) {
-            Ok(_) => stream.finish().map_err(|e| said("o servidor", e)),
+            Ok(_) => stream.finish().map_err(|e| said(server(), e)),
             Err(e) => {
                 self.broken = true;
                 let _ = self.s.abort(stream);
@@ -242,9 +253,9 @@ impl Conn for Ftp {
     }
 
     fn upload(&mut self, path: &str, src: &mut dyn Read, _len: u64, progress: Progress) -> Result<()> {
-        let mut stream = self.s.put_with_stream(path).map_err(|e| said("o servidor", e))?;
+        let mut stream = self.s.put_with_stream(path).map_err(|e| said(server(), e))?;
         match pump(src, &mut stream, progress) {
-            Ok(_) => stream.finish().map_err(|e| said("o servidor", e)),
+            Ok(_) => stream.finish().map_err(|e| said(server(), e)),
             Err(e) => {
                 self.broken = true;
                 let _ = self.s.abort(stream);
@@ -256,7 +267,7 @@ impl Conn for Ftp {
     }
 
     fn home(&mut self) -> Result<String> {
-        self.s.pwd().map_err(|e| said("o servidor", e))
+        self.s.pwd().map_err(|e| said(server(), e))
     }
 
     fn alive(&mut self) -> bool {

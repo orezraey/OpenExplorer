@@ -4,6 +4,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
+use openexplorer_i18n::{t, tr};
 use serde::Deserialize;
 
 use crate::oauth::{self, Tokens};
@@ -59,10 +60,10 @@ impl View {
 
     fn what(self) -> &'static str {
         match self {
-            View::SharedWithMe => "Compartilhados comigo",
-            View::Starred => "Com estrela",
-            View::Recent => "Recentes",
-            View::Trash => "Lixeira",
+            View::SharedWithMe => t("Compartilhados comigo", "Shared with me"),
+            View::Starred => t("Com estrela", "Starred"),
+            View::Recent => t("Recentes", "Recent"),
+            View::Trash => t("Lixeira", "Trash"),
         }
     }
 }
@@ -184,14 +185,14 @@ impl Drive {
         if let Some(id) = self.root.get() {
             return Ok(id.clone());
         }
-        let v = self.get("/files/root", &[("fields", "id")], "Meu Drive")?;
-        let id = v.get("id").and_then(|v| v.as_str()).filter(|id| !id.is_empty()).ok_or("Meu Drive: o Google não informou a pasta raiz.")?;
+        let v = self.get("/files/root", &[("fields", "id")], t("Meu Drive", "My Drive"))?;
+        let id = v.get("id").and_then(|v| v.as_str()).filter(|id| !id.is_empty()).ok_or(t("Meu Drive: o Google não informou a pasta raiz.", "My Drive: Google didn't send the top folder."))?;
         Ok(self.root.get_or_init(|| id.to_string()).clone())
     }
 
     /// Starts from the tokens a login just returned, saving the first refresh.
     pub fn from_login(cfg: ClientConfig, tokens: &Tokens) -> Result<Drive> {
-        let refresh = tokens.refresh_token.clone().ok_or("O Google não devolveu um token de renovação; tente conectar de novo.")?;
+        let refresh = tokens.refresh_token.clone().ok_or(t("O Google não devolveu um token de renovação; tente conectar de novo.", "Google didn't send back a refresh token; try connecting again."))?;
         let d = Drive::new(cfg, refresh);
         *d.access.lock().unwrap() = Some((tokens.access_token.clone(), Instant::now() + Duration::from_secs(tokens.expires_in)));
         Ok(d)
@@ -274,7 +275,7 @@ impl Drive {
             };
             let resp = sent.map_err(|e| {
                 crate::log(&format!("{method} {path} falhou em {} ms: {e}", started.elapsed().as_millis()));
-                format!("{what}: sem conexão com o Google: {e}")
+                tr!("{what}: sem conexão com o Google: {e}", "{what}: no connection to Google: {e}")
             })?;
             let mut resp = resp;
             let status = resp.status().as_u16();
@@ -307,11 +308,11 @@ impl Drive {
     }
 
     pub fn about(&self) -> Result<Account> {
-        let v = self.get("/about", &[("fields", "user(emailAddress,displayName)")], "Dados da conta")?;
+        let v = self.get("/about", &[("fields", "user(emailAddress,displayName)")], t("Dados da conta", "Account details"))?;
         let s = |p: &str| v.pointer(p).and_then(|x| x.as_str()).unwrap_or_default().to_string();
         let email = s("/user/emailAddress");
         if email.is_empty() {
-            return Err("O Google não informou o e-mail da conta.".into());
+            return Err(t("O Google não informou o e-mail da conta.", "Google didn't send the account's e-mail.").into());
         }
         Ok(Account { name: s("/user/displayName"), email })
     }
@@ -335,7 +336,7 @@ impl Drive {
             }
             let mut v = self.get(path, &q, what)?;
             let page: Vec<T> = serde_json::from_value(v.get_mut(items).map(serde_json::Value::take).unwrap_or_default())
-                .map_err(|e| format!("{what}: resposta inesperada: {e}"))?;
+                .map_err(|e| tr!("{what}: resposta inesperada: {e}", "{what}: unexpected answer: {e}"))?;
             token = v.get("nextPageToken").and_then(|t| t.as_str()).map(str::to_string);
             crate::log(&format!("  {} itens nesta página{}", page.len(), if token.is_some() { ", há mais" } else { ", última" }));
             if !each(page, token.is_some()) || token.is_none() {
@@ -348,7 +349,7 @@ impl Drive {
     /// website (marked in `hidden`), which would otherwise be out of reach here.
     pub fn shared_drives(&self) -> Result<Vec<SharedDrive>> {
         let mut out = Vec::new();
-        self.pages("/drives", &[("pageSize", "100"), ("fields", "nextPageToken,drives(id,name,hidden)")], "drives", "Lista de drives compartilhados", |page, _| {
+        self.pages("/drives", &[("pageSize", "100"), ("fields", "nextPageToken,drives(id,name,hidden)")], "drives", t("Lista de drives compartilhados", "Shared drives list"), |page, _| {
             out.extend(page);
             true
         })?;
@@ -368,10 +369,10 @@ impl Drive {
         // Drive ids are [A-Za-z0-9_-]; anything else would break out of the query string.
         let valid = |id: &str| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
         if !valid(folder_id) {
-            return Err(format!("Id de pasta inválido: {folder_id}"));
+            return Err(tr!("Id de pasta inválido: {folder_id}", "Invalid folder id: {folder_id}"));
         }
         if let Some(d) = shared_drive.filter(|d| !valid(d)) {
-            return Err(format!("Id de drive compartilhado inválido: {d}"));
+            return Err(tr!("Id de drive compartilhado inválido: {d}", "Invalid shared drive id: {d}"));
         }
         let q = format!("'{folder_id}' in parents and trashed = false");
         let mut query = vec![
@@ -388,7 +389,7 @@ impl Drive {
             Some(d) => query.extend([("corpora", "drive"), ("driveId", d)]),
             None => query.push(("corpora", "allDrives")),
         }
-        self.pages("/files", &query, "files", "Listagem da pasta", |raw: Vec<RawFile>, more| each(raw.into_iter().map(DriveFile::from).collect(), more))
+        self.pages("/files", &query, "files", t("Listagem da pasta", "Folder listing"), |raw: Vec<RawFile>, more| each(raw.into_iter().map(DriveFile::from).collect(), more))
     }
 
     /// The folders in folder `folder_id` (and shortcuts to folders), for the tree: only those
@@ -401,7 +402,7 @@ impl Drive {
             None => query.push(("corpora", "allDrives")),
         }
         let mut out = Vec::new();
-        self.pages("/files", &query, "files", "Pastas", |raw: Vec<RawFile>, _| {
+        self.pages("/files", &query, "files", t("Pastas", "Folders"), |raw: Vec<RawFile>, _| {
             // A shortcut to a file isn't a folder.
             out.extend(raw.into_iter().map(DriveFile::from).filter(|f| f.is_dir));
             true
@@ -441,56 +442,56 @@ impl Drive {
             ("includeItemsFromAllDrives", "true"),
             ("corpora", "allDrives"),
         ];
-        self.pages("/files", &query, "files", "Listagem da pasta na lixeira", |raw: Vec<RawFile>, more| each(raw.into_iter().map(DriveFile::from).collect(), more))
+        self.pages("/files", &query, "files", t("Listagem da pasta na lixeira", "Trashed folder listing"), |raw: Vec<RawFile>, more| each(raw.into_iter().map(DriveFile::from).collect(), more))
     }
 
     /// Takes a file or folder out of the trash, back where it was.
     pub fn restore(&self, id: &str) -> Result<DriveFile> {
-        self.file_call("PATCH", &format!("/files/{}", checked(id)?), &[], &serde_json::json!({ "trashed": false }), "Restaurar")
+        self.file_call("PATCH", &format!("/files/{}", checked(id)?), &[], &serde_json::json!({ "trashed": false }), t("Restaurar", "Restore"))
     }
 
     /// Deletes a file or folder for good, skipping the trash: it can't be undone.
     pub fn delete_forever(&self, id: &str) -> Result<()> {
-        self.call("DELETE", &format!("/files/{}", checked(id)?), &[("supportsAllDrives", "true")], None, "Excluir permanentemente").map(|_| ())
+        self.call("DELETE", &format!("/files/{}", checked(id)?), &[("supportsAllDrives", "true")], None, t("Excluir permanentemente", "Delete forever")).map(|_| ())
     }
 
     /// Deletes for good everything in this account's My Drive trash; shared drives keep theirs.
     pub fn empty_trash(&self) -> Result<()> {
-        self.call("DELETE", "/files/trash", &[], None, "Esvaziar lixeira").map(|_| ())
+        self.call("DELETE", "/files/trash", &[], None, t("Esvaziar lixeira", "Empty trash")).map(|_| ())
     }
 
     /// Adds or removes the star.
     pub fn set_starred(&self, id: &str, starred: bool) -> Result<DriveFile> {
-        let what = if starred { "Adicionar estrela" } else { "Remover estrela" };
+        let what = if starred { t("Adicionar estrela", "Add star") } else { t("Remover estrela", "Remove star") };
         self.file_call("PATCH", &format!("/files/{}", checked(id)?), &[], &serde_json::json!({ "starred": starred }), what)
     }
 
     /// A new folder named `name` in folder `parent` (`"root"` is My Drive).
     pub fn create_folder(&self, name: &str, parent: &str) -> Result<DriveFile> {
         let body = serde_json::json!({ "name": name, "mimeType": FOLDER_MIME, "parents": [parent] });
-        self.file_call("POST", "/files", &[], &body, "Criar pasta")
+        self.file_call("POST", "/files", &[], &body, t("Criar pasta", "Create folder"))
     }
 
     pub fn rename(&self, id: &str, name: &str) -> Result<DriveFile> {
-        self.file_call("PATCH", &format!("/files/{}", checked(id)?), &[], &serde_json::json!({ "name": name }), "Renomear")
+        self.file_call("PATCH", &format!("/files/{}", checked(id)?), &[], &serde_json::json!({ "name": name }), t("Renomear", "Rename"))
     }
 
     /// Moves a file or folder to the Drive trash, from where it can be restored for 30 days.
     pub fn trash(&self, id: &str) -> Result<DriveFile> {
-        self.file_call("PATCH", &format!("/files/{}", checked(id)?), &[], &serde_json::json!({ "trashed": true }), "Mover para a lixeira")
+        self.file_call("PATCH", &format!("/files/{}", checked(id)?), &[], &serde_json::json!({ "trashed": true }), t("Mover para a lixeira", "Move to trash"))
     }
 
     /// Moves `id` out of folder `from` into folder `to`.
     pub fn move_to(&self, id: &str, from: &str, to: &str) -> Result<DriveFile> {
         let path = format!("/files/{}", checked(id)?);
-        self.file_call("PATCH", &path, &[("addParents", checked(to)?), ("removeParents", checked(from)?)], &serde_json::json!({}), "Mover")
+        self.file_call("PATCH", &path, &[("addParents", checked(to)?), ("removeParents", checked(from)?)], &serde_json::json!({}), t("Mover", "Move"))
     }
 
     /// Where file `id` stands now: its name, its folders and whether it's in the trash, which
     /// Desfazer checks before changing anything back.
     pub fn status(&self, id: &str) -> Result<Status> {
-        let v = self.get(&format!("/files/{}", checked(id)?), &[("fields", "name,parents,trashed"), ("supportsAllDrives", "true")], "Desfazer")?;
-        serde_json::from_value(v).map_err(|e| format!("Desfazer: resposta inesperada: {e}"))
+        let v = self.get(&format!("/files/{}", checked(id)?), &[("fields", "name,parents,trashed"), ("supportsAllDrives", "true")], t("Desfazer", "Undo"))?;
+        serde_json::from_value(v).map_err(|e| tr!("Desfazer: resposta inesperada: {e}", "Undo: unexpected answer: {e}"))
     }
 
     /// Whether folder `id` holds anything (trashed items aside).
@@ -508,7 +509,7 @@ impl Drive {
     pub fn copy(&self, src: &DriveFile, to: &str, name: &str) -> Result<DriveFile> {
         if !src.is_dir {
             let body = serde_json::json!({ "name": name, "parents": [to] });
-            return self.file_call("POST", &format!("/files/{}/copy", checked(&src.id)?), &[], &body, "Copiar");
+            return self.file_call("POST", &format!("/files/{}/copy", checked(&src.id)?), &[], &body, t("Copiar", "Copy"));
         }
         let folder = self.create_folder(name, to)?;
         let mut children = Vec::new();
@@ -527,7 +528,7 @@ impl Drive {
     /// Where file `id` sits, for Mostrar na pasta and Drive links: climbs through its parents to
     /// the top of its shared drive or My Drive, or to the highest folder the account can see.
     pub fn place(&self, id: &str) -> Result<Place> {
-        const WHAT: &str = "Achar a pasta";
+        let what = t("Achar a pasta", "Find the folder");
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Up {
@@ -540,11 +541,11 @@ impl Drive {
             drive_id: Option<String>,
         }
         let up = |id: &str, fields: &str| -> Result<Up> {
-            let v = self.get(&format!("/files/{}", checked(id)?), &[("fields", fields), ("supportsAllDrives", "true")], WHAT)?;
-            serde_json::from_value(v).map_err(|e| format!("{WHAT}: resposta inesperada: {e}"))
+            let v = self.get(&format!("/files/{}", checked(id)?), &[("fields", fields), ("supportsAllDrives", "true")], what)?;
+            serde_json::from_value(v).map_err(|e| tr!("{what}: resposta inesperada: {e}", "{what}: unexpected answer: {e}"))
         };
         let drive_name = |drive: &str| -> Result<String> {
-            let d = self.get(&format!("/drives/{}", checked(drive)?), &[("fields", "name")], WHAT)?;
+            let d = self.get(&format!("/drives/{}", checked(drive)?), &[("fields", "name")], what)?;
             Ok(d.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string())
         };
         let file = up(id, "name,mimeType,parents,driveId")?;
@@ -571,7 +572,7 @@ impl Drive {
             }
             // Deeper than Drive nests folders: going round in circles.
             if folders.len() >= 100 {
-                return Err(format!("{WHAT}: a pasta de {id} não tem fim."));
+                return Err(tr!("{what}: a pasta de {id} não tem fim.", "{what}: the folders above {id} never end."));
             }
             let folder = up(&at, "name,parents")?;
             folders.push((at, folder.name));
@@ -610,8 +611,8 @@ impl Drive {
 
     /// The first folder `query` finds, else its first file.
     fn first_named(&self, query: &[(&str, &str)]) -> Result<Option<DriveFile>> {
-        let mut v = self.get("/files", query, "Achar pelo nome")?;
-        let found: Vec<RawFile> = serde_json::from_value(v.get_mut("files").map(serde_json::Value::take).unwrap_or_default()).map_err(|e| format!("Achar pelo nome: resposta inesperada: {e}"))?;
+        let mut v = self.get("/files", query, t("Achar pelo nome", "Find by name"))?;
+        let found: Vec<RawFile> = serde_json::from_value(v.get_mut("files").map(serde_json::Value::take).unwrap_or_default()).map_err(|e| tr!("Achar pelo nome: resposta inesperada: {e}", "Find by name: unexpected answer: {e}"))?;
         let mut found: Vec<DriveFile> = found.into_iter().map(DriveFile::from).collect();
         let at = found.iter().position(|f| f.is_dir).unwrap_or(0);
         Ok((!found.is_empty()).then(|| found.swap_remove(at)))
@@ -620,7 +621,7 @@ impl Drive {
     /// One file's details, for Propriedades.
     pub fn details(&self, id: &str) -> Result<Details> {
         let fields = "id,description,mimeType,md5Checksum,createdTime,viewedByMeTime,webViewLink,shared,starred,                      owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),sharingUser(displayName)";
-        let v = self.get(&format!("/files/{}", checked(id)?), &[("fields", fields), ("supportsAllDrives", "true")], "Propriedades")?;
+        let v = self.get(&format!("/files/{}", checked(id)?), &[("fields", fields), ("supportsAllDrives", "true")], t("Propriedades", "Properties"))?;
         let s = |p: &str| v.pointer(p).and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(str::to_string);
         let person = |p: &str| s(&format!("{p}/displayName")).or_else(|| s(&format!("{p}/emailAddress")));
         Ok(Details {
@@ -654,7 +655,7 @@ impl Drive {
         let path = format!("/files/{}/revisions", checked(id)?);
         let fields = "nextPageToken,revisions(id,modifiedTime,size,keepForever,originalFilename,lastModifyingUser(displayName,emailAddress))";
         let mut out = Vec::new();
-        self.pages(&path, &[("pageSize", "200"), ("fields", fields)], "revisions", "Histórico de versões", |page: Vec<Raw>, _| {
+        self.pages(&path, &[("pageSize", "200"), ("fields", fields)], "revisions", t("Histórico de versões", "Version history"), |page: Vec<Raw>, _| {
             out.extend(page.into_iter().map(|r| Revision {
                 modified: r.modified_time.as_deref().and_then(parse_time),
                 size: r.size.and_then(|s| s.parse().ok()),
@@ -675,7 +676,7 @@ impl Drive {
         let mut q = vec![("supportsAllDrives", "true"), ("fields", FILE_FIELDS)];
         q.extend_from_slice(query);
         let v = self.call(method, path, &q, Some(body), what)?;
-        let raw: RawFile = serde_json::from_value(v).map_err(|e| format!("{what}: resposta inesperada: {e}"))?;
+        let raw: RawFile = serde_json::from_value(v).map_err(|e| tr!("{what}: resposta inesperada: {e}", "{what}: unexpected answer: {e}"))?;
         Ok(raw.into())
     }
 }
@@ -724,7 +725,7 @@ pub fn valid_id(id: &str) -> bool {
 
 /// A Drive id, refused unless [`valid_id`].
 pub(crate) fn checked(id: &str) -> Result<&str> {
-    if valid_id(id) { Ok(id) } else { Err(format!("Id inválido: {id}")) }
+    if valid_id(id) { Ok(id) } else { Err(tr!("Id inválido: {id}", "Invalid id: {id}")) }
 }
 
 #[derive(Deserialize)]

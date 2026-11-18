@@ -3,6 +3,8 @@
 
 use std::path::PathBuf;
 
+use openexplorer_i18n::tr;
+
 use crate::{Result, Server};
 
 const SERVICE: &str = "OpenExplorer servidor";
@@ -24,10 +26,10 @@ impl Store {
 
     fn write(&self, list: &[Server]) -> Result<()> {
         if let Some(dir) = self.file.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("Não consegui criar {}: {e}", dir.display()))?;
+            std::fs::create_dir_all(dir).map_err(|e| tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", dir.display()))?;
         }
         let text = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
-        std::fs::write(&self.file, text).map_err(|e| format!("Não consegui salvar a lista de servidores: {e}"))
+        std::fs::write(&self.file, text).map_err(|e| tr!("Não consegui salvar a lista de servidores: {e}", "Couldn't save the list of servers: {e}"))
     }
 
     /// Adds or replaces `server`, and its password: `None` keeps the one stored, `Some("")`
@@ -35,7 +37,7 @@ impl Store {
     pub fn save(&self, server: Server, secret: Option<&str>) -> Result<()> {
         match secret {
             Some("") => forget_secret(&server.id),
-            Some(s) => entry(&server.id)?.set_password(s).map_err(|e| format!("Não consegui guardar a senha no cofre do sistema: {e}"))?,
+            Some(s) => entry(&server.id)?.set_password(s).map_err(|e| tr!("Não consegui guardar a senha no cofre do sistema: {e}", "Couldn't keep the password in the system's credential store: {e}"))?,
             None => {}
         }
         let mut list = self.servers();
@@ -56,7 +58,7 @@ impl Store {
 }
 
 fn entry(id: &str) -> Result<keyring::Entry> {
-    keyring::Entry::new(SERVICE, id).map_err(|e| format!("Cofre de credenciais indisponível: {e}"))
+    keyring::Entry::new(SERVICE, id).map_err(|e| tr!("Cofre de credenciais indisponível: {e}", "Credential store unavailable: {e}"))
 }
 
 fn forget_secret(id: &str) {

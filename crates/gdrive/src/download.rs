@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use openexplorer_i18n::tr;
+
 use crate::api::{Drive, DriveFile, FOLDER_MIME};
 use crate::{CANCELLED, Result};
 
@@ -88,13 +90,16 @@ fn backoff(attempt: u32, moved: &mut dyn FnMut(u64) -> bool) -> bool {
 /// The message for an answer that won't get better by asking again.
 fn refused(what: &str, status: u16, body: &str) -> String {
     if body.contains("exportSizeLimitExceeded") {
-        return format!("{what}: o Google só exporta arquivos de até 10 MB, e este passa disso. Abra-o no navegador e use Arquivo > Fazer download.");
+        return tr!(
+            "{what}: o Google só exporta arquivos de até 10 MB, e este passa disso. Abra-o no navegador e use Arquivo > Fazer download.",
+            "{what}: Google only exports files up to 10 MB, and this one is larger. Open it in the browser and use File > Download."
+        );
     }
     if body.contains("cannotDownloadAbusiveFile") {
-        return format!("{what}: o Google marcou este arquivo como malware ou spam e não deixa baixá-lo por aqui.");
+        return tr!("{what}: o Google marcou este arquivo como malware ou spam e não deixa baixá-lo por aqui.", "{what}: Google marked this file as malware or spam and won't let it be downloaded here.");
     }
     if body.contains("cannotExportFile") || body.contains("fileNotDownloadable") {
-        return format!("{what}: o Google não deixa baixar este arquivo (o dono pode ter desativado o download).");
+        return tr!("{what}: o Google não deixa baixar este arquivo (o dono pode ter desativado o download).", "{what}: Google won't let this file be downloaded (its owner may have turned downloads off).");
     }
     format!("{what}: HTTP {status}: {}", crate::google_reason(body))
 }
@@ -113,15 +118,15 @@ impl Drive {
 
     /// [`Drive::download`] in `pieces` parallel segments (1 for one stream).
     pub(crate) fn download_in(&self, file: &DriveFile, to: &Path, pieces: usize, got: &mut dyn FnMut(u64) -> bool) -> Result<u64> {
-        let what = format!("Baixar \"{}\"", file.name);
+        let what = tr!("Baixar \"{}\"", "Download \"{}\"", file.name);
         if file.is_dir || file.mime == FOLDER_MIME {
-            return Err(format!("{what}: é uma pasta."));
+            return Err(tr!("{what}: é uma pasta.", "{what}: it's a folder."));
         }
         if file.mime == SHORTCUT {
-            return Err(format!("{what}: é um atalho; baixe o arquivo original."));
+            return Err(tr!("{what}: é um atalho; baixe o arquivo original.", "{what}: it's a shortcut; download the original file."));
         }
         if !file.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') || file.id.is_empty() {
-            return Err(format!("Id inválido: {}", file.id));
+            return Err(tr!("Id inválido: {}", "Invalid id: {}", file.id));
         }
         let (url, size) = self.media_url(file, &what)?;
         let part = part_path(to);
@@ -132,7 +137,7 @@ impl Drive {
                 let f = OpenOptions::new().write(true).open(&part).map_err(|e| format!("{what}: {e}"))?;
                 f.set_modified(t).map_err(|e| format!("{what}: {e}"))?;
             }
-            std::fs::rename(&part, to).map_err(|e| format!("{what}: não consegui dar o nome final ao arquivo: {e}"))?;
+            std::fs::rename(&part, to).map_err(|e| tr!("{what}: não consegui dar o nome final ao arquivo: {e}", "{what}: couldn't give the file its final name: {e}"))?;
             Ok(written)
         });
         if out.is_err() {
@@ -153,7 +158,7 @@ impl Drive {
         let base = self.api_url.trim_end_matches('/');
         Ok(if file.mime.starts_with(GOOGLE) {
             let Some((mime, _)) = export_format(&file.mime) else {
-                return Err(format!("{what}: este tipo de arquivo do Google não pode ser baixado, só aberto no navegador."));
+                return Err(tr!("{what}: este tipo de arquivo do Google não pode ser baixado, só aberto no navegador.", "{what}: this kind of Google file can't be downloaded, only opened in the browser."));
             };
             (format!("{base}/files/{}/export?mimeType={}", file.id, url::form_urlencoded::byte_serialize(mime.as_bytes()).collect::<String>()), None)
         } else {
@@ -165,12 +170,12 @@ impl Drive {
     /// else (a drag into Windows Explorer pulls them this way). The caller asks again from
     /// where it got to when a read fails. An export, which takes no `Range`, skips to `from`.
     pub fn open_media(&self, file: &DriveFile, from: u64) -> Result<Box<dyn Read + Send>> {
-        let what = format!("Baixar \"{}\"", file.name);
+        let what = tr!("Baixar \"{}\"", "Download \"{}\"", file.name);
         if file.is_dir || file.mime == FOLDER_MIME || file.mime == SHORTCUT {
-            return Err(format!("{what}: não é um arquivo."));
+            return Err(tr!("{what}: não é um arquivo.", "{what}: it's not a file."));
         }
         if !file.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') || file.id.is_empty() {
-            return Err(format!("Id inválido: {}", file.id));
+            return Err(tr!("Id inválido: {}", "Invalid id: {}", file.id));
         }
         let (url, _) = self.media_url(file, &what)?;
         for renewed in [false, true] {
@@ -178,13 +183,13 @@ impl Drive {
             if from > 0 {
                 req = req.header("Range", &format!("bytes={from}-"));
             }
-            let mut r = req.call().map_err(|e| format!("{what}: sem conexão com o Google: {e}"))?;
+            let mut r = req.call().map_err(|e| tr!("{what}: sem conexão com o Google: {e}", "{what}: no connection to Google: {e}"))?;
             match r.status().as_u16() {
                 206 => return Ok(Box::new(r.into_body().into_reader())),
                 200 => {
                     let mut body = r.into_body().into_reader();
                     if from > 0 && std::io::copy(&mut (&mut body).take(from), &mut std::io::sink()).map_err(|e| format!("{what}: {e}"))? != from {
-                        return Err(format!("{what}: o arquivo acabou antes do esperado."));
+                        return Err(tr!("{what}: o arquivo acabou antes do esperado.", "{what}: the file ended sooner than expected."));
                     }
                     return Ok(Box::new(body));
                 }
@@ -195,13 +200,13 @@ impl Drive {
                 }
             }
         }
-        Err(format!("{what}: o Google recusou o acesso."))
+        Err(tr!("{what}: o Google recusou o acesso.", "{what}: Google refused access."))
     }
 
     /// Fetches `url` into `part`: `size` bytes in `pieces` segments when known, else one stream
     /// to its end.
     fn fetch_to(&self, url: &str, part: &Path, size: Option<u64>, pieces: usize, got: &mut dyn FnMut(u64) -> bool, what: &str) -> Result<u64> {
-        let file = File::create(part).map_err(|e| format!("{what}: não consegui criar o arquivo: {e}"))?;
+        let file = File::create(part).map_err(|e| tr!("{what}: não consegui criar o arquivo: {e}", "{what}: couldn't create the file: {e}"))?;
         let Some(size) = size.filter(|_| pieces > 1) else {
             drop(file);
             let mut total = 0u64;
@@ -212,12 +217,12 @@ impl Drive {
                 got(total)
             }, what)?;
             return match size {
-                Some(n) if end != n => Err(format!("{what}: chegaram {end} de {n} bytes.")),
+                Some(n) if end != n => Err(tr!("{what}: chegaram {end} de {n} bytes.", "{what}: {end} of {n} bytes arrived.")),
                 _ => Ok(end),
             };
         };
         // The whole size up front, so each segment writes its own part of it.
-        file.set_len(size).map_err(|e| format!("{what}: sem espaço para o arquivo? {e}"))?;
+        file.set_len(size).map_err(|e| tr!("{what}: sem espaço para o arquivo? {e}", "{what}: no room for the file? {e}"))?;
         drop(file);
         let total = AtomicU64::new(0);
         let stop = AtomicBool::new(false);
@@ -248,7 +253,7 @@ impl Drive {
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            runs.into_iter().map(|r| r.join().unwrap_or_else(|_| Err(format!("{what}: erro interno num segmento.")))).collect()
+            runs.into_iter().map(|r| r.join().unwrap_or_else(|_| Err(tr!("{what}: erro interno num segmento.", "{what}: internal error in a segment.")))).collect()
         });
         let written = total.load(Ordering::Relaxed);
         if !got(written) {
@@ -308,7 +313,7 @@ impl Drive {
                             match body.read(&mut buf[..room]) {
                                 Ok(0) => break,
                                 Ok(n) => {
-                                    file.write_all(&buf[..n]).map_err(|e| format!("{what}: não consegui gravar no disco: {e}"))?;
+                                    file.write_all(&buf[..n]).map_err(|e| tr!("{what}: não consegui gravar no disco: {e}", "{what}: couldn't write to the disk: {e}"))?;
                                     at += n as u64;
                                     if !moved(n as u64) {
                                         return Err(CANCELLED.into());
@@ -340,7 +345,7 @@ impl Drive {
                         true
                     }
                 },
-                Err(e) if failures >= RETRIES => return Err(format!("{what}: sem conexão com o Google: {e}")),
+                Err(e) if failures >= RETRIES => return Err(tr!("{what}: sem conexão com o Google: {e}", "{what}: no connection to Google: {e}")),
                 Err(_) => true,
             };
             if failed {
@@ -349,7 +354,7 @@ impl Drive {
                     failures = 0;
                 }
                 if failures >= RETRIES {
-                    return Err(format!("{what}: a conexão caiu várias vezes; tente de novo."));
+                    return Err(tr!("{what}: a conexão caiu várias vezes; tente de novo.", "{what}: the connection dropped several times; try again."));
                 }
                 if !backoff(failures, moved) {
                     return Err(CANCELLED.into());

@@ -26,6 +26,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use openexplorer_i18n::{t, tr};
+
 use crate::index::{Index, Vol};
 use crate::proto::{self, Answer, Request};
 use crate::tree::{self, ROOT, Tree};
@@ -503,7 +505,9 @@ pub fn follow(vol: Arc<Vol>) {
         };
         vol.ready(tree, t0.elapsed().as_millis() as u64);
         if live.full.load(Ordering::Relaxed) {
-            vol.note(Some("Pastas demais para o inotify vigiar: mudanças em parte delas aparecem só na próxima releitura.".into()));
+            vol.note(Some(
+                t("Pastas demais para o inotify vigiar: mudanças em parte delas aparecem só na próxima releitura.", "Too many folders for inotify to watch: changes in some of them show only at the next reading.").into(),
+            ));
         }
         save(&vol);
         let (mut saved, mut dirty) = (Instant::now(), false);
@@ -543,14 +547,14 @@ pub fn follow(vol: Arc<Vol>) {
 pub fn serve(index: Arc<Index>) -> Result<(), String> {
     let path = socket_path();
     if UnixStream::connect(&path).is_ok() {
-        return Err("O serviço de pesquisa já está rodando.".into());
+        return Err(t("O serviço de pesquisa já está rodando.", "The search service is already running.").into());
     }
     let _ = std::fs::remove_file(&path);
     // Made private before anyone can connect: the umask covers the moment between bind and chmod.
     let old = unsafe { libc::umask(0o177) };
     let listener = UnixListener::bind(&path);
     unsafe { libc::umask(old) };
-    let listener = listener.map_err(|e| format!("Abrir {}: {e}", path.display()))?;
+    let listener = listener.map_err(|e| tr!("Abrir {}: {e}", "Open {}: {e}", path.display()))?;
     let clients = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -577,9 +581,9 @@ pub fn serve(index: Arc<Index>) -> Result<(), String> {
 /// runs. Several searches can start the service at once (typing on first use); the copies that
 /// come second end here, before touching the socket.
 fn only_copy() -> Result<std::fs::File, String> {
-    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(cache_dir().join("index.lock")).map_err(|e| format!("Trava do serviço: {e}"))?;
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(cache_dir().join("index.lock")).map_err(|e| tr!("Trava do serviço: {e}", "Service lock: {e}"))?;
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err("O serviço de pesquisa já está rodando.".into());
+        return Err(t("O serviço de pesquisa já está rodando.", "The search service is already running.").into());
     }
     Ok(f)
 }
@@ -604,13 +608,13 @@ pub fn ask(req: &Request) -> Result<Answer, String> {
                 match UnixStream::connect(socket_path()) {
                     Ok(s) => break s,
                     Err(_) if t.elapsed() < Duration::from_secs(3) => std::thread::sleep(Duration::from_millis(50)),
-                    Err(e) => return Err(format!("O serviço de pesquisa não respondeu ({e}).")),
+                    Err(e) => return Err(tr!("O serviço de pesquisa não respondeu ({e}).", "The search service didn't answer ({e}).")),
                 }
             }
         }
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-    proto::write_request(&mut &stream, req).map_err(|e| format!("Falar com o serviço: {e}"))?;
+    proto::write_request(&mut &stream, req).map_err(|e| tr!("Falar com o serviço: {e}", "Talking to the service: {e}"))?;
     proto::read_answer(&mut BufReader::with_capacity(1 << 16, &stream))
 }
 
@@ -645,7 +649,7 @@ pub fn start() -> Result<(), String> {
         here.parent().and_then(Path::parent).map_or_else(PathBuf::new, |d| d.join(APP)),
         installed_exe(),
     ];
-    let exe = candidates.iter().find(|p| p.is_file()).ok_or_else(|| format!("{APP} não foi encontrado para iniciar o serviço de pesquisa."))?;
+    let exe = candidates.iter().find(|p| p.is_file()).ok_or_else(|| tr!("{APP} não foi encontrado para iniciar o serviço de pesquisa.", "{APP} wasn't found to start the search service."))?;
     std::process::Command::new(exe)
         .args([crate::cli::ARG, "serve"])
         .stdin(std::process::Stdio::null())
@@ -654,7 +658,7 @@ pub fn start() -> Result<(), String> {
         .process_group(0)
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("Iniciar {}: {e}", exe.display()))
+        .map_err(|e| tr!("Iniciar {}: {e}", "Start {}: {e}", exe.display()))
 }
 
 /// Whether the service answers.
@@ -667,12 +671,12 @@ pub fn running() -> bool {
 pub fn install() -> Result<(), String> {
     let dst = installed_exe();
     let dir = dst.parent().unwrap();
-    std::fs::create_dir_all(dir).map_err(|e| format!("Criar {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| tr!("Criar {}: {e}", "Create {}: {e}", dir.display()))?;
     let src = std::env::current_exe().map_err(|e| e.to_string())?;
     if src != dst {
         // Copied to a new name and renamed over, so a running copy keeps its file.
         let tmp = dst.with_extension("new");
-        std::fs::copy(&src, &tmp).and_then(|_| std::fs::rename(&tmp, &dst)).map_err(|e| format!("Copiar o serviço: {e}"))?;
+        std::fs::copy(&src, &tmp).and_then(|_| std::fs::rename(&tmp, &dst)).map_err(|e| tr!("Copiar o serviço: {e}", "Copy the service: {e}"))?;
     }
     let unit = unit_path();
     std::fs::create_dir_all(unit.parent().unwrap()).map_err(|e| e.to_string())?;
@@ -681,9 +685,13 @@ pub fn install() -> Result<(), String> {
         dst.display(),
         crate::cli::ARG
     );
-    std::fs::write(&unit, text).map_err(|e| format!("Escrever {}: {e}", unit.display()))?;
+    std::fs::write(&unit, text).map_err(|e| tr!("Escrever {}: {e}", "Write {}: {e}", unit.display()))?;
     if !systemctl(&["daemon-reload"]) || !systemctl(&["enable", "--now", UNIT]) {
-        return Err("O systemd do usuário não respondeu: o serviço foi copiado, mas não inicia com o sistema. O app o inicia quando pesquisar.".into());
+        return Err(t(
+            "O systemd do usuário não respondeu: o serviço foi copiado, mas não inicia com o sistema. O app o inicia quando pesquisar.",
+            "The user's systemd didn't answer: the service was copied, but won't start with the system. The app starts it when searching.",
+        )
+        .into());
     }
     Ok(())
 }

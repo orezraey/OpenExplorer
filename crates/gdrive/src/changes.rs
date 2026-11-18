@@ -3,6 +3,7 @@
 //! token; [`Drive::start_page_token`] gives the current one, and [`Drive::changes`] what
 //! changed since a token, with the token to ask from next time.
 
+use openexplorer_i18n::{t, tr};
 use serde::Deserialize;
 
 use crate::Result;
@@ -63,8 +64,8 @@ impl Drive {
     /// The point the account's change log is at now: [`Drive::changes`] from it gives what
     /// changes after this call.
     pub fn start_page_token(&self) -> Result<String> {
-        let v = self.get("/changes/startPageToken", &[("supportsAllDrives", "true"), ("fields", "startPageToken")], "Início das mudanças")?;
-        v.get("startPageToken").and_then(|t| t.as_str()).map(str::to_string).ok_or_else(|| "Início das mudanças: o Google não respondeu o ponto de início.".into())
+        let v = self.get("/changes/startPageToken", &[("supportsAllDrives", "true"), ("fields", "startPageToken")], t("Início das mudanças", "Start of changes"))?;
+        v.get("startPageToken").and_then(|t| t.as_str()).map(str::to_string).ok_or_else(|| t("Início das mudanças: o Google não respondeu o ponto de início.", "Start of changes: Google didn't send the starting point.").into())
     }
 
     /// What changed since `token`, in My Drive and the shared drives, and the token to ask from
@@ -83,15 +84,15 @@ impl Drive {
                 ("supportsAllDrives", "true"),
                 ("fields", fields.as_str()),
             ];
-            let mut v = self.get("/changes", &query, "Mudanças no Drive")?;
+            let mut v = self.get("/changes", &query, t("Mudanças no Drive", "Drive changes"))?;
             let page: Vec<RawChange> = serde_json::from_value(v.get_mut("changes").map(serde_json::Value::take).unwrap_or_default())
-                .map_err(|e| format!("Mudanças no Drive: resposta inesperada: {e}"))?;
+                .map_err(|e| tr!("Mudanças no Drive: resposta inesperada: {e}", "Drive changes: unexpected answer: {e}"))?;
             out.extend(page.into_iter().map(Change::from).filter(|c| checked(&c.file_id).is_ok()));
             let next = |k: &str| v.get(k).and_then(|t| t.as_str()).map(str::to_string);
             match (next("newStartPageToken"), next("nextPageToken")) {
                 (Some(done), _) => return Ok((latest(out), done)),
                 (None, Some(more)) => at = more,
-                (None, None) => return Err("Mudanças no Drive: o Google não respondeu onde continuar.".into()),
+                (None, None) => return Err(t("Mudanças no Drive: o Google não respondeu onde continuar.", "Drive changes: Google didn't say where to continue from.").into()),
             }
         }
         // A long backlog: the rest comes on the next call, from here.

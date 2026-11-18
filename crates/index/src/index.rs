@@ -120,7 +120,13 @@ impl Index {
         // A folder on no indexed volume (a pen drive, a network drive, FAT) isn't "nothing found".
         let error = match &req.within {
             Some(w) if !searched && !volumes.iter().any(|v: &Volume| w.get(..v.root.len()).is_some_and(|d| d.eq_ignore_ascii_case(&v.root))) => {
-                Some("Este disco não está no índice: a pesquisa lê só discos NTFS fixos (não pen drives nem unidades de rede).".into())
+                Some(
+                    openexplorer_i18n::t(
+                        "Este disco não está no índice: a pesquisa lê só discos NTFS fixos (não pen drives nem unidades de rede).",
+                        "This disk isn't in the index: the search reads only fixed NTFS disks (not USB drives or network drives).",
+                    )
+                    .into(),
+                )
             }
             _ => None,
         };

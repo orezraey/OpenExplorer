@@ -1,6 +1,8 @@
 //! How much of the account's storage is used, from `about.get`.
 //! <https://developers.google.com/workspace/drive/api/reference/rest/v3/about>
 
+use openexplorer_i18n::t;
+
 use crate::{Drive, Result};
 
 /// The account's storage: Drive, Gmail and Photos together.
@@ -25,7 +27,7 @@ impl Quota {
 
     /// Reads `about`'s `storageQuota`, whose numbers come as strings (int64 in JSON).
     pub fn parse(about: &serde_json::Value) -> Result<Quota> {
-        let q = about.get("storageQuota").ok_or("Espaço da conta: o Google não informou a cota.")?;
+        let q = about.get("storageQuota").ok_or(t("Espaço da conta: o Google não informou a cota.", "Account storage: Google didn't send the quota."))?;
         let n = |k: &str| q.get(k).and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_u64()));
         Ok(Quota { limit: n("limit"), usage: n("usage").unwrap_or(0), in_drive: n("usageInDrive").unwrap_or(0), in_trash: n("usageInDriveTrash").unwrap_or(0) })
     }
@@ -33,7 +35,7 @@ impl Quota {
 
 impl Drive {
     pub fn quota(&self) -> Result<Quota> {
-        let v = self.call("GET", "/about", &[("fields", "storageQuota")], None, "Espaço da conta")?;
+        let v = self.call("GET", "/about", &[("fields", "storageQuota")], None, t("Espaço da conta", "Account storage"))?;
         Quota::parse(&v)
     }
 }

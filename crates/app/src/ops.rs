@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use openexplorer_i18n::{t, tr};
+
 /// The error a copy, move or upload gives when Cancelar stopped it.
 pub const CANCELLED: &str = openexplorer_gdrive::CANCELLED;
 
@@ -183,13 +185,13 @@ const FORBIDDEN: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
 pub fn invalid_name(name: &str) -> Option<String> {
     let name = name.trim();
     if name.is_empty() {
-        return Some("O nome não pode ficar vazio.".into());
+        return Some(t("O nome não pode ficar vazio.", "The name can't be empty.").into());
     }
     if name == "." || name == ".." {
-        return Some("Esse nome não é permitido.".into());
+        return Some(t("Esse nome não é permitido.", "That name isn't allowed.").into());
     }
     if let Some(c) = name.chars().find(|c| FORBIDDEN.contains(c) || c.is_control()) {
-        return Some(format!("O nome não pode conter o caractere {c:?}."));
+        return Some(tr!("O nome não pode conter o caractere {c:?}.", "The name can't contain the character {c:?}."));
     }
     None
 }
@@ -206,7 +208,7 @@ pub fn open(path: &Path) -> Result<(), String> {
         let code = unsafe {
             windows_sys::Win32::UI::Shell::ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1)
         } as isize;
-        if code > 32 { Ok(()) } else { Err(format!("O Windows não conseguiu abrir {} (código {code}).", path.display())) }
+        if code > 32 { Ok(()) } else { Err(tr!("O Windows não conseguiu abrir {} (código {code}).", "Windows couldn't open {} (code {code}).", path.display())) }
     }
     #[cfg(not(windows))]
     {
@@ -233,7 +235,7 @@ pub fn unique_where(dir: &Path, name: &str, taken: &dyn Fn(&Path) -> bool) -> Pa
         _ => (name, String::new()),
     };
     (1..)
-        .map(|n| if n == 1 { format!("{stem} - Cópia{ext}") } else { format!("{stem} - Cópia ({n}){ext}") })
+        .map(|n| if n == 1 { tr!("{stem} - Cópia{ext}", "{stem} - Copy{ext}") } else { tr!("{stem} - Cópia ({n}){ext}", "{stem} - Copy ({n}){ext}") })
         .map(|n| dir.join(n))
         .find(free)
         .expect("an unused name exists")
@@ -260,9 +262,9 @@ pub fn rename(from: &Path, name: &str) -> Result<PathBuf, String> {
     }
     let to = from.with_file_name(name.trim());
     if to.exists() && !same_file(from, &to) {
-        return Err(format!("Já existe um item chamado \"{}\" aqui.", name.trim()));
+        return Err(tr!("Já existe um item chamado \"{}\" aqui.", "There's already an item named \"{}\" here.", name.trim()));
     }
-    std::fs::rename(from, &to).map(|_| to).map_err(|e| format!("Não consegui renomear: {e}"))
+    std::fs::rename(from, &to).map(|_| to).map_err(|e| tr!("Não consegui renomear: {e}", "Couldn't rename: {e}"))
 }
 
 /// Same path ignoring case, as Windows compares names: renaming `a.txt` to `A.txt` is allowed.
@@ -276,14 +278,14 @@ pub fn new_folder(dir: &Path, name: &str) -> Result<PathBuf, String> {
     }
     let path = dir.join(name.trim());
     if path.exists() {
-        return Err(format!("Já existe um item chamado \"{}\" aqui.", name.trim()));
+        return Err(tr!("Já existe um item chamado \"{}\" aqui.", "There's already an item named \"{}\" here.", name.trim()));
     }
-    std::fs::create_dir(&path).map(|_| path).map_err(|e| format!("Não consegui criar a pasta: {e}"))
+    std::fs::create_dir(&path).map(|_| path).map_err(|e| tr!("Não consegui criar a pasta: {e}", "Couldn't create the folder: {e}"))
 }
 
 /// Sends files and folders to the Recycle Bin, where they can be restored.
 pub fn to_recycle_bin(paths: &[PathBuf]) -> Result<(), String> {
-    trash::delete_all(paths).map_err(|e| format!("Não consegui mover para a Lixeira: {e}"))
+    trash::delete_all(paths).map_err(|e| tr!("Não consegui mover para a Lixeira: {e}", "Couldn't move to the Recycle Bin: {e}"))
 }
 
 /// Deletes files and folders for good, where there's no Recycle Bin (a shared folder, WSL).
@@ -297,8 +299,8 @@ pub fn delete_forever(paths: &[PathBuf]) -> Result<(), String> {
         });
         // Say how far it got: what went before an error is gone for good.
         gone.map_err(|e| {
-            let done = if i == 0 { String::new() } else { format!(" (já excluídos para sempre: {i})") };
-            format!("Não consegui excluir {}: {e}{done}", path.display())
+            let done = if i == 0 { String::new() } else { tr!(" (já excluídos para sempre: {i})", " (already deleted for good: {i})") };
+            tr!("Não consegui excluir {}: {e}{done}", "Couldn't delete {}: {e}{done}", path.display())
         })?;
     }
     Ok(())
@@ -306,12 +308,12 @@ pub fn delete_forever(paths: &[PathBuf]) -> Result<(), String> {
 
 /// Copies a file or a whole folder into `dir`, under a free name there.
 pub fn copy_into(src: &Path, dir: &Path, prog: &Progress) -> Result<PathBuf, String> {
-    let name = src.file_name().ok_or("Item sem nome.")?.to_string_lossy().into_owned();
+    let name = src.file_name().ok_or(t("Item sem nome.", "Item has no name."))?.to_string_lossy().into_owned();
     if src.is_dir() && dir.starts_with(src) {
-        return Err(format!("Não dá para copiar a pasta \"{name}\" para dentro dela mesma."));
+        return Err(tr!("Não dá para copiar a pasta \"{name}\" para dentro dela mesma.", "Can't copy the folder \"{name}\" into itself."));
     }
     let to = unique_in(dir, &name);
-    copy_tree(src, &to, prog).map(|_| to.clone()).map_err(|e| failed(e, &to, &format!("Não consegui copiar \"{name}\"")))
+    copy_tree(src, &to, prog).map(|_| to.clone()).map_err(|e| failed(e, &to, &tr!("Não consegui copiar \"{name}\"", "Couldn't copy \"{name}\"")))
 }
 
 /// The message for a copy that stopped. A cancelled one takes away the item it was in the
@@ -390,23 +392,23 @@ pub fn measure(path: &Path, stop: &dyn Fn() -> bool) -> u64 {
 /// Moves a file or folder into `dir`, keeping its name; a rename when both are on one disk,
 /// a copy then delete across disks.
 pub fn move_into(src: &Path, dir: &Path, prog: &Progress) -> Result<PathBuf, String> {
-    let name = src.file_name().ok_or("Item sem nome.")?.to_string_lossy().into_owned();
+    let name = src.file_name().ok_or(t("Item sem nome.", "Item has no name."))?.to_string_lossy().into_owned();
     if src.parent() == Some(dir) {
         return Ok(src.to_path_buf());
     }
     if src.is_dir() && dir.starts_with(src) {
-        return Err(format!("Não dá para mover a pasta \"{name}\" para dentro dela mesma."));
+        return Err(tr!("Não dá para mover a pasta \"{name}\" para dentro dela mesma.", "Can't move the folder \"{name}\" into itself."));
     }
     let to = dir.join(&name);
     if to.exists() {
-        return Err(format!("Já existe \"{name}\" no destino."));
+        return Err(tr!("Já existe \"{name}\" no destino.", "\"{name}\" already exists in the destination."));
     }
     if std::fs::rename(src, &to).is_ok() {
         return Ok(to);
     }
-    copy_tree(src, &to, prog).map_err(|e| failed(e, &to, &format!("Não consegui mover \"{name}\"")))?;
+    copy_tree(src, &to, prog).map_err(|e| failed(e, &to, &tr!("Não consegui mover \"{name}\"", "Couldn't move \"{name}\"")))?;
     let removed = if src.is_dir() { std::fs::remove_dir_all(src) } else { std::fs::remove_file(src) };
-    removed.map(|_| to).map_err(|e| format!("\"{name}\" foi copiado, mas o original não pôde ser apagado: {e}"))
+    removed.map(|_| to).map_err(|e| tr!("\"{name}\" foi copiado, mas o original não pôde ser apagado: {e}", "\"{name}\" was copied, but the original couldn't be deleted: {e}"))
 }
 
 /// What a set of files and folders adds up to: bytes and how many files and folders, counting
@@ -454,14 +456,14 @@ pub fn totals(paths: &[PathBuf], stop: &dyn Fn() -> bool) -> Totals {
 pub fn md5_file(path: &Path, stop: &dyn Fn() -> bool) -> Result<String, String> {
     use md5::{Digest, Md5};
     use std::io::Read;
-    let mut f = std::fs::File::open(path).map_err(|e| format!("Não consegui ler o arquivo: {e}"))?;
+    let mut f = std::fs::File::open(path).map_err(|e| tr!("Não consegui ler o arquivo: {e}", "Couldn't read the file: {e}"))?;
     let mut hash = Md5::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
         if stop() {
             return Err("Cancelado.".into());
         }
-        let n = f.read(&mut buf).map_err(|e| format!("Não consegui ler o arquivo: {e}"))?;
+        let n = f.read(&mut buf).map_err(|e| tr!("Não consegui ler o arquivo: {e}", "Couldn't read the file: {e}"))?;
         if n == 0 {
             break;
         }
@@ -477,7 +479,7 @@ pub fn attributes(meta: &std::fs::Metadata) -> Vec<&'static str> {
         use std::os::windows::fs::MetadataExt;
         let a = meta.file_attributes();
         // FILE_ATTRIBUTE_* bits.
-        [(0x1, "Somente leitura"), (0x2, "Oculto"), (0x4, "Sistema"), (0x20, "Arquivo"), (0x800, "Compactado"), (0x4000, "Criptografado")]
+        [(0x1, t("Somente leitura", "Read-only")), (0x2, t("Oculto", "Hidden")), (0x4, t("Sistema", "System")), (0x20, t("Arquivo", "Archive")), (0x800, t("Compactado", "Compressed")), (0x4000, t("Criptografado", "Encrypted"))]
             .into_iter()
             .filter(|(bit, _)| a & bit != 0)
             .map(|(_, name)| name)

@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::time::{Duration, SystemTime};
 
 use base64::Engine;
+use openexplorer_i18n::{t, tr};
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -102,32 +103,32 @@ impl Dav {
             }
             return Ok(res);
         }
-        Err(format!("{} redirecionou para outro endereço.", self.host))
+        Err(tr!("{} redirecionou para outro endereço.", "{} redirected to another address.", self.host))
     }
 
     fn failed(&self, e: ureq::Error) -> String {
         match e {
             ureq::Error::Io(e) => crate::unreachable(&self.host, &e),
-            ureq::Error::HostNotFound => format!("Não encontrei o servidor {}.", self.host),
-            ureq::Error::ConnectionFailed => format!("{} recusou a conexão: o servidor não está rodando nessa porta.", self.host),
-            ureq::Error::Timeout(_) => format!("{} não respondeu a tempo.", self.host),
-            ureq::Error::Tls(m) => format!("Erro de TLS com {}: {m}", self.host),
-            ureq::Error::Rustls(e) => format!("Erro de TLS com {}: {e}", self.host),
-            e => format!("Erro com {}: {e}", self.host),
+            ureq::Error::HostNotFound => tr!("Não encontrei o servidor {}.", "Couldn't find the server {}.", self.host),
+            ureq::Error::ConnectionFailed => tr!("{} recusou a conexão: o servidor não está rodando nessa porta.", "{} refused the connection: the server isn't running on that port.", self.host),
+            ureq::Error::Timeout(_) => tr!("{} não respondeu a tempo.", "{} didn't answer in time.", self.host),
+            ureq::Error::Tls(m) => tr!("Erro de TLS com {}: {m}", "TLS error with {}: {m}", self.host),
+            ureq::Error::Rustls(e) => tr!("Erro de TLS com {}: {e}", "TLS error with {}: {e}", self.host),
+            e => tr!("Erro com {}: {e}", "Error with {}: {e}", self.host),
         }
     }
 
     /// The message for an answer that isn't a success.
     fn refused(&self, status: u16) -> String {
         match status {
-            401 => format!("{} recusou o usuário ou a senha.", self.host),
-            403 => "O servidor negou a permissão.".into(),
-            404 | 409 => "Não existe no servidor.".into(),
-            405 => "O servidor não permite isso aqui (ou o item já existe).".into(),
-            412 => "Já existe um item com esse nome.".into(),
-            423 => "O item está bloqueado no servidor.".into(),
-            507 => "O servidor está sem espaço.".into(),
-            s => format!("O servidor respondeu {s}."),
+            401 => tr!("{} recusou o usuário ou a senha.", "{} refused the user name or password.", self.host),
+            403 => t("O servidor negou a permissão.", "The server denied permission.").into(),
+            404 | 409 => t("Não existe no servidor.", "It doesn't exist on the server.").into(),
+            405 => t("O servidor não permite isso aqui (ou o item já existe).", "The server doesn't allow that here (or the item already exists).").into(),
+            412 => t("Já existe um item com esse nome.", "There's already an item with that name.").into(),
+            423 => t("O item está bloqueado no servidor.", "The item is locked on the server.").into(),
+            507 => t("O servidor está sem espaço.", "The server is out of space.").into(),
+            s => tr!("O servidor respondeu {s}.", "The server answered {s}."),
         }
     }
 
@@ -138,7 +139,7 @@ impl Dav {
             404 => return Ok(None),
             s => return Err(self.refused(s)),
         }
-        let text = res.into_body().read_to_string().map_err(|e| format!("A resposta do servidor não chegou inteira: {e}"))?;
+        let text = res.into_body().read_to_string().map_err(|e| tr!("A resposta do servidor não chegou inteira: {e}", "The server's answer didn't arrive whole: {e}"))?;
         Ok(Some(parse_multistatus(&text)))
     }
 
@@ -235,7 +236,7 @@ fn same(a: &str, b: &str) -> bool {
 
 impl Conn for Dav {
     fn list(&mut self, dir: &str) -> Result<Vec<Item>> {
-        let all = self.propfind(dir, "1", true)?.ok_or_else(|| "Não existe no servidor.".to_string())?;
+        let all = self.propfind(dir, "1", true)?.ok_or_else(|| t("Não existe no servidor.", "It doesn't exist on the server.").to_string())?;
         // The answer starts with the folder itself.
         Ok(all.into_iter().filter(|(p, _)| !same(p, dir) && !p.is_empty()).map(|(_, i)| i).collect())
     }
@@ -257,7 +258,7 @@ impl Conn for Dav {
     fn mkdir(&mut self, path: &str) -> Result<()> {
         let res = self.call("MKCOL", &self.url(path, true), &[], "")?;
         if res.status().as_u16() == 405 {
-            return Err("Já existe um item com esse nome.".into());
+            return Err(t("Já existe um item com esse nome.", "There's already an item with that name.").into());
         }
         self.ok(res)
     }

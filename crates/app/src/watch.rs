@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use openexplorer_gdrive::Change;
+use openexplorer_i18n::t;
 
 use crate::model::{Entry, Location, Pane, Space};
 use crate::{Msg, State, drive_task, entry_of};
@@ -74,7 +75,7 @@ pub fn tick(s: &mut State, now: f64) -> bool {
         drive_task(
             s,
             &email,
-            "ler as mudanças do Drive",
+            t("ler as mudanças do Drive", "read the changes in Drive"),
             move |d| match token {
                 None => Ok(Fetched::Start { token: d.start_page_token()?, root: d.root_id()? }),
                 Some(t) => d.changes(&t).map(|(changes, token)| Fetched::Changes { changes, token }),

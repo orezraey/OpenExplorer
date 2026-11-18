@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Condvar, Mutex};
 
+use openexplorer_i18n::{t, tr};
 use serde::Deserialize;
 
 use crate::Result;
@@ -115,7 +116,7 @@ impl Corpus {
 
 /// The results in a page of `files.list`.
 fn hits(v: &mut serde_json::Value) -> Result<Vec<Hit>> {
-    serde_json::from_value(v.get_mut("files").map(serde_json::Value::take).unwrap_or_default()).map_err(|e| format!("Pesquisa: resposta inesperada: {e}"))
+    serde_json::from_value(v.get_mut("files").map(serde_json::Value::take).unwrap_or_default()).map_err(|e| tr!("Pesquisa: resposta inesperada: {e}", "Search: unexpected answer: {e}"))
 }
 
 /// A stretch of modification dates in one corpus, `from` included, `to` not; open ends unbounded.
@@ -171,7 +172,7 @@ impl Drive {
         let corpus = match within {
             Within::SharedDrive(d) | Within::Folder { shared_drive: Some(d), .. } => {
                 if !valid_id(d) {
-                    return Err(format!("Id de drive compartilhado inválido: {d}"));
+                    return Err(tr!("Id de drive compartilhado inválido: {d}", "Invalid shared drive id: {d}"));
                 }
                 Corpus::Drive(d.clone())
             }
@@ -188,7 +189,7 @@ impl Drive {
             return self.search_all(&q, FIELDS, start, &AtomicBool::new(false), |hits, more| each(hits.into_iter().filter(|h| seen.insert(h.file.id.clone())).map(|h| h.file.into()).collect(), more));
         };
         if !valid_id(id) {
-            return Err(format!("Id de pasta inválido: {id}"));
+            return Err(tr!("Id de pasta inválido: {id}", "Invalid folder id: {id}"));
         }
         // The folder's tree is walked while the search runs. (Asking for the words in the tree's
         // folders, `'id' in parents`, would spare paging through every match in Drive, but Drive
@@ -252,7 +253,7 @@ impl Drive {
             if placed {
                 stop.store(true, Ordering::Relaxed);
             }
-            let walk = walk.join().unwrap_or_else(|_| Err("Erro interno ao percorrer a pasta.".into()));
+            let walk = walk.join().unwrap_or_else(|_| Err(t("Erro interno ao percorrer a pasta.", "Internal error going through the folder.").into()));
             stop.store(true, Ordering::Relaxed);
             if !placed {
                 walk?;
@@ -286,7 +287,7 @@ impl Drive {
             scope.spawn(move || {
                 let mut query = vec![("q", q), ("fields", fields), ("pageSize", GLIMPSE), ("supportsAllDrives", "true"), ("includeItemsFromAllDrives", "true")];
                 corpus.params(&mut query);
-                if let Ok(page) = self.get("/files", &query, "Pesquisa").and_then(|mut v| hits(&mut v)) {
+                if let Ok(page) = self.get("/files", &query, t("Pesquisa", "Search")).and_then(|mut v| hits(&mut v)) {
                     let _ = glimpse.send(Ok(page));
                 }
             });
@@ -367,7 +368,7 @@ impl Drive {
             if let Some(t) = &token {
                 query.push(("pageToken", t.as_str()));
             }
-            let mut v = self.get("/files", &query, "Pesquisa")?;
+            let mut v = self.get("/files", &query, t("Pesquisa", "Search"))?;
             let page = hits(&mut v)?;
             token = v.get("nextPageToken").and_then(|t| t.as_str()).map(str::to_string);
             let (first, last) = (page.first().and_then(|h| h.file.modified_time.clone()), page.last().and_then(|h| h.file.modified_time.clone()));
@@ -420,7 +421,7 @@ impl Drive {
                             if outside.lock().unwrap().contains(&folder) || !valid_id(&folder) {
                                 break false;
                             }
-                            let got = self.get(&format!("/files/{folder}"), &[("fields", "parents"), ("supportsAllDrives", "true")], "Pastas da pesquisa");
+                            let got = self.get(&format!("/files/{folder}"), &[("fields", "parents"), ("supportsAllDrives", "true")], t("Pastas da pesquisa", "Search folders"));
                             let parents: Option<Vec<String>> = got.ok().map(|mut v| v.get_mut("parents").map(serde_json::Value::take).and_then(|p| serde_json::from_value(p).ok()).unwrap_or_default());
                             let Some(parents) = parents.filter(|p| p.len() <= 1 && way.len() < DEEPEST_FOLDER) else {
                                 failed.store(true, Ordering::Relaxed);
@@ -447,7 +448,7 @@ impl Drive {
             let size = if parents.len() == 1 { "1000" } else { PAGE_OF_MANY_PARENTS };
             let mut query = vec![("q", q.as_str()), ("fields", "nextPageToken,files(id)"), ("pageSize", size), ("supportsAllDrives", "true"), ("includeItemsFromAllDrives", "true")];
             corpus.params(&mut query);
-            self.pages("/files", &query, "files", "Pastas da pesquisa", |found: Vec<FolderId>, _| {
+            self.pages("/files", &query, "files", t("Pastas da pesquisa", "Search folders"), |found: Vec<FolderId>, _| {
                 let mut tree = tree.lock().unwrap();
                 let fresh: Vec<String> = found.into_iter().map(|f| f.id).filter(|id| tree.insert(id.clone())).collect();
                 drop(tree);

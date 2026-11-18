@@ -11,6 +11,7 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
+use openexplorer_i18n::{t, tr};
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
@@ -48,11 +49,17 @@ impl Trust {
     pub fn refusal(&self, host: &str) -> Option<String> {
         let r = self.rejected()?;
         Some(match &self.pinned {
-            Some(old) => format!(
+            Some(old) => tr!(
                 "O certificado de {host} mudou: o confiado era {old}, o de agora é {} ({}). Se a mudança é esperada, edite o servidor para confiar no novo.",
-                r.fingerprint, r.why
+                "The certificate of {host} changed: the trusted one was {old}, now it is {} (it {}). If the change is expected, edit the server to trust the new one.",
+                r.fingerprint,
+                r.why
             ),
-            None => format!("O certificado de {host} não é confiável: {}. Edite o servidor para ver a impressão digital e confiar nele.", r.why),
+            None => tr!(
+                "O certificado de {host} não é confiável: {}. Edite o servidor para ver a impressão digital e confiar nele.",
+                "The certificate of {host} is not trusted: it {}. Edit the server to see the fingerprint and trust it.",
+                r.why
+            ),
         })
     }
 }
@@ -65,16 +72,20 @@ pub fn fingerprint(der: &[u8]) -> String {
 fn why(e: &rustls::Error) -> String {
     match e {
         rustls::Error::InvalidCertificate(c) => match c {
-            CertificateError::UnknownIssuer | CertificateError::BadSignature => "não foi emitido por uma autoridade conhecida (é um certificado próprio)".into(),
-            CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => "foi emitido para outro nome".into(),
-            CertificateError::Expired | CertificateError::ExpiredContext { .. } => "está vencido".into(),
-            CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => "ainda não vale (o relógio está certo?)".into(),
-            CertificateError::Revoked => "foi revogado".into(),
+            CertificateError::UnknownIssuer | CertificateError::BadSignature => {
+                t("não foi emitido por uma autoridade conhecida (é um certificado próprio)", "was not issued by a known authority (it is self-signed)").into()
+            }
+            CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => t("foi emitido para outro nome", "was issued for another name").into(),
+            CertificateError::Expired | CertificateError::ExpiredContext { .. } => t("está vencido", "has expired").into(),
+            CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => t("ainda não vale (o relógio está certo?)", "is not valid yet (is the clock right?)").into(),
+            CertificateError::Revoked => t("foi revogado", "was revoked").into(),
             // A NAS's own certificate is often made as a CA and used for itself.
-            CertificateError::Other(o) if format!("{o:?}").contains("CaUsedAsEndEntity") => "não foi emitido por uma autoridade conhecida (é um certificado próprio)".into(),
-            other => format!("é inválido ({other:?})"),
+            CertificateError::Other(o) if format!("{o:?}").contains("CaUsedAsEndEntity") => {
+                t("não foi emitido por uma autoridade conhecida (é um certificado próprio)", "was not issued by a known authority (it is self-signed)").into()
+            }
+            other => tr!("é inválido ({other:?})", "is invalid ({other:?})"),
         },
-        other => format!("é inválido ({other})"),
+        other => tr!("é inválido ({other})", "is invalid ({other})"),
     }
 }
 
@@ -155,7 +166,7 @@ impl<In: Transport> ureq::unversioned::transport::Connector<In> for Connector {
             return Ok(Some(Either::A(transport)));
         }
         let host = details.uri.host().unwrap_or_default().trim_start_matches('[').trim_end_matches(']').to_string();
-        let name = ServerName::try_from(host).map_err(|_| ureq::Error::Tls("nome de servidor inválido"))?;
+        let name = ServerName::try_from(host).map_err(|_| ureq::Error::Tls(t("nome de servidor inválido", "invalid server name")))?;
         let mut conn = ClientConnection::new(self.config.clone(), name)?;
         let mut sock = TransportAdapter::new(transport.boxed(), details.current_time.clone());
         sock.set_timeout(details.timeout);

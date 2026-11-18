@@ -5,6 +5,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
+use openexplorer_i18n::{t, tr};
+
 use crate::model::{Entry, Found};
 
 /// The most results a search shows; how many there are in all is said apart.
@@ -69,6 +71,11 @@ pub fn sample() -> Vec<Entry> {
 /// Why a search can't run without the service.
 pub const MISSING: &str = "Falta instalar o serviço de pesquisa (link acima).";
 
+/// [`MISSING`] in the interface's language.
+pub fn missing() -> &'static str {
+    t(MISSING, "The search service isn't installed (link above).")
+}
+
 /// The folder `e`, a result, sits in.
 pub fn folder_of(e: &Entry) -> String {
     Path::new(&e.id).parent().map(|p| p.display().to_string()).unwrap_or_default()
@@ -123,9 +130,9 @@ pub fn search(f: &Found, show_hidden: bool) -> (Result<Vec<Entry>, String>, Info
         Err(e) => {
             let service = service();
             let why = match service {
-                Service::Missing => MISSING.to_string(),
-                Service::Stopped => "O serviço de pesquisa está parado. Reinstale-o para que volte a iniciar com o Windows.".to_string(),
-                Service::Starting => "O serviço de pesquisa está iniciando; tente de novo em instantes.".to_string(),
+                Service::Missing => missing().to_string(),
+                Service::Stopped => t("O serviço de pesquisa está parado. Reinstale-o para que volte a iniciar com o Windows.", "The search service is stopped. Reinstall it so it starts with Windows again.").to_string(),
+                Service::Starting => t("O serviço de pesquisa está iniciando; tente de novo em instantes.", "The search service is starting; try again in a moment.").to_string(),
                 Service::Running => e,
             };
             (Err(why), Info { total: 0, shown: 0, indexing: Vec::new(), service })
@@ -150,7 +157,7 @@ pub fn search(f: &Found, show_hidden: bool) -> (Result<Vec<Entry>, String>, Info
 
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn search(_: &Found, _: bool) -> (Result<Vec<Entry>, String>, Info) {
-    (Err("A pesquisa no computador só existe no Windows e no Linux.".into()), Info { total: 0, shown: 0, indexing: Vec::new(), service: Service::Missing })
+    (Err(t("A pesquisa no computador só existe no Windows e no Linux.", "Searching the computer works only on Windows and Linux.").into()), Info { total: 0, shown: 0, indexing: Vec::new(), service: Service::Missing })
 }
 
 /// Installs the service, Windows asking for an administrator's permission; blocks until done.
@@ -164,19 +171,19 @@ pub fn install() -> Result<String, String> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Ok("Serviço de pesquisa instalado. Os discos estão sendo lidos; os resultados aparecem em segundos.".into())
+    Ok(t("Serviço de pesquisa instalado. Os discos estão sendo lidos; os resultados aparecem em segundos.", "Search service installed. The disks are being read; results show up in seconds.").into())
 }
 
 /// Has systemd start the service at login (no root); it runs from now on too.
 #[cfg(target_os = "linux")]
 pub fn install() -> Result<String, String> {
     openexplorer_index::unix::install()?;
-    Ok("Serviço de pesquisa instalado: inicia com a sessão.".into())
+    Ok(t("Serviço de pesquisa instalado: inicia com a sessão.", "Search service installed: it starts when you sign in.").into())
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn install() -> Result<String, String> {
-    Err("A pesquisa no computador só existe no Windows e no Linux.".into())
+    Err(t("A pesquisa no computador só existe no Windows e no Linux.", "Searching the computer works only on Windows and Linux.").into())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -284,7 +291,7 @@ impl<'a> Pager<'a> {
 /// page with `more` false; it stops early once `alive` says the search was left.
 pub fn search_elsewhere(f: &Found, show_hidden: bool, alive: &dyn Fn() -> bool, page: &mut dyn FnMut(Vec<Entry>, bool)) -> Result<(), String> {
     use crate::network::{is_wsl, share_path, shares, unc};
-    let within = f.within.as_deref().ok_or("Pesquisa sem pasta.")?;
+    let within = f.within.as_deref().ok_or(t("Pesquisa sem pasta.", "Search without a folder."))?;
     let words = words(&f.text);
     let mut pager = Pager::new(page);
     match unc(within) {
@@ -310,7 +317,7 @@ pub fn search_elsewhere(f: &Found, show_hidden: bool, alive: &dyn Fn() -> bool, 
             if let (false, Some(e)) = (any, failed) {
                 return Err(match e {
                     Find::Failed(why) => why,
-                    Find::NoPrintf => "O find desta distribuição não lista os arquivos como a pesquisa precisa.".into(),
+                    Find::NoPrintf => t("O find desta distribuição não lista os arquivos como a pesquisa precisa.", "This distribution's find doesn't list files the way search needs.").into(),
                 });
             }
         }
@@ -327,7 +334,7 @@ pub fn search_elsewhere(f: &Found, show_hidden: bool, alive: &dyn Fn() -> bool, 
         Some((server, distro)) if is_wsl(&server) => {
             // As `within` spells it, so results read as it does.
             let top = share_path(&server, &distro);
-            let rest = within.strip_prefix(&top).map_err(|_| format!("Não entendi o caminho “{}”.", within.display()))?;
+            let rest = within.strip_prefix(&top).map_err(|_| tr!("Não entendi o caminho “{}”.", "Couldn't understand the path “{}”.", within.display()))?;
             let linux = format!("/{}", rest.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/"));
             match wsl_find(&distro, &linux, &top, &words, show_hidden, alive, &mut pager, true) {
                 Err(Find::NoPrintf) => wsl_find(&distro, &linux, &top, &words, show_hidden, alive, &mut pager, false),
@@ -335,7 +342,7 @@ pub fn search_elsewhere(f: &Found, show_hidden: bool, alive: &dyn Fn() -> bool, 
             }
             .map_err(|e| match e {
                 Find::Failed(why) => why,
-                Find::NoPrintf => "O find desta distribuição não lista os arquivos como a pesquisa precisa.".into(),
+                Find::NoPrintf => t("O find desta distribuição não lista os arquivos como a pesquisa precisa.", "This distribution's find doesn't list files the way search needs.").into(),
             })?;
         }
         _ => walk(&[within.to_path_buf()], &words, show_hidden, alive, &mut pager)?,
@@ -375,7 +382,7 @@ fn wsl_find(distro: &str, linux: &str, top: &Path, words: &[Vec<u8>], show_hidde
         // No console window flashing up.
         cmd.creation_flags(0x0800_0000);
     }
-    let mut child = cmd.spawn().map_err(|e| Find::Failed(format!("Não consegui rodar o WSL: {e}")))?;
+    let mut child = cmd.spawn().map_err(|e| Find::Failed(tr!("Não consegui rodar o WSL: {e}", "Couldn't run WSL: {e}")))?;
     // Folders it may not read fill stderr: drained apart, so `find` never waits on it.
     let mut stderr = child.stderr.take().expect("piped");
     let said = std::thread::spawn(move || {
@@ -458,8 +465,8 @@ fn wsl_find(distro: &str, linux: &str, top: &Path, words: &[Vec<u8>], show_hidde
         if printf && said.contains("printf") {
             return Err(Find::NoPrintf);
         }
-        let why = told.lines().chain(said.lines()).map(str::trim).find(|l| !l.is_empty()).unwrap_or("o WSL não respondeu");
-        return Err(Find::Failed(format!("Não consegui pesquisar em {distro}: {why}")));
+        let why = told.lines().chain(said.lines()).map(str::trim).find(|l| !l.is_empty()).unwrap_or(t("o WSL não respondeu", "WSL didn't answer"));
+        return Err(Find::Failed(tr!("Não consegui pesquisar em {distro}: {why}", "Couldn't search {distro}: {why}")));
     }
     Ok(())
 }
@@ -580,7 +587,7 @@ fn walk(roots: &[PathBuf], words: &[Vec<u8>], show_hidden: bool, alive: &dyn Fn(
 
 /// Where searching `text` from the local location `within` (a folder, or everywhere) goes.
 pub fn found(text: &str, within: Option<PathBuf>) -> Found {
-    let place = within.as_deref().map_or_else(|| "todo o computador".to_string(), place_of);
+    let place = within.as_deref().map_or_else(|| t("todo o computador", "This PC").to_string(), place_of);
     Found { text: text.split_whitespace().collect::<Vec<_>>().join(" "), within, place }
 }
 

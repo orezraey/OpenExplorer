@@ -6,6 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use openexplorer_i18n::{t, tr};
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Entry {
     /// Unique in its folder: the name on disk and in the simulated drive, the file id in Google
@@ -87,24 +89,27 @@ impl Entry {
     /// The Tipo column: "Pasta de arquivos", "Arquivo JPG", "Documento Google"...
     pub fn kind_label(&self) -> String {
         if self.is_dir {
-            return if self.target.is_some() { "Atalho de pasta".into() } else { "Pasta de arquivos".into() };
+            return if self.target.is_some() { t("Atalho de pasta", "Folder shortcut").into() } else { t("Pasta de arquivos", "File folder").into() };
         }
         let google = match self.mime.as_deref() {
-            Some("application/vnd.google-apps.document") => Some("Documento Google"),
-            Some("application/vnd.google-apps.spreadsheet") => Some("Planilha Google"),
-            Some("application/vnd.google-apps.presentation") => Some("Apresentação Google"),
-            Some("application/vnd.google-apps.form") => Some("Formulário Google"),
-            Some("application/vnd.google-apps.drawing") => Some("Desenho Google"),
-            Some("application/vnd.google-apps.shortcut") => Some("Atalho"),
-            Some(m) if m.starts_with("application/vnd.google-apps.") => Some("Arquivo Google"),
+            Some("application/vnd.google-apps.document") => Some(t("Documento Google", "Google Doc")),
+            Some("application/vnd.google-apps.spreadsheet") => Some(t("Planilha Google", "Google Sheet")),
+            Some("application/vnd.google-apps.presentation") => Some(t("Apresentação Google", "Google Slides")),
+            Some("application/vnd.google-apps.form") => Some(t("Formulário Google", "Google Form")),
+            Some("application/vnd.google-apps.drawing") => Some(t("Desenho Google", "Google Drawing")),
+            Some("application/vnd.google-apps.shortcut") => Some(t("Atalho", "Shortcut")),
+            Some(m) if m.starts_with("application/vnd.google-apps.") => Some(t("Arquivo Google", "Google file")),
             _ => None,
         };
         if let Some(g) = google {
             return g.into();
         }
         match self.ext() {
-            Some(ext) => format!("Arquivo {}", ext.to_ascii_uppercase()),
-            None => "Arquivo".into(),
+            Some(ext) => {
+                let ext = ext.to_ascii_uppercase();
+                tr!("Arquivo {ext}", "{ext} File")
+            }
+            None => t("Arquivo", "File").into(),
         }
     }
 }
@@ -179,14 +184,14 @@ impl Space {
     /// Its name in the tree and the path bar.
     pub fn label(&self) -> &str {
         match self {
-            Space::MyDrive => "Meu Drive",
-            Space::SharedDrives => "Drives compartilhados",
+            Space::MyDrive => t("Meu Drive", "My Drive"),
+            Space::SharedDrives => t("Drives compartilhados", "Shared drives"),
             Space::Shared { name, .. } => name,
-            Space::SharedWithMe => "Compartilhados comigo",
-            Space::Starred => "Com estrela",
-            Space::Recent => "Recentes",
-            Space::Trash => "Lixeira",
-            Space::Search(_) => "Pesquisa",
+            Space::SharedWithMe => t("Compartilhados comigo", "Shared with me"),
+            Space::Starred => t("Com estrela", "Starred"),
+            Space::Recent => t("Recentes", "Recent"),
+            Space::Trash => t("Lixeira", "Trash"),
+            Space::Search(_) => t("Pesquisa", "Search"),
         }
     }
 }
@@ -452,11 +457,11 @@ impl Pane {
     pub fn title(&self) -> String {
         match &self.loc {
             Location::Local(p) => p.display().to_string(),
-            Location::Found(f) => format!("“{}” em {}", f.text, f.place),
-            Location::Mock(segs) => format!("Meu Drive/{}", segs.join("/")),
+            Location::Found(f) => tr!("“{}” em {}", "“{}” in {}", f.text, f.place),
+            Location::Mock(segs) => tr!("Meu Drive/{}", "My Drive/{}", segs.join("/")),
             Location::Drive { space, path, .. } => {
                 let mut parts: Vec<&str> = match space {
-                    Space::Shared { name, .. } => vec!["Drives compartilhados", name],
+                    Space::Shared { name, .. } => vec![t("Drives compartilhados", "Shared drives"), name],
                     other => vec![other.label()],
                 };
                 parts.extend(path.iter().map(|(_, n)| n.as_str()));
@@ -465,7 +470,7 @@ impl Pane {
             Location::Server { server, path, find } => {
                 let place = std::iter::once(server.name.as_str()).chain(path.iter().map(String::as_str)).collect::<Vec<_>>().join("/");
                 match find {
-                    Some(text) => format!("“{text}” em {place}"),
+                    Some(text) => tr!("“{text}” em {place}", "“{text}” in {place}"),
                     None => place,
                 }
             }
@@ -596,8 +601,9 @@ pub fn format_size(b: u64) -> String {
         v /= 1024.0;
         u += 1;
     }
-    // pt-BR decimal comma.
-    format!("{v:.1} {}", UNITS[u]).replace('.', ",")
+    let size = format!("{v:.1} {}", UNITS[u]);
+    // A decimal comma in Portuguese.
+    if openexplorer_i18n::english() { size } else { size.replace('.', ",") }
 }
 
 /// A date in full, as Windows' Properties shows it: "sexta-feira, 10 de fevereiro de 2023 20:19:35".
@@ -605,12 +611,16 @@ pub fn format_long(t: SystemTime) -> String {
     use chrono::{Datelike, Timelike};
     const DAYS: [&str; 7] = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"];
     const MONTHS: [&str; 12] = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"];
+    const DAYS_EN: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+    const MONTHS_EN: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
     let d = chrono::DateTime::<chrono::Local>::from(t);
-    format!(
-        "{}, {} de {} de {} {:02}:{:02}:{:02}",
-        DAYS[d.weekday().num_days_from_monday() as usize],
+    let (day, month) = (d.weekday().num_days_from_monday() as usize, d.month0() as usize);
+    tr!(
+        "{0}, {1} de {2} de {3} {4:02}:{5:02}:{6:02}",
+        "{0}, {1} {2} {3} {4:02}:{5:02}:{6:02}",
+        openexplorer_i18n::t(DAYS[day], DAYS_EN[day]),
         d.day(),
-        MONTHS[d.month0() as usize],
+        openexplorer_i18n::t(MONTHS[month], MONTHS_EN[month]),
         d.year(),
         d.hour(),
         d.minute(),
@@ -737,19 +747,19 @@ pub fn crumbs(loc: &Location) -> Vec<Crumb> {
         // The folder searched, then the search.
         Location::Found(f) => {
             let mut out = f.within.as_ref().map(|w| crumbs(&Location::Local(w.clone()))).unwrap_or_default();
-            out.push(Crumb { label: format!("“{}” em {}", f.text, f.place), to: loc.clone() });
+            out.push(Crumb { label: tr!("“{}” em {}", "“{}” in {}", f.text, f.place), to: loc.clone() });
             out
         }
-        Location::Mock(segs) => std::iter::once(Crumb { label: "Drive simulado".into(), to: Location::Mock(Vec::new()) })
+        Location::Mock(segs) => std::iter::once(Crumb { label: t("Drive simulado", "Simulated drive").into(), to: Location::Mock(Vec::new()) })
             .chain((0..segs.len()).map(|i| Crumb { label: segs[i].clone(), to: Location::Mock(segs[..=i].to_vec()) }))
             .collect(),
         Location::Drive { email, space, path } => {
             let mut out = vec![Crumb { label: email.clone(), to: Location::drive(email.clone(), Space::MyDrive) }];
             if let Space::Shared { .. } = space {
-                out.push(Crumb { label: "Drives compartilhados".into(), to: Location::drive(email.clone(), Space::SharedDrives) });
+                out.push(Crumb { label: t("Drives compartilhados", "Shared drives").into(), to: Location::drive(email.clone(), Space::SharedDrives) });
             }
             let label = match space {
-                Space::Search(q) => format!("“{}” em {}", q.text, q.place),
+                Space::Search(q) => tr!("“{}” em {}", "“{}” in {}", q.text, q.place),
                 _ => shown(space.label()),
             };
             out.push(Crumb { label, to: Location::drive(email.clone(), space.clone()) });
@@ -766,7 +776,7 @@ pub fn crumbs(loc: &Location) -> Vec<Crumb> {
             }
             if let Some(text) = find {
                 let place = path.last().unwrap_or(&server.name);
-                out.push(Crumb { label: format!("“{text}” em {place}"), to: loc.clone() });
+                out.push(Crumb { label: tr!("“{text}” em {place}", "“{text}” in {place}"), to: loc.clone() });
             }
             out
         }
@@ -786,11 +796,11 @@ pub enum DriveKind {
 impl DriveKind {
     pub fn label(self, letter: &str) -> String {
         match self {
-            DriveKind::Fixed => format!("Disco local ({letter})"),
-            DriveKind::Removable => format!("Unidade removível ({letter})"),
-            DriveKind::Network => format!("Unidade de rede ({letter})"),
-            DriveKind::Optical => format!("Unidade de DVD ({letter})"),
-            DriveKind::Other => format!("Unidade ({letter})"),
+            DriveKind::Fixed => tr!("Disco local ({letter})", "Local Disk ({letter})"),
+            DriveKind::Removable => tr!("Unidade removível ({letter})", "Removable Disk ({letter})"),
+            DriveKind::Network => tr!("Unidade de rede ({letter})", "Network Drive ({letter})"),
+            DriveKind::Optical => tr!("Unidade de DVD ({letter})", "DVD Drive ({letter})"),
+            DriveKind::Other => tr!("Unidade ({letter})", "Drive ({letter})"),
         }
     }
 }

@@ -16,6 +16,7 @@ pub mod upload;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use openexplorer_i18n::{t, tr};
 use serde::{Deserialize, Serialize};
 
 pub use api::{Account, Details, Drive, DriveFile, Place, Revision, SharedDrive, Status, Top, View, valid_id};
@@ -23,7 +24,8 @@ pub use changes::Change;
 pub use quota::Quota;
 pub use share::{Access, Permission, Role, Sharing};
 
-/// Errors are shown to the user as they are, so they're plain Portuguese sentences.
+/// Errors are shown to the user as they are, so they're plain sentences in the interface's
+/// language (see `openexplorer_i18n`).
 pub type Result<T> = std::result::Result<T, String>;
 
 /// The OAuth client the app logs in with. Google only lets an app reach every file in a Drive
@@ -53,12 +55,13 @@ impl ClientConfig {
         let env_non_empty = |k| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         match (env_non_empty("OPENEXPLORER_GOOGLE_CLIENT_ID"), env_non_empty("OPENEXPLORER_GOOGLE_CLIENT_SECRET")) {
             (Some(id), Some(secret)) => return Ok(ClientConfig { client_id: id, client_secret: secret }),
-            (Some(_), None) => return Err("OPENEXPLORER_GOOGLE_CLIENT_ID está definida, mas falta OPENEXPLORER_GOOGLE_CLIENT_SECRET.".into()),
-            (None, Some(_)) => return Err("OPENEXPLORER_GOOGLE_CLIENT_SECRET está definida, mas falta OPENEXPLORER_GOOGLE_CLIENT_ID.".into()),
+            (Some(_), None) => return Err(t("OPENEXPLORER_GOOGLE_CLIENT_ID está definida, mas falta OPENEXPLORER_GOOGLE_CLIENT_SECRET.", "OPENEXPLORER_GOOGLE_CLIENT_ID is set, but OPENEXPLORER_GOOGLE_CLIENT_SECRET is missing.").into()),
+            (None, Some(_)) => return Err(t("OPENEXPLORER_GOOGLE_CLIENT_SECRET está definida, mas falta OPENEXPLORER_GOOGLE_CLIENT_ID.", "OPENEXPLORER_GOOGLE_CLIENT_SECRET is set, but OPENEXPLORER_GOOGLE_CLIENT_ID is missing.").into()),
             (None, None) => {}
         }
-        Err(format!(
+        Err(tr!(
             "Credenciais do Google não encontradas. Salve o JSON do cliente OAuth (tipo \"App para computador\") em {}",
+            "Google credentials not found. Save the OAuth client's JSON (type \"Desktop app\") to {}",
             path.display()
         ))
     }
@@ -76,14 +79,14 @@ impl ClientConfig {
             client_secret: Option<String>,
         }
         let text = text.trim_start_matches('\u{feff}');
-        let f: File = serde_json::from_str(text).map_err(|e| format!("não é um JSON válido: {e}"))?;
+        let f: File = serde_json::from_str(text).map_err(|e| tr!("não é um JSON válido: {e}", "is not valid JSON: {e}"))?;
         let (id, secret) = match (f.installed, f.client_id, f.client_secret) {
             (Some(i), _, _) => (i.client_id, i.client_secret),
             (None, Some(id), Some(secret)) => (id, secret),
-            _ => return Err("não tem client_id e client_secret de um app para computador (um cliente \"web\" não serve).".into()),
+            _ => return Err(t("não tem client_id e client_secret de um app para computador (um cliente \"web\" não serve).", "has no client_id and client_secret of a desktop app (a \"web\" client won't do).").into()),
         };
         if id.trim().is_empty() || secret.trim().is_empty() {
-            return Err("client_id e client_secret não podem estar vazios.".into());
+            return Err(t("client_id e client_secret não podem estar vazios.", "client_id and client_secret can't be empty.").into());
         }
         Ok(ClientConfig { client_id: id.trim().to_string(), client_secret: secret.trim().to_string() })
     }
@@ -92,7 +95,7 @@ impl ClientConfig {
     pub fn save(&self) -> Result<()> {
         use std::io::Write;
         let dir = config_dir();
-        std::fs::create_dir_all(&dir).map_err(|e| format!("Não consegui criar {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(&dir).map_err(|e| tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", dir.display()))?;
         let path = client_file();
         let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         let mut opts = std::fs::OpenOptions::new();
@@ -102,8 +105,8 @@ impl ClientConfig {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut f = opts.open(&path).map_err(|e| format!("Não consegui salvar {}: {e}", path.display()))?;
-        f.write_all(text.as_bytes()).map_err(|e| format!("Não consegui salvar {}: {e}", path.display()))
+        let mut f = opts.open(&path).map_err(|e| tr!("Não consegui salvar {}: {e}", "Couldn't save {}: {e}", path.display()))?;
+        f.write_all(text.as_bytes()).map_err(|e| tr!("Não consegui salvar {}: {e}", "Couldn't save {}: {e}", path.display()))
     }
 }
 
@@ -163,7 +166,7 @@ pub fn clear_log() -> Result<()> {
     match std::fs::OpenOptions::new().write(true).truncate(true).open(&path) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("Não consegui limpar {}: {e}", path.display())),
+        Err(e) => Err(tr!("Não consegui limpar {}: {e}", "Couldn't clear {}: {e}", path.display())),
     }
 }
 
@@ -214,7 +217,7 @@ pub(crate) fn json<T: serde::de::DeserializeOwned>(mut resp: ureq::http::Respons
     if !(200..300).contains(&status) {
         return Err(format!("{what}: HTTP {status}: {}", google_reason(&body)));
     }
-    serde_json::from_str(&body).map_err(|e| format!("{what}: resposta inesperada: {e}"))
+    serde_json::from_str(&body).map_err(|e| tr!("{what}: resposta inesperada: {e}", "{what}: unexpected answer: {e}"))
 }
 
 /// The human part of a Google error body (`error_description`, `error.message`), else the body.

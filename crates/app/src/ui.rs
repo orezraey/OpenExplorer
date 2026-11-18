@@ -12,6 +12,7 @@ use crate::actions::{self, ClipMode, Dialog};
 use crate::{State, click, disconnect, drag_item, dragged_ids, dropped, go_back, go_forward, go_up, key, load, navigate, open, pane_key, paths_for, row_key, set_sort};
 use crate::icons;
 use crate::ops::Stage;
+use openexplorer_i18n::{t, tr};
 use crate::sysicons::{self, IconKey};
 use crate::transfers;
 use crate::layout::{self, clamp_col, clamp_tree};
@@ -35,7 +36,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         let mut toast = Toast::new("notice", s.status.clone()).on_close(close);
         // The latest action's notice offers to take it back (or to redo what was just undone).
         if let Some(redo) = s.undo.offers(&s.status) {
-            toast = toast.action(&k, if redo { "Refazer" } else { "Desfazer" }, false, move |s: &mut State, _| crate::undo::undo(s, redo));
+            toast = toast.action(&k, if redo { t("Refazer", "Redo") } else { t("Desfazer", "Undo") }, false, move |s: &mut State, _| crate::undo::undo(s, redo));
         }
         // Not a live region of its own: `notice` has each message said once, at once for errors.
         layer.push(ToastRegion::new().toast(toast.build(&k).live_region(LiveRegion::Off)).build(&k));
@@ -64,7 +65,7 @@ fn stepper(k: &Kit, key: &str, value: u8, set: fn(&mut State, i32)) -> El {
         let b = row()
             .key(format!("{key}-{delta}"))
             .role("button")
-            .label(if delta < 0 { "Diminuir" } else { "Aumentar" })
+            .label(if delta < 0 { t("Diminuir", "Decrease") } else { t("Aumentar", "Increase") })
             .size(26.0, 26.0)
             .center()
             .radius(k.radius.sm)
@@ -118,6 +119,7 @@ fn reset_settings(s: &mut State, tx: &mut Tx) {
     let was_hidden = s.settings.show_hidden;
     s.settings = crate::settings::Settings::default();
     s.settings.save();
+    s.settings.language.apply();
     let (sans, mono) = s.settings.font.families();
     tx.set_font_families(sans, mono);
     tx.set_font_smoothing(s.settings.text_render.smoothing());
@@ -127,7 +129,7 @@ fn reset_settings(s: &mut State, tx: &mut Tx) {
     if s.settings.clear_completed {
         s.transfers.retain(|t| t.progress.stage() != Stage::Done);
     }
-    s.status = "Opções restauradas para os valores padrão.".into();
+    s.status = t("Opções restauradas para os valores padrão.", "Options restored to their defaults.").into();
 }
 
 fn set_options_tab(s: &mut State, tab: crate::settings::OptionsTab) {
@@ -170,7 +172,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
         let mut item = k
             .interactive(
                 row()
-                    .key(format!("opt-tab-{}", tab.label()))
+                    .key(format!("opt-tab-{tab:?}"))
                     .role("tab")
                     .label(tab.label())
                     .checked(on)
@@ -206,7 +208,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
 
     let modified = st != Settings::default();
     nav = nav.child(el().grow(1.0)).child(
-        Button::new("Restaurar padrões")
+        Button::new(t("Restaurar padrões", "Restore defaults"))
             .variant(ButtonVariant::Neutral)
             .disabled(!modified)
             .on_press_tx(reset_settings)
@@ -314,10 +316,21 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
         let mut pills = seg_track(track_key);
         for f in TextFont::ALL {
             let on = st.font == f;
-            pills = pills.child(seg_btn(format!("{prefix}-{}", f.label()), f.label(), on).on_press_tx(move |s: &mut State, tx: &mut Tx| {
+            pills = pills.child(seg_btn(format!("{prefix}-{f:?}"), f.label(), on).on_press_tx(move |s: &mut State, tx: &mut Tx| {
                 change_settings(s, |c| c.font = f);
                 let (sans, mono) = f.families();
                 tx.set_font_families(sans, mono);
+            }));
+        }
+        pills
+    };
+    let make_language_pills = |track_key: &'static str| {
+        let mut pills = seg_track(track_key);
+        for l in crate::settings::Language::ALL {
+            let on = st.language == l;
+            pills = pills.child(seg_btn(format!("lang-{l:?}"), l.label(), on).on_press(move |s: &mut State| {
+                change_settings(s, |c| c.language = l);
+                l.apply();
             }));
         }
         pills
@@ -326,7 +339,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
         let mut pills = seg_track(track_key);
         for &r in TextRender::available() {
             let on = st.text_render == r;
-            pills = pills.child(seg_btn(format!("{prefix}-{}", r.label()), r.label(), on).on_press_tx(move |s: &mut State, tx: &mut Tx| {
+            pills = pills.child(seg_btn(format!("{prefix}-{r:?}"), r.label(), on).on_press_tx(move |s: &mut State, tx: &mut Tx| {
                 change_settings(s, |c| c.text_render = r);
                 tx.set_font_smoothing(r.smoothing());
             }));
@@ -366,7 +379,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 let pill = k
                     .interactive(
                         row()
-                            .key(format!("th-{}", th.label()))
+                            .key(format!("th-{th:?}"))
                             .role("radio")
                             .label(th.label())
                             .checked(on)
@@ -389,11 +402,11 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
             }
 
             let font_desc = if cfg!(windows) {
-                "Usa a fonte nativa do Windows (Segoe UI) ou a fonte integrada Inter."
+                t("Usa a fonte nativa do Windows (Segoe UI) ou a fonte integrada Inter.", "Uses Windows' own font (Segoe UI) or the built-in Inter font.")
             } else if cfg!(target_os = "macos") {
-                "Usa a fonte nativa do macOS (San Francisco) ou a fonte integrada Inter."
+                t("Usa a fonte nativa do macOS (San Francisco) ou a fonte integrada Inter.", "Uses macOS's own font (San Francisco) or the built-in Inter font.")
             } else {
-                "Usa a fonte nativa do sistema ou a fonte integrada Inter."
+                t("Usa a fonte nativa do sistema ou a fonte integrada Inter.", "Uses the system's own font or the built-in Inter font.")
             };
 
             let appearance = card_box("card-theme")
@@ -407,20 +420,27 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                             col()
                                 .w_full()
                                 .gap(2.0)
-                                .child(text("Tema do aplicativo").font(k.ty.text_small_medium).color(k.c.text_base))
-                                .child(text("Escolha a aparência das janelas ou acompanhe automaticamente o tema do sistema.").font(k.ty.caption()).color(k.c.text_muted).wrap().w_full()),
+                                .child(text(t("Tema do aplicativo", "App theme")).font(k.ty.text_small_medium).color(k.c.text_base))
+                                .child(text(t("Escolha a aparência das janelas ou acompanhe automaticamente o tema do sistema.", "Choose how the windows look, or follow the system theme automatically.")).font(k.ty.caption()).color(k.c.text_muted).wrap().w_full()),
                         )
                         .child(theme_pills),
                 )
                 .child(divider())
-                .child(control_row("row-font", "Fonte da interface", font_desc, make_font_pills("font-pills", "font")));
+                .child(control_row("row-font", t("Fonte da interface", "Interface font"), font_desc, make_font_pills("font-pills", "font")))
+                .child(divider())
+                .child(control_row(
+                    "row-language",
+                    t("Idioma", "Language"),
+                    t("Automático segue o idioma do Windows.", "Automatic follows Windows' language."),
+                    make_language_pills("language-pills"),
+                ));
 
-            let purge_badge = st.skip_recycle_bin.then_some(("Permanente", rune_kit::BadgeVariant::Accent));
+            let purge_badge = st.skip_recycle_bin.then_some((t("Permanente", "Permanent"), rune_kit::BadgeVariant::Accent));
             let files_card = card_box("card-files")
                 .child(switch_row(
                     "opt-hidden",
-                    "Exibir arquivos ocultos",
-                    "Mostra pastas e arquivos ocultos do sistema ou iniciados por ponto (ex.: .git, .cargo).",
+                    t("Exibir arquivos ocultos", "Show hidden files"),
+                    t("Mostra pastas e arquivos ocultos do sistema ou iniciados por ponto (ex.: .git, .cargo).", "Shows hidden system files and folders, and those starting with a dot (e.g. .git, .cargo)."),
                     None,
                     st.show_hidden,
                     toggle_show_hidden,
@@ -428,8 +448,8 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .child(divider())
                 .child(switch_row(
                     "opt-clear-done",
-                    "Limpar concluídos automaticamente",
-                    "Remove da fila inferior os envios e downloads assim que terminam sem erro.",
+                    t("Limpar concluídos automaticamente", "Clear finished automatically"),
+                    t("Remove da fila inferior os envios e downloads assim que terminam sem erro.", "Removes uploads and downloads from the queue below as soon as they finish without errors."),
                     None,
                     st.clear_completed,
                     toggle_clear_completed,
@@ -437,8 +457,8 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .child(divider())
                 .child(switch_row(
                     "opt-skip-trash",
-                    "Não mover arquivos locais para a Lixeira",
-                    "Exclui itens do computador permanentemente após confirmação, sem passar pela Lixeira.",
+                    t("Não mover arquivos locais para a Lixeira", "Don't move local files to the Recycle Bin"),
+                    t("Exclui itens do computador permanentemente após confirmação, sem passar pela Lixeira.", "Deletes items on this PC permanently after confirmation, skipping the Recycle Bin."),
                     purge_badge,
                     st.skip_recycle_bin,
                     |s| change_settings(s, |c| c.skip_recycle_bin = !c.skip_recycle_bin),
@@ -448,7 +468,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .key("page-general")
                 .w_full()
                 .gap(12.0)
-                .child(section_head("Geral", "Aparência, fonte da interface e comportamento de arquivos e transferências."))
+                .child(section_head(t("Geral", "General"), t("Aparência, fonte da interface e comportamento de arquivos e transferências.", "Appearance, interface font, and how files and transfers behave.")))
                 .child(appearance)
                 .child(files_card)
         }
@@ -465,7 +485,10 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .border(1.0, k.alpha(k.c.warning.fg, 0.28))
                 .child(rune_kit::Badge::new("Experimental").variant(rune_kit::BadgeVariant::Accent).build(k))
                 .child(
-                    text("Opções avançadas de diagnóstico do motor gráfico. O padrão Suave (GPU) já entrega a melhor qualidade e eficiência.")
+                    text(t(
+                        "Opções avançadas de diagnóstico do motor gráfico. O padrão Suave (GPU) já entrega a melhor qualidade e eficiência.",
+                        "Advanced diagnostic options for the graphics engine. The default, Smooth (GPU), already gives the best quality and efficiency.",
+                    ))
                         .font(k.ty.caption())
                         .color(k.c.text_muted)
                         .wrap()
@@ -475,13 +498,19 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 );
 
             let render_desc = if cfg!(windows) {
-                "Alterna entre o suavizador vetorial na GPU (padrão recomendado), DirectWrite em tons de cinza e subpixels ClearType."
+                t(
+                    "Alterna entre o suavizador vetorial na GPU (padrão recomendado), DirectWrite em tons de cinza e subpixels ClearType.",
+                    "Switches between vector smoothing on the GPU (recommended default), grayscale DirectWrite and ClearType subpixels.",
+                )
             } else {
-                "Este sistema usa o suavizador vetorial nativo na GPU (DirectWrite e ClearType estão disponíveis apenas no Windows)."
+                t(
+                    "Este sistema usa o suavizador vetorial nativo na GPU (DirectWrite e ClearType estão disponíveis apenas no Windows).",
+                    "This system uses native vector smoothing on the GPU (DirectWrite and ClearType are only available on Windows).",
+                )
             };
             let exp_card = card_box("card-experimental").child(control_row(
                 "row-render",
-                "Nitidez e rasterização de texto",
+                t("Nitidez e rasterização de texto", "Text sharpness and rendering"),
                 render_desc,
                 make_render_pills("render-pills", "render"),
             ));
@@ -490,7 +519,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .key("page-experimental")
                 .w_full()
                 .gap(12.0)
-                .child(section_head("Experimental", "Parâmetros internos de renderização para testes e monitores específicos."))
+                .child(section_head("Experimental", t("Parâmetros internos de renderização para testes e monitores específicos.", "Internal rendering settings for testing and specific monitors.")))
                 .child(banner)
                 .child(exp_card)
         }
@@ -501,22 +530,22 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
             let concurrency = card_box("card-concurrency")
                 .child(count_row(
                     "row-uploads",
-                    "Uploads simultâneos",
-                    "Arquivos enviados ao mesmo tempo para o Google Drive ou servidor remoto (1 a 10).",
+                    t("Uploads simultâneos", "Simultaneous uploads"),
+                    t("Arquivos enviados ao mesmo tempo para o Google Drive ou servidor remoto (1 a 10).", "Files uploaded at the same time to Google Drive or a remote server (1 to 10)."),
                     stepper(k, "uploads", st.uploads, |s, d| change_settings(s, |c| c.uploads = at_once(i32::from(c.uploads) + d))),
                 ))
                 .child(divider())
                 .child(count_row(
                     "row-downloads",
-                    "Downloads simultâneos",
-                    "Arquivos baixados ao mesmo tempo para o computador (1 a 10).",
+                    t("Downloads simultâneos", "Simultaneous downloads"),
+                    t("Arquivos baixados ao mesmo tempo para o computador (1 a 10).", "Files downloaded at the same time to this PC (1 to 10)."),
                     stepper(k, "downloads", st.downloads, |s, d| change_settings(s, |c| c.downloads = at_once(i32::from(c.downloads) + d))),
                 ));
 
             let speed_card = card_box("card-segmented").child(switch_row(
                 "opt-segmented",
-                "Baixar arquivos grandes em segmentos paralelos",
-                "Divide arquivos grandes em múltiplas conexões simultâneas para acelerar o download.",
+                t("Baixar arquivos grandes em segmentos paralelos", "Download large files in parallel segments"),
+                t("Divide arquivos grandes em múltiplas conexões simultâneas para acelerar o download.", "Splits large files across several simultaneous connections to speed up the download."),
                 Some(("≥ 64 MB", rune_kit::BadgeVariant::Subtle)),
                 st.segmented_downloads,
                 |s| change_settings(s, |c| c.segmented_downloads = !c.segmented_downloads),
@@ -531,7 +560,10 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .fill(k.alpha(k.c.text_accent, if k.dark { 0.08 } else { 0.05 }))
                 .border(1.0, k.alpha(k.c.text_accent, 0.22))
                 .child(
-                    text("As alterações de simultaneidade e segmentos paralelos passam a valer na próxima transferência iniciada. Cada servidor também respeita o próprio limite de conexões configurado na conta.")
+                    text(t(
+                        "As alterações de simultaneidade e segmentos paralelos passam a valer na próxima transferência iniciada. Cada servidor também respeita o próprio limite de conexões configurado na conta.",
+                        "Changes to simultaneous transfers and parallel segments take effect on the next transfer started. Each server also keeps to the connection limit set in its account.",
+                    ))
                         .font(k.ty.caption())
                         .color(k.c.text_muted)
                         .wrap()
@@ -543,14 +575,14 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .key("page-transfers")
                 .w_full()
                 .gap(12.0)
-                .child(section_head("Transferências", "Ajuste quantas transferências rodam em paralelo e a aceleração de downloads grandes."))
+                .child(section_head(t("Transferências", "Transfers"), t("Ajuste quantas transferências rodam em paralelo e a aceleração de downloads grandes.", "Set how many transfers run in parallel and how large downloads are sped up.")))
                 .child(concurrency)
                 .child(speed_card)
                 .child(info_box)
         }
         OptionsTab::Logs => {
             let visible = opt.filtered_logs();
-            let size_badge = if opt.log_bytes > 0 { format_size(opt.log_bytes) } else { "Vazio".into() };
+            let size_badge = if opt.log_bytes > 0 { format_size(opt.log_bytes) } else { t("Vazio", "Empty").into() };
 
             let tools = row()
                 .key("log-tools")
@@ -561,7 +593,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .child(rune_kit::Badge::new(size_badge).variant(rune_kit::BadgeVariant::Subtle).standard().build(k))
                 .child(el().grow(1.0))
                 .child(
-                    Button::new("Atualizar")
+                    Button::new(t("Atualizar", "Refresh"))
                         .icon(&icons::REFRESH)
                         .variant(ButtonVariant::Neutral)
                         .on_press(|s: &mut State| {
@@ -572,19 +604,19 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                         .build(k),
                 )
                 .child(
-                    Button::new("Copiar")
+                    Button::new(t("Copiar", "Copy"))
                         .variant(ButtonVariant::Neutral)
                         .disabled(visible.is_empty())
                         .on_press_tx(|s: &mut State, tx: &mut Tx| {
                             // Joined on the press, not on every frame the tab is drawn.
                             let Some(Dialog::Options(opt)) = &s.dialog else { return };
                             tx.copy(opt.filtered_logs().join("\n"));
-                            s.status = "Log copiado para a área de transferência.".into();
+                            s.status = t("Log copiado para a área de transferência.", "Log copied to the clipboard.").into();
                         })
                         .build(k),
                 )
                 .child(
-                    Button::new("Abrir pasta")
+                    Button::new(t("Abrir pasta", "Open folder"))
                         .variant(ButtonVariant::Neutral)
                         .on_press(|s: &mut State| {
                             let dir = openexplorer_gdrive::local_dir();
@@ -596,7 +628,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                         .build(k),
                 )
                 .child(
-                    Button::new("Limpar")
+                    Button::new(t("Limpar", "Clear"))
                         .variant(ButtonVariant::Danger)
                         .disabled(opt.log_lines.is_empty())
                         .on_press(|s: &mut State| match openexplorer_gdrive::clear_log() {
@@ -604,7 +636,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                                 if let Some(Dialog::Options(opt)) = &mut s.dialog {
                                     opt.refresh_logs();
                                 }
-                                s.status = "Arquivo de log limpo.".into();
+                                s.status = t("Arquivo de log limpo.", "Log file cleared.").into();
                             }
                             Err(e) => crate::fail(s, e),
                         })
@@ -613,9 +645,9 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
 
             let mut filter_input = rune_kit::TextInput::new(&opt.log_filter)
                 .width(None)
-                .label("Filtrar log")
+                .label(t("Filtrar log", "Filter log"))
                 .leading_icon(&icons::SEARCH)
-                .placeholder("Filtrar registros do log (ex.: erro, sftp, cota, operação)…")
+                .placeholder(t("Filtrar registros do log (ex.: erro, sftp, cota, operação)…", "Filter log entries (e.g. error, sftp, quota, operation)…"))
                 .on_edit(|s: &mut State| match &mut s.dialog {
                     Some(Dialog::Options(opt)) => &mut opt.log_filter,
                     _ => &mut s.name_edit,
@@ -631,9 +663,9 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
 
             let viewer: El = if visible.is_empty() {
                 let empty_msg = if opt.log_lines.is_empty() {
-                    "Nenhum evento registrado ainda em openexplorer.log."
+                    t("Nenhum evento registrado ainda em openexplorer.log.", "Nothing logged in openexplorer.log yet.")
                 } else {
-                    "Nenhuma linha do log corresponde ao filtro digitado."
+                    t("Nenhuma linha do log corresponde ao filtro digitado.", "No log line matches the filter.")
                 };
                 col()
                     .key("log-empty")
@@ -650,7 +682,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 // Newest entries at the top so recent activity is visible immediately.
                 for (idx, line) in visible.iter().rev().enumerate() {
                     let lower = line.to_lowercase();
-                    let is_err = lower.contains("erro") || lower.contains("falha") || lower.contains("pânico") || lower.contains("http 4") || lower.contains("http 5");
+                    let is_err = lower.contains("erro") || lower.contains("falha") || lower.contains("pânico") || lower.contains("error") || lower.contains("failed") || lower.contains("panic") || lower.contains("http 4") || lower.contains("http 5");
                     let (stamp, rest) = match line.split_once(' ') {
                         Some((ts, msg)) if ts.contains(':') => (ts, msg),
                         _ => ("", *line),
@@ -719,8 +751,8 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
         .center_y()
         .border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_weak)
         .child(el().size(6.0, 6.0).radius(3.0).fill(k.c.success.fg))
-        .child(text("Alterações salvas automaticamente").font(k.ty.caption()).color(k.c.text_faint).grow(1.0))
-        .child(Button::new("Concluído").variant(ButtonVariant::Submit).on_press(close).build(k).default_button());
+        .child(text(t("Alterações salvas automaticamente", "Changes are saved automatically")).font(k.ty.caption()).color(k.c.text_faint).grow(1.0))
+        .child(Button::new(t("Concluído", "Done")).variant(ButtonVariant::Submit).on_press(close).build(k).default_button());
 
     let right_col = col().key("opt-right").grow(1.0).w(0.0).h_full().min_w(0.0).child(main_scroll).child(footer);
 
@@ -732,14 +764,23 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
         .child(nav)
         .child(right_col);
 
-    Modal::new("options", "Opções").open(true).child(body).width(750.0).fit().on_close(close).build(k, layer);
+    Modal::new("options", t("Opções", "Options")).open(true).child(body).width(750.0).fit().on_close(close).build(k, layer);
 }
 
 // ---------------------------------------------------------------------------------------------
 // Transfer queue
 
-/// The queue's columns, as in Air Explorer.
-const QUEUE_LABELS: [&str; 8] = ["Operação", "Origem", "Destino", "Estado", "Tamanho", "Progresso", "Velocidade", "Estimado"];
+/// The queue's columns, as in Air Explorer: each in Portuguese and in English.
+const QUEUE_LABELS: [(&str, &str); 8] = [
+    ("Operação", "Operation"),
+    ("Origem", "Source"),
+    ("Destino", "Destination"),
+    ("Estado", "Status"),
+    ("Tamanho", "Size"),
+    ("Progresso", "Progress"),
+    ("Velocidade", "Speed"),
+    ("Estimado", "Time left"),
+];
 
 fn queue_cell(w: f32) -> El {
     row().w(w).h_full().px(6.0).gap(5.0).center_y().clip_soft(0.0)
@@ -778,18 +819,25 @@ fn queue_row(s: &State, k: &Kit, t: &transfers::Transfer) -> El {
     let p = &t.progress;
     let w = s.layout.queue_cols;
     let muted = |t: String| text(t).font(k.ty.text_xsmall).color(k.c.text_base).truncate().shrink().min_w(0.0);
+    // `t` is the transfer here, so the words go through their full name.
+    use openexplorer_i18n::t as words;
     let (state, dot) = match p.stage() {
-        Stage::Waiting if p.cancelled() => ("Cancelando…", k.c.text_faint),
-        Stage::Waiting => ("Aguardando", k.c.text_faint),
-        Stage::Running if p.cancelled() => ("Cancelando…", k.c.warning.fg),
-        Stage::Running => ("Em andamento", k.c.success.fg),
-        Stage::Done => ("Concluído", k.c.text_accent),
-        Stage::Cancelled => ("Cancelado", k.c.warning.fg),
-        Stage::Failed => ("Erro", k.c.danger.fg),
+        Stage::Waiting if p.cancelled() => (words("Cancelando…", "Canceling…"), k.c.text_faint),
+        Stage::Waiting => (words("Aguardando", "Waiting"), k.c.text_faint),
+        Stage::Running if p.cancelled() => (words("Cancelando…", "Canceling…"), k.c.warning.fg),
+        Stage::Running => (words("Em andamento", "In progress"), k.c.success.fg),
+        Stage::Done => (words("Concluído", "Done"), k.c.text_accent),
+        Stage::Cancelled => (words("Cancelado", "Canceled"), k.c.warning.fg),
+        Stage::Failed => (words("Erro", "Error"), k.c.danger.fg),
     };
     // A folder's row counts its items while running: "Em andamento · 120 de 1.946".
     let items = p.items.load(Relaxed);
-    let state = if p.stage() == Stage::Running && items > 1 { format!("{state} · {} de {}", ui_count(p.items_done.load(Relaxed) as usize), ui_count(items as usize)) } else { state.to_string() };
+    let state = if p.stage() == Stage::Running && items > 1 {
+        let (done, items) = (ui_count(p.items_done.load(Relaxed) as usize), ui_count(items as usize));
+        tr!("{state} · {done} de {items}", "{state} · {done} of {items}")
+    } else {
+        state.to_string()
+    };
     let mut state_cell = queue_cell(w[3]).child(el().size(8.0, 8.0).radius(4.0).fill(dot)).child(muted(state.clone()).help_when_truncated(state));
     if p.stage() == Stage::Failed {
         state_cell = state_cell.help(p.error());
@@ -849,8 +897,8 @@ fn transfers(s: &State, k: &Kit) -> El {
         .fill(k.c.bg_base)
         .sticky_top(0.0)
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
-        .children(QUEUE_LABELS.iter().enumerate().map(|(i, label)| {
-            queue_cell(w[i]).border_sides([0.0, 1.0, 0.0, 0.0], k.c.border_weak).child(text(label.to_string()).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().min_w(0.0))
+        .children(QUEUE_LABELS.iter().enumerate().map(|(i, &(pt, en))| {
+            queue_cell(w[i]).border_sides([0.0, 1.0, 0.0, 0.0], k.c.border_weak).child(text(t(pt, en)).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().min_w(0.0))
         }))
         .children(grips);
     // Only the rows in view are built: copying a 5,000-file folder makes 5,000 rows.
@@ -900,7 +948,7 @@ fn queue_totals(s: &State, k: &Kit) -> El {
         .key("totals")
         .gap(8.0)
         .center_y()
-        .child(small(format!("Total: {}", transfers::pair(done, total))))
+        .child(small(tr!("Total: {}", "Total: {}", transfers::pair(done, total))))
         .child(row().w(80.0).h(10.0).border(1.0, k.c.border_base).child(el().h_full().w_frac(fraction).fill(k.alpha(k.c.text_accent, 0.5))))
         .child(small(if speed > 0.0 { format!("{}/s", format_size(speed as u64)) } else { String::new() }))
 }
@@ -919,13 +967,13 @@ fn transfer_context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     if let Some(row) = row {
         let (over, other) = (row.over(), row.clone());
         menu = menu
-            .item(item("Cancelar", !over, Box::new(move |_| actions::cancel_transfer(&row))))
-            .item(item("Remover da lista", over, Box::new(move |s| actions::remove_transfer(s, &other))))
+            .item(item(t("Cancelar", "Cancel"), !over, Box::new(move |_| actions::cancel_transfer(&row))))
+            .item(item(t("Remover da lista", "Remove from list"), over, Box::new(move |s| actions::remove_transfer(s, &other))))
             .separator();
     }
     let (any_live, any_over) = (s.transfers.iter().any(|t| !t.progress.over()), s.transfers.iter().any(|t| t.progress.over()));
-    menu.item(item("Cancelar todas", any_live, Box::new(actions::cancel_all_transfers)))
-        .item(item("Limpar finalizadas", any_over, Box::new(actions::clear_transfers)))
+    menu.item(item(t("Cancelar todas", "Cancel all"), any_live, Box::new(actions::cancel_all_transfers)))
+        .item(item(t("Limpar finalizadas", "Clear finished"), any_over, Box::new(actions::clear_transfers)))
         .on_close(|s: &mut State| s.transfer_menu = None)
         .build(k, layer)
 }
@@ -941,13 +989,13 @@ fn address_context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             f(s, p, tx);
         })
     };
-    let mut menu = context_menu("address-menu", anchor, Some(at)).min_width(220.0).item(item("Copiar endereço", &icons::M_COPY, "", actions::copy_address));
+    let mut menu = context_menu("address-menu", anchor, Some(at)).min_width(220.0).item(item(t("Copiar endereço", "Copy address"), &icons::M_COPY, "", actions::copy_address));
     if crate::address::drive_link(&s.panes[p].loc).is_some() {
-        menu = menu.item(item("Copiar link do Drive", &icons::M_LINK, "", actions::copy_drive_link));
+        menu = menu.item(item(t("Copiar link do Drive", "Copy Drive link"), &icons::M_LINK, "", actions::copy_drive_link));
     }
-    menu.item(item("Colar e ir", &icons::M_PASTE, "", actions::paste_and_go))
+    menu.item(item(t("Colar e ir", "Paste and go"), &icons::M_PASTE, "", actions::paste_and_go))
         .separator()
-        .item(item("Editar endereço", &icons::M_RENAME, "Ctrl+L", |s, p, _| actions::edit_address(s, p)))
+        .item(item(t("Editar endereço", "Edit address"), &icons::M_RENAME, "Ctrl+L", |s, p, _| actions::edit_address(s, p)))
         .on_close(|s: &mut State| s.address_menu = None)
         .build(k, layer)
 }
@@ -975,36 +1023,36 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         menu = menu.min_width(270.0);
         if n > 0 {
             menu = menu
-                .item(item("Abrir", &icons::M_OPEN, "Enter", n == 1, actions::open))
+                .item(item(t("Abrir", "Open"), &icons::M_OPEN, "Enter", n == 1, actions::open))
                 .separator()
-                .item(item("Restaurar", &icons::M_RESTORE, "", true, |s, p, _| actions::restore(s, p)))
-                .item(item("Excluir permanentemente", &icons::M_DELETE, "Del", true, |s, p, _| actions::ask_purge(s, p)).danger(true))
+                .item(item(t("Restaurar", "Restore"), &icons::M_RESTORE, "", true, |s, p, _| actions::restore(s, p)))
+                .item(item(t("Excluir permanentemente", "Delete permanently"), &icons::M_DELETE, "Del", true, |s, p, _| actions::ask_purge(s, p)).danger(true))
                 .separator()
-                .item(item("Propriedades", &icons::M_PROPERTIES, "Alt+Enter", true, |s, p, _| actions::properties(s, p)))
+                .item(item(t("Propriedades", "Properties"), &icons::M_PROPERTIES, "Alt+Enter", true, |s, p, _| actions::properties(s, p)))
                 .separator();
         }
-        menu = menu.item(item("Esvaziar lixeira", &icons::M_EMPTY_TRASH, "", true, |s, p, _| actions::ask_empty_trash(s, p)).danger(true));
+        menu = menu.item(item(t("Esvaziar lixeira", "Empty trash"), &icons::M_EMPTY_TRASH, "", true, |s, p, _| actions::ask_empty_trash(s, p)).danger(true));
         return menu.on_close(|s: &mut State| s.menu = None).build(k, layer);
     }
     let changeable = actions::items_editable(&s.panes[p].loc);
     if n > 0 {
-        menu = menu.item(item("Abrir", &icons::M_OPEN, "Enter", n == 1, actions::open));
+        menu = menu.item(item(t("Abrir", "Open"), &icons::M_OPEN, "Enter", n == 1, actions::open));
         if actions::shows_results(&s.panes[p].loc) {
-            menu = menu.item(item("Mostrar na pasta", &icons::M_SHOW_IN_FOLDER, "", n == 1, actions::show_in_folder));
+            menu = menu.item(item(t("Mostrar na pasta", "Show in folder"), &icons::M_SHOW_IN_FOLDER, "", n == 1, actions::show_in_folder));
         }
         menu = menu
             .separator()
-            .item(item("Recortar", &icons::M_CUT, "Ctrl+X", editable, |s, p, _| actions::pick_up(s, p, ClipMode::Cut)))
-            .item(item("Copiar", &icons::M_COPY, "Ctrl+C", changeable, |s, p, _| actions::pick_up(s, p, ClipMode::Copy)));
+            .item(item(t("Recortar", "Cut"), &icons::M_CUT, "Ctrl+X", editable, |s, p, _| actions::pick_up(s, p, ClipMode::Cut)))
+            .item(item(t("Copiar", "Copy"), &icons::M_COPY, "Ctrl+C", changeable, |s, p, _| actions::pick_up(s, p, ClipMode::Copy)));
     }
-    menu = menu.item(item("Colar", &icons::M_PASTE, "Ctrl+V", actions::can_paste(s, p), |s, p, _| actions::paste(s, p)));
+    menu = menu.item(item(t("Colar", "Paste"), &icons::M_PASTE, "Ctrl+V", actions::can_paste(s, p), |s, p, _| actions::paste(s, p)));
     if n > 0 {
         menu = menu
             .separator()
-            .item(item("Excluir", &icons::M_DELETE, "Del", changeable, |s, p, _| actions::ask_delete(s, p)).danger(true))
-            .item(item("Renomear", &icons::M_RENAME, "F2", changeable && n == 1, actions::ask_rename));
+            .item(item(t("Excluir", "Delete"), &icons::M_DELETE, "Del", changeable, |s, p, _| actions::ask_delete(s, p)).danger(true))
+            .item(item(t("Renomear", "Rename"), &icons::M_RENAME, "F2", changeable && n == 1, actions::ask_rename));
         if changeable && matches!(s.panes[p].loc, Location::Drive { .. }) {
-            let label = if actions::stars_to_add(s, p) { "Adicionar estrela" } else { "Remover estrela" };
+            let label = if actions::stars_to_add(s, p) { t("Adicionar estrela", "Add star") } else { t("Remover estrela", "Remove star") };
             menu = menu.item(item(label, &icons::M_STAR, "", true, |s, p, _| actions::star(s, p)));
         }
     }
@@ -1012,12 +1060,12 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     if n == 1 && editable && matches!(s.panes[p].loc, Location::Drive { .. }) {
         menu = menu
             .separator()
-            .item(item("Copiar link", &icons::M_LINK, "", true, crate::sharing::copy_link))
-            .item(item("Compartilhar…", &icons::M_SHARE, "", true, crate::sharing::ask_share));
+            .item(item(t("Copiar link", "Copy link"), &icons::M_LINK, "", true, crate::sharing::copy_link))
+            .item(item(t("Compartilhar…", "Share…"), &icons::M_SHARE, "", true, crate::sharing::ask_share));
     }
-    menu = menu.separator().item(item("Nova pasta", &icons::M_NEW_FOLDER, "Ctrl+Shift+N", editable, actions::ask_new_folder));
+    menu = menu.separator().item(item(t("Nova pasta", "New folder"), &icons::M_NEW_FOLDER, "Ctrl+Shift+N", editable, actions::ask_new_folder));
     if n > 0 {
-        menu = menu.separator().item(item("Propriedades", &icons::M_PROPERTIES, "Alt+Enter", true, |s, p, _| actions::properties(s, p)));
+        menu = menu.separator().item(item(t("Propriedades", "Properties"), &icons::M_PROPERTIES, "Alt+Enter", true, |s, p, _| actions::properties(s, p)));
     }
     menu.on_close(|s: &mut State| s.menu = None).build(k, layer)
 }
@@ -1048,53 +1096,66 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
         Dialog::Delete { pane, items } => {
             let local = s.panes[*pane].loc.is_local();
             let title = match items.as_slice() {
-                [one] => format!("Excluir \"{}\"?", shown(&one.name)),
-                many => format!("Excluir {} itens?", ui_count(many.len())),
+                [one] => tr!("Excluir \"{}\"?", "Delete \"{}\"?", shown(&one.name)),
+                many => tr!("Excluir {} itens?", "Delete {} items?", ui_count(many.len())),
             };
             let where_to = if local {
-                "Os itens vão para a Lixeira do Windows, de onde podem ser restaurados."
+                t("Os itens vão para a Lixeira do Windows, de onde podem ser restaurados.", "The items go to the Windows Recycle Bin, where they can be restored.")
             } else {
-                "Os itens vão para a lixeira do Google Drive, onde ficam 30 dias antes de serem apagados de vez."
+                t(
+                    "Os itens vão para a lixeira do Google Drive, onde ficam 30 dias antes de serem apagados de vez.",
+                    "The items go to the Google Drive trash, where they stay for 30 days before being deleted for good.",
+                )
             };
             // The explanation goes in the body, where it wraps; the dialog's own description
             // line doesn't, and would run under the close button.
             let note = text(where_to).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
-            let body = col().w_full().gap(12.0).child(note).child(item_list(s, k, *pane, items)).child(actions_row(k, "Cancelar", Button::new("Excluir").variant(ButtonVariant::Danger).on_press(actions::delete)));
+            let body = col().w_full().gap(12.0).child(note).child(item_list(s, k, *pane, items)).child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Excluir", "Delete")).variant(ButtonVariant::Danger).on_press(actions::delete)));
             Modal::new("delete", title).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
         }
         Dialog::Purge { pane, items } => {
             let title = match items.as_slice() {
-                [one] => format!("Excluir \"{}\" permanentemente?", shown(&one.name)),
-                many => format!("Excluir {} itens permanentemente?", ui_count(many.len())),
+                [one] => tr!("Excluir \"{}\" permanentemente?", "Permanently delete \"{}\"?", shown(&one.name)),
+                many => tr!("Excluir {} itens permanentemente?", "Permanently delete {} items?", ui_count(many.len())),
             };
             let remote = items.iter().filter_map(|e| s.panes[*pane].loc.local_path(e)).any(|path| crate::network::is_remote(&path));
             let note: Cow<str> = if s.panes[*pane].loc.is_local() && !remote && s.settings.skip_recycle_bin {
-                "A exclusão direta está ativada nas Opções: os itens serão apagados para sempre, sem passar pela Lixeira. Isso não pode ser desfeito.".into()
+                t(
+                    "A exclusão direta está ativada nas Opções: os itens serão apagados para sempre, sem passar pela Lixeira. Isso não pode ser desfeito.",
+                    "Permanent deletion is on in Options: the items will be deleted for good, skipping the Recycle Bin. This can't be undone.",
+                )
+                .into()
             } else if s.panes[*pane].loc.is_local() {
-                "Aqui não há Lixeira: os itens serão apagados para sempre. Isso não pode ser desfeito.".into()
+                t("Aqui não há Lixeira: os itens serão apagados para sempre. Isso não pode ser desfeito.", "There's no Recycle Bin here: the items will be deleted for good. This can't be undone.").into()
             } else if let Location::Server { server, .. } = &s.panes[*pane].loc {
-                format!("Servidores não têm lixeira: os itens serão apagados para sempre de {}. Isso não pode ser desfeito.", server.name).into()
+                tr!(
+                    "Servidores não têm lixeira: os itens serão apagados para sempre de {}. Isso não pode ser desfeito.",
+                    "Servers have no trash: the items will be deleted from {} for good. This can't be undone.",
+                    server.name
+                )
+                .into()
             } else {
-                "Os itens serão apagados para sempre do Google Drive. Isso não pode ser desfeito.".into()
+                t("Os itens serão apagados para sempre do Google Drive. Isso não pode ser desfeito.", "The items will be deleted from Google Drive for good. This can't be undone.").into()
             };
             let body = col()
                 .w_full()
                 .gap(12.0)
                 .child(text(note.into_owned()).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
                 .child(item_list(s, k, *pane, items))
-                .child(actions_row(k, "Cancelar", Button::new("Excluir permanentemente").variant(ButtonVariant::Danger).on_press(actions::purge)));
+                .child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Excluir permanentemente", "Delete permanently")).variant(ButtonVariant::Danger).on_press(actions::purge)));
             Modal::new("purge", title).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
         }
         Dialog::EmptyTrash { email } => {
-            let note = format!(
-                "Todos os itens da lixeira do Meu Drive de {email} serão apagados para sempre. Isso não pode ser desfeito. Itens na lixeira de drives compartilhados continuam lá."
+            let note = tr!(
+                "Todos os itens da lixeira do Meu Drive de {email} serão apagados para sempre. Isso não pode ser desfeito. Itens na lixeira de drives compartilhados continuam lá.",
+                "Everything in the My Drive trash of {email} will be deleted for good. This can't be undone. Items in the trash of shared drives stay there."
             );
             let body = col()
                 .w_full()
                 .gap(12.0)
                 .child(text(note).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
-                .child(actions_row(k, "Cancelar", Button::new("Esvaziar lixeira").variant(ButtonVariant::Danger).on_press(actions::empty_trash)));
-            Modal::new("empty-trash", "Esvaziar lixeira?").open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
+                .child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Esvaziar lixeira", "Empty trash")).variant(ButtonVariant::Danger).on_press(actions::empty_trash)));
+            Modal::new("empty-trash", t("Esvaziar lixeira?", "Empty trash?")).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
         }
         Dialog::NewFolder { error, .. } => {
             // Rune's own field, so it can take the dialog's first focus (`autofocus`); Enter
@@ -1102,7 +1163,7 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
             let field = rune::text_input(&s.name_edit, k.ty.ui_compact)
                 .single_line()
                 .key("name-input")
-                .label("Nome")
+                .label(t("Nome", "Name"))
                 .grow(1.0)
                 .shrink()
                 .min_w(0.0)
@@ -1125,9 +1186,9 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
             if let Some(e) = error {
                 body = body.child(text(e.clone()).font(k.ty.text_small).color(k.c.danger.fg));
             }
-            let act = Button::new("Criar").variant(ButtonVariant::Submit).on_press(actions::submit_name);
-            let body = body.child(actions_row(k, "Cancelar", act));
-            Modal::new("name", "Nova pasta").open(true).child(pad(body)).width(420.0).fit().on_close(close).build(k, layer);
+            let act = Button::new(t("Criar", "Create")).variant(ButtonVariant::Submit).on_press(actions::submit_name);
+            let body = body.child(actions_row(k, t("Cancelar", "Cancel"), act));
+            Modal::new("name", t("Nova pasta", "New folder")).open(true).child(pad(body)).width(420.0).fit().on_close(close).build(k, layer);
         }
         Dialog::Properties(p) => props_dialog(s, k, p, layer),
         Dialog::Options(opt) => options_dialog(s, k, opt, window_h, layer),
@@ -1195,9 +1256,9 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         let mut search = rune_kit::TextInput::new(&f.filter)
             .width(None)
             .large()
-            .label("Buscar provedor")
+            .label(t("Buscar provedor", "Search providers"))
             .leading_icon(&icons::SEARCH)
-            .placeholder("Buscar provedor ou colar endereço (ex.: Google Drive, FTP, sftp://nas)…")
+            .placeholder(t("Buscar provedor ou colar endereço (ex.: Google Drive, FTP, sftp://nas)…", "Search providers or paste an address (e.g. Google Drive, FTP, sftp://nas)…"))
             .on_edit(|s: &mut State| part(s, |f| &mut f.filter))
             .on_submit(|s: &mut State, _: &mut Tx| crate::servers::submit_filter(s));
         if !f.filter.text.is_empty() {
@@ -1216,7 +1277,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
             let pill = k
                 .interactive(
                     row()
-                        .key(format!("cat-{}", cat.label()))
+                        .key(format!("cat-{cat:?}"))
                         .role("tab")
                         .label(cat.label())
                         .checked(on)
@@ -1252,14 +1313,14 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
             let trimmed = f.filter.text.trim().trim_matches('"');
             let is_url = crate::servers::parse_address(trimmed).is_some();
             let msg = if is_url {
-                format!("Endereço “{trimmed}” reconhecido. Clique abaixo ou pressione Enter para configurar.")
+                tr!("Endereço “{trimmed}” reconhecido. Clique abaixo ou pressione Enter para configurar.", "Address “{trimmed}” recognized. Click below or press Enter to set it up.")
             } else {
-                format!("Nenhum provedor encontrado para “{}”.", f.filter.text.trim())
+                tr!("Nenhum provedor encontrado para “{}”.", "No provider found for “{}”.", f.filter.text.trim())
             };
             let act = if is_url {
-                Button::new("Configurar endereço").variant(ButtonVariant::Submit).on_press(crate::servers::submit_filter).build(k).default_button()
+                Button::new(t("Configurar endereço", "Set up address")).variant(ButtonVariant::Submit).on_press(crate::servers::submit_filter).build(k).default_button()
             } else {
-                Button::new("Limpar busca").variant(ButtonVariant::Neutral).on_press(crate::servers::clear_filter).build(k)
+                Button::new(t("Limpar busca", "Clear search")).variant(ButtonVariant::Neutral).on_press(crate::servers::clear_filter).build(k)
             };
             col()
                 .key("empty-grid")
@@ -1305,7 +1366,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
                         .child(text(provider.label()).font(k.ty.text_small_medium).color(k.c.text_base).align(Align::Center))
                         .child(text(provider.subtitle()).font(k.ty.caption()).color(k.c.text_muted).align(Align::Center).truncate().w_full());
                     if connected > 0 {
-                        let badge_label = if connected == 1 { "1 ativa".to_string() } else { format!("{connected} ativas") };
+                        let badge_label = if connected == 1 { t("1 ativa", "1 active").to_string() } else { tr!("{connected} ativas", "{connected} active") };
                         card = card.child(
                             row()
                                 .pin(None, Some(8.0), Some(8.0), None)
@@ -1337,7 +1398,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
                 .grow(1.0)
                 .min_w(0.0)
                 .child(el().size(7.0, 7.0).radius(3.5).fill(k.c.text_accent))
-                .child(text("Aguardando autorização do Google no navegador…").font(k.ty.text_xsmall).color(k.c.text_accent).truncate().min_w(0.0))
+                .child(text(t("Aguardando autorização do Google no navegador…", "Waiting for Google's authorization in the browser…")).font(k.ty.text_xsmall).color(k.c.text_accent).truncate().min_w(0.0))
         } else {
             row()
                 .gap(5.0)
@@ -1345,7 +1406,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
                 .grow(1.0)
                 .min_w(0.0)
                 .child(icon(k.glyph.lock, 13.0).color(k.c.icon_faint))
-                .child(text("Senhas e tokens ficam protegidos no Cofre do sistema.").font(k.ty.caption()).color(k.c.text_faint).truncate().min_w(0.0))
+                .child(text(t("Senhas e tokens ficam protegidos no Cofre do sistema.", "Passwords and tokens are kept safe in the system's Credential Manager.")).font(k.ty.caption()).color(k.c.text_faint).truncate().min_w(0.0))
         };
 
         let picker_inner = col()
@@ -1353,7 +1414,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
             .px(16.0)
             .pb(4.0)
             .gap(12.0)
-            .child(text("Escolha uma nuvem, NAS ou protocolo remoto para conectar ao Open Explorer.").font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
+            .child(text(t("Escolha uma nuvem, NAS ou protocolo remoto para conectar ao Open Explorer.", "Choose a cloud, NAS or remote protocol to connect to Open Explorer.")).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
             .child(search.build(k))
             .child(tabs)
             .child(grid);
@@ -1362,9 +1423,9 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
             .key("picker-content")
             .w_full()
             .child(account_scroll(k, "picker-scroll", window_h, picker_inner))
-            .child(row().key("picker-footer").w_full().px(16.0).pt(12.0).pb(16.0).gap(8.0).center_y().child(footer_note).child(Button::new("Cancelar").variant(ButtonVariant::Neutral).on_press(close).build(k)));
+            .child(row().key("picker-footer").w_full().px(16.0).pt(12.0).pb(16.0).gap(8.0).center_y().child(footer_note).child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k)));
 
-        Modal::new("server", "Registrar conta").open(true).child(body).width(600.0).fit().on_close(close).build(k, layer);
+        Modal::new("server", t("Registrar conta", "Add account")).open(true).child(body).width(600.0).fit().on_close(close).build(k, layer);
         return;
     }
 
@@ -1373,16 +1434,16 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
 
     let proto = f.effective_protocol();
     let (summary, badge_text) = match (f.provider, proto) {
-        (Provider::GoogleDrive, _) => ("Autorização segura OAuth 2.0 pelo navegador padrão", "OAuth 2.0"),
-        (Provider::Nextcloud, Protocol::Davs) => ("Servidor Nextcloud · conexão criptografada", "HTTPS"),
-        (Provider::Nextcloud, _) => ("Servidor Nextcloud · conexão sem criptografia", "HTTP"),
-        (Provider::OwnCloud, Protocol::Davs) => ("Servidor ownCloud · conexão criptografada", "HTTPS"),
-        (Provider::OwnCloud, _) => ("Servidor ownCloud · conexão sem criptografia", "HTTP"),
-        (Provider::Sftp, _) => ("Transferência segura sobre SSH · porta padrão 22", "SSH"),
-        (Provider::Ftp, Protocol::Ftps) => ("FTP explícito ou implícito com criptografia TLS", "FTPS"),
-        (Provider::Ftp, _) => ("FTP padrão · ative SSL/TLS abaixo se o servidor aceitar", "FTP"),
-        (Provider::WebDav, Protocol::Davs) => ("Servidor WebDAV seguro · porta padrão 443", "HTTPS"),
-        (Provider::WebDav, _) => ("Servidor WebDAV sem criptografia · porta padrão 80", "HTTP"),
+        (Provider::GoogleDrive, _) => (t("Autorização segura OAuth 2.0 pelo navegador padrão", "Secure OAuth 2.0 sign-in through the default browser"), "OAuth 2.0"),
+        (Provider::Nextcloud, Protocol::Davs) => (t("Servidor Nextcloud · conexão criptografada", "Nextcloud server · encrypted connection"), "HTTPS"),
+        (Provider::Nextcloud, _) => (t("Servidor Nextcloud · conexão sem criptografia", "Nextcloud server · unencrypted connection"), "HTTP"),
+        (Provider::OwnCloud, Protocol::Davs) => (t("Servidor ownCloud · conexão criptografada", "ownCloud server · encrypted connection"), "HTTPS"),
+        (Provider::OwnCloud, _) => (t("Servidor ownCloud · conexão sem criptografia", "ownCloud server · unencrypted connection"), "HTTP"),
+        (Provider::Sftp, _) => (t("Transferência segura sobre SSH · porta padrão 22", "Secure transfer over SSH · default port 22"), "SSH"),
+        (Provider::Ftp, Protocol::Ftps) => (t("FTP explícito ou implícito com criptografia TLS", "Explicit or implicit FTP with TLS encryption"), "FTPS"),
+        (Provider::Ftp, _) => (t("FTP padrão · ative SSL/TLS abaixo se o servidor aceitar", "Standard FTP · turn on SSL/TLS below if the server supports it"), "FTP"),
+        (Provider::WebDav, Protocol::Davs) => (t("Servidor WebDAV seguro · porta padrão 443", "Secure WebDAV server · default port 443"), "HTTPS"),
+        (Provider::WebDav, _) => (t("Servidor WebDAV sem criptografia · porta padrão 80", "Unencrypted WebDAV server · default port 80"), "HTTP"),
     };
 
     let badge_variant = if f.provider != Provider::GoogleDrive && proto.plain() {
@@ -1416,7 +1477,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         row()
             .key(key)
             .role("button")
-            .label(if revealed { "Ocultar senha" } else { "Mostrar senha" })
+            .label(if revealed { t("Ocultar senha", "Hide password") } else { t("Mostrar senha", "Show password") })
             .preserve_focus_on_press(true)
             .focusable(true)
             .focus_ring(2.0, 1.0, k.c.border_focus)
@@ -1441,7 +1502,10 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
             .gap(12.0)
             .child(banner)
             .child(
-                text("Ao continuar, o navegador abrirá a página do Google para você escolher a conta e autorizar o acesso ao Meu Drive e aos Drives compartilhados.")
+                text(t(
+                    "Ao continuar, o navegador abrirá a página do Google para você escolher a conta e autorizar o acesso ao Meu Drive e aos Drives compartilhados.",
+                    "When you continue, the browser opens Google's page so you can pick the account and allow access to My Drive and Shared drives.",
+                ))
                     .font(k.ty.text_small)
                     .color(k.c.text_muted)
                     .wrap()
@@ -1462,15 +1526,15 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
                     .radius(k.radius.sm)
                     .fill(k.alpha(k.c.text_accent, if k.dark { 0.10 } else { 0.06 }))
                     .child(el().size(6.0, 6.0).radius(3.0).fill(k.c.success.fg))
-                    .child(text(format!("Já conectadas: {emails}")).font(k.ty.text_xsmall).color(k.c.text_base).truncate().min_w(0.0).grow(1.0)),
+                    .child(text(tr!("Já conectadas: {emails}", "Already connected: {emails}")).font(k.ty.text_xsmall).color(k.c.text_base).truncate().min_w(0.0).grow(1.0)),
             );
         }
 
         if show_oauth_form {
             let id_input = rune_kit::TextInput::new(&f.client_id)
                 .width(None)
-                .label("Client ID (ou JSON completo)")
-                .placeholder("123456-abc.apps.googleusercontent.com ou cole o JSON inteiro")
+                .label(t("Client ID (ou JSON completo)", "Client ID (or the full JSON)"))
+                .placeholder(t("123456-abc.apps.googleusercontent.com ou cole o JSON inteiro", "123456-abc.apps.googleusercontent.com or paste the whole JSON"))
                 .on_edit(|s: &mut State| part(s, |f| &mut f.client_id))
                 .on_submit(|s: &mut State, tx: &mut Tx| crate::servers::submit_google(s, tx));
             let secret_eye = eye_toggle("secret-eye", f.reveal_secret, |s| {
@@ -1481,17 +1545,17 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
             let secret_input = rune_kit::TextInput::new(&f.client_secret)
                 .width(None)
                 .label("Client Secret")
-                .placeholder("GOCSPX-… (dispensável se colar o JSON acima)")
+                .placeholder(t("GOCSPX-… (dispensável se colar o JSON acima)", "GOCSPX-… (not needed if you paste the JSON above)"))
                 .revealed(f.reveal_secret)
                 .trailing(secret_eye)
                 .on_edit(|s: &mut State| part(s, |f| &mut f.client_secret))
                 .on_submit(|s: &mut State, tx: &mut Tx| crate::servers::submit_google(s, tx));
-            let console_btn = Button::new("Abrir Google Cloud Console")
+            let console_btn = Button::new(t("Abrir Google Cloud Console", "Open Google Cloud Console"))
                 .icon(&icons::EXTERNAL_LINK)
                 .variant(ButtonVariant::Neutral)
                 .on_press_tx(|s: &mut State, tx: &mut Tx| {
                     if let Err(e) = tx.open_url("https://console.cloud.google.com/apis/credentials") {
-                        crate::fail(s, format!("Não consegui abrir o navegador: {e:?}"));
+                        crate::fail(s, tr!("Não consegui abrir o navegador: {e:?}", "Couldn't open the browser: {e:?}"));
                     }
                 })
                 .build(k);
@@ -1507,18 +1571,21 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
                     row()
                         .w_full()
                         .center_y()
-                        .child(text("Cliente OAuth (App para computador)").font(k.ty.text_small_medium).color(k.c.text_base).grow(1.0))
+                        .child(text(t("Cliente OAuth (App para computador)", "OAuth client (Desktop app)")).font(k.ty.text_small_medium).color(k.c.text_base).grow(1.0))
                         .child(console_btn),
                 )
                 .child(
-                    text("Crie uma credencial OAuth do tipo “App para computador” no Google Cloud Console, ou cole o arquivo google-client.json diretamente abaixo:")
+                    text(t(
+                        "Crie uma credencial OAuth do tipo “App para computador” no Google Cloud Console, ou cole o arquivo google-client.json diretamente abaixo:",
+                        "Create an OAuth credential of type “Desktop app” in the Google Cloud Console, or paste the google-client.json file right below:",
+                    ))
                         .font(k.ty.caption())
                         .color(k.c.text_muted)
                         .wrap()
                         .w_full()
                         .min_w(0.0),
                 )
-                .child(col().w_full().gap(4.0).child(text("Client ID ou JSON").font(k.ty.text_xsmall_medium).color(k.c.text_base)).child(id_input.build(k)))
+                .child(col().w_full().gap(4.0).child(text(t("Client ID ou JSON", "Client ID or JSON")).font(k.ty.text_xsmall_medium).color(k.c.text_base)).child(id_input.build(k)))
                 .child(col().w_full().gap(4.0).child(text("Client Secret").font(k.ty.text_xsmall_medium).color(k.c.text_base)).child(secret_input.build(k)));
             inner = inner.child(oauth_box);
         } else {
@@ -1533,9 +1600,9 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
                 .fill(k.c.bg_base)
                 .border(1.0, k.c.border_weak)
                 .child(icon(k.glyph.lock, 15.0).color(k.c.success.fg))
-                .child(text("Cliente OAuth configurado e pronto para conectar.").font(k.ty.text_xsmall).color(k.c.text_muted).grow(1.0).min_w(0.0))
+                .child(text(t("Cliente OAuth configurado e pronto para conectar.", "OAuth client set up and ready to connect.")).font(k.ty.text_xsmall).color(k.c.text_muted).grow(1.0).min_w(0.0))
                 .child(
-                    Button::new("Alterar Client ID")
+                    Button::new(t("Alterar Client ID", "Change Client ID"))
                         .variant(ButtonVariant::GhostMuted)
                         .on_press(|s: &mut State| {
                             if let Some(Dialog::Server(f)) = &mut s.dialog {
@@ -1560,10 +1627,10 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
             .pb(16.0)
             .gap(8.0)
             .center_y()
-            .child(Button::new("Voltar").icon(&icons::BACK).variant(ButtonVariant::Neutral).on_press(crate::servers::back_to_pick).build(k))
+            .child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).on_press(crate::servers::back_to_pick).build(k))
             .child(el().grow(1.0))
-            .child(Button::new("Cancelar").variant(ButtonVariant::Neutral).on_press(close).build(k))
-            .child(Button::new("Conectar no navegador").variant(ButtonVariant::Submit).on_press_tx(crate::servers::submit_google).build(k).default_button());
+            .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k))
+            .child(Button::new(t("Conectar no navegador", "Connect in browser")).variant(ButtonVariant::Submit).on_press_tx(crate::servers::submit_google).build(k).default_button());
 
         let body = col()
             .key("gdrive-content")
@@ -1571,7 +1638,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
             .child(account_scroll(k, "gdrive-scroll", window_h, inner))
             .child(actions);
 
-        Modal::new("server", "Conectar Google Drive").open(true).child(body).width(560.0).fit().on_close(close).build(k, layer);
+        Modal::new("server", t("Conectar Google Drive", "Connect Google Drive")).open(true).child(body).width(560.0).fit().on_close(close).build(k, layer);
         return;
     }
 
@@ -1587,9 +1654,9 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         }
     });
     let password_label = match (f.editing.is_some(), f.provider) {
-        (true, _) => "Senha (vazio: manter a salva)",
-        (false, Provider::Nextcloud | Provider::OwnCloud) => "Senha ou senha de app",
-        (false, _) => "Senha",
+        (true, _) => t("Senha (vazio: manter a salva)", "Password (empty: keep the saved one)"),
+        (false, Provider::Nextcloud | Provider::OwnCloud) => t("Senha ou senha de app", "Password or app password"),
+        (false, _) => t("Senha", "Password"),
     };
     let password_field = col()
         .key("password")
@@ -1611,24 +1678,24 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
     let port_hint = proto.default_port().to_string();
     let half = |a: El, b: El| row().w_full().gap(10.0).child(a.grow(1.0).w(0.0)).child(b.grow(1.0).w(0.0));
     let host_hint = match f.provider {
-        Provider::Nextcloud => "cloud.exemplo.com ou https://cloud.exemplo.com",
-        Provider::OwnCloud => "owncloud.exemplo.com ou https://owncloud.exemplo.com",
-        Provider::Sftp => "nas.local, 192.168.0.10 ou sftp://usuario@host",
-        Provider::Ftp => "ftp.exemplo.com, 192.168.0.10 ou ftp://usuario@host",
-        Provider::WebDav | Provider::GoogleDrive => "dav.exemplo.com, 192.168.0.10 ou https://host/dav",
+        Provider::Nextcloud => t("cloud.exemplo.com ou https://cloud.exemplo.com", "cloud.example.com or https://cloud.example.com"),
+        Provider::OwnCloud => t("owncloud.exemplo.com ou https://owncloud.exemplo.com", "owncloud.example.com or https://owncloud.example.com"),
+        Provider::Sftp => t("nas.local, 192.168.0.10 ou sftp://usuario@host", "nas.local, 192.168.0.10 or sftp://user@host"),
+        Provider::Ftp => t("ftp.exemplo.com, 192.168.0.10 ou ftp://usuario@host", "ftp.example.com, 192.168.0.10 or ftp://user@host"),
+        Provider::WebDav | Provider::GoogleDrive => t("dav.exemplo.com, 192.168.0.10 ou https://host/dav", "dav.example.com, 192.168.0.10 or https://host/dav"),
     };
     let folder_hint = match f.provider {
-        Provider::Nextcloud | Provider::OwnCloud => "/remote.php/webdav (automático, se vazio)",
-        Provider::WebDav => "/dav ou /remote.php/dav/files/usuario (raiz /, se vazio)",
-        Provider::Sftp => "a pasta pessoal, se vazio",
-        Provider::Ftp | Provider::GoogleDrive => "a pasta do login, se vazio",
+        Provider::Nextcloud | Provider::OwnCloud => t("/remote.php/webdav (automático, se vazio)", "/remote.php/webdav (automatic if empty)"),
+        Provider::WebDav => t("/dav ou /remote.php/dav/files/usuario (raiz /, se vazio)", "/dav or /remote.php/dav/files/user (root / if empty)"),
+        Provider::Sftp => t("a pasta pessoal, se vazio", "the home folder if empty"),
+        Provider::Ftp | Provider::GoogleDrive => t("a pasta do login, se vazio", "the login folder if empty"),
     };
     let name_hint = match f.provider {
-        Provider::Nextcloud => "Nextcloud (servidor), se vazio",
-        Provider::OwnCloud => "ownCloud (servidor), se vazio",
-        _ => "o endereço do servidor, se vazio",
+        Provider::Nextcloud => t("Nextcloud (servidor), se vazio", "Nextcloud (server) if empty"),
+        Provider::OwnCloud => t("ownCloud (servidor), se vazio", "ownCloud (server) if empty"),
+        _ => t("o endereço do servidor, se vazio", "the server's address if empty"),
     };
-    let user_hint = if matches!(proto, Protocol::Ftp | Protocol::Ftps) { "anonymous, se vazio" } else { "" };
+    let user_hint = if matches!(proto, Protocol::Ftp | Protocol::Ftps) { t("anonymous, se vazio", "anonymous if empty") } else { "" };
 
     let mut inner = col()
         .w_full()
@@ -1640,18 +1707,18 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
             row()
                 .w_full()
                 .gap(10.0)
-                .child(field("host", "Servidor", &f.host, host_hint, |f| &mut f.host).grow(3.0).w(0.0))
-                .child(field("port", "Porta", &f.port, &port_hint, |f| &mut f.port).grow(1.0).w(0.0)),
+                .child(field("host", t("Servidor", "Server"), &f.host, host_hint, |f| &mut f.host).grow(3.0).w(0.0))
+                .child(field("port", t("Porta", "Port"), &f.port, &port_hint, |f| &mut f.port).grow(1.0).w(0.0)),
         )
-        .child(half(field("user", "Usuário", &f.user, user_hint, |f| &mut f.user), password_field));
+        .child(half(field("user", t("Usuário", "User name"), &f.user, user_hint, |f| &mut f.user), password_field));
 
     // Security toggle checkbox (inspired by the reference's "Usar SSL/TLS").
     match f.provider {
         Provider::Ftp => {
             inner = inner.child(
                 rune_kit::Checkbox::new(proto == Protocol::Ftps)
-                    .label("Usar SSL/TLS (FTPS)")
-                    .description("Criptografa login e arquivos via TLS (porta 21 ou 990).")
+                    .label(t("Usar SSL/TLS (FTPS)", "Use SSL/TLS (FTPS)"))
+                    .description(t("Criptografa login e arquivos via TLS (porta 21 ou 990).", "Encrypts the login and files with TLS (port 21 or 990)."))
                     .on_toggle(crate::servers::toggle_tls)
                     .build(k)
                     .key("tls-toggle"),
@@ -1660,8 +1727,8 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         Provider::WebDav | Provider::Nextcloud | Provider::OwnCloud => {
             inner = inner.child(
                 rune_kit::Checkbox::new(proto == Protocol::Davs)
-                    .label("Usar conexão segura SSL/TLS (HTTPS)")
-                    .description("Mantém senha e arquivos criptografados na rede.")
+                    .label(t("Usar conexão segura SSL/TLS (HTTPS)", "Use a secure SSL/TLS connection (HTTPS)"))
+                    .description(t("Mantém senha e arquivos criptografados na rede.", "Keeps the password and files encrypted on the network."))
                     .on_toggle(crate::servers::toggle_tls)
                     .build(k)
                     .key("tls-toggle"),
@@ -1670,27 +1737,45 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         Provider::Sftp | Provider::GoogleDrive => {}
     }
 
-    inner = inner.child(field("folder", "Pasta inicial", &f.folder, folder_hint, |f| &mut f.folder));
+    inner = inner.child(field("folder", t("Pasta inicial", "Start folder"), &f.folder, folder_hint, |f| &mut f.folder));
 
     if proto == Protocol::Sftp {
-        inner = inner.child(field("key", "Chave SSH (opcional)", &f.key, "C:\\Users\\voce\\.ssh\\id_ed25519 (a senha vira a da chave)", |f| &mut f.key));
-        inner = inner.child(muted("Sem senha nem chave, as chaves de ~/.ssh são tentadas. Na primeira conexão a chave do servidor é guardada.".into()));
+        inner = inner.child(field(
+            "key",
+            t("Chave SSH (opcional)", "SSH key (optional)"),
+            &f.key,
+            t("C:\\Users\\voce\\.ssh\\id_ed25519 (a senha vira a da chave)", "C:\\Users\\you\\.ssh\\id_ed25519 (the password becomes the key's)"),
+            |f| &mut f.key,
+        ));
+        inner = inner.child(muted(
+            t(
+                "Sem senha nem chave, as chaves de ~/.ssh são tentadas. Na primeira conexão a chave do servidor é guardada.",
+                "With no password or key, the keys in ~/.ssh are tried. On the first connection the server's key is saved.",
+            )
+            .into(),
+        ));
     } else if matches!(f.provider, Provider::Nextcloud | Provider::OwnCloud) {
-        inner = inner.child(muted("Dica: se a sua conta usa verificação em duas etapas (2FA), gere uma senha de aplicativo nas configurações de segurança do servidor.".into()));
+        inner = inner.child(muted(
+            t(
+                "Dica: se a sua conta usa verificação em duas etapas (2FA), gere uma senha de aplicativo nas configurações de segurança do servidor.",
+                "Tip: if your account uses two-step verification (2FA), create an app password in the server's security settings.",
+            )
+            .into(),
+        ));
     }
 
-    let connections_hint = format!("{} (de 1 a {})", openexplorer_remote::USUAL_CONNECTIONS, openexplorer_remote::MOST_CONNECTIONS);
+    let connections_hint = tr!("{} (de 1 a {})", "{} (1 to {})", openexplorer_remote::USUAL_CONNECTIONS, openexplorer_remote::MOST_CONNECTIONS);
     inner = inner.child(half(
-        field("name", "Nome na árvore (opcional)", &f.name, name_hint, |f| &mut f.name),
-        field("connections", "Conexões simultâneas", &f.connections, &connections_hint, |f| &mut f.connections),
+        field("name", t("Nome na árvore (opcional)", "Name in the tree (optional)"), &f.name, name_hint, |f| &mut f.name),
+        field("connections", t("Conexões simultâneas", "Simultaneous connections"), &f.connections, &connections_hint, |f| &mut f.connections),
     ));
 
     let active_fp = f.active_trusted();
     if let (Some(fp), None) = (active_fp, &f.untrusted) {
-        inner = inner.child(muted(format!("Certificado confiado (SHA-256): {}", fingerprint_lines(fp))));
+        inner = inner.child(muted(tr!("Certificado confiado (SHA-256): {}", "Trusted certificate (SHA-256): {}", fingerprint_lines(fp))));
     }
     if proto.plain() {
-        let secure_alt = if proto == Protocol::Ftp { "Usar SSL/TLS (FTPS) ou SFTP" } else { "HTTPS (SSL/TLS)" };
+        let secure_alt = if proto == Protocol::Ftp { t("Usar SSL/TLS (FTPS) ou SFTP", "SSL/TLS (FTPS) or SFTP") } else { "HTTPS (SSL/TLS)" };
         inner = inner.child(
             row()
                 .key("plain-warn")
@@ -1701,7 +1786,11 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
                 .fill(k.alpha(k.c.warning.fg, if k.dark { 0.12 } else { 0.08 }))
                 .border(1.0, k.alpha(k.c.warning.fg, 0.38))
                 .child(
-                    text(format!("{} não usa criptografia: senha e arquivos passam abertos pela rede. Prefira {secure_alt} se o servidor aceitar.", proto.label()))
+                    text(tr!(
+                        "{} não usa criptografia: senha e arquivos passam abertos pela rede. Prefira {secure_alt} se o servidor aceitar.",
+                        "{} isn't encrypted: the password and files travel in the clear over the network. Prefer {secure_alt} if the server supports it.",
+                        proto.label()
+                    ))
                         .font(k.ty.text_xsmall)
                         .color(k.c.text_base)
                         .wrap()
@@ -1717,9 +1806,17 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
     if let Some(r) = &f.untrusted {
         let changed = active_fp.is_some_and(|old| old != r.fingerprint);
         let lead = if changed {
-            format!("O certificado do servidor mudou desde que você confiou nele: o novo {}. Se você não trocou o certificado do servidor, alguém pode estar se passando por ele.", r.why)
+            tr!(
+                "O certificado do servidor mudou desde que você confiou nele: o novo {}. Se você não trocou o certificado do servidor, alguém pode estar se passando por ele.",
+                "The server's certificate has changed since you trusted it: the new one {}. If you didn't change the server's certificate, someone may be impersonating it.",
+                r.why
+            )
         } else {
-            format!("O certificado do servidor {}. Isso é comum num NAS ou servidor de casa; confira a impressão digital com a que o servidor mostra antes de confiar.", r.why)
+            tr!(
+                "O certificado do servidor {}. Isso é comum num NAS ou servidor de casa; confira a impressão digital com a que o servidor mostra antes de confiar.",
+                "The server's certificate {}. This is common on a NAS or home server; check the fingerprint against the one the server shows before trusting it.",
+                r.why
+            )
         };
         let warn = col()
             .key("untrusted")
@@ -1734,19 +1831,19 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
     }
 
     let checking = f.checking.is_some();
-    let save_label = if f.editing.is_some() { "Salvar" } else { "Conectar" };
+    let save_label = if f.editing.is_some() { t("Salvar", "Save") } else { t("Conectar", "Connect") };
     let save_el = match (&f.untrusted, checking) {
-        (_, true) => Button::new("Conectando…").variant(ButtonVariant::Submit).disabled(true).build(k),
-        (Some(_), false) => Button::new("Confiar e salvar").variant(ButtonVariant::Danger).on_press(crate::servers::trust).build(k).default_button(),
+        (_, true) => Button::new(t("Conectando…", "Connecting…")).variant(ButtonVariant::Submit).disabled(true).build(k),
+        (Some(_), false) => Button::new(t("Confiar e salvar", "Trust and save")).variant(ButtonVariant::Danger).on_press(crate::servers::trust).build(k).default_button(),
         (None, false) => Button::new(save_label).variant(ButtonVariant::Submit).on_press(crate::servers::submit).build(k).default_button(),
     };
     let mut actions = row().key("actions").w_full().px(16.0).pt(12.0).pb(16.0).gap(8.0).center_y();
     if f.editing.is_none() {
-        actions = actions.child(Button::new("Voltar").icon(&icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(crate::servers::back_to_pick).build(k));
+        actions = actions.child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(crate::servers::back_to_pick).build(k));
     }
     actions = actions
         .child(el().grow(1.0))
-        .child(Button::new("Cancelar").variant(ButtonVariant::Neutral).on_press(close).build(k))
+        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k))
         .child(save_el);
 
     let body = col()
@@ -1756,9 +1853,9 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         .child(actions);
 
     let title = if f.editing.is_some() {
-        format!("Editar {}", f.provider.label())
+        tr!("Editar {}", "Edit {}", f.provider.label())
     } else {
-        format!("Credenciais {}", f.provider.label())
+        tr!("Credenciais {}", "{} sign-in", f.provider.label())
     };
     Modal::new("server", title).open(true).child(body).width(560.0).fit().on_close(close).build(k, layer);
 }
@@ -1773,34 +1870,50 @@ fn clash_dialog(s: &State, k: &Kit, ask: &actions::ClashAsk, layer: &mut Vec<El>
     let shown: Vec<usize> = if all { ask.clashes.clone() } else { vec![ask.current()] };
     let current = name_of(shown[0]);
     let title = match (n, all) {
-        (1, _) => format!("\"{current}\" já existe"),
-        (_, true) => format!("{n} itens já existem"),
-        (_, false) => format!("\"{current}\" já existe ({} de {n})", ask.chosen.len() + 1),
+        (1, _) => tr!("\"{current}\" já existe", "\"{current}\" already exists"),
+        (_, true) => tr!("{n} itens já existem", "{n} items already exist"),
+        (_, false) => tr!("\"{current}\" já existe ({} de {n})", "\"{current}\" already exists ({} of {n})", ask.chosen.len() + 1),
     };
     // A folder meeting a folder is merged; the choice is for the files in it.
     let merged = |i: usize| ask.up.sources[i].is_dir() && ask.there(&name_of(i)).is_some_and(|e| e.is_dir && e.target.is_none() && e.mime.as_deref().is_none_or(|m| m == openexplorer_gdrive::api::FOLDER_MIME));
     let muted = |t: String| text(t).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
-    let lead = if shown.len() == 1 { format!("Já existe um item com esse nome em \"{place}\".") } else { format!("Já existem itens com estes nomes em \"{place}\".") };
+    let lead = if shown.len() == 1 {
+        tr!("Já existe um item com esse nome em \"{place}\".", "An item with this name already exists in \"{place}\".")
+    } else {
+        tr!("Já existem itens com estes nomes em \"{place}\".", "Items with these names already exist in \"{place}\".")
+    };
     let mut list = col().key("items").w_full().gap(4.0);
     for &i in shown.iter().take(6) {
         let name = name_of(i);
         let glyph = ask.there(&name).map_or_else(|| el().w(16.0), |e| entry_icon(s, &ask.up.to, e, 16.0));
         let mut line = row().key(format!("item-{i}")).w_full().gap(6.0).center_y().child(glyph).child(text(name).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0));
         if merged(i) {
-            line = line.child(el().grow(1.0)).child(text("pasta: juntar conteúdo").font(k.ty.text_xsmall).color(k.c.text_muted));
+            line = line.child(el().grow(1.0)).child(text(t("pasta: juntar conteúdo", "folder: merge contents")).font(k.ty.text_xsmall).color(k.c.text_muted));
         }
         list = list.child(line);
     }
     if shown.len() > 6 {
-        list = list.child(text(format!("e mais {}", ui_count(shown.len() - 6))).font(k.ty.text_small).color(k.c.text_muted));
+        list = list.child(text(tr!("e mais {}", "and {} more", ui_count(shown.len() - 6))).font(k.ty.text_small).color(k.c.text_muted));
     }
     let mut body = col().w_full().gap(12.0).child(muted(lead)).child(list);
     if shown.iter().any(|&i| merged(i)) {
-        body = body.child(muted("Uma pasta que já existe recebe o conteúdo enviado; a escolha vale para os arquivos dentro dela que já existirem.".into()));
+        body = body.child(muted(
+            t(
+                "Uma pasta que já existe recebe o conteúdo enviado; a escolha vale para os arquivos dentro dela que já existirem.",
+                "A folder that already exists receives the uploaded contents; the choice applies to the files inside it that already exist.",
+            )
+            .into(),
+        ));
     }
-    body = body.child(muted("Substituir envia o arquivo como nova versão do que está no Drive (a anterior fica no histórico de versões). Manter os dois envia com outro nome, como \"nome (2).ext\".".into()));
+    body = body.child(muted(
+        t(
+            "Substituir envia o arquivo como nova versão do que está no Drive (a anterior fica no histórico de versões). Manter os dois envia com outro nome, como \"nome (2).ext\".",
+            "Replace uploads the file as a new version of the one in Drive (the previous one stays in the version history). Keep both uploads it under another name, like \"name (2).ext\".",
+        )
+        .into(),
+    ));
     if n > 1 {
-        body = body.child(rune_kit::Checkbox::new(ask.all).label("Aplicar a todos").on_toggle(actions::toggle_clash_all).build(k));
+        body = body.child(rune_kit::Checkbox::new(ask.all).label(t("Aplicar a todos", "Apply to all")).on_toggle(actions::toggle_clash_all).build(k));
     }
     let choice = |label: &str, c: crate::uploads::Clash, variant: ButtonVariant| Button::new(label).variant(variant).on_press(move |s: &mut State| actions::answer_clash(s, Some(c))).build(k);
     let buttons = row()
@@ -1809,11 +1922,11 @@ fn clash_dialog(s: &State, k: &Kit, ask: &actions::ClashAsk, layer: &mut Vec<El>
         .pt(4.0)
         .gap(8.0)
         .justify_end()
-        .child(Button::new("Cancelar").variant(ButtonVariant::Neutral).on_press(|s: &mut State| actions::answer_clash(s, None)).build(k))
+        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(|s: &mut State| actions::answer_clash(s, None)).build(k))
         .child(el().grow(1.0))
-        .child(choice("Pular", crate::uploads::Clash::Skip, ButtonVariant::Neutral))
-        .child(choice("Manter os dois", crate::uploads::Clash::KeepBoth, ButtonVariant::Neutral))
-        .child(choice("Substituir", crate::uploads::Clash::Replace, ButtonVariant::Submit));
+        .child(choice(t("Pular", "Skip"), crate::uploads::Clash::Skip, ButtonVariant::Neutral))
+        .child(choice(t("Manter os dois", "Keep both"), crate::uploads::Clash::KeepBoth, ButtonVariant::Neutral))
+        .child(choice(t("Substituir", "Replace"), crate::uploads::Clash::Replace, ButtonVariant::Submit));
     let body = col().key("content").w_full().px(16.0).pb(16.0).child(body.child(buttons));
     Modal::new("clash", title).open(true).child(body).width(520.0).fit().on_close(|s: &mut State| actions::answer_clash(s, None)).build(k, layer);
 }
@@ -1827,7 +1940,7 @@ fn item_list(s: &State, k: &Kit, pane: usize, items: &[crate::model::Entry]) -> 
         );
     }
     if items.len() > 6 {
-        list = list.child(text(format!("e mais {}", ui_count(items.len() - 6))).font(k.ty.text_small).color(k.c.text_muted));
+        list = list.child(text(tr!("e mais {}", "and {} more", ui_count(items.len() - 6))).font(k.ty.text_small).color(k.c.text_muted));
     }
     list
 }
@@ -1849,7 +1962,7 @@ fn rename_field(s: &State, look: RenameLook) -> El {
     let field = rune::text_input(&s.name_edit, look.font)
         .single_line()
         .key("rename-input")
-        .label("Novo nome")
+        .label(t("Novo nome", "New name"))
         .grow(1.0)
         .shrink()
         .min_w(0.0)
@@ -1887,6 +2000,11 @@ fn ui_count(n: usize) -> String {
     thousands(n)
 }
 
+/// How many a search found: "1 resultado", "12 resultados".
+fn results(n: usize) -> String {
+    if n == 1 { tr!("{} resultado", "{} result", ui_count(n)) } else { tr!("{} resultados", "{} results", ui_count(n)) }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Properties
 
@@ -1911,7 +2029,7 @@ fn prop_sep(k: &Kit) -> El {
 /// The Propriedades tabs, Geral first.
 fn prop_tab(k: &Kit, label: &str, tab: actions::PropTab, on: bool) -> El {
     row()
-        .key(format!("tab-{label}"))
+        .key(format!("tab-{tab:?}"))
         .role("tab")
         .label(label.to_string())
         .checked(on)
@@ -1931,7 +2049,7 @@ fn place_of(s: &State, p: &actions::Props) -> String {
     match (&pane.loc, p.single()) {
         (loc @ (Location::Local(_) | Location::Found(_)), Some(e)) => loc.local_path(e).map(|p| p.display().to_string()).unwrap_or_default(),
         (Location::Local(dir), None) => dir.display().to_string(),
-        (Location::Found(f), None) => format!("Resultados de “{}” em {}", f.text, f.place),
+        (Location::Found(f), None) => tr!("Resultados de “{}” em {}", "Results for “{}” in {}", f.text, f.place),
         (loc @ Location::Server { server, path, .. }, single) => match single {
             Some(e) => format!("{}{}", server.address(), crate::servers::path_of(loc, e).unwrap_or_default()),
             None => format!("{}{}", server.address(), server.path(path)),
@@ -1964,15 +2082,15 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
     let loc = &s.panes[p.pane].loc;
     let (glyph, title) = match p.single() {
         Some(e) => (entry_icon(s, loc, e, 40.0), shown(&e.name)),
-        None if p.items.iter().all(|e| e.is_dir) => (shell_icon(s, Some(&IconKey::Folder), &icons::FOLDER, 40.0), format!("{} itens", ui_count(p.items.len()))),
-        None => (icon(&icons::FILE, 40.0), format!("{} itens", ui_count(p.items.len()))),
+        None if p.items.iter().all(|e| e.is_dir) => (shell_icon(s, Some(&IconKey::Folder), &icons::FOLDER, 40.0), tr!("{} itens", "{} items", ui_count(p.items.len()))),
+        None => (icon(&icons::FILE, 40.0), tr!("{} itens", "{} items", ui_count(p.items.len()))),
     };
     let editable_name = p.renamable(s);
     let name: El = if editable_name {
         rune::text_input(&s.name_edit, k.ty.text_small)
             .single_line()
             .key("prop-name")
-            .label("Nome")
+            .label(t("Nome", "Name"))
             .w_full()
             .min_w(0.0)
             .color(k.c.text_base)
@@ -1994,14 +2112,14 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
         .child(glyph)
         .child(name_box.child(name));
 
-    let mut tabs = row().key("prop-tabs").w_full().border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak).child(prop_tab(k, "Geral", PropTab::General, p.tab == PropTab::General)).child(prop_tab(
+    let mut tabs = row().key("prop-tabs").w_full().border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak).child(prop_tab(k, t("Geral", "General"), PropTab::General, p.tab == PropTab::General)).child(prop_tab(
         k,
-        "Detalhes",
+        t("Detalhes", "Details"),
         PropTab::Details,
         p.tab == PropTab::Details,
     ));
     if p.has_versions(s) {
-        tabs = tabs.child(prop_tab(k, "Histórico de versões", PropTab::Versions, p.tab == PropTab::Versions));
+        tabs = tabs.child(prop_tab(k, t("Histórico de versões", "Version history"), PropTab::Versions, p.tab == PropTab::Versions));
     }
 
     // A floor on the height, so switching tabs doesn't make the dialog jump.
@@ -2010,40 +2128,42 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
         PropTab::General => {
             body = body.child(header).child(prop_sep(k));
             // What it is and where it lives.
-            body = body.child(prop_text(k, "Tipo", p.kind.clone()));
+            body = body.child(prop_text(k, t("Tipo", "Type"), p.kind.clone()));
             if let Some(desc) = details.and_then(|d| d.description.clone()) {
-                body = body.child(prop_text(k, "Descrição", desc));
+                body = body.child(prop_text(k, t("Descrição", "Description"), desc));
             }
-            body = body.child(prop_text(k, "Local", if drive.is_some() { "Google Drive" } else { "Este computador" }));
+            body = body.child(prop_text(k, t("Local", "Location"), if drive.is_some() { "Google Drive" } else { t("Este computador", "This PC") }));
             if let Some(email) = &drive {
-                body = body.child(prop_text(k, "Conta", email.clone()));
+                body = body.child(prop_text(k, t("Conta", "Account"), email.clone()));
             }
             body = body.child(prop_sep(k));
             // Where and how big.
-            body = body.child(prop_text(k, "Caminho", place_of(s, p)));
+            body = body.child(prop_text(k, t("Caminho", "Path"), place_of(s, p)));
             let size = match (p.single(), &p.totals) {
                 (_, Some(t)) => format_bytes(t.bytes),
                 (Some(e), None) if !e.is_dir => e.size.map(format_bytes).unwrap_or_else(|| "—".into()),
-                (_, None) if loc.is_local() => "Calculando…".into(),
+                (_, None) if loc.is_local() => t("Calculando…", "Calculating…").into(),
                 (None, None) => format_bytes(p.listed_bytes),
                 _ => "—".into(),
             };
-            body = body.child(prop_text(k, "Tamanho", size));
-            if let Some(t) = &p.totals
+            body = body.child(prop_text(k, t("Tamanho", "Size"), size));
+            if let Some(totals) = &p.totals
                 && (p.items.len() > 1 || p.items.iter().any(|e| e.is_dir))
             {
                 let plural = |n: u64, one: &str, many: &str| format!("{} {}", thousands(n as usize), if n == 1 { one } else { many });
-                body = body.child(prop_text(k, "Contém", format!("{}, {}", plural(t.files, "arquivo", "arquivos"), plural(t.dirs, "pasta", "pastas"))));
+                let files = plural(totals.files, t("arquivo", "file"), t("arquivos", "files"));
+                let dirs = plural(totals.dirs, t("pasta", "folder"), t("pastas", "folders"));
+                body = body.child(prop_text(k, t("Contém", "Contains"), format!("{files}, {dirs}")));
             }
             if let Some(e) = p.single() {
                 body = body.child(prop_sep(k));
                 // When, and the content's fingerprint.
                 let created = p.local.as_ref().and_then(|l| l.created).or_else(|| details.and_then(|d| d.created));
-                body = body.child(prop_text(k, "Criado", when(created))).child(prop_text(k, "Modificado", when(e.modified)));
+                body = body.child(prop_text(k, t("Criado", "Created"), when(created))).child(prop_text(k, t("Modificado", "Modified"), when(e.modified)));
                 if let Some(l) = &p.local {
-                    body = body.child(prop_text(k, "Acessado", when(l.accessed)));
+                    body = body.child(prop_text(k, t("Acessado", "Accessed"), when(l.accessed)));
                 } else if let Some(v) = details.and_then(|d| d.viewed) {
-                    body = body.child(prop_text(k, "Aberto por você", format_long(v)));
+                    body = body.child(prop_text(k, t("Aberto por você", "Opened by you"), format_long(v)));
                 }
                 if !e.is_dir {
                     let mono = |h: &String| text(h.clone()).font(k.ty.mono).color(k.c.text_base).selectable(true);
@@ -2054,12 +2174,12 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
                     let hash: El = match (&p.local, &p.md5) {
                         (_, Some(Ok(h))) => mono(h),
                         (_, Some(Err(err))) => text(err.clone()).font(k.ty.text_small).color(k.c.danger.fg),
-                        (Some(_), None) if p.md5_running => muted("Calculando…"),
-                        (Some(_), None) => Button::new("Calcular").variant(ButtonVariant::Neutral).on_press(actions::props_md5).build(k).key("md5"),
+                        (Some(_), None) if p.md5_running => muted(t("Calculando…", "Calculating…")),
+                        (Some(_), None) => Button::new(t("Calcular", "Calculate")).variant(ButtonVariant::Neutral).on_press(actions::props_md5).build(k).key("md5"),
                         (None, None) => match drive_md5 {
                             Some(h) => mono(h),
-                            None if google_format => muted("— (formato do Google, sem arquivo binário)"),
-                            None if details.is_none() && p.details.is_none() && matches!(s.panes[p.pane].loc, Location::Drive { .. }) => muted("Carregando…"),
+                            None if google_format => muted(t("— (formato do Google, sem arquivo binário)", "— (Google format, no binary file)")),
+                            None if details.is_none() && p.details.is_none() && matches!(s.panes[p.pane].loc, Location::Drive { .. }) => muted(t("Carregando…", "Loading…")),
                             None => muted("—"),
                         },
                     };
@@ -2070,10 +2190,10 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
         PropTab::Details => {
             match (p.single(), &p.local, drive.is_some()) {
                 (Some(e), Some(l), _) => {
-                    let attrs = if l.attributes.is_empty() { "Nenhum".to_string() } else { l.attributes.join(", ") };
-                    body = body.child(prop_text(k, "Atributos", attrs));
+                    let attrs = if l.attributes.is_empty() { t("Nenhum", "None").to_string() } else { l.attributes.join(", ") };
+                    body = body.child(prop_text(k, t("Atributos", "Attributes"), attrs));
                     let ext = e.name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty() && !e.is_dir).map(|(_, x)| format!(".{x}")).unwrap_or_else(|| "—".into());
-                    body = body.child(prop_text(k, "Extensão", ext)).child(prop_text(k, "Caminho completo", l.path.display().to_string()));
+                    body = body.child(prop_text(k, t("Extensão", "Extension"), ext)).child(prop_text(k, t("Caminho completo", "Full path"), l.path.display().to_string()));
                 }
                 (Some(e), None, true) => {
                     body = body.child(prop_text(k, "ID", e.id.clone()));
@@ -2081,28 +2201,28 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
                         Some(Ok(d)) => {
                             let or_dash = |v: &Option<String>| v.clone().unwrap_or_else(|| "—".into());
                             body = body
-                                .child(prop_text(k, "Tipo MIME", or_dash(&d.mime)))
-                                .child(prop_text(k, "Proprietário", or_dash(&d.owner)))
-                                .child(prop_text(k, "Modificado por", or_dash(&d.modified_by)))
-                                .child(prop_text(k, "Compartilhado", if d.shared { "Sim" } else { "Não" }));
+                                .child(prop_text(k, t("Tipo MIME", "MIME type"), or_dash(&d.mime)))
+                                .child(prop_text(k, t("Proprietário", "Owner"), or_dash(&d.owner)))
+                                .child(prop_text(k, t("Modificado por", "Modified by"), or_dash(&d.modified_by)))
+                                .child(prop_text(k, t("Compartilhado", "Shared"), if d.shared { t("Sim", "Yes") } else { t("Não", "No") }));
                             let me = drive.as_deref().unwrap_or_default();
                             body = body.child(match &p.sharing {
-                                Some(Ok(sh)) => prop_text(k, "Compartilhamento", sh.summary(me)),
-                                Some(Err(err)) => prop_row(k, "Compartilhamento", muted(err)),
-                                None => prop_row(k, "Compartilhamento", muted("Carregando…")),
+                                Some(Ok(sh)) => prop_text(k, t("Compartilhamento", "Sharing"), sh.summary(me)),
+                                Some(Err(err)) => prop_row(k, t("Compartilhamento", "Sharing"), muted(err)),
+                                None => prop_row(k, t("Compartilhamento", "Sharing"), muted(t("Carregando…", "Loading…"))),
                             });
                             if let Some(by) = &d.shared_by {
-                                body = body.child(prop_text(k, "Compartilhado por", by.clone()));
+                                body = body.child(prop_text(k, t("Compartilhado por", "Shared by"), by.clone()));
                             }
-                            body = body.child(prop_text(k, "Com estrela", if d.starred { "Sim" } else { "Não" }));
+                            body = body.child(prop_text(k, t("Com estrela", "Starred"), if d.starred { t("Sim", "Yes") } else { t("Não", "No") }));
                             if let Some(url) = d.link.clone() {
                                 body = body.child(prop_sep(k)).child(
                                     row().w_full().justify_end().child(
-                                        Button::new("Abrir no Google Drive")
+                                        Button::new(t("Abrir no Google Drive", "Open in Google Drive"))
                                             .variant(ButtonVariant::Neutral)
                                             .on_press_tx(move |s: &mut State, tx: &mut Tx| {
                                                 if let Err(e) = tx.open_url(&url) {
-                                                    crate::fail(s, format!("Não consegui abrir o navegador: {e:?}"));
+                                                    crate::fail(s, tr!("Não consegui abrir o navegador: {e:?}", "Couldn't open the browser: {e:?}"));
                                                 }
                                             })
                                             .build(k),
@@ -2110,8 +2230,8 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
                                 );
                             }
                         }
-                        Some(Err(err)) => body = body.child(prop_text(k, "Detalhes", err.clone())),
-                        None => body = body.child(prop_row(k, "Detalhes", muted("Carregando…"))),
+                        Some(Err(err)) => body = body.child(prop_text(k, t("Detalhes", "Details"), err.clone())),
+                        None => body = body.child(prop_row(k, t("Detalhes", "Details"), muted(t("Carregando…", "Loading…")))),
                     }
                 }
                 _ => {
@@ -2121,26 +2241,34 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
                         names = names.child(row().gap(6.0).center_y().child(entry_icon(s, loc, e, 16.0)).child(text(shown(&e.name)).font(k.ty.text_small).color(k.c.text_base).truncate().min_w(0.0)));
                     }
                     if p.items.len() > 20 {
-                        names = names.child(muted(&format!("e mais {}", ui_count(p.items.len() - 20))));
+                        names = names.child(muted(&tr!("e mais {}", "and {} more", ui_count(p.items.len() - 20))));
                     }
-                    body = body.child(prop_row(k, "Itens", names));
+                    body = body.child(prop_row(k, t("Itens", "Items"), names));
                 }
             }
         }
         PropTab::Versions => match &p.revisions {
-            None => body = body.child(muted("Carregando…")),
+            None => body = body.child(muted(t("Carregando…", "Loading…"))),
             Some(Err(err)) => body = body.child(text(err.clone()).font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full()),
-            Some(Ok(list)) if list.is_empty() => body = body.child(muted("Nenhuma versão guardada.")),
+            Some(Ok(list)) if list.is_empty() => body = body.child(muted(t("Nenhuma versão guardada.", "No versions kept."))),
             Some(Ok(list)) => {
-                let head = |t: &str, w: f32| text(t.to_string()).font(k.ty.text_xsmall).color(k.c.text_muted).w(w);
-                body = body.child(row().w_full().pb(6.0).border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak).child(head("Data", 150.0)).child(head("Tamanho", 90.0)).child(head("Por", 150.0)));
+                let head = |label: &str, w: f32| text(label.to_string()).font(k.ty.text_xsmall).color(k.c.text_muted).w(w);
+                body = body.child(
+                    row()
+                        .w_full()
+                        .pb(6.0)
+                        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+                        .child(head(t("Data", "Date"), 150.0))
+                        .child(head(t("Tamanho", "Size"), 90.0))
+                        .child(head(t("Por", "By"), 150.0)),
+                );
                 let mut rows = col().w_full();
                 // Newest first, as the Drive website lists them.
                 for r in list.iter().rev() {
                     let date = r.modified.map(format_time).unwrap_or_else(|| "—".into());
                     let mut by = r.by.clone().unwrap_or_else(|| "—".into());
                     if r.keep_forever {
-                        by.push_str(" · mantida para sempre");
+                        by.push_str(t(" · mantida para sempre", " · kept forever"));
                     }
                     rows = rows.child(
                         row()
@@ -2164,9 +2292,9 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
         .gap(8.0)
         .justify_end()
         .child(Button::new("OK").variant(ButtonVariant::Submit).on_press(actions::props_ok).build(k))
-        .child(Button::new("Cancelar").variant(ButtonVariant::Neutral).on_press(actions::close_properties).build(k));
+        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(actions::close_properties).build(k));
     let content = col().key("content").w_full().px(16.0).pb(16.0).child(tabs).child(body).child(buttons);
-    Modal::new("props", format!("Propriedades: {title}")).open(true).child(content).width(520.0).fit().on_close(actions::close_properties).build(k, layer);
+    Modal::new("props", tr!("Propriedades: {title}", "Properties: {title}")).open(true).child(content).width(520.0).fit().on_close(actions::close_properties).build(k, layer);
 }
 
 /// Windows' icon for `key` once it has loaded, else the app's own `fallback`.
@@ -2243,7 +2371,7 @@ fn toolbar(s: &State, k: &Kit) -> El {
     };
     let connecting = s.login.is_some();
     let sep = || el().w(1.0).h(20.0).mx(4.0).fill(k.c.border_weak);
-    let add_label = if connecting { "Adicionar conta · Conectando…" } else { "Adicionar conta" };
+    let add_label = if connecting { t("Adicionar conta · Conectando…", "Add account · Connecting…") } else { t("Adicionar conta", "Add account") };
     let bar = row()
         .key("toolbar")
         .w_full()
@@ -2255,7 +2383,7 @@ fn toolbar(s: &State, k: &Kit) -> El {
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
         .child(
             tool(k, "add-account", &icons::ADD_ACCOUNT, add_label, true, |s: &mut State, _| crate::servers::ask_add(s))
-                .help("Conectar Google Drive, Nextcloud, ownCloud, SFTP, FTP ou WebDAV"),
+                .help(t("Conectar Google Drive, Nextcloud, ownCloud, SFTP, FTP ou WebDAV", "Connect Google Drive, Nextcloud, ownCloud, SFTP, FTP or WebDAV")),
         );
     let bar = match (account, server) {
         (Some(email), _) => {
@@ -2266,21 +2394,27 @@ fn toolbar(s: &State, k: &Kit) -> El {
             };
             let who = email.clone();
             bar.child(
-                tool(k, "disconnect", &icons::SIGN_OUT, &format!("Desconectar {short}"), true, move |s: &mut State, _| disconnect(s, &who))
-                    .help(format!("Desconectar {email}: remove o acesso e o cache desta conta")),
+                tool(k, "disconnect", &icons::SIGN_OUT, &tr!("Desconectar {short}", "Disconnect {short}"), true, move |s: &mut State, _| disconnect(s, &who))
+                    .help(tr!("Desconectar {email}: remove o acesso e o cache desta conta", "Disconnect {email}: removes this account's access and cache")),
             )
         }
         (None, Some((id, name))) => {
             let edit = id.clone();
-            bar.child(tool(k, "edit-server", &icons::M_RENAME, "Editar conta", true, move |s: &mut State, _| crate::servers::ask_edit(s, &edit)).help(format!("Muda o endereço, o login ou a pasta de {name}")))
-                .child(tool(k, "remove-server", &icons::SIGN_OUT, "Remover conta", true, move |s: &mut State, _| crate::servers::remove(s, &id)).help(format!("Tira {name} da lista e esquece a senha dele")))
+            bar.child(
+                tool(k, "edit-server", &icons::M_RENAME, t("Editar conta", "Edit account"), true, move |s: &mut State, _| crate::servers::ask_edit(s, &edit))
+                    .help(tr!("Muda o endereço, o login ou a pasta de {name}", "Changes the address, login or folder of {name}")),
+            )
+            .child(
+                tool(k, "remove-server", &icons::SIGN_OUT, t("Remover conta", "Remove account"), true, move |s: &mut State, _| crate::servers::remove(s, &id))
+                    .help(tr!("Tira {name} da lista e esquece a senha dele", "Removes {name} from the list and forgets its password")),
+            )
         }
         (None, None) => bar,
     };
     bar.child(sep())
-        .child(tool(k, "reload-all", &icons::REFRESH, "Atualizar", true, |s: &mut State, _| load(s, s.active)))
+        .child(tool(k, "reload-all", &icons::REFRESH, t("Atualizar", "Refresh"), true, |s: &mut State, _| load(s, s.active)))
         .child(el().grow(1.0))
-        .child(tool(k, "options", &icons::SETTINGS, "Opções", true, |s: &mut State, _| {
+        .child(tool(k, "options", &icons::SETTINGS, t("Opções", "Options"), true, |s: &mut State, _| {
             s.dialog = Some(Dialog::Options(Box::new(crate::settings::OptionsView::open(crate::settings::OptionsTab::General))));
         }))
         .child(text("Open Explorer").font(k.ty.text_small_medium).color(k.c.text_faint).mx(8.0))
@@ -2341,7 +2475,7 @@ fn splitter(k: &Kit, key: &str, thick: f32, way: Split, size: impl Fn(&mut State
     };
     bar.key(key.to_string())
         .role("separator")
-        .label("Arraste para redimensionar; clique duas vezes para voltar ao padrão")
+        .label(t("Arraste para redimensionar; clique duas vezes para voltar ao padrão", "Drag to resize; double-click to restore the default"))
         .justify_center()
         .hover(k.alpha(line, 0.18))
         .press(k.alpha(line, 0.32))
@@ -2387,8 +2521,8 @@ fn gutter(s: &State, k: &Kit) -> El {
         .items_center()
         .pt(96.0)
         .gap(6.0)
-        .child(arrow("copy-right", &icons::COPY_RIGHT, "Copiar a seleção do painel esquerdo para o direito", 0, 1))
-        .child(arrow("copy-left", &icons::COPY_LEFT, "Copiar a seleção do painel direito para o esquerdo", 1, 0))
+        .child(arrow("copy-right", &icons::COPY_RIGHT, t("Copiar a seleção do painel esquerdo para o direito", "Copy the selection from the left pane to the right"), 0, 1))
+        .child(arrow("copy-left", &icons::COPY_LEFT, t("Copiar a seleção do painel direito para o esquerdo", "Copy the selection from the right pane to the left"), 1, 0))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2407,7 +2541,7 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
     col()
         .key(pane_key(p))
         .focusable(true)
-        .label(format!("Painel {}", p + 1))
+        .label(tr!("Painel {}", "Pane {}", p + 1))
         .w(0.0)
         .grow(1.0)
         .h_full()
@@ -2477,7 +2611,7 @@ fn path_bar(s: &State, k: &Kit, p: usize) -> El {
         let field = rune::text_input(edit, k.ty.text_small)
             .single_line()
             .key(address_key(p))
-            .label("Endereço")
+            .label(t("Endereço", "Address"))
             .grow(1.0)
             .shrink()
             .min_w(0.0)
@@ -2555,12 +2689,12 @@ fn navbar(s: &State, k: &Kit, p: usize) -> El {
         .gap(2.0)
         .center_y()
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
-        .child(nav_button(k, "back", &icons::BACK, "Voltar (Alt+←)", !pane.back.is_empty(), move |s: &mut State| go_back(s, p)))
-        .child(nav_button(k, "forward", &icons::FORWARD, "Avançar (Alt+→)", !pane.forward.is_empty(), move |s: &mut State| go_forward(s, p)))
-        .child(nav_button(k, "up", &icons::UP, "Acima (Backspace)", can_go_up(&pane.loc), move |s: &mut State| go_up(s, p)))
+        .child(nav_button(k, "back", &icons::BACK, t("Voltar (Alt+←)", "Back (Alt+←)"), !pane.back.is_empty(), move |s: &mut State| go_back(s, p)))
+        .child(nav_button(k, "forward", &icons::FORWARD, t("Avançar (Alt+→)", "Forward (Alt+→)"), !pane.forward.is_empty(), move |s: &mut State| go_forward(s, p)))
+        .child(nav_button(k, "up", &icons::UP, t("Acima (Backspace)", "Up (Backspace)"), can_go_up(&pane.loc), move |s: &mut State| go_up(s, p)))
         .child(path_bar(s, k, p).mx(4.0))
         .child(search_box(s, k, p))
-        .child(nav_button(k, "reload", &icons::REFRESH, "Atualizar (Ctrl+R)", true, move |s: &mut State| load(s, p)))
+        .child(nav_button(k, "reload", &icons::REFRESH, t("Atualizar (Ctrl+R)", "Refresh (Ctrl+R)"), true, move |s: &mut State| load(s, p)))
 }
 
 /// The search field of a Drive pane: Enter searches where the pane is (see
@@ -2580,8 +2714,8 @@ fn search_box(s: &State, k: &Kit, p: usize) -> El {
     let field = rune::text_input(&s.search[p], k.ty.text_small)
         .single_line()
         .key(search_key(p))
-        .label("Pesquisar")
-        .placeholder(format!("Pesquisar em {place}"), k.c.text_faint)
+        .label(t("Pesquisar", "Search"))
+        .placeholder(tr!("Pesquisar em {place}", "Search {place}"), k.c.text_faint)
         .grow(1.0)
         .shrink()
         .min_w(0.0)
@@ -2624,23 +2758,22 @@ fn found_bar(s: &State, k: &Kit, p: usize, f: &crate::model::Found) -> El {
     use crate::finder::Service;
     let pane = &s.panes[p];
     let info = s.found[p].as_ref();
-    let mut said = format!("“{}” em {}", f.text, f.place);
+    let mut said = tr!("“{}” em {}", "“{}” in {}", f.text, f.place);
     let n = pane.entries.len();
-    let results = |n: usize| format!("{} {}", ui_count(n), if n == 1 { "resultado" } else { "resultados" });
     match info {
         // In WSL or on the network (no index): results come in as folders are read.
-        None if pane.loading && n > 0 => said.push_str(&format!(" · Pesquisando… {} até agora", results(n))),
+        None if pane.loading && n > 0 => said.push_str(&tr!(" · Pesquisando… {} até agora", " · Searching… {} so far", results(n))),
         None if !pane.loading && pane.error.is_none() => said.push_str(&format!(" · {}", results(n))),
-        _ if pane.loading => said.push_str(" · Pesquisando…"),
-        Some(i) if i.service != Service::Running => said.push_str(" · sem o serviço"),
-        Some(i) if i.total > i.shown => said.push_str(&format!(" · mostrando {} de {} resultados", ui_count(i.shown), ui_count(i.total))),
-        Some(i) => said.push_str(&format!(" · {} {}", ui_count(i.total), if i.total == 1 { "resultado" } else { "resultados" })),
+        _ if pane.loading => said.push_str(t(" · Pesquisando…", " · Searching…")),
+        Some(i) if i.service != Service::Running => said.push_str(t(" · sem o serviço", " · without the service")),
+        Some(i) if i.total > i.shown => said.push_str(&tr!(" · mostrando {} de {} resultados", " · showing {} of {} results", ui_count(i.shown), ui_count(i.total))),
+        Some(i) => said.push_str(&format!(" · {}", results(i.total))),
         None => {}
     }
     if let Some(i) = info
         && !i.indexing.is_empty()
     {
-        said.push_str(&format!(" · lendo {} (resultados incompletos)", i.indexing.join(", ")));
+        said.push_str(&tr!(" · lendo {} (resultados incompletos)", " · reading {} (results incomplete)", i.indexing.join(", ")));
     }
     let link = |key: &'static str, label: String, act: fn(&mut State, usize)| {
         text(label).key(key).role("link").font(k.ty.text_xsmall).color(k.c.text_accent).cursor(Cursor::Pointer).on_press(move |s: &mut State| act(s, p))
@@ -2656,11 +2789,11 @@ fn found_bar(s: &State, k: &Kit, p: usize, f: &crate::model::Found) -> El {
         .child(text(said).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0))
         .child(el().grow(1.0));
     if info.is_some_and(|i| i.service != Service::Running) {
-        let label = if s.installing_finder { "Instalando…" } else { "Instalar o serviço de pesquisa" };
+        let label = if s.installing_finder { t("Instalando…", "Installing…") } else { t("Instalar o serviço de pesquisa", "Install the search service") };
         bar = bar.child(link("install-finder", label.into(), |s, _| actions::install_finder(s)));
     }
     if f.within.is_some() {
-        bar = bar.child(link("search-everywhere", "Pesquisar no computador todo".into(), actions::search_everywhere));
+        bar = bar.child(link("search-everywhere", t("Pesquisar no computador todo", "Search the whole computer").into(), actions::search_everywhere));
     }
     bar
 }
@@ -2674,12 +2807,12 @@ fn search_bar(s: &State, k: &Kit, p: usize) -> El {
         let text_ = words;
         let pane = &s.panes[p];
         let n = pane.entries.len();
-        let results = format!("{} {}", ui_count(n), if n == 1 { "resultado" } else { "resultados" });
+        let results = results(n);
         let place = path.last().unwrap_or(&server.name);
         let said = match (pane.loading, n) {
-            (true, 0) => format!("“{text_}” em {place} · Pesquisando…"),
-            (true, _) => format!("“{text_}” em {place} · Pesquisando… {results} até agora"),
-            _ => format!("“{text_}” em {place} e nas pastas dentro · {results}"),
+            (true, 0) => tr!("“{text_}” em {place} · Pesquisando…", "“{text_}” in {place} · Searching…"),
+            (true, _) => tr!("“{text_}” em {place} · Pesquisando… {results} até agora", "“{text_}” in {place} · Searching… {results} so far"),
+            _ => tr!("“{text_}” em {place} e nas pastas dentro · {results}", "“{text_}” in {place} and the folders inside · {results}"),
         };
         return row()
             .key("search-bar")
@@ -2696,7 +2829,7 @@ fn search_bar(s: &State, k: &Kit, p: usize) -> El {
         return el().key("search-bar");
     }
     let pane = &s.panes[p];
-    let found = if pane.loading { "Pesquisando…".to_string() } else { format!("{} {}", ui_count(pane.entries.len()), if pane.entries.len() == 1 { "resultado" } else { "resultados" }) };
+    let found = if pane.loading { t("Pesquisando…", "Searching…").to_string() } else { results(pane.entries.len()) };
     let mut bar = row()
         .key("search-bar")
         .w_full()
@@ -2705,10 +2838,10 @@ fn search_bar(s: &State, k: &Kit, p: usize) -> El {
         .gap(10.0)
         .center_y()
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
-        .child(text(format!("“{}” em {} · {found}", q.text, q.place)).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0));
+        .child(text(tr!("“{}” em {} · {found}", "“{}” in {} · {found}", q.text, q.place)).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0));
     if q.within != openexplorer_gdrive::search::Within::Everything {
         bar = bar.child(el().grow(1.0)).child(
-            text("Pesquisar em todo o Drive")
+            text(t("Pesquisar em todo o Drive", "Search all of Drive"))
                 .key("search-everywhere")
                 .role("link")
                 .font(k.ty.text_xsmall)
@@ -2834,7 +2967,7 @@ fn tree(s: &State, k: &Kit, p: usize) -> El {
     let viewport = col()
         .key(tree_key(p))
         .role("tree")
-        .label("Pastas")
+        .label(t("Pastas", "Folders"))
         .focusable(true)
         // The row the keyboard is on shows focus with its own ring.
         .no_focus_ring()
@@ -2862,7 +2995,7 @@ fn col_grip(k: &Kit, p: usize, i: usize, edge: f32) -> El {
 fn grip(k: &Kit, key: &str, edge: f32, height: f32, size: impl Fn(&mut State) -> &mut f32 + 'static, default: f32, clamp: impl Fn(f32) -> f32 + 'static) -> El {
     el().key(key.to_string())
         .role("separator")
-        .label("Arraste para mudar a largura da coluna; clique duas vezes para voltar ao padrão")
+        .label(t("Arraste para mudar a largura da coluna; clique duas vezes para voltar ao padrão", "Drag to change the column's width; double-click to restore the default"))
         .absolute(edge - 4.0, 0.0)
         .w(8.0)
         .h(height)
@@ -2950,10 +3083,10 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .fill(k.c.bg_base)
         .sticky_top(0.0)
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
-        .child(head(0, "h-name", "Nome", SortCol::Name, false))
-        .child(head(1, "h-size", "Tamanho", SortCol::Size, true))
-        .child(head(2, "h-mod", "Data", SortCol::Modified, false))
-        .child(head(3, "h-kind", if pane.loc.finds() { "Pasta" } else { "Tipo" }, SortCol::Kind, false))
+        .child(head(0, "h-name", t("Nome", "Name"), SortCol::Name, false))
+        .child(head(1, "h-size", t("Tamanho", "Size"), SortCol::Size, true))
+        .child(head(2, "h-mod", t("Data", "Date modified"), SortCol::Modified, false))
+        .child(head(3, "h-kind", if pane.loc.finds() { t("Pasta", "Folder") } else { t("Tipo", "Type") }, SortCol::Kind, false))
         .children(grips);
 
     let selected = k.alpha(k.c.text_accent, if k.dark { 0.26 } else { 0.18 });
@@ -3037,8 +3170,8 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         })
         .on_drag_end(move |s: &mut State, outcome: DragOutcome, _| {
             s.status = match outcome {
-                DragOutcome::Cancelled => "Arrastar cancelado.".into(),
-                o => format!("Arrastar terminou: {o:?}"),
+                DragOutcome::Cancelled => t("Arrastar cancelado.", "Drag canceled.").into(),
+                o => tr!("Arrastar terminou: {o:?}", "Drag ended: {o:?}"),
             };
         })
     };
@@ -3061,30 +3194,37 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         notice(err.clone(), k.c.danger.fg)
     } else if pane.loading && n == 0 {
         let searching = actions::shows_results(&pane.loc);
-        notice(if searching { "Pesquisando…" } else { "Carregando…" }.into(), k.c.text_muted)
+        notice(if searching { t("Pesquisando…", "Searching…") } else { t("Carregando…", "Loading…") }.into(), k.c.text_muted)
     } else if let (0, Location::Drive { space: Space::Search(q), path, .. }) = (n, &pane.loc)
         && path.is_empty()
     {
-        notice(format!("Nada com “{}” no nome em {}.", q.text, q.place), k.c.text_faint)
+        notice(tr!("Nada com “{}” no nome em {}.", "Nothing with “{}” in its name in {}.", q.text, q.place), k.c.text_faint)
     } else if let (0, Location::Found(f)) = (n, &pane.loc) {
-        notice(format!("Nada com “{}” no nome em {}.", f.text, f.place), k.c.text_faint)
+        notice(tr!("Nada com “{}” no nome em {}.", "Nothing with “{}” in its name in {}.", f.text, f.place), k.c.text_faint)
     } else if let (0, Location::Server { server, path, find: Some(text) }) = (n, &pane.loc) {
-        notice(format!("Nada com “{text}” no nome em {} nem nas pastas dentro.", path.last().unwrap_or(&server.name)), k.c.text_faint)
+        notice(
+            tr!(
+                "Nada com “{text}” no nome em {} nem nas pastas dentro.",
+                "Nothing with “{text}” in its name in {} or the folders inside.",
+                path.last().unwrap_or(&server.name)
+            ),
+            k.c.text_faint,
+        )
     } else if n == 0 && matches!(pane.loc, Location::Drive { space: Space::SharedDrives, .. }) {
-        notice("Esta conta não participa de nenhum drive compartilhado.".into(), k.c.text_muted)
+        notice(t("Esta conta não participa de nenhum drive compartilhado.", "This account isn't a member of any shared drive.").into(), k.c.text_muted)
     } else if let (0, Location::Drive { space, path, .. }) = (n, &pane.loc)
         && path.is_empty()
         && space.view().is_some()
     {
         let msg = match space {
-            Space::SharedWithMe => "Ninguém compartilhou arquivos com esta conta.",
-            Space::Starred => "Nenhum item com estrela. Use Adicionar estrela no menu de um arquivo.",
-            Space::Recent => "Nenhum arquivo aberto recentemente.",
-            _ => "A lixeira está vazia.",
+            Space::SharedWithMe => t("Ninguém compartilhou arquivos com esta conta.", "No one has shared files with this account."),
+            Space::Starred => t("Nenhum item com estrela. Use Adicionar estrela no menu de um arquivo.", "No starred items. Use Add star in a file's menu."),
+            Space::Recent => t("Nenhum arquivo aberto recentemente.", "No recently opened files."),
+            _ => t("A lixeira está vazia.", "The trash is empty."),
         };
         notice(msg.into(), k.c.text_faint)
     } else if n == 0 {
-        notice("Esta pasta está vazia.".into(), k.c.text_faint)
+        notice(t("Esta pasta está vazia.", "This folder is empty.").into(), k.c.text_faint)
     } else {
         rows
     };
@@ -3129,19 +3269,20 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
 fn statusbar(s: &State, k: &Kit, p: usize) -> El {
     let pane = &s.panes[p];
     let n = pane.entries.len();
-    let mut left = format!("{} {}", thousands(n), if n == 1 { "item" } else { "itens" });
+    let mut left = if n == 1 { tr!("{} item", "{} item", thousands(n)) } else { tr!("{} itens", "{} items", thousands(n)) };
     let picked: Vec<_> = if pane.selected.is_empty() { Vec::new() } else { pane.entries.iter().filter(|e| pane.selected.contains(&e.id)).collect() };
     if !picked.is_empty() {
         let bytes: u64 = picked.iter().filter_map(|e| e.size).sum();
-        left.push_str(&format!("   ·   {} {}", thousands(picked.len()), if picked.len() == 1 { "selecionado" } else { "selecionados" }));
+        let count = thousands(picked.len());
+        left.push_str(&if picked.len() == 1 { tr!("   ·   {count} selecionado", "   ·   {count} selected") } else { tr!("   ·   {count} selecionados", "   ·   {count} selected") });
         if bytes > 0 {
             left.push_str(&format!(" ({})", format_size(bytes)));
         }
     }
     if pane.loading {
-        left.push_str("   ·   carregando…");
+        left.push_str(t("   ·   carregando…", "   ·   loading…"));
     }
-    let right = pane.free.map(|b| format!("{} livres", format_size(b))).unwrap_or_default();
+    let right = pane.free.map(|b| tr!("{} livres", "{} free", format_size(b))).unwrap_or_default();
     // A Drive account's storage, beside My Drive's folders (a shared drive's files count
     // against its organisation, not the account).
     let quota = match &pane.loc {
@@ -3181,21 +3322,23 @@ fn statusbar(s: &State, k: &Kit, p: usize) -> El {
 /// when there's no limit.
 pub fn quota_label(q: &openexplorer_gdrive::Quota) -> String {
     match (q.limit, q.free()) {
-        (Some(limit), Some(free)) => format!("{} livres de {}", format_size(free), whole_size(limit)),
-        _ => format!("{} usados · Ilimitado", format_size(q.usage)),
+        (Some(limit), Some(free)) => tr!("{} livres de {}", "{} free of {}", format_size(free), whole_size(limit)),
+        _ => tr!("{} usados · Ilimitado", "{} used · Unlimited", format_size(q.usage)),
     }
 }
 
 /// The quota's breakdown, on hover.
 fn quota_help(q: openexplorer_gdrive::Quota) -> String {
-    let mut out = format!("Usado: {}", format_size(q.usage));
-    if let Some(l) = q.limit {
-        out.push_str(&format!(" de {}", whole_size(l)));
-    }
-    out.push_str(&format!("
-No Drive: {} (lixeira: {})", format_size(q.in_drive), format_size(q.in_trash)));
-    out.push_str(&format!("
-Gmail e Fotos: {}", format_size(q.usage.saturating_sub(q.in_drive))));
+    let mut out = match q.limit {
+        Some(l) => tr!("Usado: {} de {}", "Used: {} of {}", format_size(q.usage), whole_size(l)),
+        None => tr!("Usado: {}", "Used: {}", format_size(q.usage)),
+    };
+    out.push_str(&tr!("
+No Drive: {} (lixeira: {})", "
+In Drive: {} (trash: {})", format_size(q.in_drive), format_size(q.in_trash)));
+    out.push_str(&tr!("
+Gmail e Fotos: {}", "
+Gmail and Photos: {}", format_size(q.usage.saturating_sub(q.in_drive))));
     out
 }
 
@@ -3203,16 +3346,18 @@ Gmail e Fotos: {}", format_size(q.usage.saturating_sub(q.in_drive))));
 fn whole_size(b: u64) -> String {
     let s = format_size(b);
     match s.split_once(' ') {
-        Some((n, unit)) if n.ends_with(",0") => format!("{} {unit}", &n[..n.len() - 2]),
+        Some((n, unit)) if n.ends_with(",0") || n.ends_with(".0") => format!("{} {unit}", &n[..n.len() - 2]),
         _ => s,
     }
 }
 
+/// A count with its thousands grouped: "1.946" in Portuguese, "1,946" in English.
 pub fn thousands(n: usize) -> String {
     let d = n.to_string();
+    let sep = if openexplorer_i18n::english() { ',' } else { '.' };
     d.chars().enumerate().fold(String::new(), |mut out, (i, ch)| {
         if i > 0 && (d.len() - i).is_multiple_of(3) {
-            out.push('.');
+            out.push(sep);
         }
         out.push(ch);
         out

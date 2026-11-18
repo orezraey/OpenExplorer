@@ -1,0 +1,8 @@
+[package]
+name = "openexplorer-i18n"
+version.workspace = true
+edition.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# The language of Windows' own interface, for the Automatic language.
+windows-sys = { version = "0.61", features = ["Win32_Globalization"] }

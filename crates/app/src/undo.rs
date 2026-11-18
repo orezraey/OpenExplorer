@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use openexplorer_gdrive::{Drive, Status};
+use openexplorer_i18n::{t, tr};
 use openexplorer_remote::{Conn, Pool, Server};
 
 use crate::model::Location;
@@ -86,7 +87,7 @@ impl Rec {
 
 /// "1 item", "3 itens".
 pub fn items(n: usize) -> String {
-    if n == 1 { "1 item".into() } else { format!("{n} itens") }
+    if n == 1 { "1 item".into() } else { tr!("{n} itens", "{n} items") }
 }
 
 /// What a background job gives back for Desfazer.
@@ -185,7 +186,7 @@ fn did(rec: &Rec, what: impl FnOnce(usize) -> String, reload: Vec<Location>, res
 pub fn local_job(s: &State, reload: Vec<Location>, what: impl FnOnce(usize) -> String + Send + 'static, work: impl FnOnce(&Rec) -> Result<String, String> + Send + 'static) {
     background(s, move |emit| {
         let rec = Rec::default();
-        let result = catch_panic("operar no disco", || work(&rec));
+        let result = catch_panic(t("operar no disco", "work on the disk"), || work(&rec));
         emit(did(&rec, what, reload, result));
     });
 }
@@ -200,7 +201,7 @@ pub fn drive_job(
 ) {
     let rec = Arc::new(Rec::default());
     let job = rec.clone();
-    drive_task(s, email, "operar no Drive", move |d| Ok(work(d, &job)), move |result| did(&rec, what, reload, result.and_then(|r| r)));
+    drive_task(s, email, t("operar no Drive", "work in Drive"), move |d| Ok(work(d, &job)), move |result| did(&rec, what, reload, result.and_then(|r| r)));
 }
 
 /// [`local_job`] with a connection to `server`.
@@ -214,7 +215,7 @@ pub fn server_job(
     let (pool, server) = (s.servers.pool.clone(), server.clone());
     background(s, move |emit| {
         let rec = Rec::default();
-        let result = catch_panic("operar no servidor", || crate::servers::with(&pool, &server, |c| work(c, &rec)));
+        let result = catch_panic(t("operar no servidor", "work on the server"), || crate::servers::with(&pool, &server, |c| work(c, &rec)));
         emit(did(&rec, what, reload, result));
     });
 }
@@ -226,17 +227,17 @@ pub fn server_job(
 /// background thread.
 pub fn undo(s: &mut State, redo: bool) {
     if s.undo.busy {
-        s.status = format!("Espere: ainda {} a última ação.", if redo { "refazendo" } else { "desfazendo" });
+        s.status = if redo { t("Espere: ainda refazendo a última ação.", "Wait: still redoing the last action.") } else { t("Espere: ainda desfazendo a última ação.", "Wait: still undoing the last action.") }.into();
         return;
     }
     let list = if redo { &mut s.undo.undone } else { &mut s.undo.done };
     let Some(record) = list.pop() else {
-        s.status = if redo { "Nada para refazer." } else { "Nada para desfazer." }.into();
+        s.status = if redo { t("Nada para refazer.", "Nothing to redo.") } else { t("Nada para desfazer.", "Nothing to undo.") }.into();
         return;
     };
     s.undo.busy = true;
     s.undo.offer = None;
-    s.status = format!("{} {}…", if redo { "Refazendo:" } else { "Desfazendo:" }, record.what);
+    s.status = if redo { tr!("Refazendo: {}…", "Redoing: {}…", record.what) } else { tr!("Desfazendo: {}…", "Undoing: {}…", record.what) };
     let mut accounts: Vec<AccountRef> = Vec::new();
     for step in &record.steps {
         if let Some(email) = step.account()
@@ -249,7 +250,7 @@ pub fn undo(s: &mut State, redo: bool) {
     background(s, move |emit| {
         let reload = record.reload.clone();
         let mut live = Live { accounts, open: HashMap::new(), pool, emit };
-        let replayed = catch_panic(if redo { "refazer" } else { "desfazer" }, || Ok(replay(record, &mut live, redo)));
+        let replayed = catch_panic(if redo { t("refazer", "redo") } else { t("desfazer", "undo") }, || Ok(replay(record, &mut live, redo)));
         let (back, left, result) = match replayed {
             Ok(r) => (r.back, r.left, r.result),
             Err(e) => (None, None, Err(e)),
@@ -270,11 +271,11 @@ pub struct Replayed {
 /// be taken back any more. A step that fails while running stops the rest, which stay to be
 /// tried again.
 pub fn replay(record: Record, reach: &mut dyn Reach, redo: bool) -> Replayed {
-    let (verb, done) = if redo { ("refazer", "Refeito") } else { ("desfazer", "Desfeito") };
     let Record { what, steps, reload } = record;
     let mut bin = Bin::default();
     if let Some(why) = steps.iter().find_map(|step| step.check(reach, &mut bin).err()) {
-        return Replayed { back: None, left: None, result: Err(format!("Não dá para {verb} “{what}”: {why}")) };
+        let result = if redo { tr!("Não dá para refazer “{what}”: {why}", "Can't redo “{what}”: {why}") } else { tr!("Não dá para desfazer “{what}”: {why}", "Can't undo “{what}”: {why}") };
+        return Replayed { back: None, left: None, result: Err(result) };
     }
     let mut back = Vec::new();
     for (i, step) in steps.iter().enumerate() {
@@ -284,11 +285,17 @@ pub fn replay(record: Record, reach: &mut dyn Reach, redo: bool) -> Replayed {
                 let n = steps.len();
                 let left = Some(Record { what: what.clone(), steps: steps[i..].to_vec(), reload: reload.clone() });
                 let back = (!back.is_empty()).then(|| Record { what: what.clone(), steps: back, reload });
-                return Replayed { back, left, result: Err(format!("{done} só em parte ({i} de {n}) — “{what}”: {e}")) };
+                let result = if redo {
+                    tr!("Refeito só em parte ({i} de {n}) — “{what}”: {e}", "Only partly redone ({i} of {n}) — “{what}”: {e}")
+                } else {
+                    tr!("Desfeito só em parte ({i} de {n}) — “{what}”: {e}", "Only partly undone ({i} of {n}) — “{what}”: {e}")
+                };
+                return Replayed { back, left, result: Err(result) };
             }
         }
     }
-    Replayed { back: Some(Record { what: what.clone(), steps: back, reload }), left: None, result: Ok(format!("{done}: {what}.")) }
+    let result = if redo { tr!("Refeito: {what}.", "Redone: {what}.") } else { tr!("Desfeito: {what}.", "Undone: {what}.") };
+    Replayed { back: Some(Record { what, steps: back, reload }), left: None, result: Ok(result) }
 }
 
 /// The Drive accounts and servers a replay reaches.
@@ -345,7 +352,7 @@ struct Live<'a> {
 impl Reach for Live<'_> {
     fn drive(&mut self, email: &str) -> Result<&dyn DriveSide, String> {
         if !self.open.contains_key(email) {
-            let at = self.accounts.iter().position(|a| a.email == email).ok_or_else(|| format!("A conta {email} não está conectada."))?;
+            let at = self.accounts.iter().position(|a| a.email == email).ok_or_else(|| tr!("A conta {email} não está conectada.", "The account {email} isn't connected."))?;
             let drive = self.accounts.remove(at).open(self.emit)?;
             self.open.insert(email.to_string(), drive);
         }
@@ -417,12 +424,12 @@ impl Bin {
 
 #[cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
 fn read_bin() -> Result<Vec<Recycled>, String> {
-    trash::os_limited::list().map_err(|e| format!("Não consegui ler a Lixeira: {e}"))
+    trash::os_limited::list().map_err(|e| tr!("Não consegui ler a Lixeira: {e}", "Couldn't read the Recycle Bin: {e}"))
 }
 
 #[cfg(not(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))))]
 fn read_bin() -> Result<Vec<Recycled>, String> {
-    Err("Restaurar da Lixeira não é possível neste sistema.".into())
+    Err(t("Restaurar da Lixeira não é possível neste sistema.", "Restoring from the Recycle Bin isn't possible on this system.").into())
 }
 
 #[cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
@@ -458,52 +465,52 @@ impl Step {
         match self {
             Step::Move { from, to } => {
                 if !there(from) {
-                    return Err(format!("“{}” não está mais em {}.", name_of(from), dir_of(from)));
+                    return Err(tr!("“{}” não está mais em {}.", "“{}” is no longer in {}.", name_of(from), dir_of(from)));
                 }
                 if there(to) && !same_path(from, to) {
-                    return Err(format!("já existe “{}” em {}.", name_of(to), dir_of(to)));
+                    return Err(tr!("já existe “{}” em {}.", "“{}” already exists in {}.", name_of(to), dir_of(to)));
                 }
                 if !to.parent().is_some_and(Path::is_dir) {
-                    return Err(format!("a pasta {} não existe mais.", dir_of(to)));
+                    return Err(tr!("a pasta {} não existe mais.", "the folder {} no longer exists.", dir_of(to)));
                 }
                 Ok(())
             }
             Step::Recycle { path } => {
                 if !there(path) {
-                    return Err(format!("“{}” não está mais em {}.", name_of(path), dir_of(path)));
+                    return Err(tr!("“{}” não está mais em {}.", "“{}” is no longer in {}.", name_of(path), dir_of(path)));
                 }
                 // Without a Recycle Bin (a shared folder, WSL, a USB stick) it would be gone for good.
                 if !has_recycle_bin(path) {
-                    return Err(format!("{} não tem Lixeira, e “{}” seria apagado para sempre.", dir_of(path), name_of(path)));
+                    return Err(tr!("{} não tem Lixeira, e “{}” seria apagado para sempre.", "{} has no Recycle Bin, and “{}” would be deleted for good.", dir_of(path), name_of(path)));
                 }
                 Ok(())
             }
             Step::Unrecycle { path, since } => {
                 if there(path) {
-                    return Err(format!("já existe “{}” em {}.", name_of(path), dir_of(path)));
+                    return Err(tr!("já existe “{}” em {}.", "“{}” already exists in {}.", name_of(path), dir_of(path)));
                 }
                 match bin.find(path, *since)? {
                     Some(_) => Ok(()),
-                    None => Err(format!("“{}” não está mais na Lixeira.", name_of(path))),
+                    None => Err(tr!("“{}” não está mais na Lixeira.", "“{}” is no longer in the Recycle Bin.", name_of(path))),
                 }
             }
             Step::MakeDir { path } => {
                 if there(path) {
-                    return Err(format!("já existe “{}” em {}.", name_of(path), dir_of(path)));
+                    return Err(tr!("já existe “{}” em {}.", "“{}” already exists in {}.", name_of(path), dir_of(path)));
                 }
                 if !path.parent().is_some_and(Path::is_dir) {
-                    return Err(format!("a pasta {} não existe mais.", dir_of(path)));
+                    return Err(tr!("a pasta {} não existe mais.", "the folder {} no longer exists.", dir_of(path)));
                 }
                 Ok(())
             }
             Step::RemoveDir { path } => {
-                let meta = std::fs::symlink_metadata(path).map_err(|_| format!("“{}” não está mais em {}.", name_of(path), dir_of(path)))?;
+                let meta = std::fs::symlink_metadata(path).map_err(|_| tr!("“{}” não está mais em {}.", "“{}” is no longer in {}.", name_of(path), dir_of(path)))?;
                 if !meta.is_dir() {
-                    return Err(format!("“{}” não é mais uma pasta.", name_of(path)));
+                    return Err(tr!("“{}” não é mais uma pasta.", "“{}” is no longer a folder.", name_of(path)));
                 }
                 let empty = std::fs::read_dir(path).map(|mut d| d.next().is_none()).unwrap_or(false);
                 if !empty {
-                    return Err(format!("a pasta “{}” não está mais vazia.", name_of(path)));
+                    return Err(tr!("a pasta “{}” não está mais vazia.", "the folder “{}” is no longer empty.", name_of(path)));
                 }
                 Ok(())
             }
@@ -515,7 +522,7 @@ impl Step {
                     && !from.eq(to)
                     && d.taken(parent, to)?
                 {
-                    return Err(format!("já existe “{to}” nessa pasta do Drive."));
+                    return Err(tr!("já existe “{to}” nessa pasta do Drive.", "“{to}” already exists in that Drive folder."));
                 }
                 Ok(())
             }
@@ -524,10 +531,10 @@ impl Step {
                 let st = d.status(id)?;
                 drive_alive(&st, name)?;
                 if !st.parents.contains(from) {
-                    return Err(format!("“{name}” mudou de pasta no Drive."));
+                    return Err(tr!("“{name}” mudou de pasta no Drive.", "“{name}” moved to another folder in Drive."));
                 }
                 if d.taken(to, name)? {
-                    return Err(format!("já existe “{name}” na pasta de destino do Drive."));
+                    return Err(tr!("já existe “{name}” na pasta de destino do Drive.", "“{name}” already exists in the destination folder in Drive."));
                 }
                 Ok(())
             }
@@ -535,7 +542,7 @@ impl Step {
                 let d = reach.drive(email)?;
                 drive_alive(&d.status(id)?, name)?;
                 if *empty && d.has_children(id)? {
-                    return Err(format!("a pasta “{name}” não está mais vazia."));
+                    return Err(tr!("a pasta “{name}” não está mais vazia.", "the folder “{name}” is no longer empty."));
                 }
                 Ok(())
             }
@@ -543,35 +550,35 @@ impl Step {
                 let d = reach.drive(email)?;
                 let st = d.status(id)?;
                 if !st.trashed {
-                    return Err(format!("“{name}” não está mais na lixeira do Drive."));
+                    return Err(tr!("“{name}” não está mais na lixeira do Drive.", "“{name}” is no longer in the Drive trash."));
                 }
                 if st.name != *name {
-                    return Err(format!("“{name}” mudou de nome no Drive."));
+                    return Err(tr!("“{name}” mudou de nome no Drive.", "“{name}” was renamed in Drive."));
                 }
                 if let Some(parent) = st.parents.first()
                     && d.taken(parent, name)?
                 {
-                    return Err(format!("já existe “{name}” na pasta de onde ele saiu, no Drive."));
+                    return Err(tr!("já existe “{name}” na pasta de onde ele saiu, no Drive.", "“{name}” already exists in the Drive folder it came from."));
                 }
                 Ok(())
             }
             Step::ServerMove { server, from, to } => reach.server(server, &mut |c| {
                 if c.stat(from)?.is_none() {
-                    return Err(format!("“{}” não está mais no servidor.", server_name(from)));
+                    return Err(tr!("“{}” não está mais no servidor.", "“{}” is no longer on the server.", server_name(from)));
                 }
                 if c.stat(to)?.is_some() {
-                    return Err(format!("já existe “{}” no servidor.", server_name(to)));
+                    return Err(tr!("já existe “{}” no servidor.", "“{}” already exists on the server.", server_name(to)));
                 }
                 Ok(())
             }),
             Step::ServerMakeDir { server, path } => reach.server(server, &mut |c| match c.stat(path)? {
-                Some(_) => Err(format!("já existe “{}” no servidor.", server_name(path))),
+                Some(_) => Err(tr!("já existe “{}” no servidor.", "“{}” already exists on the server.", server_name(path))),
                 None => Ok(()),
             }),
             Step::ServerRemoveDir { server, path } => reach.server(server, &mut |c| match c.stat(path)? {
-                None => Err(format!("“{}” não está mais no servidor.", server_name(path))),
-                Some(it) if !it.is_dir || it.link => Err(format!("“{}” não é mais uma pasta.", server_name(path))),
-                Some(_) if !c.list(path)?.is_empty() => Err(format!("a pasta “{}” não está mais vazia.", server_name(path))),
+                None => Err(tr!("“{}” não está mais no servidor.", "“{}” is no longer on the server.", server_name(path))),
+                Some(it) if !it.is_dir || it.link => Err(tr!("“{}” não é mais uma pasta.", "“{}” is no longer a folder.", server_name(path))),
+                Some(_) if !c.list(path)?.is_empty() => Err(tr!("a pasta “{}” não está mais vazia.", "the folder “{}” is no longer empty.", server_name(path))),
                 Some(_) => Ok(()),
             }),
         }
@@ -581,14 +588,14 @@ impl Step {
     fn run(&self, reach: &mut dyn Reach, bin: &mut Bin) -> Result<Step, String> {
         Ok(match self {
             Step::Move { from, to } => {
-                let into = to.parent().ok_or("Destino sem pasta.")?;
+                let into = to.parent().ok_or(t("Destino sem pasta.", "The destination has no folder."))?;
                 if from.parent() == Some(into) {
                     ops::rename(from, &name_of(to))?;
                 } else if from.file_name() == to.file_name() {
                     // Across disks, a copy then a delete of the original, as the move was.
                     ops::move_into(from, into, &ops::Progress::new(None))?;
                 } else {
-                    std::fs::rename(from, to).map_err(|e| format!("Não consegui mover “{}”: {e}", name_of(from)))?;
+                    std::fs::rename(from, to).map_err(|e| tr!("Não consegui mover “{}”: {e}", "Couldn't move “{}”: {e}", name_of(from)))?;
                 }
                 Step::Move { from: to.clone(), to: from.clone() }
             }
@@ -601,20 +608,20 @@ impl Step {
             Step::Unrecycle { path, since } => {
                 #[cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
                 {
-                    let item = bin.find(path, *since)?.ok_or_else(|| format!("“{}” não está mais na Lixeira.", name_of(path)))?;
-                    trash::os_limited::restore_all([item]).map_err(|e| format!("Não consegui restaurar “{}” da Lixeira: {e}", name_of(path)))?;
+                    let item = bin.find(path, *since)?.ok_or_else(|| tr!("“{}” não está mais na Lixeira.", "“{}” is no longer in the Recycle Bin.", name_of(path)))?;
+                    trash::os_limited::restore_all([item]).map_err(|e| tr!("Não consegui restaurar “{}” da Lixeira: {e}", "Couldn't restore “{}” from the Recycle Bin: {e}", name_of(path)))?;
                 }
                 #[cfg(not(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))))]
                 bin.find(path, *since)?;
                 Step::Recycle { path: path.clone() }
             }
             Step::MakeDir { path } => {
-                std::fs::create_dir(path).map_err(|e| format!("Não consegui criar a pasta “{}”: {e}", name_of(path)))?;
+                std::fs::create_dir(path).map_err(|e| tr!("Não consegui criar a pasta “{}”: {e}", "Couldn't create the folder “{}”: {e}", name_of(path)))?;
                 Step::RemoveDir { path: path.clone() }
             }
             Step::RemoveDir { path } => {
                 // Fails if anything arrived in it since the check: it's never emptied here.
-                std::fs::remove_dir(path).map_err(|e| format!("Não consegui remover a pasta “{}”: {e}", name_of(path)))?;
+                std::fs::remove_dir(path).map_err(|e| tr!("Não consegui remover a pasta “{}”: {e}", "Couldn't remove the folder “{}”: {e}", name_of(path)))?;
                 Step::MakeDir { path: path.clone() }
             }
             Step::DriveRename { email, id, from, to } => {
@@ -653,10 +660,10 @@ impl Step {
 /// Whether a Drive item is still out of the trash under the name `name`.
 fn drive_alive(st: &Status, name: &str) -> Result<(), String> {
     if st.trashed {
-        return Err(format!("“{name}” está na lixeira do Drive."));
+        return Err(tr!("“{name}” está na lixeira do Drive.", "“{name}” is in the Drive trash."));
     }
     if st.name != name {
-        return Err(format!("“{name}” mudou de nome no Drive (agora “{}”).", st.name));
+        return Err(tr!("“{name}” mudou de nome no Drive (agora “{}”).", "“{name}” was renamed in Drive (now “{}”).", st.name));
     }
     Ok(())
 }

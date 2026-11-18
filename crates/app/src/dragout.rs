@@ -66,7 +66,7 @@ impl Files for DriveSource {
     fn open(&self, file: &File, from: u64) -> Result<Box<dyn Read + Send>, String> {
         match &file.fetch {
             Fetch::Drive(f) => self.drive.open_media(f, from),
-            Fetch::Server(_) => Err("Arquivo de outro lugar.".into()),
+            Fetch::Server(_) => Err(openexplorer_i18n::t("Arquivo de outro lugar.", "File from another place.").into()),
         }
     }
 }

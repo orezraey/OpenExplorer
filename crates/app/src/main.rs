@@ -47,6 +47,7 @@ use std::time::SystemTime;
 
 use openexplorer_gdrive::store::{self, StoredAccount};
 use openexplorer_gdrive::{ClientConfig, Drive, DriveFile, Quota, oauth};
+use openexplorer_i18n::{t, tr};
 use rune::{AppSpec, DragItem, Key, KeyEvent, LiveRegion, Mods, Tx, Waker};
 
 use model::{Entry, Location, MockDrive, Pane, SortCol, Space};
@@ -224,6 +225,10 @@ struct State {
 fn init() -> State {
     let (outbox, inbox) = channel();
     let settings = settings::Settings::load();
+    // Tests read the Portuguese words, whatever the machine's language.
+    if !cfg!(test) {
+        settings.language.apply();
+    }
     let mock = MockDrive::new();
     let mut panes = [Pane::new(Location::home()), Pane::new(Location::Mock(Vec::new()))];
     for p in &mut panes {
@@ -307,7 +312,7 @@ fn catch_panic<T>(doing: &str, f: impl FnOnce() -> Result<T, String>) -> Result<
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|p| {
         let what = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
         openexplorer_gdrive::log(&format!("pânico ao {doing}: {what}"));
-        Err(format!("Erro interno ao {doing} ({what}). Detalhes no log."))
+        Err(tr!("Erro interno ao {doing} ({what}). Detalhes no log.", "Internal error trying to {doing} ({what}). Details in the log."))
     })
 }
 
@@ -456,7 +461,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     Ok(page) => p.append_entries(page),
                     // A later page, or the refresh of a cached listing, failed: keep what the pane
                     // shows and say so.
-                    Err(e) => fail(s, format!("Não consegui terminar a listagem, mostrando o que chegou: {e}")),
+                    Err(e) => fail(s, tr!("Não consegui terminar a listagem, mostrando o que chegou: {e}", "Couldn't finish the listing, showing what arrived: {e}")),
                 }
                 let p = &mut s.panes[pane];
                 p.loading = ok && more;
@@ -555,7 +560,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                 match result {
                     Ok((account, drive)) => {
                         openexplorer_gdrive::log(&format!("conta Google conectada: {}", account.email));
-                        s.status = format!("Conta conectada: {}", account.email);
+                        s.status = tr!("Conta conectada: {}", "Account connected: {}", account.email);
                         s.drives.insert(account.email.clone(), drive);
                         s.tree.account_added(&account.email);
                         let email = account.email.clone();
@@ -609,7 +614,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         } else if !pane.loading {
             pane.reveal = None;
             if pane.error.is_none() {
-                s.status = format!("“{name}” não está mais nesta pasta.");
+                s.status = tr!("“{name}” não está mais nesta pasta.", "“{name}” is no longer in this folder.");
                 changed = true;
             }
         }
@@ -716,13 +721,13 @@ fn drive_task<T>(
 
 pub(crate) fn connect_with(s: &mut State, p: usize, cfg: ClientConfig, tx: &mut Tx) -> Result<(), String> {
     let pending = oauth::begin(&cfg)?;
-    tx.open_url(&pending.url).map_err(|e| format!("Não consegui abrir o navegador: {e:?}"))?;
+    tx.open_url(&pending.url).map_err(|e| tr!("Não consegui abrir o navegador: {e:?}", "Couldn't open the browser: {e:?}"))?;
     s.logins += 1;
     let attempt = s.logins;
     s.login = Some(attempt);
-    s.status = "Faça o login no navegador que abriu. Esperando o Google…".into();
+    s.status = t("Faça o login no navegador que abriu. Esperando o Google…", "Sign in in the browser that opened. Waiting for Google…").into();
     background(s, move |emit| {
-        let result = catch_panic("conectar", || {
+        let result = catch_panic(t("conectar", "connect"), || {
             let tokens = pending.finish(&cfg)?;
             let drive = Drive::from_login(cfg, &tokens)?;
             let who = drive.about()?;
@@ -754,7 +759,7 @@ fn disconnect(s: &mut State, email: &str) {
             switch(s, p, Location::Mock(Vec::new()));
         }
     }
-    s.status = format!("Conta desconectada: {email}");
+    s.status = tr!("Conta desconectada: {email}", "Account disconnected: {email}");
 }
 
 /// Asks Drive how much of `email`'s storage is used, on a background thread; the status bar
@@ -765,7 +770,7 @@ fn ask_quota(s: &mut State, email: &str) {
     }
     s.quotas.entry(email.to_string()).or_insert(None);
     let who = email.to_string();
-    drive_task(s, email, "ler a cota", |d| d.quota(), move |result| Msg::Quota { email: who, result });
+    drive_task(s, email, t("ler a cota", "read the storage quota"), |d| d.quota(), move |result| Msg::Quota { email: who, result });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -791,7 +796,7 @@ fn load(s: &mut State, p: usize) {
             let live = s.live[p].clone();
             background(s, move |emit| {
                 let alive = || live.load(Ordering::Relaxed) == request;                let mut first = true;
-                let result = catch_panic("pesquisar", || {
+                let result = catch_panic(t("pesquisar", "search"), || {
                     finder::search_elsewhere(&f, show_hidden, &alive, &mut |entries, more| {                        emit(Msg::Listed { pane: p, request, part: Part::Page { first, more }, result: Ok(entries) });                        first = false;
                     })
                 });
@@ -818,7 +823,7 @@ fn load(s: &mut State, p: usize) {
         pane.error = None;
         pane.free = None;
         background(s, move |emit| {
-            let result = catch_panic("listar", || model::read_local(&dir, show_hidden).map_err(|e| format!("{}: {e}", dir.display())));
+            let result = catch_panic(t("listar", "list"), || model::read_local(&dir, show_hidden).map_err(|e| format!("{}: {e}", dir.display())));
             emit(Msg::Listed { pane: p, request, part: Part::WHOLE, result });
         });
         return;
@@ -880,7 +885,7 @@ fn load(s: &mut State, p: usize) {
             live.load(Ordering::Relaxed) == request
         };
         // A panic here (a bad value from Drive, say) must not leave the pane loading forever.
-        let result = catch_panic("listar", || match (&space, folder.as_deref()) {
+        let result = catch_panic(t("listar", "list"), || match (&space, folder.as_deref()) {
             (Space::MyDrive, f) => drive.list(f.unwrap_or("root"), None, &mut page),
             (Space::Shared { id, .. }, f) => drive.list(f.unwrap_or(id), Some(id), &mut page),
             (Space::Trash, Some(f)) => drive.list_trashed(f, &mut page),
@@ -896,7 +901,7 @@ fn load(s: &mut State, p: usize) {
             (Space::SharedDrives, _) => drive.shared_drives().map(|list| {
                 list.into_iter()
                     .map(|d| Entry {
-                        name: if d.hidden { format!("{} (oculto)", d.name) } else { d.name },
+                        name: if d.hidden { tr!("{} (oculto)", "{} (hidden)", d.name) } else { d.name },
                         id: d.id,
                         is_dir: true,
                         size: None,
@@ -1372,7 +1377,7 @@ fn drive_drag_ended(s: &mut State, from: usize, ids: Vec<String>, ended: dragout
             s.active = to;
             actions::copy_across(s, from, to);
         }
-        dragout::Ended::Outside => s.status = "Baixando para onde os itens foram soltos: o Windows mostra o andamento.".into(),
+        dragout::Ended::Outside => s.status = t("Baixando para onde os itens foram soltos: o Windows mostra o andamento.", "Downloading to where the items were dropped: Windows shows the progress.").into(),
         _ => {}
     }
 }
@@ -1387,7 +1392,7 @@ fn found_scene(s: &mut State, installed: bool) {
         s.panes[0].set_entries(Ok(finder::sample()));
         s.found[0] = Some(finder::Info { total: 1234, shown: 4, indexing: vec![r"D:\".into()], service: finder::Service::Running });
     } else {
-        s.panes[0].set_entries(Err(finder::MISSING.into()));
+        s.panes[0].set_entries(Err(finder::missing().into()));
         s.found[0] = Some(finder::Info { total: 0, shown: 0, indexing: Vec::new(), service: finder::Service::Missing });
     }
 }
@@ -1405,22 +1410,18 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
     let loc = s.panes[p].loc.clone();
     let (mut done, mut skipped) = (0, 0);
     match &loc {
-        Location::Found(_) => {
-            s.status = "Os resultados da pesquisa não são uma pasta: solte os arquivos numa pasta.".into();
+        Location::Found(_) | Location::Server { find: Some(_), .. } => {
+            s.status = t("Os resultados da pesquisa não são uma pasta: solte os arquivos numa pasta.", "Search results aren't a folder: drop the files in a folder.").into();
             return;
         }
         Location::Local(dir) if network::is_server(dir) => {
-            s.status = "Aqui estão as pastas compartilhadas do computador: solte os arquivos numa delas.".into();
-            return;
-        }
-        Location::Server { find: Some(_), .. } => {
-            s.status = "Os resultados da pesquisa não são uma pasta: solte os arquivos numa pasta.".into();
+            s.status = t("Aqui estão as pastas compartilhadas do computador: solte os arquivos numa delas.", "These are the computer's shared folders: drop the files in one of them.").into();
             return;
         }
         Location::Server { .. } => {
             let real: Vec<PathBuf> = files.iter().filter(|f| !f.starts_with(&s.temp)).cloned().collect();
             if real.is_empty() {
-                s.status = "Nada para enviar: arraste arquivos ou pastas do computador.".into();
+                s.status = nothing_to_upload();
                 return;
             }
             servers::upload(s, real, &loc, false, vec![loc.clone()]);
@@ -1431,13 +1432,13 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
             // the simulated drive's items are placeholders in the temp folder and stay out.
             let real: Vec<PathBuf> = files.iter().filter(|f| !f.starts_with(&s.temp)).cloned().collect();
             if real.is_empty() {
-                s.status = "Nada para enviar: arraste arquivos ou pastas do computador.".into();
+                s.status = nothing_to_upload();
                 return;
             }
             let left_out = files.len() - real.len();
             actions::upload(s, real, &loc, false, vec![loc.clone()]);
             if left_out > 0 {
-                s.status = format!("Itens do drive simulado não são enviados ({left_out}).");
+                s.status = tr!("Itens do drive simulado não são enviados ({left_out}).", "Items of the simulated drive aren't uploaded ({left_out}).");
             }
             return;
         }
@@ -1450,7 +1451,7 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
                 actions::local_transfer(s, transfers::Op::Copy, fresh, dir.clone(), vec![loc.clone()]);
             }
             if skipped > 0 {
-                s.status = format!("Ignorados (já estão aqui): {skipped}.");
+                s.status = tr!("Ignorados (já estão aqui): {skipped}.", "Skipped (already here): {skipped}.");
             }
             return;
         }
@@ -1475,8 +1476,13 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
             }
         }
     }
-    s.status = format!("Enviados (simulado): {done} · ignorados (já existem): {skipped}");
+    s.status = tr!("Enviados (simulado): {done} · ignorados (já existem): {skipped}", "Uploaded (simulated): {done} · skipped (already there): {skipped}");
     load(s, p);
+}
+
+/// Files dropped on a server or Drive folder that are only the simulated drive's placeholders.
+fn nothing_to_upload() -> String {
+    t("Nada para enviar: arraste arquivos ou pastas do computador.", "Nothing to upload: drag files or folders from the computer.").into()
 }
 
 /// The clash dialog over a fake account's Drive folder, for sample files in %TEMP%.

@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 use openexplorer_remote::{self as remote, Brand, Conn, Item, Pool, Protocol, Refusal, Rejected, Server, Store};
+use openexplorer_i18n::{t, tr};
 use rune::{Icon, TextEdit, Tx};
 
 use crate::actions::{Dialog, Then};
@@ -114,14 +115,14 @@ pub fn load(s: &mut State, p: usize, request: u64) {
         let listed = |part, result| Msg::Listed { pane: p, request, part, result };
         let dir = server.path(&path);
         let Some(text) = find else {
-            let result = catch_panic("listar", || {
+            let result = catch_panic(t("listar", "list"), || {
                 with(&pool, &server, |c| c.list(&dir)).map(|v| v.into_iter().filter(|i| show_hidden || !i.name.starts_with('.')).map(entry).collect())
             });
             return emit(listed(Part::WHOLE, result));
         };
         let alive = || live.load(Ordering::Relaxed) == request;
         let mut first = true;
-        let result = catch_panic("pesquisar", || {
+        let result = catch_panic(t("pesquisar", "search"), || {
             with(&pool, &server, |c| {
                 search(c, &dir, &text, show_hidden, &alive, &mut |entries, more| {
                     emit(listed(Part::Page { first, more }, Ok(entries)));
@@ -197,7 +198,7 @@ pub fn open_file(s: &mut State, p: usize, item: &Entry) {
         return;
     }
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        crate::fail(s, format!("Não consegui criar a pasta temporária: {e}"));
+        crate::fail(s, tr!("Não consegui criar a pasta temporária: {e}", "Couldn't create the temporary folder: {e}"));
         return;
     }
     let _ = std::fs::remove_file(&ready);
@@ -207,7 +208,7 @@ pub fn open_file(s: &mut State, p: usize, item: &Entry) {
 /// Runs a server job on a thread, then reloads `reload` and says how it went.
 fn job(s: &State, server: &Server, reload: Vec<Location>, work: impl FnOnce(&mut dyn Conn) -> Result<String, String> + Send + 'static) {
     let (pool, server) = (s.servers.pool.clone(), server.clone());
-    background(s, move |emit| emit(Msg::Done { reload, result: catch_panic("operar no servidor", || with(&pool, &server, work)) }));
+    background(s, move |emit| emit(Msg::Done { reload, result: catch_panic(t("operar no servidor", "work on the server"), || with(&pool, &server, work)) }));
 }
 
 /// How deep a download goes into folders (links followed, as the copy follows them): a link back
@@ -249,7 +250,7 @@ fn transfer<P: Send + Sync + 'static>(
     let workers = at_once.min(server.limit().saturating_sub(1)).min(batch.rows().len()).max(1);
     let (pool, server) = (s.servers.pool.clone(), server.clone());
     background(s, move |emit| {
-        let result = catch_panic("transferir", || {
+        let result = catch_panic(t("transferir", "transfer"), || {
             let shared = with(&pool, &server, |c| prepare(c, &batch))?;
             let next = std::sync::atomic::AtomicUsize::new(0);
             let failed = std::sync::Mutex::new(None);
@@ -327,16 +328,16 @@ fn fetch(c: &mut dyn Conn, path: &str, is_dir: bool, modified: Option<SystemTime
     }
     if is_dir {
         if depth > DEEPEST {
-            return Err(format!("{path}: pastas demais umas dentro das outras (um link que volta para cima?)."));
+            return Err(tr!("{path}: pastas demais umas dentro das outras (um link que volta para cima?).", "{path}: too many folders inside one another (a link that loops back up?)."));
         }
-        std::fs::create_dir(local).map_err(|e| format!("Não consegui criar {}: {e}", local.display()))?;
+        std::fs::create_dir(local).map_err(|e| tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", local.display()))?;
         for it in c.list(path)? {
             let to = ops::unique_in(local, &ops::windows_name(&it.name));
             fetch(c, &child(path, &it.name), it.is_dir, it.modified, &to, p, depth + 1)?;
         }
         return Ok(());
     }
-    let mut file = std::fs::File::create_new(local).map_err(|e| format!("Não consegui criar {}: {e}", local.display()))?;
+    let mut file = std::fs::File::create_new(local).map_err(|e| tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", local.display()))?;
     let mut last = 0;
     let got = c.download(path, &mut file, &mut |n| {
         p.add_bytes(n - last);
@@ -360,7 +361,7 @@ fn fetch(c: &mut dyn Conn, path: &str, is_dir: bool, modified: Option<SystemTime
 /// With `remove` (Recortar), each original goes to the Recycle Bin once all of it arrived.
 pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool, reload: Vec<Location>) {
     let Some((server, dir)) = target(to) else {
-        s.status = "Abra uma pasta do servidor para enviar para ela.".into();
+        s.status = t("Abra uma pasta do servidor para enviar para ela.", "Open a folder on the server to upload to it.").into();
         return;
     };
     let server = server.clone();
@@ -396,7 +397,7 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
             return Err(e);
         }
         if remove {
-            trash::delete(src).map_err(|e| format!("Enviado, mas não consegui mover o original para a Lixeira: {e}"))?;
+            trash::delete(src).map_err(|e| tr!("Enviado, mas não consegui mover o original para a Lixeira: {e}", "Uploaded, but couldn't move the original to the Recycle Bin: {e}"))?;
         }
         Ok(())
     };
@@ -422,14 +423,14 @@ fn send(c: &mut dyn Conn, src: &Path, target: &str, p: &Progress) -> Result<(), 
     }
     if src.is_dir() {
         c.mkdir(target)?;
-        let items = std::fs::read_dir(src).map_err(|e| format!("Não consegui ler {}: {e}", src.display()))?;
+        let items = std::fs::read_dir(src).map_err(|e| tr!("Não consegui ler {}: {e}", "Couldn't read {}: {e}", src.display()))?;
         for item in items {
-            let item = item.map_err(|e| format!("Não consegui ler {}: {e}", src.display()))?;
+            let item = item.map_err(|e| tr!("Não consegui ler {}: {e}", "Couldn't read {}: {e}", src.display()))?;
             send(c, &item.path(), &child(target, &item.file_name().to_string_lossy()), p)?;
         }
         return Ok(());
     }
-    let mut file = std::fs::File::open(src).map_err(|e| format!("Não consegui abrir {}: {e}", src.display()))?;
+    let mut file = std::fs::File::open(src).map_err(|e| tr!("Não consegui abrir {}: {e}", "Couldn't open {}: {e}", src.display()))?;
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut last = 0;
     c.upload(target, &mut file, len, &mut |n| {
@@ -446,7 +447,7 @@ pub fn move_within(s: &mut State, from: &Location, items: Vec<Entry>, to: &Locat
     let paths: Vec<String> = items.iter().filter_map(|e| path_of(from, e)).collect();
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Move, items.iter().map(|e| (end(from, Some(&e.name)), end(to, None))));
     let at = server.clone();
-    undo::server_job(s, &server, reload, |n| format!("mover {}", undo::items(n)), move |c, rec| {
+    undo::server_job(s, &server, reload, |n| tr!("mover {}", "move {}", undo::items(n)), move |c, rec| {
         batch.run(|i, _| {
             let (e, path) = (&items[i], &paths[i]);
             let into = child(&dst, &e.name);
@@ -454,7 +455,7 @@ pub fn move_within(s: &mut State, from: &Location, items: Vec<Entry>, to: &Locat
                 return Ok(());
             }
             if e.is_dir && (dst == *path || dst.starts_with(&format!("{path}/"))) {
-                return Err(format!("Não dá para mover a pasta \"{}\" para dentro dela mesma.", e.name));
+                return Err(tr!("Não dá para mover a pasta \"{}\" para dentro dela mesma.", "Can't move the folder \"{}\" into itself.", e.name));
             }
             c.rename(path, &into)?;
             rec.add([undo::Step::ServerMove { server: at.clone(), from: into, to: path.clone() }]);
@@ -471,11 +472,11 @@ pub fn delete(s: &mut State, loc: &Location, items: Vec<Entry>, reload: Vec<Loca
     job(s, server, reload, move |c| {
         for (i, (path, is_dir)) in paths.iter().enumerate() {
             c.remove(path, *is_dir).map_err(|e| {
-                let done = if i == 0 { String::new() } else { format!(" (já excluídos para sempre: {i})") };
-                format!("Não consegui excluir {path}: {e}{done}")
+                let done = if i == 0 { String::new() } else { tr!(" (já excluídos para sempre: {i})", " (already deleted for good: {i})") };
+                tr!("Não consegui excluir {path}: {e}{done}", "Couldn't delete {path}: {e}{done}")
             })?;
         }
-        Ok(format!("Excluído para sempre: {}.", if n == 1 { "1 item".into() } else { format!("{n} itens") }))
+        Ok(if n == 1 { t("Excluído para sempre: 1 item.", "Deleted for good: 1 item.").to_string() } else { tr!("Excluído para sempre: {n} itens.", "Deleted for good: {n} items.") })
     });
 }
 
@@ -487,20 +488,20 @@ pub fn name(s: &mut State, loc: &Location, item: Option<Entry>, name: String) {
         Some(item) => {
             let Some(from) = path_of(loc, &item) else { return };
             let to = child(from.rsplit_once('/').map_or("", |(d, _)| d), &name);
-            let (what, at) = (format!("renomear “{}” para “{name}”", item.name), Server::clone(server));
+            let (what, at) = (tr!("renomear “{}” para “{name}”", "rename “{}” to “{name}”", item.name), Server::clone(server));
             undo::server_job(s, server, reload, move |_| what, move |c, rec| {
                 c.rename(&from, &to)?;
                 rec.add([undo::Step::ServerMove { server: at, from: to, to: from }]);
-                Ok(format!("Renomeado para \"{name}\"."))
+                Ok(tr!("Renomeado para \"{name}\".", "Renamed to \"{name}\"."))
             });
         }
         None => {
             let to = child(&server.path(path), &name);
-            let (what, at) = (format!("criar a pasta “{name}”"), Server::clone(server));
+            let (what, at) = (tr!("criar a pasta “{name}”", "create the folder “{name}”"), Server::clone(server));
             undo::server_job(s, server, reload, move |_| what, move |c, rec| {
                 c.mkdir(&to)?;
                 rec.add([undo::Step::ServerRemoveDir { server: at, path: to }]);
-                Ok(format!("Pasta \"{name}\" criada."))
+                Ok(tr!("Pasta \"{name}\" criada.", "Folder \"{name}\" created."))
             });
         }
     }
@@ -524,10 +525,10 @@ impl Category {
 
     pub fn label(self) -> &'static str {
         match self {
-            Category::All => "Todos",
-            Category::Cloud => "Nuvem",
+            Category::All => t("Todos", "All"),
+            Category::Cloud => t("Nuvem", "Cloud"),
             Category::Nas => "NAS",
-            Category::Protocols => "Protocolos",
+            Category::Protocols => t("Protocolos", "Protocols"),
         }
     }
 
@@ -575,11 +576,11 @@ impl Provider {
 
     pub fn subtitle(self) -> &'static str {
         match self {
-            Provider::GoogleDrive => "OAuth no navegador",
-            Provider::Nextcloud => "Nuvem via WebDAV",
-            Provider::OwnCloud => "Nuvem via WebDAV",
-            Provider::Sftp => "SSH seguro · porta 22",
-            Provider::Ftp => "FTP / FTPS · porta 21",
+            Provider::GoogleDrive => t("OAuth no navegador", "OAuth in the browser"),
+            Provider::Nextcloud => t("Nuvem via WebDAV", "Cloud via WebDAV"),
+            Provider::OwnCloud => t("Nuvem via WebDAV", "Cloud via WebDAV"),
+            Provider::Sftp => t("SSH seguro · porta 22", "Secure SSH · port 22"),
+            Provider::Ftp => t("FTP / FTPS · porta 21", "FTP / FTPS · port 21"),
             Provider::WebDav => "HTTPS / HTTP",
         }
     }
@@ -610,12 +611,12 @@ impl Provider {
             return true;
         }
         let keywords = match self {
-            Provider::GoogleDrive => "google drive gdrive nuvem workspace oauth gmail",
-            Provider::Nextcloud => "nextcloud webdav dav https nas nuvem",
-            Provider::OwnCloud => "owncloud webdav dav https nas nuvem",
-            Provider::Sftp => "sftp ssh servidor linux nas chave 22",
-            Provider::Ftp => "ftp ftps tls ssl servidor nas 21 990",
-            Provider::WebDav => "webdav dav davs http https servidor nas",
+            Provider::GoogleDrive => "google drive gdrive nuvem workspace oauth gmail cloud",
+            Provider::Nextcloud => "nextcloud webdav dav https nas nuvem cloud",
+            Provider::OwnCloud => "owncloud webdav dav https nas nuvem cloud",
+            Provider::Sftp => "sftp ssh servidor linux nas chave 22 server key secure",
+            Provider::Ftp => "ftp ftps tls ssl servidor nas 21 990 server",
+            Provider::WebDav => "webdav dav davs http https servidor nas server",
         };
         q.split_whitespace().all(|w| self.label().to_lowercase().contains(w) || self.subtitle().to_lowercase().contains(w) || keywords.contains(w))
     }
@@ -891,7 +892,7 @@ impl Form {
         // A whole address pasted in the Servidor field fills the rest; an unschemed `host:port` splits cleanly.
         let (host, parsed_port) = if raw_host.contains("://") {
             let Some(a) = parse_address(raw_host) else {
-                return Err("Endereço inválido. Use o formato protocolo://servidor:porta/pasta ou informe apenas o servidor.".into());
+                return Err(t("Endereço inválido. Use o formato protocolo://servidor:porta/pasta ou informe apenas o servidor.", "Invalid address. Use the form protocol://server:port/folder or give just the server.").into());
             };
             protocol = a.protocol;
             if user.is_empty() {
@@ -906,10 +907,10 @@ impl Form {
             split_host_port(raw_host)?
         };
         if host.is_empty() {
-            return Err("Escreva o endereço do servidor.".into());
+            return Err(t("Escreva o endereço do servidor.", "Type the server's address.").into());
         }
         if host.contains('/') || host.contains(' ') {
-            return Err("O servidor é só o nome ou o IP, sem pastas: a pasta vai em Pasta inicial.".into());
+            return Err(t("O servidor é só o nome ou o IP, sem pastas: a pasta vai em Pasta inicial.", "The server is just the name or IP, without folders: the folder goes in Start folder.").into());
         }
         // Nextcloud and ownCloud speak WebDAV under `/remote.php/webdav` (which maps to the
         // authenticated user's root even when logging in by e-mail), unless a full `/remote.php/…`
@@ -924,7 +925,7 @@ impl Form {
         let port = match (self.port.text.trim(), parsed_port) {
             ("", Some(p)) => p,
             ("", None) => protocol.default_port(),
-            (t, _) => t.parse::<u16>().ok().filter(|p| *p > 0).ok_or("A porta é um número de 1 a 65535.")?,
+            (t, _) => t.parse::<u16>().ok().filter(|p| *p > 0).ok_or(openexplorer_i18n::t("A porta é um número de 1 a 65535.", "The port is a number from 1 to 65535."))?,
         };
         if !root.is_empty() && !root.starts_with('/') {
             root.insert(0, '/');
@@ -946,11 +947,11 @@ impl Form {
         if let Some(k) = &key
             && !Path::new(k).is_file()
         {
-            return Err(format!("A chave {k} não existe."));
+            return Err(tr!("A chave {k} não existe.", "The key {k} doesn't exist."));
         }
         let connections = match self.connections.text.trim() {
             "" => remote::USUAL_CONNECTIONS,
-            t => t.parse::<u8>().ok().filter(|n| (1..=remote::MOST_CONNECTIONS).contains(n)).ok_or(format!("Conexões simultâneas é um número de 1 a {}.", remote::MOST_CONNECTIONS))?,
+            t => t.parse::<u8>().ok().filter(|n| (1..=remote::MOST_CONNECTIONS).contains(n)).ok_or(tr!("Conexões simultâneas é um número de 1 a {}.", "Simultaneous connections is a number from 1 to {}.", remote::MOST_CONNECTIONS))?,
         };
         // A certificate trusted applies only to the exact `(host, port)` over TLS.
         let cert = self.trusted.clone().filter(|_| {
@@ -1013,15 +1014,15 @@ fn split_host_port(raw: &str) -> Result<(String, Option<u16>), String> {
     }
     if let Some(v6) = raw.strip_prefix('[') {
         let Some((h, after)) = v6.split_once(']') else {
-            return Err("Endereço IPv6 inválido (falta fechar ']').".into());
+            return Err(t("Endereço IPv6 inválido (falta fechar ']').", "Invalid IPv6 address (missing the closing ']').").into());
         };
         if after.is_empty() {
             return Ok((h.to_string(), None));
         }
         let Some(p_str) = after.strip_prefix(':') else {
-            return Err("O servidor é só o nome ou o IP, sem pastas: a pasta vai em Pasta inicial.".into());
+            return Err(t("O servidor é só o nome ou o IP, sem pastas: a pasta vai em Pasta inicial.", "The server is just the name or IP, without folders: the folder goes in Start folder.").into());
         };
-        let port = p_str.parse::<u16>().ok().filter(|p| *p > 0).ok_or("A porta é um número de 1 a 65535.")?;
+        let port = p_str.parse::<u16>().ok().filter(|p| *p > 0).ok_or(openexplorer_i18n::t("A porta é um número de 1 a 65535.", "The port is a number from 1 to 65535."))?;
         return Ok((h.to_string(), Some(port)));
     }
     // Bare IPv6 address (two or more colons) has no port suffix; single colon is `host:port`.
@@ -1029,7 +1030,7 @@ fn split_host_port(raw: &str) -> Result<(String, Option<u16>), String> {
     if colons == 1
         && let Some((h, p_str)) = raw.split_once(':')
     {
-        let port = p_str.parse::<u16>().ok().filter(|p| *p > 0).ok_or("A porta é um número de 1 a 65535.")?;
+        let port = p_str.parse::<u16>().ok().filter(|p| *p > 0).ok_or(openexplorer_i18n::t("A porta é um número de 1 a 65535.", "The port is a number from 1 to 65535."))?;
         return Ok((h.to_string(), Some(port)));
     }
     Ok((raw.to_string(), None))
@@ -1139,7 +1140,7 @@ pub fn submit_google(s: &mut State, tx: &mut Tx) {
             } else if secret.starts_with('{') {
                 openexplorer_gdrive::ClientConfig::parse(secret)
             } else if id.is_empty() || secret.is_empty() {
-                Err("Informe o Client ID e o Client Secret (ou cole o JSON completo no campo Client ID).".into())
+                Err(t("Informe o Client ID e o Client Secret (ou cole o JSON completo no campo Client ID).", "Enter the Client ID and the Client Secret (or paste the full JSON into the Client ID field).").into())
             } else {
                 Ok(openexplorer_gdrive::ClientConfig { client_id: id.to_string(), client_secret: secret.to_string() })
             };
@@ -1207,7 +1208,7 @@ pub fn submit(s: &mut State) {
         f.untrusted = None;
     }
     background(s, move |emit| {
-        let checked = catch_panic("conectar ao servidor", || {
+        let checked = catch_panic(t("conectar ao servidor", "connect to the server"), || {
             let mut server = server;
             Ok(remote::probe(&mut server, secret.as_deref()).map(|_| server))
         });
@@ -1295,10 +1296,14 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
         }
     }
     let key = match &server.host_key {
-        Some(k) if !edited => format!(" Chave do servidor: {k}."),
+        Some(k) if !edited => tr!(" Chave do servidor: {k}.", " Server key: {k}."),
         _ => String::new(),
     };
-    s.status = format!("{} {}: {}.{key}", if edited { "Servidor alterado" } else { "Servidor adicionado" }, server.name, server.address());
+    s.status = if edited {
+        tr!("Servidor alterado {}: {}.{key}", "Server changed {}: {}.{key}", server.name, server.address())
+    } else {
+        tr!("Servidor adicionado {}: {}.{key}", "Server added {}: {}.{key}", server.name, server.address())
+    };
     if !edited {
         let p = s.active;
         crate::navigate(s, p, folder(&server, Vec::new()));
@@ -1326,7 +1331,7 @@ pub fn remove(s: &mut State, id: &str) {
             crate::switch(s, p, Location::home());
         }
     }
-    s.status = format!("Servidor removido: {name}");
+    s.status = tr!("Servidor removido: {name}", "Server removed: {name}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1426,7 +1431,7 @@ pub fn reach(servers: &[Server], a: &Address) -> Result<Location, String> {
         })
         .max_by_key(|sv| sv.root.trim_end_matches('/').len());
     let Some(sv) = best else {
-        return Err(format!("{} fica fora da pasta inicial do servidor ({}).", a.path, candidates[0].root));
+        return Err(tr!("{} fica fora da pasta inicial do servidor ({}).", "{} is outside the server's start folder ({}).", a.path, candidates[0].root));
     };
     let rest = wanted[sv.root.trim_end_matches('/').len()..].trim_start_matches('/');
     let path = rest.split('/').filter(|s| !s.is_empty()).map(str::to_string).collect();

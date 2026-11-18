@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use openexplorer_i18n::{t, tr};
 use windows_service::service::{ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType};
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -49,12 +50,12 @@ pub fn process_id() -> Option<u32> {
 
 /// Where the service runs from.
 fn installed_exe() -> Result<PathBuf, String> {
-    let pf = std::env::var_os("ProgramFiles").ok_or("ProgramFiles não está definido.")?;
+    let pf = std::env::var_os("ProgramFiles").ok_or(t("ProgramFiles não está definido.", "ProgramFiles isn't set."))?;
     Ok(Path::new(&pf).join("OpenExplorer").join(EXE))
 }
 
 fn manager(access: ServiceManagerAccess) -> Result<ServiceManager, String> {
-    ServiceManager::local_computer(None::<&str>, access).map_err(|e| format!("Gerenciador de serviços: {e}"))
+    ServiceManager::local_computer(None::<&str>, access).map_err(|e| tr!("Gerenciador de serviços: {e}", "Service manager: {e}"))
 }
 
 /// Stops `s` and waits for it, up to 20 seconds.
@@ -84,7 +85,7 @@ pub fn install() -> Result<(), String> {
         _ => src.as_os_str().eq_ignore_ascii_case(dst.as_os_str()),
     };
     if !same {
-        std::fs::create_dir_all(dst.parent().unwrap()).map_err(|e| format!("Criar {}: {e}", dst.display()))?;
+        std::fs::create_dir_all(dst.parent().unwrap()).map_err(|e| tr!("Criar {}: {e}", "Create {}: {e}", dst.display()))?;
         // The old process can take a moment to let go of the file.
         let mut copied = std::fs::copy(&src, &dst);
         for _ in 0..20 {
@@ -94,7 +95,7 @@ pub fn install() -> Result<(), String> {
             std::thread::sleep(Duration::from_millis(250));
             copied = std::fs::copy(&src, &dst);
         }
-        copied.map_err(|e| format!("Copiar o serviço para {}: {e}", dst.display()))?;
+        copied.map_err(|e| tr!("Copiar o serviço para {}: {e}", "Copy the service to {}: {e}", dst.display()))?;
     }
     let info = ServiceInfo {
         name: SERVICE.into(),
@@ -110,21 +111,21 @@ pub fn install() -> Result<(), String> {
     };
     let s = match existing {
         Some(s) => {
-            s.change_config(&info).map_err(|e| format!("Atualizar o serviço: {e}"))?;
+            s.change_config(&info).map_err(|e| tr!("Atualizar o serviço: {e}", "Update the service: {e}"))?;
             s
         }
-        None => m.create_service(&info, access).map_err(|e| format!("Criar o serviço: {e}"))?,
+        None => m.create_service(&info, access).map_err(|e| tr!("Criar o serviço: {e}", "Create the service: {e}"))?,
     };
     let _ = s.set_description(DESCRIPTION);
-    s.start(&[] as &[&std::ffi::OsStr]).map_err(|e| format!("Iniciar o serviço: {e}"))
+    s.start(&[] as &[&std::ffi::OsStr]).map_err(|e| tr!("Iniciar o serviço: {e}", "Start the service: {e}"))
 }
 
 /// Stops and removes the service and its copy in Program Files. Needs an administrator.
 pub fn uninstall() -> Result<(), String> {
     let m = manager(ServiceManagerAccess::CONNECT)?;
-    let s = m.open_service(SERVICE, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE).map_err(|e| format!("Abrir o serviço: {e}"))?;
+    let s = m.open_service(SERVICE, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE).map_err(|e| tr!("Abrir o serviço: {e}", "Open the service: {e}"))?;
     stop(&s);
-    s.delete().map_err(|e| format!("Remover o serviço: {e}"))?;
+    s.delete().map_err(|e| tr!("Remover o serviço: {e}", "Remove the service: {e}"))?;
     drop(s);
     let exe = installed_exe()?;
     let _ = std::fs::remove_file(&exe);
@@ -141,12 +142,14 @@ pub fn install_elevated() -> Result<(), String> {
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
     use windows::core::{HSTRING, PCWSTR, w};
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // The elevated installer is a process of its own: it's told the app's language.
+    let english = if openexplorer_i18n::english() { format!(" {}", crate::cli::ENGLISH) } else { String::new() };
     let report = std::env::temp_dir().join(format!("openexplorer-index-install-{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&report);
-    let (file, params) = (HSTRING::from(exe.as_os_str()), HSTRING::from(format!("{} install --report \"{}\"", crate::cli::ARG, report.display())));
+    let (file, params) = (HSTRING::from(exe.as_os_str()), HSTRING::from(format!("{} install --report \"{}\"{english}", crate::cli::ARG, report.display())));
     let mut info = SHELLEXECUTEINFOW { cbSize: size_of::<SHELLEXECUTEINFOW>() as u32, fMask: SEE_MASK_NOCLOSEPROCESS, lpVerb: w!("runas"), lpFile: PCWSTR(file.as_ptr()), lpParameters: PCWSTR(params.as_ptr()), nShow: SW_HIDE.0, ..Default::default() };
     if let Err(e) = unsafe { ShellExecuteExW(&mut info) } {
-        return Err(if e.code() == ERROR_CANCELLED.to_hresult() { "A instalação foi cancelada.".into() } else { format!("Pedir permissão de administrador: {e}") });
+        return Err(if e.code() == ERROR_CANCELLED.to_hresult() { t("A instalação foi cancelada.", "The installation was cancelled.").into() } else { tr!("Pedir permissão de administrador: {e}", "Asking for administrator permission: {e}") });
     }
     let mut code = 1u32;
     unsafe {
@@ -157,7 +160,7 @@ pub fn install_elevated() -> Result<(), String> {
     }
     let said = std::fs::read_to_string(&report).unwrap_or_default();
     let _ = std::fs::remove_file(&report);
-    if code == 0 { Ok(()) } else { Err(if said.is_empty() { format!("A instalação falhou (código {code}).") } else { said }) }
+    if code == 0 { Ok(()) } else { Err(if said.is_empty() { tr!("A instalação falhou (código {code}).", "The installation failed (code {code}).") } else { said }) }
 }
 
 /// Indexes every NTFS volume of a fixed disk, each on its own thread, and serves searches.

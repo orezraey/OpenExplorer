@@ -4,6 +4,7 @@
 
 use std::io::{BufRead, Write};
 
+use openexplorer_i18n::{t, tr};
 use serde::{Deserialize, Serialize};
 
 use crate::tree::Row;
@@ -72,9 +73,9 @@ pub fn read_request(r: &mut impl BufRead) -> Result<Request, String> {
     let mut line = Vec::new();
     std::io::Read::take(&mut *r, MAX_REQUEST as u64 + 1).read_until(b'\n', &mut line).map_err(|e| e.to_string())?;
     if line.len() > MAX_REQUEST {
-        return Err("Pedido grande demais.".into());
+        return Err(t("Pedido grande demais.", "Request too large.").into());
     }
-    serde_json::from_slice(&line).map_err(|e| format!("Pedido inválido: {e}"))
+    serde_json::from_slice(&line).map_err(|e| tr!("Pedido inválido: {e}", "Invalid request: {e}"))
 }
 
 pub fn write_answer(w: &mut impl Write, a: &Answer) -> std::io::Result<()> {
@@ -87,7 +88,7 @@ pub fn write_answer(w: &mut impl Write, a: &Answer) -> std::io::Result<()> {
 }
 
 pub fn read_answer(r: &mut impl BufRead) -> Result<Answer, String> {
-    let bad = |e: &dyn std::fmt::Display| format!("Resposta inválida do serviço: {e}");
+    let bad = |e: &dyn std::fmt::Display| tr!("Resposta inválida do serviço: {e}", "Invalid answer from the service: {e}");
     let mut line = String::new();
     r.read_line(&mut line).map_err(|e| bad(&e))?;
     let header: Header = serde_json::from_str(&line).map_err(|e| bad(&e))?;
@@ -95,7 +96,7 @@ pub fn read_answer(r: &mut impl BufRead) -> Result<Answer, String> {
     for _ in 0..header.rows {
         line.clear();
         if r.read_line(&mut line).map_err(|e| bad(&e))? == 0 {
-            return Err(bad(&"terminou antes da hora"));
+            return Err(bad(&t("terminou antes da hora", "it ended too soon")));
         }
         let mut f = line.trim_end_matches(['\r', '\n']).splitn(4, '\t');
         let (Some(kind), Some(size), Some(modified), Some(path)) = (f.next(), f.next(), f.next(), f.next()) else { return Err(bad(&line)) };

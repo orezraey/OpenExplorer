@@ -13,6 +13,10 @@
 /// The first argument that makes the app's executable the search service.
 pub const ARG: &str = "index";
 
+/// An argument that has a command speak English rather than Portuguese.
+#[cfg(windows)]
+pub(crate) const ENGLISH: &str = "--english";
+
 /// Attaches to the parent terminal in release builds (`windows_subsystem = "windows"`) when
 /// neither stdout nor stderr is already redirected, so CLI commands like `openexplorer index
 /// console --walk` and `openexplorer index uninstall` print to PowerShell / cmd.
@@ -45,16 +49,28 @@ pub fn run(args: &[String]) -> i32 {
     if sub != Some("service") {
         attach_parent_console();
     }
+    // The installer the app runs as an administrator speaks the app's language (see
+    // `service::install_elevated`).
+    // The service itself runs on its own and follows the system's language.
+    if args.iter().any(|a| a == ENGLISH) {
+        openexplorer_i18n::set_english(true);
+    } else if matches!(sub, None | Some("service" | "console")) {
+        openexplorer_i18n::set_english(openexplorer_i18n::system_english());
+    }
     if matches!(sub, Some("help" | "--help" | "-h")) {
-        println!("Uso: openexplorer index install | uninstall | console [--walk]");
+        println!("{}", openexplorer_i18n::t("Uso: openexplorer index install | uninstall | console [--walk]", "Usage: openexplorer index install | uninstall | console [--walk]"));
         return 0;
     }
     let result = match sub {
-        None | Some("service") => service::dispatch().map_err(|e| format!("{e}\nUso: openexplorer index install | uninstall | console [--walk]")),
+        None | Some("service") => service::dispatch()
+            .map_err(|e| openexplorer_i18n::tr!("{e}\nUso: openexplorer index install | uninstall | console [--walk]", "{e}\nUsage: openexplorer index install | uninstall | console [--walk]")),
         Some("install") => service::install(),
         Some("uninstall") => service::uninstall(),
         Some("console") => service::run(args.iter().any(|a| a == "--walk")),
-        Some(other) => Err(format!("Comando desconhecido: {other}\nUso: openexplorer index install | uninstall | console [--walk]")),
+        Some(other) => Err(openexplorer_i18n::tr!(
+            "Comando desconhecido: {other}\nUso: openexplorer index install | uninstall | console [--walk]",
+            "Unknown command: {other}\nUsage: openexplorer index install | uninstall | console [--walk]"
+        )),
     };
     let Err(e) = result else { return 0 };
     // Run elevated, this must not write through a link someone left at that path: only a new
@@ -75,14 +91,21 @@ pub fn run(args: &[String]) -> i32 {
 pub fn run(args: &[String]) -> i32 {
     use crate::unix;
     if matches!(args.first().map(String::as_str), Some("help" | "--help" | "-h")) {
-        println!("Uso: openexplorer index [serve] | install | uninstall");
+        println!("{}", openexplorer_i18n::t("Uso: openexplorer index [serve] | install | uninstall", "Usage: openexplorer index [serve] | install | uninstall"));
         return 0;
+    }
+    // The service runs on its own and follows the system's language.
+    if matches!(args.first().map(String::as_str), None | Some("serve" | "console")) {
+        openexplorer_i18n::set_english(openexplorer_i18n::system_english());
     }
     let result = match args.first().map(String::as_str) {
         None | Some("serve" | "console") => unix::run(),
         Some("install") => unix::install(),
         Some("uninstall") => unix::uninstall(),
-        Some(other) => Err(format!("Comando desconhecido: {other}\nUso: openexplorer index [serve] | install | uninstall")),
+        Some(other) => Err(openexplorer_i18n::tr!(
+            "Comando desconhecido: {other}\nUso: openexplorer index [serve] | install | uninstall",
+            "Unknown command: {other}\nUsage: openexplorer index [serve] | install | uninstall"
+        )),
     };
     let Err(e) = result else { return 0 };
     eprintln!("{e}");
@@ -91,6 +114,6 @@ pub fn run(args: &[String]) -> i32 {
 
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn run(_: &[String]) -> i32 {
-    eprintln!("O serviço de pesquisa só existe no Windows e no Linux.");
+    eprintln!("{}", openexplorer_i18n::t("O serviço de pesquisa só existe no Windows e no Linux.", "The search service exists only on Windows and Linux."));
     1
 }

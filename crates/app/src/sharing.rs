@@ -5,6 +5,7 @@
 
 use openexplorer_gdrive::share::valid_email;
 use openexplorer_gdrive::{Access, Drive, Role, Sharing};
+use openexplorer_i18n::{t, tr};
 use rune::{El, Tx, col, el, row, text};
 use rune_kit::{Button, ButtonVariant, Checkbox, Dialog as Modal, Kit, SegmentedControl, Switch};
 
@@ -72,7 +73,7 @@ fn target(s: &mut State, p: usize) -> Option<(String, Entry)> {
     let loc = &s.panes[p].loc;
     let ([item], Location::Drive { email, space, path }) = (items.as_slice(), loc) else {
         if items.len() > 1 {
-            s.status = "Selecione um item só para compartilhar.".into();
+            s.status = t("Selecione um item só para compartilhar.", "Select just one item to share.").into();
         }
         return None;
     };
@@ -80,11 +81,11 @@ fn target(s: &mut State, p: usize) -> Option<(String, Entry)> {
     // shared drives themselves and what's in Lixeira.
     match space {
         Space::SharedDrives if path.is_empty() => {
-            s.status = "Os drives compartilhados são compartilhados no site do Google Drive.".into();
+            s.status = t("Os drives compartilhados são compartilhados no site do Google Drive.", "Shared drives are shared on the Google Drive website.").into();
             None
         }
         Space::Trash => {
-            s.status = "Restaure o item da Lixeira antes de compartilhar.".into();
+            s.status = t("Restaure o item da Lixeira antes de compartilhar.", "Restore the item from the Trash before sharing it.").into();
             None
         }
         _ => Some((email.clone(), item.clone())),
@@ -99,8 +100,8 @@ fn target(s: &mut State, p: usize) -> Option<(String, Entry)> {
 pub fn copy_link(s: &mut State, p: usize, _: &mut Tx) {
     let Some((email, item)) = target(s, p) else { return };
     let (id, account) = (item.id.clone(), email.clone());
-    s.status = format!("Buscando o link de \"{}\"…", item.name);
-    drive_task(s, &email, "compartilhar", move |d| d.sharing(&id), move |result| Msg::Link(LinkAnswer { email: account, item, opened: false, result }));
+    s.status = tr!("Buscando o link de \"{}\"…", "Getting the link for \"{}\"…", item.name);
+    drive_task(s, &email, t("compartilhar", "share"), move |d| d.sharing(&id), move |result| Msg::Link(LinkAnswer { email: account, item, opened: false, result }));
 }
 
 /// An open item's link goes to the clipboard; a private one first asks (when this account may
@@ -114,15 +115,15 @@ pub fn link_answer(s: &mut State, a: LinkAnswer, tx: &mut Tx) {
         }
     };
     let Some(link) = sharing.link.clone() else {
-        s.status = format!("O Google não informou o link de \"{}\".", a.item.name);
+        s.status = tr!("O Google não informou o link de \"{}\".", "Google didn't give the link for \"{}\".", a.item.name);
         return;
     };
     if sharing.anyone().is_some() {
         tx.copy(link);
-        s.status = format!("Link copiado: qualquer pessoa com o link pode abrir \"{}\".", a.item.name);
+        s.status = tr!("Link copiado: qualquer pessoa com o link pode abrir \"{}\".", "Link copied: anyone with the link can open \"{}\".", a.item.name);
     } else if a.opened || !sharing.can_share {
         tx.copy(link);
-        s.status = "Link copiado. Só quem já tem acesso consegue abrir (esta conta não pode mudar o compartilhamento).".into();
+        s.status = t("Link copiado. Só quem já tem acesso consegue abrir (esta conta não pode mudar o compartilhamento).", "Link copied. Only people who already have access can open it (this account can't change sharing).").into();
     } else {
         s.dialog = Some(Dialog::MakePublic(Box::new(MakePublic { email: a.email, item: a.item, link: Some(link) })));
     }
@@ -133,8 +134,8 @@ pub fn make_public(s: &mut State) {
     let Some(Dialog::MakePublic(m)) = s.dialog.take() else { return };
     let MakePublic { email, item, .. } = *m;
     let (id, account) = (item.id.clone(), email.clone());
-    s.status = format!("Liberando o link de \"{}\"…", item.name);
-    drive_task(s, &email, "compartilhar", move |d| d.set_link_access(&id, true).and_then(|_| d.sharing(&id)), move |result| Msg::Link(LinkAnswer { email: account, item, opened: true, result }));
+    s.status = tr!("Liberando o link de \"{}\"…", "Turning on the link for \"{}\"…", item.name);
+    drive_task(s, &email, t("compartilhar", "share"), move |d| d.set_link_access(&id, true).and_then(|_| d.sharing(&id)), move |result| Msg::Link(LinkAnswer { email: account, item, opened: true, result }));
 }
 
 /// Copiar sem mudar o acesso.
@@ -142,7 +143,7 @@ pub fn copy_as_is(s: &mut State, tx: &mut Tx) {
     let Some(Dialog::MakePublic(m)) = s.dialog.take() else { return };
     if let Some(link) = m.link {
         tx.copy(link);
-        s.status = "Link copiado. Só quem já tem acesso consegue abrir.".into();
+        s.status = t("Link copiado. Só quem já tem acesso consegue abrir.", "Link copied. Only people who already have access can open it.").into();
     }
 }
 
@@ -154,7 +155,7 @@ pub fn ask_share(s: &mut State, p: usize, _: &mut Tx) {
     s.name_edit = rune::TextEdit::new("");
     let id = item.id.clone();
     let key = item.id.clone();
-    drive_task(s, &email, "compartilhar", move |d| d.sharing(&id), move |r| Msg::Share { item: key, update: Update::Loaded(r) });
+    drive_task(s, &email, t("compartilhar", "share"), move |d| d.sharing(&id), move |r| Msg::Share { item: key, update: Update::Loaded(r) });
     s.dialog = Some(Dialog::Share(Box::new(Share { email, item, sharing: None, busy: false, error: None, role: Role::Reader, notify: true })));
 }
 
@@ -193,7 +194,7 @@ fn change(s: &mut State, added: bool, work: impl FnOnce(&Drive, &str) -> Result<
     sh.error = None;
     let (email, id) = (sh.email.clone(), sh.item.id.clone());
     let key = id.clone();
-    drive_task(s, &email, "compartilhar", move |d| work(d, &id).and_then(|_| d.sharing(&id)), move |result| Msg::Share { item: key, update: Update::Saved { result, added } });
+    drive_task(s, &email, t("compartilhar", "share"), move |d| work(d, &id).and_then(|_| d.sharing(&id)), move |result| Msg::Share { item: key, update: Update::Saved { result, added } });
 }
 
 /// Compartilhar: gives the e-mail typed the role picked.
@@ -201,7 +202,7 @@ pub fn add_person(s: &mut State) {
     let typed = s.name_edit.text.trim().to_string();
     let Some(sh) = share_mut(s) else { return };
     if !valid_email(&typed) {
-        sh.error = Some(if typed.is_empty() { "Digite o e-mail de uma pessoa ou de um grupo.".into() } else { format!("E-mail inválido: {typed}") });
+        sh.error = Some(if typed.is_empty() { t("Digite o e-mail de uma pessoa ou de um grupo.", "Type the email of a person or a group.").into() } else { tr!("E-mail inválido: {typed}", "Invalid email: {typed}") });
         return;
     }
     let (role, notify) = (sh.role, sh.notify);
@@ -246,13 +247,13 @@ fn roles(k: &Kit, key: String, current: Role, enabled: bool, pick: impl Fn(&mut 
 fn person_row(k: &Kit, sh: &Share, p: &openexplorer_gdrive::Permission) -> El {
     let me = p.email.as_deref().is_some_and(|e| e.eq_ignore_ascii_case(&sh.email));
     let (name, sub) = match (p.access, &p.name, &p.email) {
-        (Access::Domain, ..) => (p.who(), "Domínio".to_string()),
-        (Access::Group, n, e) => (n.clone().or_else(|| e.clone()).unwrap_or_default(), format!("Grupo · {}", e.as_deref().unwrap_or(""))),
+        (Access::Domain, ..) => (p.who(), t("Domínio", "Domain").to_string()),
+        (Access::Group, n, e) => (n.clone().or_else(|| e.clone()).unwrap_or_default(), tr!("Grupo · {}", "Group · {}", e.as_deref().unwrap_or(""))),
         (_, Some(n), Some(e)) if n != e => (n.clone(), e.clone()),
         _ => (p.who(), String::new()),
     };
-    let name = if me { format!("{name} (você)") } else { name };
-    let sub = if p.deleted { "Conta excluída".to_string() } else { sub };
+    let name = if me { tr!("{name} (você)", "{name} (you)") } else { name };
+    let sub = if p.deleted { t("Conta excluída", "Deleted account").to_string() } else { sub };
     let mut who = col().w(0.0).grow(1.0).min_w(0.0).gap(1.0).child(text(name).font(k.ty.text_small).color(k.c.text_base).truncate().min_w(0.0));
     if !sub.is_empty() {
         who = who.child(text(sub).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().min_w(0.0));
@@ -262,7 +263,7 @@ fn person_row(k: &Kit, sh: &Share, p: &openexplorer_gdrive::Permission) -> El {
     if fixed {
         let mut label = p.role.label().to_string();
         if p.inherited {
-            label.push_str(" · herdado");
+            label.push_str(t(" · herdado", " · inherited"));
         }
         line = line.child(text(label).font(k.ty.text_small).color(k.c.text_muted));
     } else {
@@ -270,7 +271,7 @@ fn person_row(k: &Kit, sh: &Share, p: &openexplorer_gdrive::Permission) -> El {
         let id = p.id.clone();
         line = line.child(roles(k, format!("role-{}", p.id), p.role, enabled, move |s, r| set_role(s, id.clone(), r)));
         let id = p.id.clone();
-        line = line.child(Button::new("Remover").variant(ButtonVariant::GhostMuted).disabled(!enabled).on_press(move |s: &mut State| remove(s, id.clone())).build(k).key(format!("remove-{}", p.id)));
+        line = line.child(Button::new(t("Remover", "Remove")).variant(ButtonVariant::GhostMuted).disabled(!enabled).on_press(move |s: &mut State| remove(s, id.clone())).build(k).key(format!("remove-{}", p.id)));
     }
     line
 }
@@ -284,8 +285,8 @@ pub fn share_dialog(s: &State, k: &Kit, sh: &Share, layer: &mut Vec<El>) {
     let field = rune::text_input(&s.name_edit, k.ty.ui_compact)
         .single_line()
         .key("share-email")
-        .label("E-mail")
-        .placeholder("E-mail de uma pessoa ou grupo", k.c.text_muted)
+        .label(t("E-mail", "Email"))
+        .placeholder(t("E-mail de uma pessoa ou grupo", "Email of a person or group"), k.c.text_muted)
         .grow(1.0)
         .shrink()
         .min_w(0.0)
@@ -301,7 +302,7 @@ pub fn share_dialog(s: &State, k: &Kit, sh: &Share, layer: &mut Vec<El>) {
         .gap(8.0)
         .center_y()
         .child(input)
-        .child(Button::new("Compartilhar").variant(ButtonVariant::Submit).disabled(!can).on_press(add_person).build(k).key("share-add"));
+        .child(Button::new(t("Compartilhar", "Share")).variant(ButtonVariant::Submit).disabled(!can).on_press(add_person).build(k).key("share-add"));
     let options = row()
         .key("add-options")
         .w_full()
@@ -314,7 +315,7 @@ pub fn share_dialog(s: &State, k: &Kit, sh: &Share, layer: &mut Vec<El>) {
         }))
         .child(
             Checkbox::new(sh.notify)
-                .label("Avisar por e-mail")
+                .label(t("Avisar por e-mail", "Notify by email"))
                 .on_toggle(|s: &mut State| {
                     if let Some(sh) = share_mut(s) {
                         sh.notify = !sh.notify;
@@ -326,13 +327,13 @@ pub fn share_dialog(s: &State, k: &Kit, sh: &Share, layer: &mut Vec<El>) {
     let mut body = col().key("content").w_full().px(16.0).pb(16.0).gap(10.0).child(add).child(options);
 
     match &sh.sharing {
-        None => body = body.child(muted("Carregando quem tem acesso…")),
+        None => body = body.child(muted(t("Carregando quem tem acesso…", "Loading who has access…"))),
         Some(Err(e)) => body = body.child(text(e.clone()).font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0)),
         Some(Ok(sharing)) => {
             if !sharing.can_share {
-                body = body.child(muted("Esta conta não pode mudar o compartilhamento deste item."));
+                body = body.child(muted(t("Esta conta não pode mudar o compartilhamento deste item.", "This account can't change this item's sharing.")));
             }
-            body = body.child(el().w_full().h(1.0).fill(k.c.border_weak)).child(heading("Pessoas com acesso"));
+            body = body.child(el().w_full().h(1.0).fill(k.c.border_weak)).child(heading(t("Pessoas com acesso", "People with access")));
             let mut people = col().key("people").w_full();
             for p in sharing.permissions.iter().filter(|p| p.access != Access::Anyone) {
                 people = people.child(person_row(k, sh, p));
@@ -343,37 +344,37 @@ pub fn share_dialog(s: &State, k: &Kit, sh: &Share, layer: &mut Vec<El>) {
             let anyone = sharing.anyone();
             let open = anyone.is_some();
             let note = match anyone {
-                Some(p) => format!("Pode abrir sem fazer login, como {}.", p.role.label().to_lowercase()),
-                None => "Desativado: só as pessoas acima podem abrir.".into(),
+                Some(p) => tr!("Pode abrir sem fazer login, como {}.", "Can open it without signing in, as {}.", p.role.label().to_lowercase()),
+                None => t("Desativado: só as pessoas acima podem abrir.", "Off: only the people above can open it.").into(),
             };
-            let switch = Switch::new(open).label("Qualquer pessoa com o link").hide_label().disabled(!can).on_toggle(move |s: &mut State| set_link(s, !open)).build(k).key("link-switch");
+            let switch = Switch::new(open).label(t("Qualquer pessoa com o link", "Anyone with the link")).hide_label().disabled(!can).on_toggle(move |s: &mut State| set_link(s, !open)).build(k).key("link-switch");
             let words = col()
                 .w(0.0)
                 .grow(1.0)
                 .min_w(0.0)
                 .gap(1.0)
-                .child(text("Qualquer pessoa com o link").font(k.ty.text_small).color(k.c.text_base))
+                .child(text(t("Qualquer pessoa com o link", "Anyone with the link")).font(k.ty.text_small).color(k.c.text_base))
                 .child(text(note).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().min_w(0.0));
             let mut link_row = row().key("link").w_full().gap(10.0).center_y().child(switch).child(words);
             if let Some(url) = sharing.link.clone() {
                 link_row = link_row.child(
-                    Button::new("Copiar link")
+                    Button::new(t("Copiar link", "Copy link"))
                         .variant(ButtonVariant::Neutral)
                         .on_press_tx(move |s: &mut State, tx: &mut Tx| {
                             tx.copy(url.clone());
-                            s.status = "Link copiado.".into();
+                            s.status = t("Link copiado.", "Link copied.").into();
                         })
                         .build(k)
                         .key("copy-link"),
                 );
             }
-            body = body.child(el().w_full().h(1.0).fill(k.c.border_weak)).child(heading("Acesso pelo link")).child(link_row);
+            body = body.child(el().w_full().h(1.0).fill(k.c.border_weak)).child(heading(t("Acesso pelo link", "Link access"))).child(link_row);
         }
     }
     if let Some(e) = &sh.error {
         body = body.child(text(e.clone()).font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0).key("share-error"));
     }
-    let status = if sh.busy { "Salvando…" } else { "" };
+    let status = if sh.busy { t("Salvando…", "Saving…") } else { "" };
     body = body.child(
         row()
             .key("actions")
@@ -382,14 +383,15 @@ pub fn share_dialog(s: &State, k: &Kit, sh: &Share, layer: &mut Vec<El>) {
             .gap(8.0)
             .center_y()
             .child(text(status).font(k.ty.text_small).color(k.c.text_muted).grow(1.0))
-            .child(Button::new("Concluído").variant(ButtonVariant::Submit).on_press(close).build(k)),
+            .child(Button::new(t("Concluído", "Done")).variant(ButtonVariant::Submit).on_press(close).build(k)),
     );
-    Modal::new("share", format!("Compartilhar \"{}\"", sh.item.name)).open(true).child(body).width(600.0).fit().on_close(close).build(k, layer);
+    Modal::new("share", tr!("Compartilhar \"{}\"", "Share \"{}\"", sh.item.name)).open(true).child(body).width(600.0).fit().on_close(close).build(k, layer);
 }
 
 pub fn public_dialog(k: &Kit, m: &MakePublic, layer: &mut Vec<El>) {
-    let note = format!(
+    let note = tr!(
         "Só quem já tem acesso consegue abrir \"{}\" pelo link. Para copiar um link que qualquer pessoa possa abrir, o item passa a ser visível para qualquer pessoa com o link (somente leitura). Dá para desfazer em Compartilhar…",
+        "Only people who already have access can open \"{}\" from the link. To copy a link anyone can open, the item becomes visible to anyone with the link (view only). You can undo this in Share…",
         m.item.name
     );
     let body = col()
@@ -406,11 +408,11 @@ pub fn public_dialog(k: &Kit, m: &MakePublic, layer: &mut Vec<El>) {
                 .pt(8.0)
                 .gap(8.0)
                 .justify_end()
-                .child(Button::new("Cancelar").variant(ButtonVariant::Neutral).on_press(close).build(k))
-                .child(Button::new("Copiar sem mudar").variant(ButtonVariant::Neutral).on_press_tx(|s: &mut State, tx: &mut Tx| copy_as_is(s, tx)).build(k))
-                .child(Button::new("Permitir e copiar").variant(ButtonVariant::Submit).on_press(make_public).build(k)),
+                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k))
+                .child(Button::new(t("Copiar sem mudar", "Copy without changing")).variant(ButtonVariant::Neutral).on_press_tx(|s: &mut State, tx: &mut Tx| copy_as_is(s, tx)).build(k))
+                .child(Button::new(t("Permitir e copiar", "Allow and copy")).variant(ButtonVariant::Submit).on_press(make_public).build(k)),
         );
-    Modal::new("make-public", "Liberar o link?").open(true).child(body).width(480.0).fit().on_close(close).build(k, layer);
+    Modal::new("make-public", t("Liberar o link?", "Turn on the link?")).open(true).child(body).width(480.0).fit().on_close(close).build(k, layer);
 }
 
 #[cfg(test)]

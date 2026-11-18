@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use openexplorer_gdrive::{Drive, DriveFile};
+use openexplorer_i18n::{t, tr};
 use openexplorer_remote::{Conn, store};
 
 use crate::actions::drive_folder;
@@ -32,7 +33,7 @@ struct PipeIn(SyncSender<Result<Vec<u8>, String>>);
 
 impl Write for PipeIn {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.send(Ok(buf.to_vec())).map_err(|_| io::Error::other("o envio parou"))?;
+        self.0.send(Ok(buf.to_vec())).map_err(|_| io::Error::other(t("o envio parou", "the transfer stopped")))?;
         Ok(buf.len())
     }
 
@@ -125,7 +126,7 @@ fn stream(a: &mut dyn Conn, from: &str, b: &mut dyn Conn, to: &str, len: u64, p:
         });
         // The upload stopping closes the pipe, which stops the download.
         drop(out);
-        let got = reading.join().unwrap_or_else(|_| Err("A leitura do servidor de origem parou.".into()));
+        let got = reading.join().unwrap_or_else(|_| Err(t("A leitura do servidor de origem parou.", "Reading from the source server stopped.").into()));
         match (got, sent) {
             _ if p.cancelled() => Err(CANCELLED.into()),
             (Err(e), _) => Err(e),
@@ -138,7 +139,7 @@ fn stream(a: &mut dyn Conn, from: &str, b: &mut dyn Conn, to: &str, len: u64, p:
 /// A file within a server that allows one connection: down to a temporary file, then up.
 fn relay(c: &mut dyn Conn, from: &str, to: &str, len: u64, p: &Progress) -> Result<(), String> {
     let tmp = Temp::new()?;
-    let mut file = std::fs::File::create(&tmp.0).map_err(|e| format!("Não consegui criar o arquivo temporário: {e}"))?;
+    let mut file = std::fs::File::create(&tmp.0).map_err(|e| tr!("Não consegui criar o arquivo temporário: {e}", "Couldn't create the temporary file: {e}"))?;
     // The bar counts both ways (its size is twice the file's): down, then up.
     let mut last = 0;
     c.download(from, &mut file, &mut |n| {
@@ -148,7 +149,7 @@ fn relay(c: &mut dyn Conn, from: &str, to: &str, len: u64, p: &Progress) -> Resu
     })
     .map_err(|e| if p.cancelled() { CANCELLED.into() } else { e })?;
     drop(file);
-    let mut file = std::fs::File::open(&tmp.0).map_err(|e| format!("Não consegui ler o arquivo temporário: {e}"))?;
+    let mut file = std::fs::File::open(&tmp.0).map_err(|e| tr!("Não consegui ler o arquivo temporário: {e}", "Couldn't read the temporary file: {e}"))?;
     let mut last = 0;
     c.upload(to, &mut file, len, &mut |n| {
         p.add_bytes(n - last);
@@ -167,7 +168,7 @@ fn copy_tree(ends: &mut Ends, from: &str, to: &str, is_dir: bool, len: u64, p: &
         return ends.file(from, to, len, p);
     }
     if depth > DEEPEST {
-        return Err(format!("{from}: pastas demais umas dentro das outras (um link que volta para cima?)."));
+        return Err(tr!("{from}: pastas demais umas dentro das outras (um link que volta para cima?).", "{from}: too many folders inside one another (a link that loops back up?)."));
     }
     ends.dst().mkdir(to)?;
     for it in ends.src().list(from)? {
@@ -186,7 +187,7 @@ pub fn between_servers(s: &mut State, from: &Location, items: Vec<Entry>, to: &L
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, items.iter().map(|e| (end(from, Some(&e.name)), end(to, None))));
     let pool = s.servers.pool.clone();
     background(s, move |emit| {
-        let result = catch_panic("copiar entre servidores", || {
+        let result = catch_panic(t("copiar entre servidores", "copy between servers"), || {
             let same = a.id == b.id;
             // A server allowing a single connection relays each file through the disk, which
             // the bar counts twice: down, then up.
@@ -203,7 +204,7 @@ pub fn between_servers(s: &mut State, from: &Location, items: Vec<Entry>, to: &L
             batch.run(|i, p| {
                 let (e, path) = (&items[i], &paths[i]);
                 if e.is_dir && same && (dir == *path || dir.starts_with(&format!("{path}/"))) {
-                    return Err(format!("Não dá para copiar a pasta \"{}\" para dentro dela mesma.", e.name));
+                    return Err(tr!("Não dá para copiar a pasta \"{}\" para dentro dela mesma.", "Can't copy the folder \"{}\" into itself.", e.name));
                 }
                 let name = free_name(&e.name, e.is_dir, &taken);
                 taken.insert(name.to_lowercase());
@@ -255,7 +256,7 @@ struct Temp(PathBuf);
 impl Temp {
     fn new() -> Result<Temp, String> {
         let dir = std::env::temp_dir().join("OpenExplorer-copiar");
-        std::fs::create_dir_all(&dir).map_err(|e| format!("Não consegui criar a pasta temporária: {e}"))?;
+        std::fs::create_dir_all(&dir).map_err(|e| tr!("Não consegui criar a pasta temporária: {e}", "Couldn't create the temporary folder: {e}"))?;
         // A number of its own for each, so jobs running at once never share one.
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -313,7 +314,7 @@ pub fn server_to_drive(s: &mut State, from: &Location, items: Vec<Entry>, to: &L
             })
         })
     };
-    drive_task(s, &email, "copiar para o Drive", work, move |result| Msg::Done { reload, result });
+    drive_task(s, &email, t("copiar para o Drive", "copy to Drive"), work, move |result| Msg::Done { reload, result });
 }
 
 /// A file or a folder and all it holds, from `path` on the server into Drive folder `parent`
@@ -325,7 +326,7 @@ fn up(c: &mut dyn Conn, d: &Drive, path: &str, is_dir: bool, parent: &str, name:
     }
     if is_dir {
         if depth > DEEPEST {
-            return Err(format!("{path}: pastas demais umas dentro das outras (um link que volta para cima?)."));
+            return Err(tr!("{path}: pastas demais umas dentro das outras (um link que volta para cima?).", "{path}: too many folders inside one another (a link that loops back up?)."));
         }
         let folder = d.create_folder(name, parent)?;
         let filled = c.list(path).and_then(|items| items.iter().try_for_each(|it| up(c, d, &child(path, &it.name), it.is_dir, &folder.id, &it.name, p, depth + 1)));
@@ -336,7 +337,7 @@ fn up(c: &mut dyn Conn, d: &Drive, path: &str, is_dir: bool, parent: &str, name:
         return filled;
     }
     let tmp = Temp::new()?;
-    let mut file = std::fs::File::create(&tmp.0).map_err(|e| format!("Não consegui criar o arquivo temporário: {e}"))?;
+    let mut file = std::fs::File::create(&tmp.0).map_err(|e| tr!("Não consegui criar o arquivo temporário: {e}", "Couldn't create the temporary file: {e}"))?;
     let mut last = 0;
     c.download(path, &mut file, &mut |n| {
         p.add_bytes(n - last);
@@ -382,7 +383,7 @@ pub fn drive_to_server(s: &mut State, from: &Location, items: Vec<Entry>, to: &L
                 taken.insert(name.to_lowercase());
                 let target = child(&dir, &name);
                 if !fetchable(f) {
-                    return Err(format!("\"{}\" é um item do Google que não vira arquivo (formulário, atalho para arquivo…): não dá para copiá-lo.", f.name));
+                    return Err(tr!("\"{}\" é um item do Google que não vira arquivo (formulário, atalho para arquivo…): não dá para copiá-lo.", "\"{}\" is a Google item that can't become a file (a form, a shortcut to a file…): it can't be copied.", f.name));
                 }
                 let left_out = match down(c, d, f, &target, shared.as_deref(), p, 0) {
                     Ok(n) => n,
@@ -394,13 +395,13 @@ pub fn drive_to_server(s: &mut State, from: &Location, items: Vec<Entry>, to: &L
                 match (cut, left_out) {
                     (true, 0) => d.trash(&f.id).map(|_| ()),
                     // Recortar keeps the original when something in it couldn't come.
-                    (true, n) => Err(format!("Copiado, mas {n} item(ns) do Google que não viram arquivo ficaram de fora; o original continua no Drive.")),
+                    (true, n) => Err(tr!("Copiado, mas {n} item(ns) do Google que não viram arquivo ficaram de fora; o original continua no Drive.", "Copied, but {n} Google item(s) that can't become files were left out; the original stays in Drive.")),
                     (false, _) => Ok(()),
                 }
             })
         })
     };
-    drive_task(s, &email, "copiar do Drive", work, move |result| Msg::Done { reload, result });
+    drive_task(s, &email, t("copiar do Drive", "copy from Drive"), work, move |result| Msg::Done { reload, result });
 }
 
 /// Whether a Drive item has bytes to copy: a folder, a file, or one of Google's formats that
@@ -417,7 +418,7 @@ fn down(c: &mut dyn Conn, d: &Drive, f: &DriveFile, target: &str, shared: Option
     }
     if f.is_dir {
         if depth > DEEPEST {
-            return Err(format!("{}: pastas demais umas dentro das outras.", f.name));
+            return Err(tr!("{}: pastas demais umas dentro das outras.", "{}: too many folders inside one another.", f.name));
         }
         c.mkdir(target)?;
         let folder = f.target.clone().unwrap_or_else(|| f.id.clone());
@@ -444,7 +445,7 @@ fn down(c: &mut dyn Conn, d: &Drive, f: &DriveFile, target: &str, shared: Option
             !p.cancelled()
         })
         .map_err(|e| if p.cancelled() { CANCELLED.into() } else { e })?;
-    let mut file = std::fs::File::open(&tmp.0).map_err(|e| format!("Não consegui ler o arquivo temporário: {e}"))?;
+    let mut file = std::fs::File::open(&tmp.0).map_err(|e| tr!("Não consegui ler o arquivo temporário: {e}", "Couldn't read the temporary file: {e}"))?;
     let mut last = 0;
     c.upload(target, &mut file, len, &mut |n| {
         p.add_bytes(n - last);
@@ -483,7 +484,7 @@ impl crate::dragout::Files for ServerFiles {
     }
 
     fn open(&self, file: &crate::dragout::File, from: u64) -> Result<Box<dyn Read + Send>, String> {
-        let crate::dragout::Fetch::Server(path) = &file.fetch else { return Err("Arquivo de outro lugar.".into()) };
+        let crate::dragout::Fetch::Server(path) = &file.fetch else { return Err(t("Arquivo de outro lugar.", "File from another place.").into()) };
         let (tx, rx) = sync_channel(8);
         let (pool, server, path) = (self.pool.clone(), self.server.clone(), path.clone());
         std::thread::spawn(move || {

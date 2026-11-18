@@ -2,6 +2,7 @@
 //! and the live activity log. Kept in `settings.json` under the config folder, saved on each
 //! change.
 
+use openexplorer_i18n::t;
 use rune::{FontSmoothing, Icon, TextEdit};
 use serde::{Deserialize, Serialize};
 
@@ -22,8 +23,8 @@ impl Theme {
     pub fn label(self) -> &'static str {
         match self {
             Theme::Auto => "Auto",
-            Theme::Light => "Claro",
-            Theme::Dark => "Escuro",
+            Theme::Light => t("Claro", "Light"),
+            Theme::Dark => t("Escuro", "Dark"),
         }
     }
 
@@ -65,7 +66,7 @@ impl TextFont {
 
     pub fn label(self) -> &'static str {
         match self {
-            TextFont::System => "Sistema",
+            TextFont::System => t("Sistema", "System"),
             TextFont::Inter => "Inter",
         }
     }
@@ -104,7 +105,7 @@ impl TextRender {
 
     pub fn label(self) -> &'static str {
         match self {
-            TextRender::Smooth => "Suave (GPU)",
+            TextRender::Smooth => t("Suave (GPU)", "Smooth (GPU)"),
             TextRender::DirectWrite => "DirectWrite",
             TextRender::ClearType => "ClearType",
         }
@@ -124,9 +125,48 @@ impl TextRender {
 /// Transfers at once: at least one, at most this many.
 pub const MAX_AT_ONCE: u8 = 10;
 
+/// The interface's language: the system's (Portuguese for a Portuguese Windows, English for any
+/// other) or one picked in Options.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Language {
+    Portuguese,
+    English,
+    #[default]
+    #[serde(other)]
+    Auto,
+}
+
+impl Language {
+    pub const ALL: [Language; 3] = [Language::Auto, Language::Portuguese, Language::English];
+
+    /// Its name in the options, each language in its own words.
+    pub fn label(self) -> &'static str {
+        match self {
+            Language::Auto => openexplorer_i18n::t("Automático", "Automatic"),
+            Language::Portuguese => "Português",
+            Language::English => "English",
+        }
+    }
+
+    /// Whether it shows the interface in English.
+    pub fn english(self) -> bool {
+        match self {
+            Language::Auto => openexplorer_i18n::system_english(),
+            Language::Portuguese => false,
+            Language::English => true,
+        }
+    }
+
+    /// Makes it the interface's language from now on.
+    pub fn apply(self) {
+        openexplorer_i18n::set_english(self.english());
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub language: Language,
     pub theme: Theme,
     pub font: TextFont,
     pub text_render: TextRender,
@@ -150,6 +190,7 @@ impl Default for Settings {
         // Four uploads at once: measured, one file tops out near 35 MB/s per connection to
         // Google, four together reached 55 MB/s.
         Settings {
+            language: Language::Auto,
             theme: Theme::Auto,
             font: TextFont::System,
             text_render: TextRender::Smooth,
@@ -200,8 +241,8 @@ impl OptionsTab {
 
     pub fn label(self) -> &'static str {
         match self {
-            OptionsTab::General => "Geral",
-            OptionsTab::Transfers => "Transferências",
+            OptionsTab::General => t("Geral", "General"),
+            OptionsTab::Transfers => t("Transferências", "Transfers"),
             OptionsTab::Logs => "Logs",
             OptionsTab::Experimental => "Experimental",
         }

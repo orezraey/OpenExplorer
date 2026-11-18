@@ -18,6 +18,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
+use openexplorer_i18n::tr;
+
 use crate::api::{Drive, DriveFile, FILE_FIELDS, RawFile, checked};
 use crate::{CANCELLED, Result};
 
@@ -68,7 +70,7 @@ fn rfc3339(t: SystemTime) -> Option<String> {
 }
 
 fn parse(body: &str, what: &str) -> Result<DriveFile> {
-    let raw: RawFile = serde_json::from_str(body).map_err(|e| format!("{what}: resposta inesperada: {e}"))?;
+    let raw: RawFile = serde_json::from_str(body).map_err(|e| tr!("{what}: resposta inesperada: {e}", "{what}: unexpected answer: {e}"))?;
     Ok(raw.into())
 }
 
@@ -92,7 +94,7 @@ struct Target {
 impl Drive {
     /// Uploads the file at `path` into folder `parent` as `name`.
     pub fn upload(&self, path: &Path, parent: &str, name: &str, sent: &mut dyn FnMut(u64) -> bool) -> Result<DriveFile> {
-        self.send_file(path, Dest::New { parent, name }, &format!("Enviar \"{name}\""), sent)
+        self.send_file(path, Dest::New { parent, name }, &tr!("Enviar \"{name}\"", "Upload \"{name}\""), sent)
     }
 
     /// Replaces the content of Drive file `id` with the file at `path`: Drive keeps it as a new
@@ -101,7 +103,7 @@ impl Drive {
     /// the same retries and resuming.
     pub fn upload_version(&self, id: &str, path: &Path, sent: &mut dyn FnMut(u64) -> bool) -> Result<DriveFile> {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        self.send_file(path, Dest::Version { id: checked(id)? }, &format!("Substituir \"{name}\""), sent)
+        self.send_file(path, Dest::Version { id: checked(id)? }, &tr!("Substituir \"{name}\"", "Replace \"{name}\""), sent)
     }
 
     fn send_file(&self, path: &Path, dest: Dest, what: &str, sent: &mut dyn FnMut(u64) -> bool) -> Result<DriveFile> {
@@ -178,7 +180,7 @@ impl Drive {
                         return Err(format!("{what}: HTTP {status}: {}", crate::google_reason(&text)));
                     }
                 }
-                Err(e) if attempt == RETRIES => return Err(format!("{what}: sem conexão com o Google: {e}")),
+                Err(e) if attempt == RETRIES => return Err(tr!("{what}: sem conexão com o Google: {e}", "{what}: no connection to Google: {e}")),
                 Err(_) => {}
             }
             backoff(attempt);
@@ -211,13 +213,13 @@ impl Drive {
                         return Err(format!("{what}: HTTP {status}: {}", crate::google_reason(&text)));
                     }
                 }
-                Err(e) if attempt == RETRIES => return Err(format!("{what}: sem conexão com o Google: {e}")),
+                Err(e) if attempt == RETRIES => return Err(tr!("{what}: sem conexão com o Google: {e}", "{what}: no connection to Google: {e}")),
                 Err(_) => {}
             }
             backoff(attempt);
         }
-        let session = session.ok_or_else(|| format!("{what}: o Google não abriu a sessão de envio."))?;
-        let expired = || format!("{what}: a sessão de envio expirou; tente de novo.");
+        let session = session.ok_or_else(|| tr!("{what}: o Google não abriu a sessão de envio.", "{what}: Google didn't open the upload session."))?;
+        let expired = || tr!("{what}: a sessão de envio expirou; tente de novo.", "{what}: the upload session expired; try again.");
         let mut offset = 0u64;
         let mut failures = 0;
         let mut file = File::open(path).map_err(|e| format!("{what}: {e}"))?;
@@ -270,7 +272,7 @@ impl Drive {
             if failed {
                 failures += 1;
                 if failures > RETRIES {
-                    return Err(format!("{what}: a conexão caiu várias vezes; tente de novo."));
+                    return Err(tr!("{what}: a conexão caiu várias vezes; tente de novo.", "{what}: the connection dropped several times; try again."));
                 }
                 backoff(failures - 1);
                 match self.kept_by_drive(&session, size) {

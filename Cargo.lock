@@ -3039,6 +3039,7 @@ dependencies = [
  "chrono",
  "md-5",
  "openexplorer-gdrive",
+ "openexplorer-i18n",
  "openexplorer-index",
  "openexplorer-remote",
  "rune",
@@ -3060,11 +3061,19 @@ dependencies = [
  "getrandom 0.3.4",
  "keyring",
  "mime_guess",
+ "openexplorer-i18n",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "ureq",
  "url",
+]
+
+[[package]]
+name = "openexplorer-i18n"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3074,6 +3083,7 @@ dependencies = [
  "libc",
  "memchr",
  "ntfs-reader",
+ "openexplorer-i18n",
  "serde",
  "serde_json",
  "windows",
@@ -3087,6 +3097,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "keyring",
+ "openexplorer-i18n",
  "percent-encoding",
  "quick-xml 0.38.4",
  "russh",

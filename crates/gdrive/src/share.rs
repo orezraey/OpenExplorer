@@ -1,6 +1,7 @@
 //! Who can reach a file: its permissions, and the link anyone can open.
 //! <https://developers.google.com/workspace/drive/api/reference/rest/v3/permissions>
 
+use openexplorer_i18n::{t, tr};
 use serde::Deserialize;
 
 use crate::api::checked;
@@ -37,16 +38,16 @@ impl Role {
         }
     }
 
-    /// As the Drive website names it in Portuguese.
+    /// As the Drive website names it.
     pub fn label(self) -> &'static str {
         match self {
-            Role::Owner => "Proprietário",
-            Role::Organizer => "Administrador",
-            Role::FileOrganizer => "Gerente de conteúdo",
-            Role::Writer => "Editor",
-            Role::Commenter => "Comentarista",
-            Role::Reader => "Leitor",
-            Role::Unknown => "Outro",
+            Role::Owner => t("Proprietário", "Owner"),
+            Role::Organizer => t("Administrador", "Manager"),
+            Role::FileOrganizer => t("Gerente de conteúdo", "Content manager"),
+            Role::Writer => t("Editor", "Editor"),
+            Role::Commenter => t("Comentarista", "Commenter"),
+            Role::Reader => t("Leitor", "Viewer"),
+            Role::Unknown => t("Outro", "Other"),
         }
     }
 }
@@ -84,13 +85,13 @@ impl Permission {
     /// link".
     pub fn who(&self) -> String {
         match self.access {
-            Access::Anyone => "Qualquer pessoa com o link".into(),
-            Access::Domain => format!("Qualquer pessoa em {}", self.domain.as_deref().unwrap_or("?")),
+            Access::Anyone => t("Qualquer pessoa com o link", "Anyone with the link").into(),
+            Access::Domain => tr!("Qualquer pessoa em {}", "Anyone in {}", self.domain.as_deref().unwrap_or("?")),
             _ => match (&self.name, &self.email) {
                 (Some(n), Some(e)) if n != e => format!("{n} <{e}>"),
                 (_, Some(e)) => e.clone(),
                 (Some(n), None) => n.clone(),
-                (None, None) => "(sem nome)".into(),
+                (None, None) => t("(sem nome)", "(no name)").into(),
             },
         }
     }
@@ -121,7 +122,7 @@ impl Sharing {
             .filter(|p| !p.email.as_deref().is_some_and(|e| e.eq_ignore_ascii_case(me)))
             .map(|p| format!("{} ({})", p.who(), p.role.label()))
             .collect();
-        if others.is_empty() { "Só você".into() } else { others.join(" · ") }
+        if others.is_empty() { t("Só você", "Only you").into() } else { others.join(" · ") }
     }
 
     /// Reads `files.get` (`webViewLink`, `capabilities.canShare`) and a `permissions.list` page.
@@ -148,7 +149,7 @@ impl Sharing {
             permission_details: Vec<Detail>,
         }
         let raw: Vec<Raw> = serde_json::from_value(permissions.get("permissions").cloned().unwrap_or_default())
-            .map_err(|e| format!("Compartilhamento: resposta inesperada: {e}"))?;
+            .map_err(|e| tr!("Compartilhamento: resposta inesperada: {e}", "Sharing: unexpected answer: {e}"))?;
         let mut list: Vec<Permission> = raw
             .into_iter()
             .map(|r| Permission {
@@ -177,11 +178,11 @@ impl Drive {
     /// Who can reach file `id`, its link, and whether this account can change that.
     pub fn sharing(&self, id: &str) -> Result<Sharing> {
         let path = format!("/files/{}", checked(id)?);
-        let file = self.call("GET", &path, &[("fields", "webViewLink,capabilities(canShare)"), ("supportsAllDrives", "true")], None, "Compartilhamento")?;
+        let file = self.call("GET", &path, &[("fields", "webViewLink,capabilities(canShare)"), ("supportsAllDrives", "true")], None, t("Compartilhamento", "Sharing"))?;
         let fields = "permissions(id,type,role,emailAddress,displayName,domain,deleted,permissionDetails(inherited))";
         // One page holds up to 100; a file shared with more than that is rare enough to show
         // the first hundred.
-        let perms = self.call("GET", &format!("{path}/permissions"), &[("fields", fields), ("pageSize", "100"), ("supportsAllDrives", "true")], None, "Compartilhamento")?;
+        let perms = self.call("GET", &format!("{path}/permissions"), &[("fields", fields), ("pageSize", "100"), ("supportsAllDrives", "true")], None, t("Compartilhamento", "Sharing"))?;
         Sharing::parse(&file, &perms)
     }
 
@@ -190,23 +191,23 @@ impl Drive {
     pub fn share_with(&self, id: &str, email: &str, role: Role, notify: bool) -> Result<()> {
         let email = email.trim();
         if !valid_email(email) {
-            return Err(format!("E-mail inválido: {email}"));
+            return Err(tr!("E-mail inválido: {email}", "Invalid e-mail: {email}"));
         }
         let body = serde_json::json!({ "type": "user", "role": role.api(), "emailAddress": email });
         let notify = if notify { "true" } else { "false" };
-        self.call("POST", &format!("/files/{}/permissions", checked(id)?), &[("sendNotificationEmail", notify), ("supportsAllDrives", "true"), ("fields", "id")], Some(&body), "Compartilhar")?;
+        self.call("POST", &format!("/files/{}/permissions", checked(id)?), &[("sendNotificationEmail", notify), ("supportsAllDrives", "true"), ("fields", "id")], Some(&body), t("Compartilhar", "Share"))?;
         Ok(())
     }
 
     pub fn set_role(&self, id: &str, permission: &str, role: Role) -> Result<()> {
         let path = format!("/files/{}/permissions/{}", checked(id)?, checked(permission)?);
-        self.call("PATCH", &path, &[("supportsAllDrives", "true"), ("fields", "id")], Some(&serde_json::json!({ "role": role.api() })), "Mudar o acesso")?;
+        self.call("PATCH", &path, &[("supportsAllDrives", "true"), ("fields", "id")], Some(&serde_json::json!({ "role": role.api() })), t("Mudar o acesso", "Change access"))?;
         Ok(())
     }
 
     pub fn unshare(&self, id: &str, permission: &str) -> Result<()> {
         let path = format!("/files/{}/permissions/{}", checked(id)?, checked(permission)?);
-        self.call("DELETE", &path, &[("supportsAllDrives", "true")], None, "Remover o acesso")?;
+        self.call("DELETE", &path, &[("supportsAllDrives", "true")], None, t("Remover o acesso", "Remove access"))?;
         Ok(())
     }
 
@@ -215,7 +216,7 @@ impl Drive {
     pub fn set_link_access(&self, id: &str, on: bool) -> Result<()> {
         if on {
             let body = serde_json::json!({ "type": "anyone", "role": "reader", "allowFileDiscovery": false });
-            self.call("POST", &format!("/files/{}/permissions", checked(id)?), &[("supportsAllDrives", "true"), ("fields", "id")], Some(&body), "Ativar o link")?;
+            self.call("POST", &format!("/files/{}/permissions", checked(id)?), &[("supportsAllDrives", "true"), ("fields", "id")], Some(&body), t("Ativar o link", "Turn on the link"))?;
             return Ok(());
         }
         let current = self.sharing(id)?;

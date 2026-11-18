@@ -131,7 +131,7 @@ fn shared_folders(server: &str) -> std::io::Result<Vec<String>> {
     if code != 0 {
         // The network's own codes (NERR_*, 2100–2999) have no text among Windows' messages.
         return Err(match code {
-            2100..=2999 => std::io::Error::other(format!("o computador não entregou a lista de pastas compartilhadas (erro de rede {code})")),
+            2100..=2999 => std::io::Error::other(openexplorer_i18n::tr!("o computador não entregou a lista de pastas compartilhadas (erro de rede {code})", "the computer didn't send its list of shared folders (network error {code})")),
             _ => std::io::Error::from_raw_os_error(code as i32),
         });
     }
