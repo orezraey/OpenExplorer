@@ -256,6 +256,11 @@ pub struct Pane {
     /// Counts moves to another location (not reloads), so an answer looked up for where the pane
     /// was (Mostrar na pasta, the address) is dropped once it moved on.
     pub moves: u64,
+    /// Where the cursor's item stood in the last listing that had it, and whether it was
+    /// selected: once a new listing lacks it (deleted, moved, renamed elsewhere), the cursor
+    /// goes to the item now there rather than pointing at nothing. Kept across a listing's
+    /// pages, since the item may be on one still to come.
+    pub cursor_was: Option<(usize, bool)>,
 }
 
 /// How a pane orders entries: folders first, as in Explorer, then by the column (`by`), ties
@@ -300,6 +305,7 @@ impl Pane {
             free: None,
             reveal: None,
             moves: 0,
+            cursor_was: None,
         }
     }
 
@@ -318,6 +324,7 @@ impl Pane {
         self.cursor = None;
         self.anchor = None;
         self.reveal = None;
+        self.cursor_was = None;
         self.moves += 1;
         self.entries.clear();
         self.version += 1;
@@ -339,6 +346,13 @@ impl Pane {
     }
 
     pub fn set_entries(&mut self, entries: Result<Vec<Entry>, String>) {
+        // A cursor not in the listing being replaced (one set for a folder still loading, or
+        // the item of an earlier page) keeps the place noted before.
+        if let Some(c) = &self.cursor
+            && let Some(i) = self.index_of(c)
+        {
+            self.cursor_was = Some((i, self.selected.contains(c)));
+        }
         self.loading = false;
         match entries {
             Ok(v) => {
@@ -350,14 +364,36 @@ impl Pane {
                 self.entries.clear();
             }
         }
-        self.prune_selection();
+        // Sorted first: the cursor falls back on the item shown at its old place.
         self.sort_entries();
+        self.prune_selection();
     }
 
-    /// Forgets selected ids the listing doesn't have (anymore).
+    /// Forgets selected ids the listing doesn't have (anymore). A cursor whose item went moves
+    /// to the item now at its place, or the last one, and the selection follows it when it
+    /// was that item, as in Explorer; the next arrow then goes on from there, not the top.
     pub fn prune_selection(&mut self) {
         let ids: HashSet<&str> = self.entries.iter().map(|e| e.id.as_str()).collect();
         self.selected.retain(|id| ids.contains(id.as_str()));
+        if self.anchor.as_deref().is_some_and(|a| !ids.contains(a)) {
+            self.anchor = None;
+        }
+        let Some(c) = &self.cursor else { return };
+        if ids.contains(c.as_str()) {
+            return;
+        }
+        let at = self.cursor_was.and_then(|(i, sel)| Some((self.entries.get(i).or(self.entries.last())?, sel)));
+        let Some((e, was_selected)) = at else {
+            self.cursor = None;
+            return;
+        };
+        let id = e.id.clone();
+        if was_selected && self.selected.is_empty() {
+            self.selected.insert(id.clone());
+            self.anchor = Some(id.clone());
+        }
+        self.anchor.get_or_insert_with(|| id.clone());
+        self.cursor = Some(id);
     }
 
     /// Adds a later page of a listing that's still arriving: the page is sorted on its own and

@@ -16,6 +16,7 @@ mod downloads;
 mod dragout;
 mod finder;
 mod icons;
+mod keyboard;
 mod layout;
 mod model;
 mod network;
@@ -165,6 +166,10 @@ struct State {
     login: Option<u64>,
     logins: u64,
     active: usize,
+    /// The start of a name typed in a list, to reach it.
+    typeahead: keyboard::Typeahead,
+    /// How many rows each pane's list shows, for Page Up and Page Down (0 before its layout).
+    page_rows: [usize; 2],
     /// The pane a drag started in and the files it carried, so a drop back on the same pane
     /// is ignored (the drop can arrive after the drag's end).
     last_drag: Option<(usize, Vec<PathBuf>)>,
@@ -236,6 +241,8 @@ fn init() -> State {
         login: None,
         logins: 0,
         active: 0,
+        typeahead: Default::default(),
+        page_rows: [0; 2],
         last_drag: None,
         status: String::new(),
         status_seen: String::new(),
@@ -395,8 +402,9 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                 };
                 let ok = result.is_ok();
                 let p = &mut s.panes[pane];
-                // The selection (the folder just left, say) may be on a page still to come.
-                let selected = p.selected.clone();
+                // The selection (the folder just left, say) may be on a page still to come, and
+                // so may the cursor's item.
+                let held = (p.selected.clone(), p.cursor.clone(), p.anchor.clone());
                 match result {
                     r if first => p.set_entries(r),
                     Ok(page) => p.append_entries(page),
@@ -407,7 +415,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                 let p = &mut s.panes[pane];
                 p.loading = ok && more;
                 if p.loading {
-                    p.selected = selected;
+                    (p.selected, p.cursor, p.anchor) = held;
                 } else {
                     p.prune_selection();
                 }
@@ -1004,6 +1012,13 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             Some(i) => (i as isize + d).clamp(0, n as isize - 1) as usize,
         })
     };
+    let page = keyboard::page(s.page_rows[p]) as isize;
+    let owns = keyboard::list_has_keys(s, p, tx.focused());
+    // Any other key ends a name being typed: Enter into a folder and a letter starts anew.
+    let plain = !(ev.mods.cmd || ev.mods.ctrl || ev.mods.alt);
+    if !(plain && matches!(ev.key, Key::Text(_))) {
+        s.typeahead.clear();
+    }
     let to = match &ev.key {
         _ if ev.is_command('c') => {
             actions::pick_up(s, p, actions::ClipMode::Copy);
@@ -1042,6 +1057,34 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             actions::edit_address(s, p);
             return true;
         }
+        // Ctrl+Space adds the cursor's item to the selection or takes it away, as in Explorer.
+        _ if ev.is_command(' ') => {
+            let pane = &mut s.panes[p];
+            if let Some(c) = pane.cursor.clone()
+                && pane.index_of(&c).is_some()
+            {
+                if !pane.selected.remove(&c) {
+                    pane.selected.insert(c.clone());
+                }
+                pane.anchor = Some(c);
+            }
+            return true;
+        }
+        // Typing a name's start goes to it.
+        Key::Text(t) if plain && owns => {
+            let Some(query) = s.typeahead.push(p, t, s.now) else { return false };
+            if let Some(i) = keyboard::find(&s.panes[p].entries, at, query) {
+                let id = s.panes[p].entries[i].id.clone();
+                click(s, p, &id, Mods::default());
+                tx.scroll_into_view_in(pane_key(p), row_key(&id));
+            }
+            return true;
+        }
+        // Esc lets go of the selection; the cursor stays.
+        Key::Escape if owns && !s.panes[p].selected.is_empty() => {
+            s.panes[p].selected.clear();
+            return true;
+        }
         Key::Enter if ev.mods.alt => {
             actions::properties(s, p);
             return true;
@@ -1056,8 +1099,8 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         }
         Key::Up => step(-1),
         Key::Down => step(1),
-        Key::PageUp => step(-20),
-        Key::PageDown => step(20),
+        Key::PageUp => step(-page),
+        Key::PageDown => step(page),
         Key::Home => step(-(n as isize)),
         Key::End => step(n as isize),
         Key::Enter => {
@@ -1090,7 +1133,13 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
     };
     if let Some(i) = to {
         let id = s.panes[p].entries[i].id.clone();
-        click(s, p, &id, Mods { shift: ev.mods.shift, ..Mods::default() });
+        // With Ctrl the cursor moves alone and the selection stays, as in Explorer.
+        if ev.mods.cmd && !ev.mods.shift {
+            s.active = p;
+            s.panes[p].cursor = Some(id.clone());
+        } else {
+            click(s, p, &id, Mods { shift: ev.mods.shift, ..Mods::default() });
+        }
         tx.scroll_into_view_in(pane_key(p), row_key(&id));
     }
     true

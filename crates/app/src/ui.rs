@@ -3008,6 +3008,12 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .w_full()
         .h_full()
         .scroll_xy()
+        // The rows in view below the header, which Page Up and Page Down move by. Only the
+        // keys read it, so the view needn't run again.
+        .on_layout_tx(move |s: &mut State, r: [f32; 4], tx: &mut Tx| {
+            s.page_rows[p] = ((r[3] - HEADER_H) / ROW_H).floor().max(1.0) as usize;
+            tx.live_only();
+        })
         .on_secondary_press(move |s: &mut State, at: rune::PointerPress, tx: &mut Tx| {
             s.active = p;
             s.panes[p].selected.clear();
