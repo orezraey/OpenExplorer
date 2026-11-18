@@ -1,6 +1,6 @@
 //! A [`Tree`] from walking folders, as any user can: what the service does when it can't read a
 //! volume's MFT (not NTFS), and how the index is tried without being an administrator
-//! (`openexplorer-index console --walk`, the timing example).
+//! (`openexplorer index console --walk`, the timing example).
 
 use std::collections::VecDeque;
 use std::path::PathBuf;

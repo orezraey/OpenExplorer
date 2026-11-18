@@ -65,22 +65,24 @@ pyftpdlib (`crates/remote/tests/ftps_server.py`): `OE_FTPS_PYTHON` aponta para u
 ## Pesquisar no computador
 
 O campo de pesquisa de um painel local procura pelo nome em todos os discos NTFS fixos enquanto
-você digita, como o Everything: um serviço do Windows (`openexplorer-index`) lê a tabela de
-arquivos (MFT) de cada disco para a memória e a mantém em dia pelo diário USN do NTFS; o app o
-consulta por um pipe. Na primeira pesquisa o painel oferece **Instalar o serviço de pesquisa**:
-o Windows pede permissão de administrador uma vez, o serviço é copiado para
-`%ProgramFiles%\OpenExplorer` e inicia com o Windows. Para remover:
-`"%ProgramFiles%\OpenExplorer\openexplorer-index.exe" uninstall` como administrador.
+você digita, como o Everything: um serviço do Windows lê a tabela de arquivos (MFT) de cada disco
+para a memória e a mantém em dia pelo diário USN do NTFS; o app o consulta por um pipe. O serviço
+não é um programa à parte: é o próprio `openexplorer.exe` iniciado como `openexplorer index …`
+(como o `Everything.exe -svc` do Everything). Na primeira pesquisa o painel oferece **Instalar o
+serviço de pesquisa**: o Windows pede permissão de administrador uma vez, o executável é copiado
+para `%ProgramFiles%\OpenExplorer\openexplorer-index.exe` (onde só administradores o alteram) e
+o serviço inicia com o Windows. Para remover:
+`"%ProgramFiles%\OpenExplorer\openexplorer-index.exe" index uninstall` como administrador.
 
-No Linux não há MFT: o serviço (`openexplorer-index`, do próprio usuário, sem root) lista as
-pastas em paralelo, vigia cada uma com o inotify e escuta num socket em `$XDG_RUNTIME_DIR`. O app
-o inicia na primeira pesquisa; `openexplorer-index install` faz o systemd do usuário iniciá-lo
-com a sessão (`uninstall` desfaz). O índice fica salvo em `~/.cache/openexplorer` e responde na
+No Linux não há MFT: o serviço (o próprio `openexplorer`, do usuário, sem root) lista as pastas em
+paralelo, vigia cada uma com o inotify e escuta num socket em `$XDG_RUNTIME_DIR`. O app o inicia
+na primeira pesquisa; `openexplorer index install` faz o systemd do usuário iniciá-lo com a
+sessão (`index uninstall` desfaz). O índice fica salvo em `~/.cache/openexplorer` e responde na
 hora enquanto os discos são listados de novo, a cada início. Ficam de fora sistemas de arquivos
 do kernel, de memória (`tmpfs`), de rede e imagens (`squashfs`).
 
-No Windows, sem administrador, para testar: `cargo run -p openexplorer-index --release -- console --walk`
-(lista as pastas em vez de ler a MFT) e o app com `OE_INDEX_CONSOLE=1`. Tempos de busca:
+No Windows, sem administrador, para testar: `cargo run -- index console --walk` (lista as pastas
+em vez de ler a MFT) e o app com `OE_INDEX_CONSOLE=1`. Tempos de busca:
 `cargo run -p openexplorer-index --release --example index_timing -- C:\ D:\`.
 
 ## Rodar
@@ -98,6 +100,25 @@ de 50.000 arquivos) ou `--scene account` (uma conta de exemplo, sem rede). `--sc
 mostra o catálogo unificado de provedores (e `--scene add-server`, `--scene add-server-ftp`,
 `--scene add-nextcloud` e `--scene add-gdrive` cada etapa de configuração); `--scene server` e
 `--scene server-search` abrem um servidor WebDAV local (`rclone serve webdav <pasta> --addr 127.0.0.1:28095`).
+
+## Publicar uma versão
+
+As versões são compiladas no GitHub Actions (`.github/workflows/release.yml`), para Windows
+(o `.exe`, que já traz o serviço de pesquisa), Linux (`.tar.gz` com o executável, que guarda a
+permissão de execução) e macOS (`.zip` com o app universal, Apple Silicon e Intel). Para
+publicar:
+
+1. Mude `version` em `[workspace.package]` no `Cargo.toml` da raiz, rode `cargo update --workspace`
+   e faça o commit.
+2. Crie e envie a tag da mesma versão: `git tag v0.1.0` e `git push origin v0.1.0`.
+
+A tag dispara a compilação nos três sistemas e cria a página da versão em **Releases** com os
+pacotes; o andamento aparece em **Actions**. Uma tag com hífen (`v0.2.0-beta.1`) sai como
+pré-lançamento. Para só testar a compilação, sem publicar: **Actions → Release → Run workflow**
+(os pacotes ficam nos artefatos da execução).
+
+Os executáveis não são assinados: o Windows (SmartScreen) e o macOS (Gatekeeper) avisam na
+primeira vez que abrem. No macOS, clique com o botão direito no app e em **Abrir**.
 
 ## Código
 

@@ -5,7 +5,7 @@
 //! index saved at the last run answers meanwhile.
 //!
 //! The service is the user's own (no root): started by the app when it isn't running, or by
-//! systemd at login once `openexplorer-index install` set that up. It listens on a Unix socket
+//! systemd at login once `openexplorer index install` set that up. It listens on a Unix socket
 //! in the user's runtime folder, which only the user can open.
 //!
 //! inotify needs one watch per folder, and the kernel caps them (`max_user_watches`, which grows
@@ -43,7 +43,10 @@ const REWALK_UNWATCHED: Duration = Duration::from_secs(20 * 60);
 const SAVE_EVERY: Duration = Duration::from_secs(10 * 60);
 /// The systemd user unit `install` writes.
 const UNIT: &str = "openexplorer-index.service";
+/// The service's copy of the app's executable, as `install` makes it.
 const EXE: &str = "openexplorer-index";
+/// The app's executable, which is also the service (see `cli.rs`).
+const APP: &str = "openexplorer";
 
 const MASK: u32 = libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE | libc::IN_ATTRIB | libc::IN_ONLYDIR | libc::IN_DONT_FOLLOW | libc::IN_EXCL_UNLINK;
 
@@ -630,12 +633,21 @@ pub fn start() -> Result<(), String> {
     if unit_path().exists() && systemctl(&["start", UNIT]) {
         return Ok(());
     }
-    // Next to the app, the folder above (cargo's examples), or the copy `install` made.
+    // The app itself (but not one of cargo's examples or test programs, in `examples/` and
+    // `deps/`, which aren't the app), the `openexplorer` binary beside or above it, or the copy
+    // `install` made.
     let here = std::env::current_exe().map_err(|e| e.to_string())?;
-    let candidates = [here.with_file_name(EXE), here.parent().and_then(Path::parent).map_or_else(PathBuf::new, |d| d.join(EXE)), installed_exe()];
-    let exe = candidates.iter().find(|p| p.is_file()).ok_or_else(|| format!("{EXE} não foi encontrado ao lado do Open Explorer."))?;
+    let from_cargo = here.parent().and_then(Path::file_name).is_some_and(|n| n == "examples" || n == "deps");
+    let self_candidate = if from_cargo { PathBuf::new() } else { here.clone() };
+    let candidates = [
+        self_candidate,
+        here.with_file_name(APP),
+        here.parent().and_then(Path::parent).map_or_else(PathBuf::new, |d| d.join(APP)),
+        installed_exe(),
+    ];
+    let exe = candidates.iter().find(|p| p.is_file()).ok_or_else(|| format!("{APP} não foi encontrado para iniciar o serviço de pesquisa."))?;
     std::process::Command::new(exe)
-        .arg("serve")
+        .args([crate::cli::ARG, "serve"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -650,8 +662,8 @@ pub fn running() -> bool {
     UnixStream::connect(socket_path()).is_ok()
 }
 
-/// Makes systemd start the service at login: this program copied to `~/.local/lib/openexplorer`
-/// and a user unit for it. No root needed.
+/// Makes systemd start the service at login: this program (the app's executable) copied to
+/// `~/.local/lib/openexplorer` and a user unit for it. No root needed.
 pub fn install() -> Result<(), String> {
     let dst = installed_exe();
     let dir = dst.parent().unwrap();
@@ -665,8 +677,9 @@ pub fn install() -> Result<(), String> {
     let unit = unit_path();
     std::fs::create_dir_all(unit.parent().unwrap()).map_err(|e| e.to_string())?;
     let text = format!(
-        "[Unit]\nDescription=Open Explorer — índice de arquivos\n\n[Service]\nExecStart=\"{}\" serve\nRestart=on-failure\nNice=10\nIOSchedulingClass=idle\n\n[Install]\nWantedBy=default.target\n",
-        dst.display()
+        "[Unit]\nDescription=Open Explorer — índice de arquivos\n\n[Service]\nExecStart=\"{}\" {} serve\nRestart=on-failure\nNice=10\nIOSchedulingClass=idle\n\n[Install]\nWantedBy=default.target\n",
+        dst.display(),
+        crate::cli::ARG
     );
     std::fs::write(&unit, text).map_err(|e| format!("Escrever {}: {e}", unit.display()))?;
     if !systemctl(&["daemon-reload"]) || !systemctl(&["enable", "--now", UNIT]) {

@@ -17,7 +17,10 @@ use crate::{ntfs, pipe, walk};
 
 const DISPLAY_NAME: &str = "Open Explorer — índice de arquivos";
 const DESCRIPTION: &str = "Mantém o índice dos nomes de arquivos dos discos, lido da MFT do NTFS, que a pesquisa do Open Explorer consulta.";
+/// The service's copy of the app's executable, in Program Files.
 const EXE: &str = "openexplorer-index.exe";
+/// What Windows starts it with: the app's executable as the service (see `cli.rs`).
+const SERVICE_ARGS: [&str; 2] = [crate::cli::ARG, "service"];
 
 /// How the service is, for the app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,7 +79,11 @@ pub fn install() -> Result<(), String> {
     }
     let src = std::env::current_exe().map_err(|e| e.to_string())?;
     let dst = installed_exe()?;
-    if src != dst {
+    let same = match (std::fs::canonicalize(&src), std::fs::canonicalize(&dst)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => src.as_os_str().eq_ignore_ascii_case(dst.as_os_str()),
+    };
+    if !same {
         std::fs::create_dir_all(dst.parent().unwrap()).map_err(|e| format!("Criar {}: {e}", dst.display()))?;
         // The old process can take a moment to let go of the file.
         let mut copied = std::fs::copy(&src, &dst);
@@ -96,7 +103,7 @@ pub fn install() -> Result<(), String> {
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: dst,
-        launch_arguments: vec![],
+        launch_arguments: SERVICE_ARGS.iter().map(OsString::from).collect(),
         dependencies: vec![],
         account_name: None,
         account_password: None,
@@ -125,21 +132,18 @@ pub fn uninstall() -> Result<(), String> {
     Ok(())
 }
 
-/// Runs `openexplorer-index install` as an administrator (Windows asks the user), from the
-/// folder the app runs from, and waits for it.
+/// Runs `openexplorer index install` as an administrator (Windows asks the user): this very
+/// executable, the app's, and waits for it.
 pub fn install_elevated() -> Result<(), String> {
     use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
     use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
     use windows::core::{HSTRING, PCWSTR, w};
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?.with_file_name(EXE);
-    if !exe.exists() {
-        return Err(format!("{} não foi encontrado ao lado do Open Explorer.", exe.display()));
-    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let report = std::env::temp_dir().join(format!("openexplorer-index-install-{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&report);
-    let (file, params) = (HSTRING::from(exe.as_os_str()), HSTRING::from(format!("install --report \"{}\"", report.display())));
+    let (file, params) = (HSTRING::from(exe.as_os_str()), HSTRING::from(format!("{} install --report \"{}\"", crate::cli::ARG, report.display())));
     let mut info = SHELLEXECUTEINFOW { cbSize: size_of::<SHELLEXECUTEINFOW>() as u32, fMask: SEE_MASK_NOCLOSEPROCESS, lpVerb: w!("runas"), lpFile: PCWSTR(file.as_ptr()), lpParameters: PCWSTR(params.as_ptr()), nShow: SW_HIDE.0, ..Default::default() };
     if let Err(e) = unsafe { ShellExecuteExW(&mut info) } {
         return Err(if e.code() == ERROR_CANCELLED.to_hresult() { "A instalação foi cancelada.".into() } else { format!("Pedir permissão de administrador: {e}") });

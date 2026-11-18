@@ -4,6 +4,7 @@
 //! Linux the folders listed as the user and followed with inotify, by the user's own service,
 //! asked over a Unix socket (see [`unix`]).
 
+pub mod cli;
 pub mod fold;
 pub mod index;
 pub mod proto;

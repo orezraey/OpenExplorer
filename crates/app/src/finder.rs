@@ -1,5 +1,5 @@
 //! Searching the computer: the words typed in a local pane go to the index service
-//! (`openexplorer-index`, see that crate), which answers from every NTFS volume's MFT in
+//! (this executable run as `openexplorer index`, see `openexplorer-index`), which answers from every NTFS volume's MFT in
 //! milliseconds. Results are entries whose id is their full path.
 
 use std::path::{Path, PathBuf};

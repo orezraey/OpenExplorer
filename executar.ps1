@@ -1,9 +1,8 @@
 ﻿# Compila o Open Explorer com o código atual e abre o app. Use executar.bat (dois cliques).
 #
 # Se o app desta pasta estiver aberto, pergunta antes de fechá-lo: o Windows não deixa
-# substituir um .exe em uso. Só o que mudou é compilado de novo. O serviço de pesquisa
-# (openexplorer-index.exe) é compilado junto, pois "Instalar o serviço de pesquisa" usa o
-# que está ao lado do app.
+# substituir um .exe em uso. Só o que mudou é compilado de novo. O serviço de pesquisa é o
+# próprio openexplorer.exe (iniciado como "openexplorer index"): não há outro executável.
 
 $ErrorActionPreference = 'Stop'
 
@@ -44,7 +43,7 @@ if ($aberto.Count -gt 0) {
 }
 
 Write-Host 'Compilando o Open Explorer...'
-& $cargo build --release -p openexplorer -p openexplorer-index
+& $cargo build --release -p openexplorer
 if ($LASTEXITCODE -ne 0) {
     Write-Host ''
     Write-Host 'A compilação falhou: veja o erro acima.' -ForegroundColor Red

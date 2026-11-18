@@ -4,6 +4,10 @@
 //! Drive calls block, so they run on background threads that send a [`Msg`] back and wake the
 //! window; `poll` applies it.
 
+// A release build opens as a window alone on Windows, with no console behind it; a debug build
+// keeps the console, for what it prints.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod actions;
 mod address;
 mod cache;
@@ -1387,6 +1391,12 @@ fn view_sample() -> Vec<Entry> {
 }
 
 fn main() {
+    // `openexplorer index …`: this executable as the search service (Windows starts it so), no
+    // window at all.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == openexplorer_index::cli::ARG) {
+        std::process::exit(openexplorer_index::cli::run(&args[1..]));
+    }
     let initial = settings::Settings::load();
     rune::App::new(AppSpec::<State> {
         min_size: Some((900.0, 420.0)),

@@ -1,6 +1,6 @@
 //! Asks the running index service, as the app does, and times the round trip.
 //! `cargo run -p openexplorer-index --release --example index_ask -- <palavras> [pasta]`
-//! (on Windows with `OE_INDEX_CONSOLE=1` when the service runs as `openexplorer-index console`;
+//! (on Windows with `OE_INDEX_CONSOLE=1` when the service runs as `openexplorer index console`;
 //! on Linux it starts the service when it isn't running).
 
 fn main() {

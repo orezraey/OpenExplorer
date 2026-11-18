@@ -1,12 +1,10 @@
 [package]
 name = "openexplorer-index"
-version = "0.0.1"
+version.workspace = true
 edition.workspace = true
 
-# The service: `openexplorer-index install|uninstall|console`, and run by Windows as a service.
-[[bin]]
-name = "openexplorer-index"
-path = "src/main.rs"
+# No program of its own: the app's executable runs the service (`openexplorer index …`, see
+# `cli.rs`).
 
 [dependencies]
 memchr = "2"
