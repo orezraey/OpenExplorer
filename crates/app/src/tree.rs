@@ -804,7 +804,7 @@ pub fn to_reveal(s: &mut State, p: usize, lines: &[Line]) -> Option<String> {
     if let Some(on) = lines.iter().find_map(|l| matches!(l, Line::Node { on: true, .. }).then(|| l.key())) {
         s.tree.follow[p] = false;
         // The keyboard picks up from the folder shown, as Explorer's tree does.
-        s.tree.cursor[p] = Some(on.clone());
+        set_cursor(s, p, on.clone());
         return Some(on);
     }
     if !lines.iter().any(|l| matches!(l, Line::Note { loading: true, .. })) {
@@ -1004,8 +1004,11 @@ pub fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             tx.focus(crate::pane_key(p), true);
             return true;
         }
+        // Voltar and Avançar work from anywhere in the pane.
+        Key::Left | Key::Right if mods.alt => return false,
+        // With modifiers these would move or open the files beside it.
+        Key::Up | Key::Down | Key::Left | Key::Right | Key::Home | Key::End | Key::PageUp | Key::PageDown | Key::Enter => return true,
         Key::Delete | Key::Function(2) => return true,
-        Key::Enter if mods.alt => return true,
         _ if ['a', 'c', 'n', 'v', 'x'].iter().any(|&c| ev.is_command(c)) => return true,
         _ => return false,
     };

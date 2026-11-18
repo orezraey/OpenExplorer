@@ -561,10 +561,12 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
         }
     }
-    // A tree the keyboard left (a click elsewhere) stops showing its row's ring.
+    // A tree shows its keyboard row's ring while it has focus, however it got it (Tab from the
+    // search field, a click), and stops once focus left it.
     for p in 0..2 {
-        if s.tree.focused[p] && tx.focused() != Some(ui::tree_key(p).as_str()) {
-            tree::focus(s, p, false);
+        let on = tx.focused() == Some(ui::tree_key(p).as_str());
+        if s.tree.focused[p] != on {
+            tree::focus(s, p, on);
             changed = true;
         }
     }
