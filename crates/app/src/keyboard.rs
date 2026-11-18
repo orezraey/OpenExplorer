@@ -302,7 +302,7 @@ mod tests {
         s.panes[0].selected = ["c".to_string()].into();
         let request = s.live[0].load(Ordering::Relaxed);
         let page = |s: &mut State, list: &[&str], first: bool, more: bool| {
-            s.outbox.send(Msg::Listed { pane: 0, request, part: Part::Page { first, more }, result: Ok(names(list)) }).unwrap();
+            s.outbox.send(Msg::Listed { pane: 0, request, part: Part::Page { first, more }, result: Ok(names(list)), at: None }).unwrap();
             crate::poll(s, 0.0, &mut Tx::default());
         };
         page(&mut s, &["a", "b"], true, true);

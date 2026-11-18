@@ -4,6 +4,8 @@
 //! Everything here blocks; the app runs it on background threads.
 
 pub mod api;
+#[cfg(test)]
+mod bench;
 pub mod changes;
 pub mod download;
 pub mod oauth;
