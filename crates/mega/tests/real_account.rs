@@ -16,7 +16,7 @@ use openexplorer_mega::api::Api;
 use openexplorer_mega::session::{self, Refused};
 use openexplorer_mega::{Account, Area, Kind};
 
-fn login() -> Option<Arc<Account>> {
+fn login_session() -> Option<(String, Api, session::Session)> {
     let (Ok(email), Ok(password)) = (std::env::var("MEGA_TEST_EMAIL"), std::env::var("MEGA_TEST_PASSWORD")) else {
         eprintln!("MEGA_TEST_EMAIL and MEGA_TEST_PASSWORD aren't set: skipped");
         return None;
@@ -29,6 +29,11 @@ fn login() -> Option<Arc<Account>> {
         Err(Refused::NeedsCode) => panic!("the account asks for a two-factor code: set MEGA_TEST_CODE"),
         Err(e) => panic!("login: {}", e.text()),
     };
+    Some((email, api, s))
+}
+
+fn login() -> Option<Arc<Account>> {
+    let (email, api, s) = login_session()?;
     Some(Arc::new(Account::start(&email, api, s).expect("reading the account")))
 }
 
@@ -68,6 +73,70 @@ fn reads_an_account() {
         let mut out = Vec::new();
         a.download(&format!("{cloud}/{}", f.name), &mut out, &mut |_| true).unwrap();
         assert_eq!(out.len() as u64, f.size.unwrap());
+    }
+}
+
+/// The tree kept on disk (in a temporary folder, deleted at the end): the first start reads the
+/// whole tree and keeps it; a second start of the same session, resumed as the app does at every
+/// start, reads the kept tree and only the changes since. With `MEGA_TEST_WRITE=1`, another
+/// session makes a folder between the two starts, and the second start must show it.
+#[test]
+#[ignore = "needs a real MEGA account"]
+fn a_second_start_comes_from_the_kept_tree() {
+    let Some((email, api, s)) = login_session() else { return };
+    let dir = std::env::temp_dir().join(format!("oe-mega-real-cache-{}", std::process::id()));
+    let file = openexplorer_mega::cache::file_in(&dir, &email);
+    let started = std::time::Instant::now();
+    let a = Arc::new(Account::start_kept(&email, api, s, Some(file.clone())).expect("reading the account"));
+    let whole = started.elapsed();
+    let _end = Logout(a.clone());
+    assert!(!a.started_from_cache(), "nothing kept yet: the whole tree is read");
+    assert!(file.exists(), "and kept");
+    let cloud = format!("/{}", Area::Cloud.label());
+    let writing = std::env::var("MEGA_TEST_WRITE").as_deref() == Ok("1");
+    let made = writing.then(|| {
+        let b = login().expect("a second session");
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let path = format!("{cloud}/OpenExplorer-cache-{stamp}");
+        let made = b.mkdir(&path).unwrap();
+        // Once the first session's channel brings it, MEGA has it for any session asking.
+        // Polling doesn't keep the tree again this soon, so the file keeps the older number.
+        for _ in 0..10 {
+            if a.poll().map(|_| a.stat(&path).is_some()).unwrap_or(false) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        (b, path, made)
+    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let api = Api::default();
+        let resumed = session::resume(&api, &a.saved()).unwrap_or_else(|f| panic!("resume: {}", f.text()));
+        let started = std::time::Instant::now();
+        let again = Account::start_kept(&email, api, resumed, Some(file.clone())).expect("reading the account again");
+        let cached = started.elapsed();
+        eprintln!("start reading the whole tree: {} ms; from the kept tree: {} ms", whole.as_millis(), cached.as_millis());
+        assert!(again.started_from_cache(), "the second start reads the kept tree");
+        let names = |x: &Account| {
+            let mut v: Vec<String> = x.list(&cloud).unwrap().into_iter().map(|i| i.name).collect();
+            v.sort();
+            v
+        };
+        if let Some((_, path, _)) = &made {
+            assert!(again.stat(path).is_some(), "a folder made after the tree was kept is there");
+        }
+        assert_eq!(names(&again), names(&a));
+        for area in [Area::Rubbish, Area::Incoming] {
+            assert_eq!(again.list(&format!("/{}", area.label())).unwrap(), a.list(&format!("/{}", area.label())).unwrap());
+        }
+    }));
+    if let Some((b, _, made)) = made {
+        b.delete(&made).unwrap();
+        b.logout();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
     }
 }
 

@@ -11,7 +11,10 @@
 //! `\0<handle>` names a node itself, wherever it is.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use openexplorer_i18n::{t, tr};
 use serde_json::{Map, Value, json};
@@ -19,8 +22,9 @@ use serde_json::{Map, Value, json};
 use crate::api::{Api, Fail, request_id};
 use crate::crypto::{attr_key, b64, ecb_encrypt, encrypt_attrs, random};
 use crate::nodes::{Handle, Keys, Kind, Node, Tree};
+use crate::changes::Caught;
 use crate::session::{self, Refused, Session};
-use crate::{Result, store};
+use crate::{Result, cache, store};
 
 /// The account's three top folders.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,7 +100,27 @@ pub struct Account {
     pub(crate) api: Api,
     pub(crate) session: Session,
     pub(crate) inner: Mutex<Inner>,
+    /// Where the tree is kept between runs and what seals it (see [`crate::cache`]); `None`
+    /// keeps nothing.
+    kept: Option<(PathBuf, cache::Secret)>,
+    /// When the tree was last kept, and whether it changed since.
+    saved: Mutex<Saved>,
+    /// The account was removed: a save still on its way writes nothing.
+    forgotten: AtomicBool,
+    /// Whether this start read the kept tree (and only the changes since), not the whole one.
+    from_cache: AtomicBool,
 }
+
+#[derive(Default)]
+struct Saved {
+    at: Option<Instant>,
+    dirty: bool,
+}
+
+/// How often, at most, polling keeps the tree again while it changes.
+const SAVE_EVERY: Duration = Duration::from_secs(5 * 60);
+/// Rounds of the change channel a start reads before giving up on the kept tree.
+const CATCH_UP_ROUNDS: usize = 1000;
 
 impl std::fmt::Debug for Account {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -115,11 +139,20 @@ pub fn handle_path(handle: &str) -> String {
 }
 
 impl Account {
-    /// An account from a session: its tree is read here.
+    /// An account from a session: its tree is read here, from the tree kept in the cache folder
+    /// (see [`crate::cache::set_dir`]) and the changes since, or whole.
     pub fn start(email: &str, api: Api, session: Session) -> Result<Account> {
+        Account::start_kept(email, api, session, cache::file_of(email))
+    }
+
+    /// [`Account::start`] with the tree kept in `file`, or nowhere.
+    pub fn start_kept(email: &str, api: Api, session: Session, file: Option<PathBuf>) -> Result<Account> {
         let keys = Keys { user: session.user.clone(), master: session.master, rsa: session.rsa.clone(), shares: HashMap::new() };
-        let account = Account { email: session::normal_email(email), api, session, inner: Mutex::new(Inner { keys, tree: Tree::default(), refetch: false }) };
-        account.fetch()?;
+        let kept = file.map(|f| (f, cache::Secret::of(&session.user, &session.master, &session.sek)));
+        let account = Account { email: session::normal_email(email), api, session, inner: Mutex::new(Inner { keys, tree: Tree::default(), refetch: false }), kept, saved: Mutex::default(), forgotten: AtomicBool::new(false), from_cache: AtomicBool::new(false) };
+        if !account.resume_kept()? {
+            account.fetch()?;
+        }
         Ok(account)
     }
 
@@ -127,7 +160,103 @@ impl Account {
     #[cfg(test)]
     pub(crate) fn offline(keys: Keys, tree: Tree) -> Account {
         let session = Session { user: keys.user.clone(), master: keys.master, sek: [0; 16], sid: String::new(), rsa: None };
-        Account { email: "ana@exemplo.com".into(), api: Api::unreachable(), session, inner: Mutex::new(Inner { keys, tree, refetch: false }) }
+        Account { email: "ana@exemplo.com".into(), api: Api::unreachable(), session, inner: Mutex::new(Inner { keys, tree, refetch: false }), kept: None, saved: Mutex::default(), forgotten: AtomicBool::new(false), from_cache: AtomicBool::new(false) }
+    }
+
+    /// Whether this start read the kept tree and only the changes since, not the whole tree.
+    pub fn started_from_cache(&self) -> bool {
+        self.from_cache.load(Ordering::SeqCst)
+    }
+
+    /// Takes in the kept tree and the changes since it was kept. `false` when there's none to
+    /// use: no file, one this session can't open, or one whose sequence number MEGA no longer
+    /// takes (then the file is thrown away). An error (no network, the session ended) leaves
+    /// the file as it is and no tree in place: a start never shows a tree it couldn't bring
+    /// up to date.
+    fn resume_kept(&self) -> Result<bool> {
+        let Some((file, secret)) = &self.kept else { return Ok(false) };
+        let started = Instant::now();
+        let (tree, shares) = match cache::read(file, secret) {
+            Ok((tree, _)) if tree.root.is_none() || tree.sn.is_empty() => {
+                crate::api::log("MEGA cache: árvore guardada sem a pasta principal, descartada");
+                cache::forget_file(file);
+                return Ok(false);
+            }
+            Ok(kept) => kept,
+            Err(cache::Refusal::Missing) => return Ok(false),
+            Err(why) => {
+                crate::api::log(&format!("MEGA cache: {why:?}, descartado"));
+                cache::forget_file(file);
+                return Ok(false);
+            }
+        };
+        let nodes = tree.len();
+        let read = started.elapsed();
+        {
+            let mut inner = self.lock();
+            inner.keys.shares = shares;
+            inner.tree = tree;
+            inner.refetch = false;
+        }
+        let mut changes = crate::Changes::default();
+        let caught = self.read_changes(CATCH_UP_ROUNDS, &mut changes);
+        match caught {
+            Ok(Caught::Up) => {
+                crate::api::log(&format!("MEGA cache: {nodes} nós lidos em {} ms, em dia em {} ms ({} pastas mudaram)", read.as_millis(), started.elapsed().as_millis(), changes.folders.len()));
+                self.from_cache.store(true, Ordering::SeqCst);
+                self.saved.lock().unwrap_or_else(|e| e.into_inner()).dirty = !changes.is_empty();
+                Ok(true)
+            }
+            Ok(caught) => {
+                crate::api::log(&format!("MEGA cache: o canal de mudanças não pôs a árvore em dia ({caught:?}), lendo a conta inteira"));
+                cache::forget_file(file);
+                self.lock().tree = Tree::default();
+                Ok(false)
+            }
+            Err(e) => {
+                self.lock().tree = Tree::default();
+                Err(e)
+            }
+        }
+    }
+
+    /// Keeps the tree on disk now, if this account keeps it. Encoded under the lock, sealed
+    /// and written after.
+    pub fn save_cache(&self) {
+        let Some((file, secret)) = &self.kept else { return };
+        let started = Instant::now();
+        let body = {
+            let inner = self.lock();
+            if inner.tree.root.is_none() || inner.refetch {
+                return;
+            }
+            cache::encode(&inner.tree, &inner.keys.shares)
+        };
+        let encoded = started.elapsed();
+        *self.saved.lock().unwrap_or_else(|e| e.into_inner()) = Saved { at: Some(Instant::now()), dirty: false };
+        match cache::write_unless(file, secret, body, &self.forgotten) {
+            Ok(()) => crate::api::log(&format!("MEGA cache: árvore guardada em {} ms ({} ms montando)", started.elapsed().as_millis(), encoded.as_millis())),
+            Err(e) => crate::api::log(&format!("MEGA cache: não consegui guardar a árvore: {e}")),
+        }
+    }
+
+    /// Notes that the tree changed, and keeps it when it's been a while.
+    pub(crate) fn changed(&self) {
+        let due = {
+            let mut saved = self.saved.lock().unwrap_or_else(|e| e.into_inner());
+            saved.dirty = true;
+            saved.at.is_none_or(|at| at.elapsed() >= SAVE_EVERY)
+        };
+        if due {
+            self.save_cache();
+        }
+    }
+
+    /// Keeps the tree if it changed since it was last kept (the app calls it before closing).
+    pub fn save_cache_if_changed(&self) {
+        if self.saved.lock().unwrap_or_else(|e| e.into_inner()).dirty {
+            self.save_cache();
+        }
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -158,8 +287,8 @@ impl Account {
         if tree.root.is_none() {
             return Err(t("O MEGA não mandou a pasta principal da conta.", "MEGA didn't send the account's main folder.").into());
         }
-        let mut inner = self.lock();
-        *inner = Inner { keys, tree, refetch: false };
+        *self.lock() = Inner { keys, tree, refetch: false };
+        self.save_cache();
         Ok(())
     }
 
@@ -689,11 +818,25 @@ pub fn connect(email: &str, password: &str, code: Option<&str>) -> std::result::
     Ok(account)
 }
 
+/// Keeps the tree of each account open whose tree changed since it was last kept: the app
+/// calls it as it closes, so the next start has less to catch up on.
+pub fn save_caches() {
+    let open: Vec<Arc<Account>> = OPEN.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
+    for a in open {
+        a.save_cache_if_changed();
+    }
+}
+
 /// Forgets account `email`: it leaves the credential store at once, and its session ends on
 /// MEGA's side on a thread of its own (an account added again meanwhile keeps its new session).
 pub fn disconnect(email: &str) {
     let email = session::normal_email(email);
     let open = OPEN.lock().unwrap_or_else(|e| e.into_inner()).remove(&email);
+    // Its kept tree goes too, and a save on its way writes nothing.
+    if let Some(a) = &open {
+        a.forgotten.store(true, Ordering::SeqCst);
+    }
+    cache::forget(&email);
     // Not opened this run: the kept session's id alone ends it.
     let sid = match &open {
         Some(_) => None,
@@ -894,6 +1037,192 @@ mod tests {
         assert!(a.rename("/Drive na nuvem/nota (2).txt", "/Drive na nuvem/Fotos/praia.jpg").unwrap_err().contains("Já existe"));
         assert!(crate::nodes::twin_of("nota (2).txt", "nota.txt", true) && crate::nodes::twin_of("Fotos (3)", "Fotos", false));
         assert!(!crate::nodes::twin_of("nota (2).txt", "nota.md", true) && !crate::nodes::twin_of("nota.txt (2)", "nota.txt", true));
+    }
+
+    /// A stand-in for MEGA on a local port: `sc` answers by the sequence number asked for (none
+    /// known: error -6, as MEGA turns away one it no longer has), `cs` answers `f` with
+    /// `listing` and `uga` with ENOENT. Counts the `f` asked for.
+    struct FakeMega {
+        base: String,
+        fs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FakeMega {
+        fn start(sc: HashMap<&'static str, Value>, listing: Value) -> FakeMega {
+            use std::io::{BufRead, BufReader, Read, Write};
+            let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", server.local_addr().unwrap());
+            let fs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = fs.clone();
+            std::thread::spawn(move || {
+                for conn in server.incoming() {
+                    let Ok(mut conn) = conn else { return };
+                    let mut reader = BufReader::new(conn.try_clone().unwrap());
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        continue;
+                    }
+                    let mut len = 0;
+                    loop {
+                        let mut h = String::new();
+                        if reader.read_line(&mut h).is_err() || h.trim().is_empty() {
+                            break;
+                        }
+                        if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0; len];
+                    let _ = reader.read_exact(&mut body);
+                    let path = line.split(' ').nth(1).unwrap_or_default();
+                    let answer = if path.starts_with("/sc") {
+                        let sn = path.split(['?', '&']).find_map(|p| p.strip_prefix("sn=")).unwrap_or_default();
+                        sc.get(sn).cloned().unwrap_or(json!(-6))
+                    } else {
+                        let cmds: Vec<Value> = serde_json::from_slice(&body).unwrap_or_default();
+                        Value::Array(
+                            cmds.iter()
+                                .map(|c| match c["a"].as_str() {
+                                    Some("f") => {
+                                        counted.fetch_add(1, Ordering::SeqCst);
+                                        listing.clone()
+                                    }
+                                    _ => json!(-9),
+                                })
+                                .collect(),
+                        )
+                    };
+                    let text = answer.to_string();
+                    let _ = write!(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
+                }
+            });
+            FakeMega { base, fs }
+        }
+
+        fn api(&self) -> Api {
+            Api::new(&self.base)
+        }
+
+        fn listings(&self) -> usize {
+            self.fs.load(Ordering::SeqCst)
+        }
+    }
+
+    fn test_session(sek: u8) -> Session {
+        let k = keys();
+        Session { user: k.user.clone(), master: k.master, sek: [sek; 16], sid: "SID".into(), rsa: None }
+    }
+
+    fn temp_file(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("oe-mega-start-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        cache::file_in(&dir, "ana@exemplo.com")
+    }
+
+    /// The kept tree as a start leaves it, from `listing` (its `sn` SN000000001).
+    fn keep(file: &std::path::Path, sek: u8) {
+        let mut k = keys();
+        let tree = { let l = listing(&k); Tree::from_listing(&mut k, &l) };
+        let s = test_session(sek);
+        cache::write(file, &cache::Secret::of(&s.user, &s.master, &s.sek), cache::encode(&tree, &k.shares)).unwrap();
+    }
+
+    /// The whole tree MEGA would send now: `listing` plus one folder made since.
+    fn fresh_listing() -> Value {
+        let k = keys();
+        let mut l = listing(&k);
+        l["f"].as_array_mut().unwrap().push(crate::nodes::tests::raw(&k, "LATER001", "ROOT0000", 1, "Feita depois", (k.user.as_str(), k.master)));
+        l["sn"] = "SN000000009".into();
+        l
+    }
+
+    #[test]
+    fn a_start_reads_the_kept_tree_and_only_the_changes_since() {
+        let file = temp_file("catch-up");
+        keep(&file, 1);
+        let k = keys();
+        let new = crate::nodes::tests::raw(&k, "NEWFILE1", "FOLDER01", 0, "nova.jpg", (k.user.as_str(), k.master));
+        let mut sc = HashMap::new();
+        sc.insert("SN000000001", json!({"a": [{"a": "t", "t": {"f": [new]}}, {"a": "d", "n": "FILE0002"}], "sn": "SN000000002"}));
+        sc.insert("SN000000002", json!({"w": "https://example.invalid/wait", "sn": "SN000000002"}));
+        let mega = FakeMega::start(sc, fresh_listing());
+        let a = Account::start_kept("ana@exemplo.com", mega.api(), test_session(1), Some(file.clone())).unwrap();
+        assert!(a.started_from_cache());
+        assert_eq!(mega.listings(), 0, "no whole listing asked for");
+        assert!(a.resolve("/Drive na nuvem/Fotos/nova.jpg").is_some(), "a change since it was kept is in");
+        assert!(a.resolve("/Drive na nuvem/nota.txt").is_none(), "and so is a deletion");
+        assert_eq!(a.lock().tree.sn, "SN000000002");
+        // The changes are kept on the next save, with the new sequence number.
+        a.save_cache_if_changed();
+        let s = test_session(1);
+        let (kept, _) = cache::read(&file, &cache::Secret::of(&s.user, &s.master, &s.sek)).unwrap();
+        assert_eq!(kept.sn, "SN000000002");
+        assert!(kept.get("NEWFILE1").is_some() && kept.get("FILE0002").is_none());
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    /// MEGA turning the kept sequence number away, a share changed meanwhile (only a fresh
+    /// listing has its keys), a file of another session, a damaged one: each falls back to the
+    /// whole listing, and the file kept after is the fresh tree.
+    #[test]
+    fn a_kept_tree_that_cant_be_brought_up_to_date_is_thrown_away() {
+        let cases: [(&str, Option<Value>, u8); 4] = [
+            ("rejected", None, 1),
+            ("share", Some(json!({"a": [{"a": "s2", "n": "FOLDER01"}], "sn": "SN000000002"})), 1),
+            ("other-session", Some(json!({"w": "x", "sn": "SN000000001"})), 2),
+            ("damaged", Some(json!({"w": "x", "sn": "SN000000001"})), 1),
+        ];
+        for (name, answer, sek) in cases {
+            let file = temp_file(name);
+            keep(&file, 1);
+            if name == "damaged" {
+                let mut raw = std::fs::read(&file).unwrap();
+                let mid = raw.len() / 2;
+                raw[mid] ^= 0x80;
+                std::fs::write(&file, raw).unwrap();
+            }
+            let mut sc = HashMap::new();
+            if let Some(answer) = answer {
+                sc.insert("SN000000001", answer);
+            }
+            let mega = FakeMega::start(sc, fresh_listing());
+            let a = Account::start_kept("ana@exemplo.com", mega.api(), test_session(sek), Some(file.clone())).unwrap();
+            assert!(!a.started_from_cache(), "{name}");
+            assert_eq!(mega.listings(), 1, "{name}: the whole listing read once");
+            assert!(a.resolve("/Drive na nuvem/Feita depois").is_some(), "{name}: the fresh tree is shown");
+            let s = test_session(sek);
+            let (kept, _) = cache::read(&file, &cache::Secret::of(&s.user, &s.master, &s.sek)).unwrap();
+            assert_eq!(kept.sn, "SN000000009", "{name}: the fresh tree is kept");
+            let _ = std::fs::remove_dir_all(file.parent().unwrap());
+        }
+    }
+
+    /// Without a network the start fails, as it would without a kept tree: a tree that couldn't
+    /// be brought up to date isn't shown. The file stays for the next try.
+    #[test]
+    fn no_network_fails_the_start_and_keeps_the_file() {
+        let file = temp_file("offline");
+        keep(&file, 1);
+        assert!(Account::start_kept("ana@exemplo.com", Api::unreachable(), test_session(1), Some(file.clone())).is_err());
+        assert!(file.exists());
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn a_removed_account_writes_no_tree() {
+        let file = temp_file("removed");
+        let mut k = keys();
+        let tree = { let l = listing(&k); Tree::from_listing(&mut k, &l) };
+        let mut a = Account::offline(k, tree);
+        let s = test_session(0);
+        a.kept = Some((file.clone(), cache::Secret::of(&s.user, &s.master, &s.sek)));
+        a.save_cache();
+        assert!(file.exists());
+        cache::forget_file(&file);
+        a.forgotten.store(true, Ordering::SeqCst);
+        a.save_cache();
+        assert!(!file.exists(), "a save after the account was removed writes nothing");
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
     #[test]

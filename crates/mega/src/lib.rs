@@ -22,6 +22,7 @@
 //!   the `mega` crate doesn't do (hashcash, links, `rr`, `cr`, copies).
 
 pub mod account;
+pub mod cache;
 pub mod api;
 pub mod changes;
 pub mod crypto;
@@ -34,7 +35,8 @@ pub mod share;
 pub mod store;
 pub mod upload;
 
-pub use account::{Account, Area, Item, Place, cached, connect, disconnect, handle_path, reach};
+pub use account::{Account, Area, Item, Place, cached, connect, disconnect, handle_path, reach, save_caches};
+pub use cache::set_dir as set_cache_dir;
 pub use api::set_log;
 pub use changes::Changes;
 pub use nodes::{Kind, Node};

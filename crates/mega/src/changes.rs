@@ -33,42 +33,64 @@ impl Changes {
     }
 }
 
+/// How far a read of the change channel got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Caught {
+    /// Nothing more to read: the tree is current.
+    Up,
+    /// There's more than the rounds allowed.
+    More,
+    /// Only reading everything again tells what changed: MEGA no longer knows the sequence
+    /// number, or a change (a share, new keys) needs a fresh listing.
+    Rejected,
+}
+
 impl Account {
     /// Takes in what changed since the last ask.
     pub fn poll(&self) -> Result<Changes> {
         let mut changes = Changes::default();
-        if !self.lock().refetch {
-            for _ in 0..32 {
-                let sn = self.lock().tree.sn.clone();
-                let url = format!("{}/sc?sn={sn}&sid={}", self.api.base(), self.api.sid().unwrap_or_default());
-                let answer = match self.api.get_json(&url) {
-                    Ok(v) => v,
-                    Err(Fail::Code(ESID)) => return Err(t("A sessão do MEGA terminou (saiu pelo site ou mudou a senha?). Remova a conta e conecte de novo.", "The MEGA session ended (signed out on the website or changed the password?). Remove the account and connect it again.").into()),
-                    // A sequence number MEGA no longer knows: only reading everything again
-                    // tells what changed.
-                    Err(Fail::Code(code)) => {
-                        crate::api::log(&format!("MEGA sc: erro {code}, lendo a conta de novo"));
-                        self.lock().refetch = true;
-                        break;
-                    }
-                    Err(f) => return Err(f.text()),
-                };
-                let Some(packets) = answer.get("a").and_then(Value::as_array) else { break };
-                let mut inner = self.lock();
-                apply(&mut inner, packets, &mut changes);
-                if let Some(sn) = answer.get("sn").and_then(Value::as_str) {
-                    inner.tree.sn = sn.to_string();
-                }
-                if packets.is_empty() || inner.refetch {
-                    break;
-                }
-            }
+        if !self.lock().refetch && self.read_changes(32, &mut changes)? == Caught::Rejected {
+            self.lock().refetch = true;
         }
         if self.lock().refetch {
             self.fetch()?;
             changes.all = true;
+        } else if !changes.is_empty() {
+            self.changed();
         }
         Ok(changes)
+    }
+
+    /// Reads the change channel from the tree's sequence number on, `rounds` answers at most,
+    /// applying what comes.
+    pub(crate) fn read_changes(&self, rounds: usize, changes: &mut Changes) -> Result<Caught> {
+        for _ in 0..rounds {
+            let sn = self.lock().tree.sn.clone();
+            let url = format!("{}/sc?sn={sn}&sid={}", self.api.base(), self.api.sid().unwrap_or_default());
+            let answer = match self.api.get_json(&url) {
+                Ok(v) => v,
+                Err(Fail::Code(ESID)) => return Err(t("A sessão do MEGA terminou (saiu pelo site ou mudou a senha?). Remova a conta e conecte de novo.", "The MEGA session ended (signed out on the website or changed the password?). Remove the account and connect it again.").into()),
+                Err(Fail::Code(code)) => {
+                    crate::api::log(&format!("MEGA sc: erro {code}, lendo a conta de novo"));
+                    return Ok(Caught::Rejected);
+                }
+                Err(f) => return Err(f.text()),
+            };
+            // No packets: a URL to wait at (`w`), nothing new.
+            let Some(packets) = answer.get("a").and_then(Value::as_array) else { return Ok(Caught::Up) };
+            let mut inner = self.lock();
+            apply(&mut inner, packets, changes);
+            if let Some(sn) = answer.get("sn").and_then(Value::as_str) {
+                inner.tree.sn = sn.to_string();
+            }
+            if inner.refetch {
+                return Ok(Caught::Rejected);
+            }
+            if packets.is_empty() {
+                return Ok(Caught::Up);
+            }
+        }
+        Ok(Caught::More)
     }
 
     /// Applies packets as `poll` would, for tests.

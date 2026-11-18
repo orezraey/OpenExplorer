@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use openexplorer_mega::crypto::{attr_key, b64, ecb_encrypt, encrypt_attrs, fingerprint, merge_file_key};
+use openexplorer_mega::cache;
 use openexplorer_mega::nodes::{Keys, Tree};
 use serde_json::{Map, Value, json};
 
@@ -191,6 +192,87 @@ fn measure(n: usize, big: usize) {
         resolving.as_millis(),
     );
     drop(tree);
+}
+
+fn mb(bytes: impl TryInto<u64>) -> f64 {
+    bytes.try_into().unwrap_or(0) as f64 / 1e6
+}
+
+/// A start both ways, network left out: today's, the `f` answer's text parsed and decrypted
+/// into the tree; and from the kept tree, its file read, opened and rebuilt. Peaks count the
+/// input (the answer's text, the file's bytes) too.
+fn start(n: usize, big: usize) {
+    let master = [7u8; 16];
+    let (l, big_h, names) = listing(n, big, &master);
+    let text = serde_json::to_vec(&l).expect("JSON");
+    drop(l);
+
+    let (before, _) = live();
+    PEAK.store(before.max(0) as usize, Ordering::Relaxed);
+    let started = Instant::now();
+    let v: Value = serde_json::from_slice(&text).expect("JSON");
+    let parsed = started.elapsed();
+    let mut keys = Keys { user: USER.into(), master, rsa: None, shares: HashMap::new() };
+    let tree = Tree::from_listing(&mut keys, &v);
+    drop(v);
+    let today = started.elapsed();
+    let today_peak = PEAK.load(Ordering::Relaxed) as isize - before + text.len() as isize;
+    let tree_bytes = live().0 - before;
+    let listing_len = text.len();
+    drop(text);
+
+    let secret = cache::Secret::of(USER, &master, &[9; 16]);
+    let dir = std::env::temp_dir().join(format!("oe-mega-bench-{}", std::process::id()));
+    let file = cache::file_in(&dir, "bench@example.com");
+    let (before, _) = live();
+    PEAK.store(before.max(0) as usize, Ordering::Relaxed);
+    let started = Instant::now();
+    let body = cache::encode(&tree, &keys.shares);
+    let encoded = started.elapsed();
+    let started = Instant::now();
+    cache::write(&file, &secret, body).expect("writing the cache");
+    let written = started.elapsed();
+    let save_peak = PEAK.load(Ordering::Relaxed) as isize - before;
+    let file_len = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+    drop(tree);
+
+    let (before, _) = live();
+    PEAK.store(before.max(0) as usize, Ordering::Relaxed);
+    let started = Instant::now();
+    let mut data = std::fs::read(&file).expect("reading the cache");
+    let read = started.elapsed();
+    let at = Instant::now();
+    let body = cache::open(&secret, &mut data).expect("opening the cache");
+    let opened = at.elapsed();
+    let at = Instant::now();
+    let (back, _) = cache::decode(&data[body]).expect("a tree");
+    let rebuilt = at.elapsed();
+    drop(data);
+    let cached = started.elapsed();
+    let cache_peak = PEAK.load(Ordering::Relaxed) as isize - before;
+    let back_bytes = live().0 - before;
+    assert_eq!(back.children(&big_h).len(), big);
+    assert!(names.iter().all(|name| back.child_named(&big_h, name).is_some()));
+    drop(back);
+    cache::forget_file(&file);
+    let _ = std::fs::remove_dir_all(dir);
+
+    eprintln!("{n} nodes, start without the network:");
+    eprintln!("  today (f):  {} ms ({} ms parsing the {:.1} MB answer), peak {:.1} MB, tree {:.1} MB", today.as_millis(), parsed.as_millis(), mb(listing_len), mb(today_peak), mb(tree_bytes));
+    eprintln!("  from cache: {} ms (read {} ms, open {} ms, rebuild {} ms), peak {:.1} MB, tree {:.1} MB; file {:.1} MB", cached.as_millis(), read.as_millis(), opened.as_millis(), rebuilt.as_millis(), mb(cache_peak), mb(back_bytes), mb(file_len));
+    eprintln!("  saving:     {} ms (encode {} ms under the lock, seal and write {} ms), {:.1} MB more at the peak", (encoded + written).as_millis(), encoded.as_millis(), written.as_millis(), mb(save_peak));
+}
+
+#[test]
+#[ignore = "benchmark"]
+fn start_100_thousand() {
+    start(100_000, 5_000);
+}
+
+#[test]
+#[ignore = "benchmark"]
+fn start_1_million() {
+    start(1_000_000, 50_000);
 }
 
 #[test]

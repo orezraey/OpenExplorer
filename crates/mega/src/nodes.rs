@@ -54,7 +54,7 @@ impl Kind {
 /// A handle as MEGA writes it (base64 text of up to `N` ASCII characters), kept inline: empty
 /// is all zeros. It reads as the `&str` it was made from, and orders the same.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Id<const N: usize>([u8; N]);
+pub struct Id<const N: usize>(pub(crate) [u8; N]);
 
 /// A node's or a public link's handle: 8 characters.
 pub type Handle = Id<8>;
@@ -179,7 +179,7 @@ pub struct Node {
     pub key: NodeKey,
     /// Its attributes other than the name (`n`), as JSON, so a rename keeps the ones it doesn't
     /// touch: see [`Node::attrs`].
-    others: Option<Box<str>>,
+    pub(crate) others: Option<Box<str>>,
     pub owner: UserHandle,
     /// The top folder of an incoming share: who shares it, and the access (0 read, 1 read and
     /// write, 2 full).
@@ -379,6 +379,39 @@ impl Tree {
             }
         }
         tree
+    }
+
+    /// An empty tree with room for `n` nodes and some changes after them.
+    pub fn with_capacity(n: usize) -> Tree {
+        let room = n + n / 16;
+        let mut tree = Tree::default();
+        tree.slots.reserve(room);
+        tree.ids.reserve(room);
+        tree.names.reserve(room);
+        tree
+    }
+
+    /// How many nodes it holds.
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// Every node, in no order.
+    pub fn nodes(&self) -> impl Iterator<Item = &Node> {
+        self.slots.iter().flatten().map(|s| &s.node)
+    }
+
+    /// The nodes no key opened yet, as MEGA sent them.
+    pub fn locked_nodes(&self) -> &[Value] {
+        &self.locked
+    }
+
+    pub(crate) fn set_locked(&mut self, locked: Vec<Value>) {
+        self.locked = locked;
     }
 
     /// Adds or replaces a node as MEGA sent it; one no key opens waits in `locked`.
