@@ -1878,8 +1878,10 @@ fn main() {
     })
     .font_smoothing(initial.text_render.smoothing())
     .args(rune_args(std::env::args().skip(1)))
+    // The app ends without returning from `run`: what MEGA changed since its trees were last
+    // kept is kept here, so the next start has less to catch up on.
+    .on_quit(|_, _| openexplorer_mega::save_caches())
     .run();
-    openexplorer_mega::save_caches();
 }
 
 /// Rune's flags: what the command line says, with scroll bars always shown on Windows unless

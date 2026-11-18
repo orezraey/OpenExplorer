@@ -121,9 +121,17 @@ pub fn forget(email: &str) {
     }
 }
 
+/// Deletes `file`, and any temporary file a write cut short (a crash) left beside it.
 pub fn forget_file(file: &Path) {
     let _held = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let _ = std::fs::remove_file(file);
+    let (Some(dir), Some(stem)) = (file.parent(), file.file_stem().and_then(|s| s.to_str())) else { return };
+    let prefix = format!("{stem}.tmp");
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_name().to_str().is_some_and(|n| n.starts_with(&prefix)) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -484,8 +492,12 @@ mod tests {
         let mut back = back;
         assert!(back.unlock(&k));
         assert_eq!(back.get("LOCKED01").unwrap().name, "segredo.txt");
+        // A write cut short left its temporary file: it goes with the account's.
+        let stray = file.with_extension("tmp123");
+        std::fs::write(&stray, b"half").unwrap();
         forget_file(&file);
         assert_eq!(read(&file, &secret()).err(), Some(Refusal::Missing));
+        assert!(!stray.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 

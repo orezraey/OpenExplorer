@@ -55,8 +55,8 @@ impl Account {
         if self.lock().refetch {
             self.fetch()?;
             changes.all = true;
-        } else if !changes.is_empty() {
-            self.changed();
+        } else {
+            self.polled(!changes.is_empty());
         }
         Ok(changes)
     }

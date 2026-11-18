@@ -129,6 +129,18 @@ fn a_second_start_comes_from_the_kept_tree() {
         for area in [Area::Rubbish, Area::Incoming] {
             assert_eq!(again.list(&format!("/{}", area.label())).unwrap(), a.list(&format!("/{}", area.label())).unwrap());
         }
+        // A sequence number MEGA never gave: the channel must turn it away, and the start read
+        // the whole tree instead of showing the kept one.
+        let api = Api::default();
+        let resumed = session::resume(&api, &a.saved()).unwrap_or_else(|f| panic!("resume: {}", f.text()));
+        let secret = openexplorer_mega::cache::Secret::of(&resumed.user, &resumed.master, &resumed.sek);
+        let (mut kept, shares) = openexplorer_mega::cache::read(&file, &secret).expect("the kept tree");
+        eprintln!("kept sequence number: {} characters", kept.sn.len());
+        kept.sn = "A".repeat(kept.sn.len());
+        openexplorer_mega::cache::write(&file, &secret, openexplorer_mega::cache::encode(&kept, &shares)).unwrap();
+        let third = Account::start_kept(&email, api, resumed, Some(file.clone())).expect("reading the account a third time");
+        assert!(!third.started_from_cache(), "a sequence number MEGA doesn't know isn't caught up from");
+        assert_eq!(names(&third), names(&a));
     }));
     if let Some((b, _, made)) = made {
         b.delete(&made).unwrap();

@@ -169,10 +169,9 @@ impl Account {
     }
 
     /// Takes in the kept tree and the changes since it was kept. `false` when there's none to
-    /// use: no file, one this session can't open, or one whose sequence number MEGA no longer
-    /// takes (then the file is thrown away). An error (no network, the session ended) leaves
-    /// the file as it is and no tree in place: a start never shows a tree it couldn't bring
-    /// up to date.
+    /// use: no file, one this session can't open, one whose sequence number MEGA no longer
+    /// takes (then the file is thrown away), or the change channel failing (then the file stays
+    /// until a whole read replaces it). A start never shows a tree it couldn't bring up to date.
     fn resume_kept(&self) -> Result<bool> {
         let Some((file, secret)) = &self.kept else { return Ok(false) };
         let started = Instant::now();
@@ -213,9 +212,13 @@ impl Account {
                 self.lock().tree = Tree::default();
                 Ok(false)
             }
+            // The channel failing (no network, an answer it can't read) doesn't show the kept
+            // tree: the whole one is read, which fails the start as before if MEGA can't be
+            // reached, the file staying for the next try; and overwrites the file if it can.
             Err(e) => {
+                crate::api::log(&format!("MEGA cache: o canal de mudanças falhou ({e}), lendo a conta inteira"));
                 self.lock().tree = Tree::default();
-                Err(e)
+                Ok(false)
             }
         }
     }
@@ -240,12 +243,13 @@ impl Account {
         }
     }
 
-    /// Notes that the tree changed, and keeps it when it's been a while.
-    pub(crate) fn changed(&self) {
+    /// After a poll: notes whether the tree changed, and keeps it when it changed since it was
+    /// last kept (by this poll or before: a start's catch-up) and it's been a while.
+    pub(crate) fn polled(&self, changed: bool) {
         let due = {
             let mut saved = self.saved.lock().unwrap_or_else(|e| e.into_inner());
-            saved.dirty = true;
-            saved.at.is_none_or(|at| at.elapsed() >= SAVE_EVERY)
+            saved.dirty |= changed;
+            saved.dirty && saved.at.is_none_or(|at| at.elapsed() >= SAVE_EVERY)
         };
         if due {
             self.save_cache();
@@ -1092,8 +1096,14 @@ mod tests {
                                 .collect(),
                         )
                     };
-                    let text = answer.to_string();
-                    let _ = write!(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
+                    // Two stand-ins for a channel answering wrong: a server error, and a body
+                    // that isn't JSON.
+                    let (status, text) = match answer.as_str() {
+                        Some("HTTP 500") => ("500 Internal Server Error", String::new()),
+                        Some("not JSON") => ("200 OK", "<html>busy</html>".to_string()),
+                        _ => ("200 OK", answer.to_string()),
+                    };
+                    let _ = write!(conn, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
                 }
             });
             FakeMega { base, fs }
@@ -1162,13 +1172,16 @@ mod tests {
     }
 
     /// MEGA turning the kept sequence number away, a share changed meanwhile (only a fresh
-    /// listing has its keys), a file of another session, a damaged one: each falls back to the
-    /// whole listing, and the file kept after is the fresh tree.
+    /// listing has its keys), the channel answering an error page or something unreadable, a
+    /// file of another session, a damaged one: each falls back to the whole listing, and the
+    /// file kept after is the fresh tree.
     #[test]
     fn a_kept_tree_that_cant_be_brought_up_to_date_is_thrown_away() {
-        let cases: [(&str, Option<Value>, u8); 4] = [
+        let cases: [(&str, Option<Value>, u8); 6] = [
             ("rejected", None, 1),
             ("share", Some(json!({"a": [{"a": "s2", "n": "FOLDER01"}], "sn": "SN000000002"})), 1),
+            ("http-500", Some(json!("HTTP 500")), 1),
+            ("not-json", Some(json!("not JSON")), 1),
             ("other-session", Some(json!({"w": "x", "sn": "SN000000001"})), 2),
             ("damaged", Some(json!({"w": "x", "sn": "SN000000001"})), 1),
         ];
