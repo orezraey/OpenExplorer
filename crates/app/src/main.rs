@@ -699,7 +699,7 @@ pub(crate) fn connect_with(s: &mut State, p: usize, cfg: ClientConfig, tx: &mut 
 
 fn disconnect(s: &mut State, email: &str) {
     if let Err(e) = store::remove(email) {
-        s.status = e;
+        fail(s, e);
         return;
     }
     s.drives.remove(email);

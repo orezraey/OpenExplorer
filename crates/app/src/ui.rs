@@ -586,7 +586,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                             let dir = openexplorer_gdrive::local_dir();
                             let _ = std::fs::create_dir_all(&dir);
                             if let Err(e) = crate::ops::open(&dir) {
-                                s.status = e;
+                                crate::fail(s, e);
                             }
                         })
                         .build(k),
@@ -602,7 +602,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                                 }
                                 s.status = "Arquivo de log limpo.".into();
                             }
-                            Err(e) => s.status = e,
+                            Err(e) => crate::fail(s, e),
                         })
                         .build(k),
                 );
@@ -1487,7 +1487,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
                 .variant(ButtonVariant::Neutral)
                 .on_press_tx(|s: &mut State, tx: &mut Tx| {
                     if let Err(e) = tx.open_url("https://console.cloud.google.com/apis/credentials") {
-                        s.status = format!("Não consegui abrir o navegador: {e:?}");
+                        crate::fail(s, format!("Não consegui abrir o navegador: {e:?}"));
                     }
                 })
                 .build(k);
@@ -2098,7 +2098,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
                                             .variant(ButtonVariant::Neutral)
                                             .on_press_tx(move |s: &mut State, tx: &mut Tx| {
                                                 if let Err(e) = tx.open_url(&url) {
-                                                    s.status = format!("Não consegui abrir o navegador: {e:?}");
+                                                    crate::fail(s, format!("Não consegui abrir o navegador: {e:?}"));
                                                 }
                                             })
                                             .build(k),

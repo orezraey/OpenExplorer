@@ -109,7 +109,7 @@ pub fn link_answer(s: &mut State, a: LinkAnswer, tx: &mut Tx) {
     let sharing = match a.result {
         Ok(sh) => sh,
         Err(e) => {
-            s.status = e;
+            crate::fail(s, e);
             return;
         }
     };
