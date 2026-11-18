@@ -3034,7 +3034,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "openexplorer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "md-5",
@@ -3055,7 +3055,7 @@ dependencies = [
 
 [[package]]
 name = "openexplorer-gdrive"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3072,14 +3072,14 @@ dependencies = [
 
 [[package]]
 name = "openexplorer-i18n"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "openexplorer-index"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "memchr",
@@ -3093,7 +3093,7 @@ dependencies = [
 
 [[package]]
 name = "openexplorer-mega"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3112,7 +3112,7 @@ dependencies = [
 
 [[package]]
 name = "openexplorer-remote"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",

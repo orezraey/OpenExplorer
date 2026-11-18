@@ -166,6 +166,14 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
+      # This version's part of CHANGELOG.md opens the release notes; GitHub's list of commits
+      # follows it.
+      - name: Release notes
+        run: awk -v v="${GITHUB_REF_NAME#v}" '/^## /{p = ($2 == v); next} p' CHANGELOG.md > notes.md
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -173,6 +181,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          body_path: notes.md
           generate_release_notes: true
           # v0.2.0-beta.1 and the like are marked as pre-releases.
           prerelease: ${{ contains(github.ref_name, '-') }}
