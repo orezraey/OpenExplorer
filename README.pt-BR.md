@@ -20,8 +20,9 @@ integrados. Escrito em Rust.
 
 ## Instalação
 
-Baixe a versão mais recente em [Releases](../../releases). O executável ainda não é assinado,
-então o SmartScreen do Windows avisa na primeira vez que você o abre.
+Baixe a versão mais recente em [Releases](../../releases): o `setup.exe` instala o Open
+Explorer com atalho no menu Iniciar e desinstalador, e o `portable.exe` roda sem instalar.
+Nenhum dos dois é assinado ainda, então o SmartScreen do Windows avisa na primeira vez.
 
 Há versões para Linux e macOS, mas são experimentais. A pesquisa no computador não existe no
 macOS.

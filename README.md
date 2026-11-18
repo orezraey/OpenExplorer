@@ -20,8 +20,9 @@ Written in Rust.
 
 ## Installation
 
-Download the latest build from [Releases](../../releases). The executable isn't code-signed yet,
-so Windows SmartScreen will warn the first time you run it.
+Download the latest version from [Releases](../../releases): the `setup.exe` installs Open
+Explorer with a Start menu shortcut and an uninstaller, and the `portable.exe` runs without
+installing. Neither is code-signed yet, so Windows SmartScreen will warn the first time.
 
 Linux and macOS builds are provided but experimental. Computer search isn't available on macOS.
 

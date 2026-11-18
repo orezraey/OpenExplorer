@@ -80,12 +80,38 @@ jobs:
           cargo build --release --locked -p openexplorer --target aarch64-apple-darwin
           cargo build --release --locked -p openexplorer --target x86_64-apple-darwin
 
-      # One .exe: the app, which is also the search service (`openexplorer index`).
+      # Two downloads: an installer (Inno Setup: Program Files, Start menu, Add or remove
+      # programs) and the same .exe to run without installing. One .exe is the app and also the
+      # search service (`openexplorer index`).
       - name: Package (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          mkdir -p dist
-          cp target/release/openexplorer.exe "dist/$PKG.exe"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/openexplorer.exe "dist/$env:PKG-portable.exe"
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y | Out-Null }
+          & $iscc /Q "/DAppVersion=$env:VERSION" "/DSourceExe=$PWD\target\release\openexplorer.exe" "/DOutputName=$env:PKG-setup" installer/openexplorer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The installer installs, the search service joins it, and uninstalling takes both away.
+      - name: Try the installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $setup = Get-Item "dist/$env:PKG-setup.exe"
+          Start-Process $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+          $app = "$env:ProgramFiles\OpenExplorer"
+          if (-not (Test-Path "$app\openexplorer.exe")) { throw "not installed in $app" }
+          if (-not (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Open Explorer.lnk")) { throw "no Start menu shortcut" }
+          Start-Process "$app\openexplorer.exe" -ArgumentList 'index', 'install' -Wait
+          if (-not (Get-Service OpenExplorerIndex -ErrorAction SilentlyContinue)) { throw "the search service didn't install" }
+          Start-Process "$app\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+          # The uninstaller hands over to a copy of itself and returns at once: wait for it.
+          for ($i = 0; $i -lt 60 -and (Test-Path "$app\openexplorer.exe"); $i++) { Start-Sleep -Seconds 1 }
+          if (Get-Service OpenExplorerIndex -ErrorAction SilentlyContinue) { throw "the search service stayed after uninstalling" }
+          if (Test-Path "$app\openexplorer.exe") { throw "the app stayed after uninstalling" }
+          "installed, search service added, both removed"
 
       # The executable (also the search service) in a .tar.gz, which keeps its permission to run:
       # a bare file downloaded by a browser loses it.
