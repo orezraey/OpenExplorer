@@ -272,12 +272,13 @@ pub struct Replayed {
 pub fn replay(record: Record, reach: &mut dyn Reach, redo: bool) -> Replayed {
     let (verb, done) = if redo { ("refazer", "Refeito") } else { ("desfazer", "Desfeito") };
     let Record { what, steps, reload } = record;
-    if let Some(why) = steps.iter().find_map(|step| step.check(reach).err()) {
+    let mut bin = Bin::default();
+    if let Some(why) = steps.iter().find_map(|step| step.check(reach, &mut bin).err()) {
         return Replayed { back: None, left: None, result: Err(format!("Não dá para {verb} “{what}”: {why}")) };
     }
     let mut back = Vec::new();
     for (i, step) in steps.iter().enumerate() {
-        match step.run(reach) {
+        match step.run(reach, &mut bin) {
             Ok(inverse) => back.push(inverse),
             Err(e) => {
                 let n = steps.len();
@@ -367,6 +368,13 @@ fn dir_of(path: &Path) -> String {
     path.parent().map(|d| d.display().to_string()).unwrap_or_default()
 }
 
+/// Whether what's sent to the trash from `path` lands in a Recycle Bin. Shared folders and WSL
+/// have none, and USB sticks and memory cards usually don't either: Windows deletes from them
+/// for good.
+pub fn has_recycle_bin(path: &Path) -> bool {
+    !crate::network::is_remote(path) && crate::model::drive_kind(path) == crate::model::DriveKind::Fixed
+}
+
 /// Whether something is at `path` (a broken link too).
 fn there(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
@@ -386,14 +394,47 @@ pub fn now_secs() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
-/// What went to the Recycle Bin from `path` at `since` or later; the latest, if several did.
+/// The Recycle Bin's listing, read once per replay: reading it is slow, and undoing a delete of
+/// 100 items would read it twice for each.
+#[derive(Default)]
+pub struct Bin(Option<Vec<Recycled>>);
+
 #[cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
-fn recycled(path: &Path, since: i64) -> Result<Option<trash::TrashItem>, String> {
-    let all = trash::os_limited::list().map_err(|e| format!("Não consegui ler a Lixeira: {e}"))?;
-    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return Ok(None) };
-    let dir = spelled_out(dir);
-    let named = |it: &trash::TrashItem| same_path(Path::new(&it.name), Path::new(name));
-    Ok(all.into_iter().filter(|it| it.time_deleted >= since && named(it) && same_path(&spelled_out(&it.original_parent), &dir)).max_by_key(|it| it.time_deleted))
+type Recycled = trash::TrashItem;
+#[cfg(not(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))))]
+type Recycled = ();
+
+impl Bin {
+    /// What went to the Recycle Bin from `path` at `since` or later; the latest, if several did.
+    fn find(&mut self, path: &Path, since: i64) -> Result<Option<Recycled>, String> {
+        let all = match &mut self.0 {
+            Some(all) => all,
+            none => none.insert(read_bin()?),
+        };
+        Ok(pick(all, path, since))
+    }
+}
+
+#[cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
+fn read_bin() -> Result<Vec<Recycled>, String> {
+    trash::os_limited::list().map_err(|e| format!("Não consegui ler a Lixeira: {e}"))
+}
+
+#[cfg(not(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))))]
+fn read_bin() -> Result<Vec<Recycled>, String> {
+    Err("Restaurar da Lixeira não é possível neste sistema.".into())
+}
+
+#[cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
+fn pick(all: &[Recycled], path: &Path, since: i64) -> Option<Recycled> {
+    let (dir, name) = (spelled_out(path.parent()?), path.file_name()?);
+    let named = |it: &&Recycled| same_path(Path::new(&it.name), Path::new(name));
+    all.iter().filter(|it| it.time_deleted >= since).filter(named).filter(|it| same_path(&spelled_out(&it.original_parent), &dir)).max_by_key(|it| it.time_deleted).cloned()
+}
+
+#[cfg(not(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))))]
+fn pick(_: &[Recycled], _: &Path, _: i64) -> Option<Recycled> {
+    None
 }
 
 /// `dir` named as the Recycle Bin keeps it: with Windows' short names, which %TEMP% often has
@@ -401,11 +442,6 @@ fn recycled(path: &Path, since: i64) -> Result<Option<trash::TrashItem>, String>
 #[cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
 fn spelled_out(dir: &Path) -> PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
-}
-
-#[cfg(not(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))))]
-fn recycled(_: &Path, _: i64) -> Result<Option<()>, String> {
-    Err("Restaurar da Lixeira não é possível neste sistema.".into())
 }
 
 impl Step {
@@ -418,7 +454,7 @@ impl Step {
     }
 
     /// Whether the item the step changes is still as it expects, or what changed.
-    fn check(&self, reach: &mut dyn Reach) -> Result<(), String> {
+    fn check(&self, reach: &mut dyn Reach, bin: &mut Bin) -> Result<(), String> {
         match self {
             Step::Move { from, to } => {
                 if !there(from) {
@@ -436,8 +472,8 @@ impl Step {
                 if !there(path) {
                     return Err(format!("“{}” não está mais em {}.", name_of(path), dir_of(path)));
                 }
-                // Without a Recycle Bin (a shared folder, WSL) it would be gone for good.
-                if crate::network::is_remote(path) {
+                // Without a Recycle Bin (a shared folder, WSL, a USB stick) it would be gone for good.
+                if !has_recycle_bin(path) {
                     return Err(format!("{} não tem Lixeira, e “{}” seria apagado para sempre.", dir_of(path), name_of(path)));
                 }
                 Ok(())
@@ -446,7 +482,7 @@ impl Step {
                 if there(path) {
                     return Err(format!("já existe “{}” em {}.", name_of(path), dir_of(path)));
                 }
-                match recycled(path, *since)? {
+                match bin.find(path, *since)? {
                     Some(_) => Ok(()),
                     None => Err(format!("“{}” não está mais na Lixeira.", name_of(path))),
                 }
@@ -542,7 +578,7 @@ impl Step {
     }
 
     /// Makes the change, giving the step that takes it back.
-    fn run(&self, reach: &mut dyn Reach) -> Result<Step, String> {
+    fn run(&self, reach: &mut dyn Reach, bin: &mut Bin) -> Result<Step, String> {
         Ok(match self {
             Step::Move { from, to } => {
                 let into = to.parent().ok_or("Destino sem pasta.")?;
@@ -565,11 +601,11 @@ impl Step {
             Step::Unrecycle { path, since } => {
                 #[cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
                 {
-                    let item = recycled(path, *since)?.ok_or_else(|| format!("“{}” não está mais na Lixeira.", name_of(path)))?;
+                    let item = bin.find(path, *since)?.ok_or_else(|| format!("“{}” não está mais na Lixeira.", name_of(path)))?;
                     trash::os_limited::restore_all([item]).map_err(|e| format!("Não consegui restaurar “{}” da Lixeira: {e}", name_of(path)))?;
                 }
                 #[cfg(not(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))))]
-                recycled(path, *since)?;
+                bin.find(path, *since)?;
                 Step::Recycle { path: path.clone() }
             }
             Step::MakeDir { path } => {
@@ -878,7 +914,7 @@ mod tests {
             fn drop(&mut self) {
                 let file = self.0.join("cópia de teste.txt");
                 if !there(&file)
-                    && let Ok(Some(item)) = recycled(&file, 0)
+                    && let Ok(Some(item)) = Bin::default().find(&file, 0)
                 {
                     let _ = trash::os_limited::restore_all([item]);
                 }
@@ -1038,5 +1074,78 @@ mod tests {
         undo(&mut s, false);
         assert_eq!(s.status, "Nada para desfazer.");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two panes on two folders of a scratch folder, each listed.
+    fn two_panes(tag: &str) -> (State, PathBuf, PathBuf) {
+        let dir = scratch(tag);
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        for name in ["um.txt", "dois.txt"] {
+            std::fs::write(a.join(name), name).unwrap();
+        }
+        let mut s = crate::init();
+        s.panes[0] = crate::model::Pane::new(Location::Local(a.clone()));
+        s.panes[1] = crate::model::Pane::new(Location::Local(b.clone()));
+        for p in &mut s.panes {
+            p.load_now(&s.mock, s.settings.show_hidden);
+        }
+        s.panes[0].selected = s.panes[0].entries.iter().map(|e| e.id.clone()).collect();
+        (s, a, b)
+    }
+
+    #[test]
+    fn a_cut_and_paste_goes_back_where_it_came_from() {
+        let (mut s, a, b) = two_panes("cut");
+        crate::actions::pick_up(&mut s, 0, crate::actions::ClipMode::Cut);
+        crate::actions::paste(&mut s, 1);
+        settle(&mut s);
+        assert!(b.join("um.txt").exists() && b.join("dois.txt").exists() && !a.join("um.txt").exists(), "{}", s.status);
+
+        undo(&mut s, false);
+        settle(&mut s);
+        assert_eq!(s.status, "Desfeito: mover 2 itens.");
+        assert_eq!(std::fs::read_to_string(a.join("um.txt")).unwrap(), "um.txt");
+        assert!(a.join("dois.txt").exists() && !b.join("um.txt").exists() && !b.join("dois.txt").exists());
+        undo(&mut s, true);
+        settle(&mut s);
+        assert!(b.join("um.txt").exists() && !a.join("um.txt").exists(), "{}", s.status);
+        let _ = std::fs::remove_dir_all(a.parent().unwrap());
+    }
+
+    /// A delete sends to the Recycle Bin and Desfazer brings it all back; the test's own files,
+    /// restored even if it fails.
+    #[cfg(windows)]
+    #[test]
+    fn a_delete_comes_back_from_the_recycle_bin() {
+        struct Tidy(PathBuf);
+        impl Drop for Tidy {
+            fn drop(&mut self) {
+                for name in ["um.txt", "dois.txt"] {
+                    let file = self.0.join(name);
+                    if !there(&file)
+                        && let Ok(Some(item)) = Bin::default().find(&file, 0)
+                    {
+                        let _ = trash::os_limited::restore_all([item]);
+                    }
+                }
+                let _ = std::fs::remove_dir_all(self.0.parent().unwrap());
+            }
+        }
+        let (mut s, a, _) = two_panes("delete");
+        let _tidy = Tidy(a.clone());
+        s.settings.skip_recycle_bin = false;
+        crate::actions::ask_delete(&mut s, 0);
+        assert!(matches!(s.dialog, Some(crate::actions::Dialog::Delete { .. })));
+        crate::actions::delete(&mut s);
+        settle(&mut s);
+        assert!(!a.join("um.txt").exists() && !a.join("dois.txt").exists(), "{}", s.status);
+
+        undo(&mut s, false);
+        settle(&mut s);
+        assert_eq!(s.status, "Desfeito: mover 2 itens para a Lixeira.");
+        assert_eq!(std::fs::read_to_string(a.join("dois.txt")).unwrap(), "dois.txt");
+        assert!(a.join("um.txt").exists());
     }
 }

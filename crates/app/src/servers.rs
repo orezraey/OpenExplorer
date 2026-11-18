@@ -1676,6 +1676,24 @@ mod real {
         settle(&mut s);
         assert!(matches!(&s.panes[0].loc, Location::Server { find: None, path, .. } if path.is_empty()));
 
+        // Desfazer three times: the move, the rename, then the new folder, empty again.
+        for _ in 0..3 {
+            crate::undo::undo(&mut s, false);
+            settle(&mut s);
+            assert!(s.status.starts_with("Desfeito"), "{}", s.status);
+        }
+        assert!(served.join("notas (2).txt").is_file() && !served.join("velhas.txt").exists());
+        assert!(!served.join("Arquivo").exists());
+        // Refazer makes the folder again; something in it keeps Desfazer from removing it.
+        crate::undo::undo(&mut s, true);
+        settle(&mut s);
+        assert!(served.join("Arquivo").is_dir(), "{}", s.status);
+        std::fs::write(served.join("Arquivo/novo.txt"), b"x").unwrap();
+        crate::undo::undo(&mut s, false);
+        settle(&mut s);
+        assert!(s.status.contains("não está mais vazia"), "{}", s.status);
+        assert!(served.join("Arquivo/novo.txt").is_file());
+
         // Deleting asks, then deletes for good.
         s.panes[0].selected = ["Projeto (2)".to_string()].into();
         actions::ask_delete(&mut s, 0);

@@ -517,9 +517,9 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
 pub fn local_transfer(s: &mut State, op: Op, sources: Vec<PathBuf>, dst: PathBuf, reload: Vec<Location>) {
     let to = End::local(&dst);
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, sources.iter().map(|p| (End::local(p), to.clone())));
-    // Copies where there's no Recycle Bin (a shared folder, WSL) aren't kept for Desfazer,
+    // Copies where there's no Recycle Bin (a shared folder, WSL, a USB stick) aren't kept for Desfazer,
     // which would have to delete them for good.
-    let recyclable = !crate::network::is_remote(&dst);
+    let recyclable = undo::has_recycle_bin(&dst);
     undo::local_job(s, reload, move |n| transfer_words(op, n), move |rec| {
         for (p, path) in batch.rows().iter().zip(&sources) {
             p.size(ops::measure(path, &|| p.cancelled()));
@@ -755,7 +755,7 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
     let (at_once, segmented) = (s.settings.downloads.into(), s.settings.segmented_downloads);
     // Desfazer sends what arrived to the Recycle Bin (not where there's none), and after
     // Recortar takes the originals out of the Drive trash. Abrir isn't kept.
-    let recyclable = !crate::network::is_remote(&dst);
+    let recyclable = undo::has_recycle_bin(&dst);
     let op = if then == Then::Trash { Op::Move } else { Op::Copy };
     let who = email.clone();
     undo::drive_job(s, &email, reload, move |n| transfer_words(op, n), move |d, rec| {
