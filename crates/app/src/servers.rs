@@ -674,8 +674,10 @@ pub struct Form {
     pub client_id: TextEdit,
     pub client_secret: TextEdit,
     pub reveal_secret: bool,
-    /// The fingerprint of the certificate the user trusts for this server (FTPS, https).
+    /// The fingerprint of the certificate the user trusts for this server (FTPS, https), and the
+    /// `(host, port)` pair it was trusted for so changing host/port never carries it over.
     pub trusted: Option<String>,
+    pub trusted_for: Option<(String, u16)>,
     /// A certificate the last check turned down, waiting for the user to trust it or not.
     pub untrusted: Option<Rejected>,
     pub error: Option<String>,
@@ -710,6 +712,7 @@ impl Form {
             client_secret: TextEdit::new("").secure(),
             reveal_secret: false,
             trusted: None,
+            trusted_for: None,
             untrusted: None,
             error: None,
             checking: None,
@@ -725,12 +728,19 @@ impl Form {
     }
 
     pub fn apply_provider(&mut self, provider: Provider) {
+        let changed_provider = self.provider != provider;
         self.step = Step::Configure;
         self.provider = provider;
         self.protocol = provider.default_protocol();
         self.error = None;
         self.untrusted = None;
+        self.trusted = None;
+        self.trusted_for = None;
         self.filter.focused = false;
+        if changed_provider && self.editing.is_none() {
+            self.port = TextEdit::new("");
+            self.folder = TextEdit::new("");
+        }
         if provider == Provider::GoogleDrive {
             let missing = openexplorer_gdrive::ClientConfig::load().is_err();
             self.custom_oauth = missing;
@@ -738,7 +748,21 @@ impl Form {
                 self.client_id.focused = true;
             }
         } else {
+            self.sync_host_scheme();
             self.host.focused = true;
+        }
+    }
+
+    /// Synchronizes `self.protocol` when `self.host` starts with an explicit URL scheme.
+    pub fn sync_host_scheme(&mut self) {
+        let h = self.host.text.trim();
+        if h.contains("://")
+            && let Some(a) = parse_address(h)
+        {
+            self.protocol = a.protocol;
+            if self.editing.is_none() && !matches!(self.provider, Provider::Nextcloud | Provider::OwnCloud) {
+                self.provider = detect_provider(&a);
+            }
         }
     }
 
@@ -766,18 +790,13 @@ impl Form {
             f.connections = TextEdit::new(server.connections.to_string());
         }
         f.trusted = server.cert.clone();
+        f.trusted_for = server.cert.as_ref().map(|_| (server.host.clone(), server.port));
         f
     }
 
     /// The form filled with what an address typed says (`sftp://ana@nas:2222/home`).
     pub fn of_address(a: &Address) -> Form {
-        let provider = if matches!(a.protocol, Protocol::Dav | Protocol::Davs) && a.path.to_lowercase().contains("nextcloud") {
-            Provider::Nextcloud
-        } else if matches!(a.protocol, Protocol::Dav | Protocol::Davs) && a.path.to_lowercase().contains("owncloud") {
-            Provider::OwnCloud
-        } else {
-            Provider::of_protocol(a.protocol)
-        };
+        let provider = detect_provider(a);
         let mut f = Form::for_provider(provider);
         f.protocol = a.protocol;
         f.host = TextEdit::new(a.host.clone());
@@ -790,34 +809,77 @@ impl Form {
             f.password = TextEdit::new(p.clone()).secure();
         }
         // Nextcloud and ownCloud serve WebDAV under `/remote.php/…`: an install's own address
-        // (`https://host/nextcloud`) gets it appended, as the Servidor field does.
-        let branded = matches!(provider, Provider::Nextcloud | Provider::OwnCloud);
-        if branded && !a.path.contains("/remote.php/") {
-            f.folder = TextEdit::new(format!("{}/remote.php/webdav", a.path.trim_end_matches('/')));
+        // (`https://host/nextcloud` or a copied `/index.php/apps/files/` URL) gets it normalized.
+        if matches!(provider, Provider::Nextcloud | Provider::OwnCloud) {
+            f.folder = TextEdit::new(branded_webdav_root(&a.path));
         } else if a.path != "/" {
             f.folder = TextEdit::new(a.path.clone());
         }
         f
     }
 
+    /// Effective protocol, honoring an explicit URL scheme typed in `Servidor` (`ftps://`, `http://`, etc.).
+    pub fn effective_protocol(&self) -> Protocol {
+        let h = self.host.text.trim();
+        if h.contains("://")
+            && let Some(a) = parse_address(h)
+        {
+            return a.protocol;
+        }
+        self.protocol
+    }
+
+    /// Current `(host, port)` target parsed from the form, used to scope trusted TLS fingerprints.
+    pub fn target_endpoint(&self) -> Option<(String, u16, Protocol)> {
+        let mut protocol = self.protocol;
+        let raw_host = self.host.text.trim();
+        let (host, url_port) = if raw_host.contains("://") {
+            let a = parse_address(raw_host)?;
+            protocol = a.protocol;
+            (a.host, a.port)
+        } else {
+            split_host_port(raw_host).ok()?
+        };
+        if host.is_empty() {
+            return None;
+        }
+        let port = match (self.port.text.trim(), url_port) {
+            ("", Some(p)) => p,
+            ("", None) => protocol.default_port(),
+            (t, _) => t.parse::<u16>().ok().filter(|p| *p > 0)?,
+        };
+        Some((host, port, protocol))
+    }
+
+    /// Returns the trusted certificate fingerprint only when it applies to the current host, port and TLS protocol.
+    pub fn active_trusted(&self) -> Option<&str> {
+        let fp = self.trusted.as_deref()?;
+        let (host, port, protocol) = self.target_endpoint()?;
+        if !matches!(protocol, Protocol::Ftps | Protocol::Davs) {
+            return None;
+        }
+        match &self.trusted_for {
+            Some((th, tp)) if !th.eq_ignore_ascii_case(&host) || *tp != port => None,
+            _ => Some(fp),
+        }
+    }
+
     /// The server the form describes, and the password a pasted address held; or what's
     /// missing.
     fn server(&self, s: &State) -> Result<(Server, Option<String>), String> {
         let mut protocol = self.protocol;
-        let mut host = self.host.text.trim().to_string();
+        let raw_host = self.host.text.trim();
         let mut user = self.user.text.trim().to_string();
         let explicit_folder = !self.folder.text.trim().is_empty();
         let mut root = self.folder.text.trim().to_string();
-        let mut port = None;
         let mut pasted = None;
         let mut pasted_path = None;
-        // A whole address pasted in the Servidor field fills the rest.
-        if host.contains("://")
-            && let Some(a) = parse_address(&host)
-        {
+        // A whole address pasted in the Servidor field fills the rest; an unschemed `host:port` splits cleanly.
+        let (host, parsed_port) = if raw_host.contains("://") {
+            let Some(a) = parse_address(raw_host) else {
+                return Err("Endereço inválido. Use o formato protocolo://servidor:porta/pasta ou informe apenas o servidor.".into());
+            };
             protocol = a.protocol;
-            host = a.host;
-            port = a.port;
             if user.is_empty() {
                 user = a.user;
             }
@@ -825,7 +887,10 @@ impl Form {
                 pasted_path = Some(a.path);
             }
             pasted = a.password;
-        }
+            (a.host, a.port)
+        } else {
+            split_host_port(raw_host)?
+        };
         if host.is_empty() {
             return Err("Escreva o endereço do servidor.".into());
         }
@@ -837,16 +902,12 @@ impl Form {
         // URL was pasted or a custom initial folder was typed.
         if !explicit_folder {
             if matches!(self.provider, Provider::Nextcloud | Provider::OwnCloud) && matches!(protocol, Protocol::Dav | Protocol::Davs) {
-                root = match pasted_path {
-                    Some(p) if p.contains("/remote.php/") => p,
-                    Some(p) => format!("{}/remote.php/webdav", p.trim_end_matches('/')),
-                    None => "/remote.php/webdav".into(),
-                };
+                root = branded_webdav_root(pasted_path.as_deref().unwrap_or("/"));
             } else if let Some(p) = pasted_path {
                 root = p;
             }
         }
-        let port = match (self.port.text.trim(), port) {
+        let port = match (self.port.text.trim(), parsed_port) {
             ("", Some(p)) => p,
             ("", None) => protocol.default_port(),
             (t, _) => t.parse::<u16>().ok().filter(|p| *p > 0).ok_or("A porta é um número de 1 a 65535.")?,
@@ -877,13 +938,87 @@ impl Form {
             "" => remote::USUAL_CONNECTIONS,
             t => t.parse::<u8>().ok().filter(|n| (1..=remote::MOST_CONNECTIONS).contains(n)).ok_or(format!("Conexões simultâneas é um número de 1 a {}.", remote::MOST_CONNECTIONS))?,
         };
-        // A certificate trusted is only for the protocols over TLS.
-        let cert = self.trusted.clone().filter(|_| matches!(protocol, Protocol::Ftps | Protocol::Davs));
+        // A certificate trusted applies only to the exact `(host, port)` over TLS.
+        let cert = self.trusted.clone().filter(|_| {
+            matches!(protocol, Protocol::Ftps | Protocol::Davs)
+                && self.trusted_for.as_ref().is_none_or(|(th, tp)| th.eq_ignore_ascii_case(&host) && *tp == port)
+        });
         let id = self.editing.clone().unwrap_or_else(remote::store::new_id);
         // The host key seen before stays, unless the server is another one now.
         let host_key = self.editing.as_ref().and_then(|id| s.servers.list.iter().find(|sv| sv.id == *id)).filter(|old| old.host == host && old.port == port && old.protocol == protocol).and_then(|old| old.host_key.clone());
         Ok((Server { id, name, protocol, brand, host, port, user, root, key, host_key, cert, connections, implicit: false }, pasted))
     }
+}
+
+/// Detects Nextcloud or ownCloud from a pasted WebDAV URL's hostname or top-level install path
+/// (without false-matching deep folder names like `/backups/nextcloud`).
+fn detect_provider(a: &Address) -> Provider {
+    if matches!(a.protocol, Protocol::Dav | Protocol::Davs) {
+        let h = a.host.to_lowercase();
+        let p = a.path.to_lowercase();
+        let first_seg = p.trim_start_matches('/').split('/').next().unwrap_or("");
+        if h.contains("nextcloud") || first_seg == "nextcloud" || p.contains("/nextcloud/remote.php") {
+            return Provider::Nextcloud;
+        }
+        if h.contains("owncloud") || first_seg == "owncloud" || p.contains("/owncloud/remote.php") {
+            return Provider::OwnCloud;
+        }
+    }
+    Provider::of_protocol(a.protocol)
+}
+
+/// Normalizes a Nextcloud or ownCloud path into its WebDAV endpoint, handling root/subfolder
+/// installs, bare `/remote.php`, and copied browser UI URLs (`/index.php/apps/files/…`).
+fn branded_webdav_root(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "/" {
+        return "/remote.php/webdav".into();
+    }
+    if let Some((prefix, after)) = trimmed.split_once("/remote.php") {
+        if after.is_empty() {
+            return format!("{prefix}/remote.php/webdav");
+        }
+        if after.starts_with('/') {
+            return path.to_string();
+        }
+    }
+    // Strip browser web UI suffixes if the user pasted the URL from their browser tab.
+    let base = trimmed
+        .split_once("/index.php")
+        .map(|(b, _)| b)
+        .or_else(|| trimmed.split_once("/apps/").map(|(b, _)| b))
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    format!("{base}/remote.php/webdav")
+}
+
+/// Splits an unschemed `host`, `host:port`, `[ipv6]`, or `[ipv6]:port` string.
+fn split_host_port(raw: &str) -> Result<(String, Option<u16>), String> {
+    if raw.is_empty() {
+        return Ok((String::new(), None));
+    }
+    if let Some(v6) = raw.strip_prefix('[') {
+        let Some((h, after)) = v6.split_once(']') else {
+            return Err("Endereço IPv6 inválido (falta fechar ']').".into());
+        };
+        if after.is_empty() {
+            return Ok((h.to_string(), None));
+        }
+        let Some(p_str) = after.strip_prefix(':') else {
+            return Err("O servidor é só o nome ou o IP, sem pastas: a pasta vai em Pasta inicial.".into());
+        };
+        let port = p_str.parse::<u16>().ok().filter(|p| *p > 0).ok_or("A porta é um número de 1 a 65535.")?;
+        return Ok((h.to_string(), Some(port)));
+    }
+    // Bare IPv6 address (two or more colons) has no port suffix; single colon is `host:port`.
+    let colons = raw.bytes().filter(|&b| b == b':').count();
+    if colons == 1
+        && let Some((h, p_str)) = raw.split_once(':')
+    {
+        let port = p_str.parse::<u16>().ok().filter(|p| *p > 0).ok_or("A porta é um número de 1 a 65535.")?;
+        return Ok((h.to_string(), Some(port)));
+    }
+    Ok((raw.to_string(), None))
 }
 
 pub fn ask_add(s: &mut State) {
@@ -910,6 +1045,8 @@ pub fn back_to_pick(s: &mut State) {
         f.step = Step::Pick;
         f.error = None;
         f.untrusted = None;
+        f.trusted = None;
+        f.trusted_for = None;
         f.filter.focused = true;
     }
 }
@@ -943,16 +1080,34 @@ pub fn submit_filter(s: &mut State) {
     }
 }
 
-/// Toggles SSL/TLS on FTP (`Ftp` ↔ `Ftps`) or WebDAV (`Dav` ↔ `Davs`).
+/// Toggles SSL/TLS on FTP (`Ftp` ↔ `Ftps`) or WebDAV (`Dav` ↔ `Davs`), keeping any explicit URL
+/// scheme in `Servidor` in sync so `submit` never silently reverts to plaintext.
 pub fn toggle_tls(s: &mut State) {
     if let Some(Dialog::Server(f)) = &mut s.dialog {
-        f.protocol = match f.protocol {
+        f.protocol = match f.effective_protocol() {
             Protocol::Ftp => Protocol::Ftps,
             Protocol::Ftps => Protocol::Ftp,
             Protocol::Dav => Protocol::Davs,
             Protocol::Davs => Protocol::Dav,
             Protocol::Sftp => Protocol::Sftp,
         };
+        let trimmed = f.host.text.trim_start();
+        if let Some((scheme, rest)) = trimmed.split_once("://") {
+            let new_scheme = match (scheme.to_ascii_lowercase().as_str(), f.protocol) {
+                ("ftp" | "ftps" | "ftpes", Protocol::Ftps) => Some("ftps"),
+                ("ftp" | "ftps" | "ftpes", Protocol::Ftp) => Some("ftp"),
+                ("http" | "https", Protocol::Davs) => Some("https"),
+                ("http" | "https", Protocol::Dav) => Some("http"),
+                ("dav" | "davs", Protocol::Davs) => Some("davs"),
+                ("dav" | "davs", Protocol::Dav) => Some("dav"),
+                ("webdav" | "webdavs", Protocol::Davs) => Some("webdavs"),
+                ("webdav" | "webdavs", Protocol::Dav) => Some("webdav"),
+                _ => None,
+            };
+            if let Some(ns) = new_scheme {
+                f.host = TextEdit::new(format!("{ns}://{rest}"));
+            }
+        }
     }
 }
 
@@ -962,11 +1117,13 @@ pub fn submit_google(s: &mut State, tx: &mut Tx) {
     let cfg = {
         let Some(Dialog::Server(f)) = &mut s.dialog else { return };
         f.error = None;
-        let id = f.client_id.text.trim();
-        let secret = f.client_secret.text.trim();
+        let id = f.client_id.text.trim().trim_start_matches('\u{feff}');
+        let secret = f.client_secret.text.trim().trim_start_matches('\u{feff}');
         if f.custom_oauth || !id.is_empty() || !secret.is_empty() {
             let parsed = if id.starts_with('{') {
                 openexplorer_gdrive::ClientConfig::parse(id)
+            } else if secret.starts_with('{') {
+                openexplorer_gdrive::ClientConfig::parse(secret)
             } else if id.is_empty() || secret.is_empty() {
                 Err("Informe o Client ID e o Client Secret (ou cole o JSON completo no campo Client ID).".into())
             } else {
@@ -1008,6 +1165,9 @@ pub fn submit_google(s: &mut State, tx: &mut Tx) {
 /// Conectar / Salvar in the dialog: checks the login on a thread; the server is kept once it worked.
 pub fn submit(s: &mut State) {
     let Some(Dialog::Server(form)) = &s.dialog else { return };
+    if form.checking.is_some() {
+        return;
+    }
     let (server, pasted) = match form.server(s) {
         Ok(found) => found,
         Err(e) => {
@@ -1046,7 +1206,11 @@ pub fn submit(s: &mut State) {
 /// checks again.
 pub fn trust(s: &mut State) {
     let Some(Dialog::Server(f)) = &mut s.dialog else { return };
+    if f.checking.is_some() {
+        return;
+    }
     let Some(r) = f.untrusted.take() else { return };
+    f.trusted_for = f.target_endpoint().map(|(h, p, _)| (h, p));
     f.trusted = Some(r.fingerprint);
     submit(s);
 }
@@ -1205,10 +1369,14 @@ pub fn parse_address(text: &str) -> Option<Address> {
     };
     let (host, port) = if let Some(v6) = hostport.strip_prefix('[') {
         let (h, after) = v6.split_once(']')?;
-        (h.to_string(), after.strip_prefix(':').and_then(|p| p.parse().ok()))
+        let port = match after {
+            "" => None,
+            _ => Some(after.strip_prefix(':')?.parse::<u16>().ok().filter(|p| *p > 0)?),
+        };
+        (h.to_string(), port)
     } else {
         match hostport.rsplit_once(':') {
-            Some((h, p)) => (h.to_string(), Some(p.parse().ok()?)),
+            Some((h, p)) => (h.to_string(), Some(p.parse::<u16>().ok().filter(|p| *p > 0)?)),
             None => (hostport.to_string(), None),
         }
     };
@@ -1269,6 +1437,8 @@ mod tests {
         assert!(parse_address(r"C:\Users").is_none());
         assert!(parse_address("gopher://x").is_none());
         assert!(parse_address("ftp://host:porta").is_none());
+        assert!(parse_address("ftp://host:0").is_none());
+        assert!(parse_address("ftp://[::1]:porta").is_none());
     }
 
     #[test]
@@ -1339,6 +1509,34 @@ mod tests {
         assert_eq!((typed.provider, sv.brand, sv.root.as_str()), (Provider::Nextcloud, Some(Brand::Nextcloud), "/nextcloud/remote.php/webdav"));
         let typed = Form::of_address(&parse_address("https://exemplo.com/nextcloud/remote.php/dav/files/ana").unwrap());
         assert_eq!(typed.folder.text, "/nextcloud/remote.php/dav/files/ana");
+
+        // Domain-root Nextcloud, copied browser UI URLs, bare /remote.php, and non-Nextcloud deep paths.
+        let dom = Form::of_address(&parse_address("https://nextcloud.empresa.com/index.php/apps/files/").unwrap());
+        assert_eq!((dom.provider, dom.folder.text.as_str()), (Provider::Nextcloud, "/remote.php/webdav"));
+        let bare = Form::of_address(&parse_address("https://nextcloud.empresa.com/remote.php").unwrap());
+        assert_eq!(bare.folder.text, "/remote.php/webdav");
+        let plain_dav = Form::of_address(&parse_address("https://dav.empresa.com/backups/nextcloud").unwrap());
+        assert_eq!((plain_dav.provider, plain_dav.folder.text.as_str()), (Provider::WebDav, "/backups/nextcloud"));
+
+        // Unschemed `host:port` splits cleanly instead of formatting as IPv6, and trusted certs don't leak across hosts.
+        nc.host = TextEdit::new("cloud.exemplo.com:8443");
+        let (sv, _) = nc.server(&s).unwrap();
+        assert_eq!((sv.host.as_str(), sv.port), ("cloud.exemplo.com", 8443));
+        let mut edited = Form::of(&Server { cert: Some("AA:BB".into()), ..sv });
+        assert_eq!(edited.active_trusted(), Some("AA:BB"));
+        edited.host = TextEdit::new("outro.exemplo.com");
+        assert_eq!(edited.active_trusted(), None);
+        assert_eq!(edited.server(&s).unwrap().0.cert, None);
+
+        // Toggling SSL/TLS rewrites an explicit `ftp://` scheme in `Servidor` so submit keeps FTPS.
+        let mut s2 = s;
+        let mut ftp_form = Form::for_provider(Provider::Ftp);
+        ftp_form.host = TextEdit::new("ftp://192.168.0.10");
+        s2.dialog = Some(Dialog::Server(Box::new(ftp_form)));
+        toggle_tls(&mut s2);
+        let Some(Dialog::Server(f2)) = &s2.dialog else { panic!() };
+        assert_eq!((f2.protocol, f2.host.text.as_str()), (Protocol::Ftps, "ftps://192.168.0.10"));
+        assert_eq!(f2.server(&s2).unwrap().0.protocol, Protocol::Ftps);
     }
 }
 

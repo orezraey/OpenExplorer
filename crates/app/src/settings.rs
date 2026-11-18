@@ -97,6 +97,11 @@ pub enum TextRender {
 impl TextRender {
     pub const ALL: [TextRender; 3] = [TextRender::Smooth, TextRender::DirectWrite, TextRender::ClearType];
 
+    /// Modes supported on the current OS (`DirectWrite` and `ClearType` are Windows-only).
+    pub fn available() -> &'static [TextRender] {
+        if cfg!(windows) { &Self::ALL } else { &[TextRender::Smooth] }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             TextRender::Smooth => "Suave (GPU)",

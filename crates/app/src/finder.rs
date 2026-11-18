@@ -92,13 +92,32 @@ pub fn search(f: &Found, show_hidden: bool) -> (Result<Vec<Entry>, String>, Info
     let req = Request { text: f.text.clone(), within: f.within.as_ref().map(|w| w.display().to_string()), limit: LIMIT, skip_hidden: !show_hidden };
     match openexplorer_index::pipe::ask(&req) {
         Ok(a) => {
+            let raw_len = a.rows.len();
+            let within = f.within.as_ref().map(|w| w.display().to_string());
+            let entries: Vec<Entry> = a
+                .rows
+                .into_iter()
+                .filter(|r| {
+                    if show_hidden {
+                        return true;
+                    }
+                    // Defensive check in case an older installed service binary ignored `skip_hidden`.
+                    // Windows paths ignore case: the folder searched may be spelled otherwise.
+                    let rel = within
+                        .as_deref()
+                        .and_then(|w| r.path.get(..w.len()).filter(|head| head.to_lowercase() == w.to_lowercase()).map(|_| &r.path[w.len()..]))
+                        .unwrap_or(&r.path);
+                    !rel.split(['\\', '/']).any(|seg| seg.starts_with('.'))
+                })
+                .map(|r| entry(r.path, r.is_dir, r.size, r.modified))
+                .collect();
+            let pruned = raw_len.saturating_sub(entries.len());
             let info = Info {
-                total: a.header.total,
-                shown: a.rows.len(),
+                total: a.header.total.saturating_sub(pruned),
+                shown: entries.len(),
                 indexing: a.header.volumes.iter().filter(|v| v.indexing).map(|v| v.root.clone()).collect(),
                 service: Service::Running,
             };
-            let entries = a.rows.into_iter().map(|r| entry(r.path, r.is_dir, r.size, r.modified)).collect();
             (a.header.error.map_or(Ok(entries), Err), info)
         }
         Err(e) => {

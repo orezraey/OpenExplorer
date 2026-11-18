@@ -115,7 +115,7 @@ icon32!(
 icon32!(
     PROVIDER_OWNCLOUD,
     "provider-owncloud",
-    r##"<rect x="2" y="2" width="28" height="28" rx="7" fill="#1D2D44"/><circle cx="11.8" cy="14.5" r="3.4" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="16.8" cy="12.6" r="4.2" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="21.4" cy="15.4" r="3.1" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="9.2" cy="18.2" r="2.9" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="23.2" cy="18.5" r="2.7" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="19.2" cy="18.6" r="3.4" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="14.2" cy="18" r="4" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/>"##
+    r##"<rect x="2" y="2" width="28" height="28" rx="7" fill="#1D2D44" stroke="#3D5A80" stroke-width="1.2"/><circle cx="11.8" cy="14.5" r="3.4" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="16.8" cy="12.6" r="4.2" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="21.4" cy="15.4" r="3.1" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="9.2" cy="18.2" r="2.9" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="23.2" cy="18.5" r="2.7" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="19.2" cy="18.6" r="3.4" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/><circle cx="14.2" cy="18" r="4" fill="#FFFFFF" stroke="#1D2D44" stroke-width="1"/>"##
 );
 icon32!(
     PROVIDER_SFTP,

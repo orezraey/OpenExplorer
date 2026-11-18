@@ -109,6 +109,15 @@ pub enum Brand {
     OwnCloud,
 }
 
+fn deserialize_brand<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Brand>, D::Error> {
+    let raw = Option::<String>::deserialize(d)?;
+    Ok(match raw.as_deref() {
+        Some("nextcloud") => Some(Brand::Nextcloud),
+        Some("owncloud") => Some(Brand::OwnCloud),
+        _ => None,
+    })
+}
+
 /// A server the user added. Its password, if any, is in the credential store under `id`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Server {
@@ -116,7 +125,7 @@ pub struct Server {
     /// What the tree shows.
     pub name: String,
     pub protocol: Protocol,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_brand", skip_serializing_if = "Option::is_none")]
     pub brand: Option<Brand>,
     pub host: String,
     pub port: u16,
@@ -627,10 +636,11 @@ mod tests {
     /// still loads, with the usual values.
     #[test]
     fn an_older_server_list_still_loads() {
-        let old = r#"[{"id":"s1","name":"NAS","protocol":"ftps","host":"nas","port":21,"user":"ana","root":"/"}]"#;
+        let old = r#"[{"id":"s1","name":"NAS","protocol":"ftps","host":"nas","port":21,"user":"ana","root":"/"},{"id":"s2","name":"Futuro","protocol":"davs","brand":"synology","host":"nas","port":443,"user":"ana","root":"/"}]"#;
         let list: Vec<Server> = serde_json::from_str(old).unwrap();
         assert_eq!((list[0].cert.as_ref(), list[0].connections, list[0].implicit), (None, USUAL_CONNECTIONS, false));
         assert_eq!(list[0].limit(), 4);
+        assert_eq!(list[1].brand, None);
     }
 
     #[test]

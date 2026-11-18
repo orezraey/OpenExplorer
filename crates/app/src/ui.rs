@@ -25,9 +25,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let menu = context(s, &k, &mut layer);
     let queue_menu = transfer_context(s, &k, &mut layer);
     let address_menu = address_context(s, &k, &mut layer);
-    // The window's height, for Opções to fit in: read from the layer it opens in (the whole
-    // window), only while it's open.
-    let window_h = matches!(s.dialog, Some(Dialog::Options(_))).then(|| cx.layout_with("options-layer", |r| r[3])).flatten();
+    // The window's height, so Opções and Registrar conta always fit inside short windows from
+    // the very first frame they open.
+    let window_h = s.dialog.is_some().then(|| cx.layout_with("window", |r| r[3])).flatten();
     dialog(s, &k, window_h, &mut layer);
     // What the last action said, for a few seconds at the bottom right.
     if !s.status.is_empty() && s.now < s.status_until {
@@ -35,6 +35,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         layer.push(ToastRegion::new().toast(Toast::new("notice", s.status.clone()).on_close(close).build(&k)).build(&k));
     }
     let body = col()
+        .key("window")
         .w_full()
         .h_full()
         .fill(k.c.page)
@@ -63,7 +64,7 @@ fn stepper(k: &Kit, key: &str, value: u8, set: fn(&mut State, i32)) -> El {
             .radius(k.radius.sm)
             .child(text(label.to_string()).font(k.ty.text_small_medium).color(ink));
         if enabled {
-            k.interactive(b).cursor(Cursor::Pointer).on_press(move |s: &mut State| set(s, delta))
+            k.interactive(b).focusable(true).focus_ring(2.0, 1.0, k.c.border_focus).cursor(Cursor::Pointer).on_press(move |s: &mut State| set(s, delta))
         } else {
             b.disabled(true)
         }
@@ -167,6 +168,8 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                     .role("tab")
                     .label(tab.label())
                     .checked(on)
+                    .focusable(true)
+                    .focus_ring(2.0, 1.0, k.c.border_focus)
                     .w_full()
                     .h(36.0)
                     .px(10.0)
@@ -241,6 +244,8 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
             .role("switch")
             .label(title.to_string())
             .checked(on)
+            .focusable(true)
+            .focus_ring(2.0, 1.0, k.c.border_focus)
             .w(36.0)
             .h(20.0)
             .px(2.0)
@@ -287,6 +292,8 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .role("radio")
                 .label(label.to_string())
                 .checked(on)
+                .focusable(true)
+                .focus_ring(2.0, 1.0, k.c.border_focus)
                 .h(28.0)
                 .px(9.0)
                 .center()
@@ -311,7 +318,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
     };
     let make_render_pills = |track_key: &'static str, prefix: &'static str| {
         let mut pills = seg_track(track_key);
-        for r in TextRender::ALL {
+        for &r in TextRender::available() {
             let on = st.text_render == r;
             pills = pills.child(seg_btn(format!("{prefix}-{}", r.label()), r.label(), on).on_press_tx(move |s: &mut State, tx: &mut Tx| {
                 change_settings(s, |c| c.text_render = r);
@@ -357,6 +364,8 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                             .role("radio")
                             .label(th.label())
                             .checked(on)
+                            .focusable(true)
+                            .focus_ring(2.0, 1.0, k.c.border_focus)
                             .grow(1.0)
                             .w(0.0)
                             .h(34.0)
@@ -459,10 +468,15 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                         .min_w(0.0),
                 );
 
+            let render_desc = if cfg!(windows) {
+                "Alterna entre o suavizador vetorial na GPU (padrão recomendado), DirectWrite em tons de cinza e subpixels ClearType."
+            } else {
+                "Este sistema usa o suavizador vetorial nativo na GPU (DirectWrite e ClearType estão disponíveis apenas no Windows)."
+            };
             let exp_card = card_box("card-experimental").child(control_row(
                 "row-render",
                 "Nitidez e rasterização de texto",
-                "Alterna entre o suavizador vetorial na GPU (padrão recomendado), DirectWrite em tons de cinza e subpixels ClearType.",
+                render_desc,
                 make_render_pills("render-pills", "render"),
             ));
 
@@ -644,6 +658,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                             .font(k.ty.mono)
                             .color(if is_err { k.c.danger.fg } else { k.c.text_base })
                             .selectable(true)
+                            .selection_color(k.selection())
                             .wrap_anywhere()
                             .grow(1.0)
                             .w(0.0)
@@ -699,7 +714,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
         .border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_weak)
         .child(el().size(6.0, 6.0).radius(3.0).fill(k.c.success.fg))
         .child(text("Alterações salvas automaticamente").font(k.ty.caption()).color(k.c.text_faint).grow(1.0))
-        .child(Button::new("Concluído").variant(ButtonVariant::Submit).on_press(close).build(k));
+        .child(Button::new("Concluído").variant(ButtonVariant::Submit).on_press(close).build(k).default_button());
 
     let right_col = col().key("opt-right").grow(1.0).w(0.0).h_full().min_w(0.0).child(main_scroll).child(footer);
 
@@ -1017,7 +1032,7 @@ fn actions_row(k: &Kit, cancel: &str, act: Button) -> El {
         .gap(8.0)
         .justify_end()
         .child(Button::new(cancel).variant(ButtonVariant::Neutral).on_press(close).build(k))
-        .child(act.build(k))
+        .child(act.build(k).default_button())
 }
 
 fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
@@ -1046,19 +1061,20 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 [one] => format!("Excluir \"{}\" permanentemente?", shown(&one.name)),
                 many => format!("Excluir {} itens permanentemente?", ui_count(many.len())),
             };
-            let note = if s.panes[*pane].loc.is_local() && s.settings.skip_recycle_bin {
-                "A exclusão direta está ativada nas Opções: os itens serão apagados para sempre, sem passar pela Lixeira. Isso não pode ser desfeito."
+            let remote = items.iter().filter_map(|e| s.panes[*pane].loc.local_path(e)).any(|path| crate::network::is_remote(&path));
+            let note: Cow<str> = if s.panes[*pane].loc.is_local() && !remote && s.settings.skip_recycle_bin {
+                "A exclusão direta está ativada nas Opções: os itens serão apagados para sempre, sem passar pela Lixeira. Isso não pode ser desfeito.".into()
             } else if s.panes[*pane].loc.is_local() {
-                "Aqui não há Lixeira: os itens serão apagados para sempre. Isso não pode ser desfeito."
+                "Aqui não há Lixeira: os itens serão apagados para sempre. Isso não pode ser desfeito.".into()
             } else if let Location::Server { server, .. } = &s.panes[*pane].loc {
-                &format!("Servidores não têm lixeira: os itens serão apagados para sempre de {}. Isso não pode ser desfeito.", server.name)
+                format!("Servidores não têm lixeira: os itens serão apagados para sempre de {}. Isso não pode ser desfeito.", server.name).into()
             } else {
-                "Os itens serão apagados para sempre do Google Drive. Isso não pode ser desfeito."
+                "Os itens serão apagados para sempre do Google Drive. Isso não pode ser desfeito.".into()
             };
             let body = col()
                 .w_full()
                 .gap(12.0)
-                .child(text(note).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
+                .child(text(note.into_owned()).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
                 .child(item_list(s, k, *pane, items))
                 .child(actions_row(k, "Cancelar", Button::new("Excluir permanentemente").variant(ButtonVariant::Danger).on_press(actions::purge)));
             Modal::new("purge", title).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
@@ -1112,7 +1128,7 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
         Dialog::Clash(ask) => clash_dialog(s, k, ask, layer),
         Dialog::Share(sh) => crate::sharing::share_dialog(s, k, sh, layer),
         Dialog::MakePublic(m) => crate::sharing::public_dialog(k, m, layer),
-        Dialog::Server(f) => account_dialog(s, k, f, layer),
+        Dialog::Server(f) => account_dialog(s, k, f, window_h, layer),
     }
 }
 
@@ -1132,10 +1148,33 @@ fn connected_count(s: &State, provider: crate::servers::Provider) -> usize {
     }
 }
 
+/// Scrollable body region inside `account_dialog`, capped to `window_h` so the dialog header
+/// and action buttons remain visible even at the minimum window height (420px) or when long
+/// certificate/error messages appear.
+fn account_scroll(k: &Kit, key: &'static str, window_h: Option<f32>, content: El) -> El {
+    let max_h = window_h.map_or(620.0, |h| (h - 2.0 * 16.0 - 48.0 - 62.0).max(120.0));
+    let bar = bar_style(k);
+    col()
+        .w_full()
+        .max_h(max_h)
+        .min_h(0.0)
+        .shrink()
+        .child(
+            col()
+                .key(key)
+                .w_full()
+                .shrink()
+                .min_h(0.0)
+                .scroll(ScrollSpec { stick_bottom: false })
+                .child(content)
+                .scroll_bar_styled(bar),
+        )
+}
+
 /// Unified Adicionar conta / Editar conta dialog:
 /// - `Step::Pick`: modern categorized provider grid with instant search and URL detection.
 /// - `Step::Configure`: tailored OAuth or server credentials screen with `← Voltar`.
-fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<El>) {
+fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option<f32>, layer: &mut Vec<El>) {
     use crate::servers::{Category, Form, Provider, Step};
     use openexplorer_remote::Protocol;
 
@@ -1175,6 +1214,8 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
                         .role("tab")
                         .label(cat.label())
                         .checked(on)
+                        .focusable(true)
+                        .focus_ring(2.0, 1.0, k.c.border_focus)
                         .h(30.0)
                         .px(11.0)
                         .gap(6.0)
@@ -1210,7 +1251,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
                 format!("Nenhum provedor encontrado para “{}”.", f.filter.text.trim())
             };
             let act = if is_url {
-                Button::new("Configurar endereço").variant(ButtonVariant::Submit).on_press(crate::servers::submit_filter).build(k)
+                Button::new("Configurar endereço").variant(ButtonVariant::Submit).on_press(crate::servers::submit_filter).build(k).default_button()
             } else {
                 Button::new("Limpar busca").variant(ButtonVariant::Neutral).on_press(crate::servers::clear_filter).build(k)
             };
@@ -1239,6 +1280,8 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
                                 .key(format!("provider-{}", provider.label()))
                                 .role("button")
                                 .label(format!("{} — {}", provider.label(), provider.subtitle()))
+                                .focusable(true)
+                                .focus_ring(2.0, 1.0, k.c.border_focus)
                                 .grow(1.0)
                                 .w(0.0)
                                 .h(118.0)
@@ -1299,17 +1342,21 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
                 .child(text("Senhas e tokens ficam protegidos no Cofre do sistema.").font(k.ty.caption()).color(k.c.text_faint).truncate().min_w(0.0))
         };
 
-        let body = col()
-            .key("picker-content")
+        let picker_inner = col()
             .w_full()
             .px(16.0)
-            .pb(16.0)
+            .pb(4.0)
             .gap(12.0)
             .child(text("Escolha uma nuvem, NAS ou protocolo remoto para conectar ao Open Explorer.").font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
             .child(search.build(k))
             .child(tabs)
-            .child(grid)
-            .child(row().key("picker-footer").w_full().pt(4.0).gap(8.0).center_y().child(footer_note).child(Button::new("Cancelar").variant(ButtonVariant::Neutral).on_press(close).build(k)));
+            .child(grid);
+
+        let body = col()
+            .key("picker-content")
+            .w_full()
+            .child(account_scroll(k, "picker-scroll", window_h, picker_inner))
+            .child(row().key("picker-footer").w_full().px(16.0).pt(12.0).pb(16.0).gap(8.0).center_y().child(footer_note).child(Button::new("Cancelar").variant(ButtonVariant::Neutral).on_press(close).build(k)));
 
         Modal::new("server", "Registrar conta").open(true).child(body).width(600.0).fit().on_close(close).build(k, layer);
         return;
@@ -1318,7 +1365,8 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
     // -----------------------------------------------------------------------------------------
     // Step 2: Provider-specific configuration (Google Drive OAuth or server credentials)
 
-    let (summary, badge_text) = match (f.provider, f.protocol) {
+    let proto = f.effective_protocol();
+    let (summary, badge_text) = match (f.provider, proto) {
         (Provider::GoogleDrive, _) => ("Autorização segura OAuth 2.0 pelo navegador padrão", "OAuth 2.0"),
         (Provider::Nextcloud, Protocol::Davs) => ("Servidor Nextcloud · conexão criptografada", "HTTPS"),
         (Provider::Nextcloud, _) => ("Servidor Nextcloud · conexão sem criptografia", "HTTP"),
@@ -1331,7 +1379,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
         (Provider::WebDav, _) => ("Servidor WebDAV sem criptografia · porta padrão 80", "HTTP"),
     };
 
-    let badge_variant = if f.provider != Provider::GoogleDrive && f.protocol.plain() {
+    let badge_variant = if f.provider != Provider::GoogleDrive && proto.plain() {
         rune_kit::BadgeVariant::Neutral
     } else {
         rune_kit::BadgeVariant::Subtle
@@ -1363,6 +1411,9 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
             .key(key)
             .role("button")
             .label(if revealed { "Ocultar senha" } else { "Mostrar senha" })
+            .preserve_focus_on_press(true)
+            .focusable(true)
+            .focus_ring(2.0, 1.0, k.c.border_focus)
             .size(22.0, 22.0)
             .center()
             .radius(k.radius.sm)
@@ -1377,11 +1428,10 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
         // Whether a client is configured was read once, on picking Google Drive (`custom_oauth`),
         // not on every frame.
         let show_oauth_form = f.custom_oauth;
-        let mut body = col()
-            .key("gdrive-content")
+        let mut inner = col()
             .w_full()
             .px(16.0)
-            .pb(16.0)
+            .pb(4.0)
             .gap(12.0)
             .child(banner)
             .child(
@@ -1395,7 +1445,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
 
         if !s.accounts.is_empty() {
             let emails = s.accounts.iter().map(|a| a.email.as_str()).collect::<Vec<_>>().join(", ");
-            body = body.child(
+            inner = inner.child(
                 row()
                     .key("connected-drives")
                     .w_full()
@@ -1464,7 +1514,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
                 )
                 .child(col().w_full().gap(4.0).child(text("Client ID ou JSON").font(k.ty.text_xsmall_medium).color(k.c.text_base)).child(id_input.build(k)))
                 .child(col().w_full().gap(4.0).child(text("Client Secret").font(k.ty.text_xsmall_medium).color(k.c.text_base)).child(secret_input.build(k)));
-            body = body.child(oauth_box);
+            inner = inner.child(oauth_box);
         } else {
             let ready_row = row()
                 .key("oauth-ready")
@@ -1489,24 +1539,31 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
                         })
                         .build(k),
                 );
-            body = body.child(ready_row);
+            inner = inner.child(ready_row);
         }
 
         if let Some(e) = &f.error {
-            body = body.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0));
+            inner = inner.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0));
         }
 
         let actions = row()
             .key("actions")
             .w_full()
-            .pt(8.0)
+            .px(16.0)
+            .pt(12.0)
+            .pb(16.0)
             .gap(8.0)
             .center_y()
             .child(Button::new("Voltar").icon(&icons::BACK).variant(ButtonVariant::Neutral).on_press(crate::servers::back_to_pick).build(k))
             .child(el().grow(1.0))
             .child(Button::new("Cancelar").variant(ButtonVariant::Neutral).on_press(close).build(k))
-            .child(Button::new("Conectar no navegador").variant(ButtonVariant::Submit).on_press_tx(crate::servers::submit_google).build(k));
-        body = body.child(actions);
+            .child(Button::new("Conectar no navegador").variant(ButtonVariant::Submit).on_press_tx(crate::servers::submit_google).build(k).default_button());
+
+        let body = col()
+            .key("gdrive-content")
+            .w_full()
+            .child(account_scroll(k, "gdrive-scroll", window_h, inner))
+            .child(actions);
 
         Modal::new("server", "Conectar Google Drive").open(true).child(body).width(560.0).fit().on_close(close).build(k, layer);
         return;
@@ -1545,7 +1602,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
         );
 
     let muted = |t: String| text(t).font(k.ty.text_xsmall).color(k.c.text_muted).wrap().w_full().min_w(0.0);
-    let port_hint = f.protocol.default_port().to_string();
+    let port_hint = proto.default_port().to_string();
     let half = |a: El, b: El| row().w_full().gap(10.0).child(a.grow(1.0).w(0.0)).child(b.grow(1.0).w(0.0));
     let host_hint = match f.provider {
         Provider::Nextcloud => "cloud.exemplo.com ou https://cloud.exemplo.com",
@@ -1565,13 +1622,12 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
         Provider::OwnCloud => "ownCloud (servidor), se vazio",
         _ => "o endereço do servidor, se vazio",
     };
-    let user_hint = if matches!(f.protocol, Protocol::Ftp | Protocol::Ftps) { "anonymous, se vazio" } else { "" };
+    let user_hint = if matches!(proto, Protocol::Ftp | Protocol::Ftps) { "anonymous, se vazio" } else { "" };
 
-    let mut body = col()
-        .key("content")
+    let mut inner = col()
         .w_full()
         .px(16.0)
-        .pb(16.0)
+        .pb(4.0)
         .gap(10.0)
         .child(banner)
         .child(
@@ -1586,18 +1642,18 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
     // Security toggle checkbox (inspired by the reference's "Usar SSL/TLS").
     match f.provider {
         Provider::Ftp => {
-            body = body.child(
-                rune_kit::Checkbox::new(f.protocol == Protocol::Ftps)
+            inner = inner.child(
+                rune_kit::Checkbox::new(proto == Protocol::Ftps)
                     .label("Usar SSL/TLS (FTPS)")
-                    .description("Criptografa o login e a transferência de arquivos (explícito na porta 21 ou implícito na 990).")
+                    .description("Criptografa login e arquivos via TLS (porta 21 ou 990).")
                     .on_toggle(crate::servers::toggle_tls)
                     .build(k)
                     .key("tls-toggle"),
             );
         }
         Provider::WebDav | Provider::Nextcloud | Provider::OwnCloud => {
-            body = body.child(
-                rune_kit::Checkbox::new(f.protocol == Protocol::Davs)
+            inner = inner.child(
+                rune_kit::Checkbox::new(proto == Protocol::Davs)
                     .label("Usar conexão segura SSL/TLS (HTTPS)")
                     .description("Mantém senha e arquivos criptografados na rede.")
                     .on_toggle(crate::servers::toggle_tls)
@@ -1608,27 +1664,28 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
         Provider::Sftp | Provider::GoogleDrive => {}
     }
 
-    body = body.child(field("folder", "Pasta inicial", &f.folder, folder_hint, |f| &mut f.folder));
+    inner = inner.child(field("folder", "Pasta inicial", &f.folder, folder_hint, |f| &mut f.folder));
 
-    if f.protocol == Protocol::Sftp {
-        body = body.child(field("key", "Chave SSH (opcional)", &f.key, "C:\\Users\\voce\\.ssh\\id_ed25519 (a senha vira a da chave)", |f| &mut f.key));
-        body = body.child(muted("Sem senha nem chave, as chaves de ~/.ssh são tentadas. Na primeira conexão a chave do servidor é guardada.".into()));
+    if proto == Protocol::Sftp {
+        inner = inner.child(field("key", "Chave SSH (opcional)", &f.key, "C:\\Users\\voce\\.ssh\\id_ed25519 (a senha vira a da chave)", |f| &mut f.key));
+        inner = inner.child(muted("Sem senha nem chave, as chaves de ~/.ssh são tentadas. Na primeira conexão a chave do servidor é guardada.".into()));
     } else if matches!(f.provider, Provider::Nextcloud | Provider::OwnCloud) {
-        body = body.child(muted("Dica: se a sua conta usa verificação em duas etapas (2FA), gere uma senha de aplicativo nas configurações de segurança do servidor.".into()));
+        inner = inner.child(muted("Dica: se a sua conta usa verificação em duas etapas (2FA), gere uma senha de aplicativo nas configurações de segurança do servidor.".into()));
     }
 
     let connections_hint = format!("{} (de 1 a {})", openexplorer_remote::USUAL_CONNECTIONS, openexplorer_remote::MOST_CONNECTIONS);
-    body = body.child(half(
+    inner = inner.child(half(
         field("name", "Nome na árvore (opcional)", &f.name, name_hint, |f| &mut f.name),
         field("connections", "Conexões simultâneas", &f.connections, &connections_hint, |f| &mut f.connections),
     ));
 
-    if let (Some(fp), None, true) = (&f.trusted, &f.untrusted, matches!(f.protocol, Protocol::Ftps | Protocol::Davs)) {
-        body = body.child(muted(format!("Certificado confiado (SHA-256): {}", fingerprint_lines(fp))));
+    let active_fp = f.active_trusted();
+    if let (Some(fp), None) = (active_fp, &f.untrusted) {
+        inner = inner.child(muted(format!("Certificado confiado (SHA-256): {}", fingerprint_lines(fp))));
     }
-    if f.protocol.plain() {
-        let secure_alt = if f.protocol == Protocol::Ftp { "Usar SSL/TLS (FTPS) ou SFTP" } else { "HTTPS (SSL/TLS)" };
-        body = body.child(
+    if proto.plain() {
+        let secure_alt = if proto == Protocol::Ftp { "Usar SSL/TLS (FTPS) ou SFTP" } else { "HTTPS (SSL/TLS)" };
+        inner = inner.child(
             row()
                 .key("plain-warn")
                 .w_full()
@@ -1636,11 +1693,11 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
                 .py(7.0)
                 .radius(k.radius.sm)
                 .fill(k.alpha(k.c.warning.fg, if k.dark { 0.12 } else { 0.08 }))
-                .border(1.0, k.alpha(k.c.warning.fg, 0.35))
+                .border(1.0, k.alpha(k.c.warning.fg, 0.38))
                 .child(
-                    text(format!("{} não usa criptografia: senha e arquivos passam abertos pela rede. Prefira {secure_alt} se o servidor aceitar.", f.protocol.label()))
+                    text(format!("{} não usa criptografia: senha e arquivos passam abertos pela rede. Prefira {secure_alt} se o servidor aceitar.", proto.label()))
                         .font(k.ty.text_xsmall)
-                        .color(k.c.warning.fg)
+                        .color(k.c.text_base)
                         .wrap()
                         .w_full()
                         .min_w(0.0),
@@ -1648,11 +1705,11 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
         );
     }
     if let Some(e) = &f.error {
-        body = body.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0));
+        inner = inner.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0));
     }
     // A certificate the usual authorities don't vouch for: shown, and trusted only on a click.
     if let Some(r) = &f.untrusted {
-        let changed = f.trusted.as_ref().is_some_and(|old| *old != r.fingerprint);
+        let changed = active_fp.is_some_and(|old| old != r.fingerprint);
         let lead = if changed {
             format!("O certificado do servidor mudou desde que você confiou nele: o novo {}. Se você não trocou o certificado do servidor, alguém pode estar se passando por ele.", r.why)
         } else {
@@ -1667,25 +1724,30 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, layer: &mut Vec<
             .border(1.0, k.c.warning.fg)
             .child(text(lead).font(k.ty.text_small).color(k.c.text_base).wrap().w_full().min_w(0.0))
             .child(text(format!("SHA-256: {}", fingerprint_lines(&r.fingerprint))).font(k.ty.text_xsmall).color(k.c.text_muted).wrap().w_full().min_w(0.0));
-        body = body.child(warn);
+        inner = inner.child(warn);
     }
 
     let checking = f.checking.is_some();
     let save_label = if f.editing.is_some() { "Salvar" } else { "Conectar" };
-    let save = match (&f.untrusted, checking) {
-        (_, true) => Button::new("Conectando…").variant(ButtonVariant::Submit).on_press(crate::servers::submit),
-        (Some(_), false) => Button::new("Confiar e salvar").variant(ButtonVariant::Danger).on_press(crate::servers::trust),
-        (None, false) => Button::new(save_label).variant(ButtonVariant::Submit).on_press(crate::servers::submit),
+    let save_el = match (&f.untrusted, checking) {
+        (_, true) => Button::new("Conectando…").variant(ButtonVariant::Submit).disabled(true).build(k),
+        (Some(_), false) => Button::new("Confiar e salvar").variant(ButtonVariant::Danger).on_press(crate::servers::trust).build(k).default_button(),
+        (None, false) => Button::new(save_label).variant(ButtonVariant::Submit).on_press(crate::servers::submit).build(k).default_button(),
     };
-    let mut actions = row().key("actions").w_full().pt(10.0).gap(8.0).center_y();
+    let mut actions = row().key("actions").w_full().px(16.0).pt(12.0).pb(16.0).gap(8.0).center_y();
     if f.editing.is_none() {
         actions = actions.child(Button::new("Voltar").icon(&icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(crate::servers::back_to_pick).build(k));
     }
     actions = actions
         .child(el().grow(1.0))
         .child(Button::new("Cancelar").variant(ButtonVariant::Neutral).on_press(close).build(k))
-        .child(save.build(k));
-    body = body.child(actions);
+        .child(save_el);
+
+    let body = col()
+        .key("content")
+        .w_full()
+        .child(account_scroll(k, "server-scroll", window_h, inner))
+        .child(actions);
 
     let title = if f.editing.is_some() {
         format!("Editar {}", f.provider.label())
@@ -2191,10 +2253,15 @@ fn toolbar(s: &State, k: &Kit) -> El {
         );
     let bar = match (account, server) {
         (Some(email), _) => {
+            let short: String = if email.chars().count() > 26 {
+                format!("{}…", email.chars().take(25).collect::<String>())
+            } else {
+                email.clone()
+            };
             let who = email.clone();
             bar.child(
-                tool(k, "disconnect", &icons::SIGN_OUT, &format!("Desconectar {email}"), true, move |s: &mut State, _| disconnect(s, &who))
-                    .help("Remove a conta do painel ativo: o acesso e o cache dela"),
+                tool(k, "disconnect", &icons::SIGN_OUT, &format!("Desconectar {short}"), true, move |s: &mut State, _| disconnect(s, &who))
+                    .help(format!("Desconectar {email}: remove o acesso e o cache desta conta")),
             )
         }
         (None, Some((id, name))) => {
