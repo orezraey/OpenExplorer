@@ -127,7 +127,7 @@ pub fn load(s: &mut State, p: usize, request: u64) {
     pane.error = None;
     pane.free = None;
     background(s, move |emit| {
-        let listed = |part, result| Msg::Listed { pane: p, request, part, result };
+        let listed = |part, result| Msg::Listed { pane: p, request, part, result, at: None };
         let dir = server.path(&path);
         let Some(text) = find else {
             let result = catch_panic(t("listar", "list"), || {

@@ -69,12 +69,27 @@ impl Drive {
     }
 
     /// What changed since `token`, in My Drive and the shared drives, and the token to ask from
-    /// next time. A file changed several times shows once, as it is now.
+    /// next time. A file changed several times shows once, as it is now. A backlog longer than
+    /// [`MOST_PAGES`] pages is read in parts: the token returned then continues it.
     pub fn changes(&self, token: &str) -> Result<(Vec<Change>, String)> {
+        let (changes, at, _) = self.read_changes(token, MOST_PAGES)?;
+        Ok((changes, at))
+    }
+
+    /// What changed since `token`, as [`Drive::changes`], only if it all fits in `pages` pages:
+    /// `None` when more remain, so the caller can't take it for everything since `token`.
+    pub fn changes_within(&self, token: &str, pages: usize) -> Result<Option<(Vec<Change>, String)>> {
+        let (changes, at, done) = self.read_changes(token, pages)?;
+        Ok(done.then_some((changes, at)))
+    }
+
+    /// Up to `pages` pages of changes since `token`: the changes, where to go on from, and
+    /// whether that's the end of the log.
+    fn read_changes(&self, token: &str, pages: usize) -> Result<(Vec<Change>, String, bool)> {
         let fields = format!("nextPageToken,newStartPageToken,changes(changeType,removed,fileId,driveId,file({FILE_FIELDS},parents,trashed))");
         let mut out = Vec::new();
         let mut at = token.to_string();
-        for _ in 0..MOST_PAGES {
+        for _ in 0..pages {
             let query = [
                 ("pageToken", at.as_str()),
                 ("pageSize", "1000"),
@@ -90,13 +105,13 @@ impl Drive {
             out.extend(page.into_iter().map(Change::from).filter(|c| checked(&c.file_id).is_ok()));
             let next = |k: &str| v.get(k).and_then(|t| t.as_str()).map(str::to_string);
             match (next("newStartPageToken"), next("nextPageToken")) {
-                (Some(done), _) => return Ok((latest(out), done)),
+                (Some(done), _) => return Ok((latest(out), done, true)),
                 (None, Some(more)) => at = more,
                 (None, None) => return Err(t("Mudanças no Drive: o Google não respondeu onde continuar.", "Drive changes: Google didn't say where to continue from.").into()),
             }
         }
         // A long backlog: the rest comes on the next call, from here.
-        Ok((latest(out), at))
+        Ok((latest(out), at, false))
     }
 }
 
@@ -146,5 +161,14 @@ mod tests {
         let seen = seen.join().unwrap();
         assert!(seen[0].starts_with("GET /changes/startPageToken?"), "{}", seen[0]);
         assert!(seen[1].starts_with("GET /files/root?"), "{}", seen[1]);
+    }
+
+    #[test]
+    fn changes_within_says_when_more_remain_past_its_pages() {
+        let more = r#"{"nextPageToken":"p2","changes":[]}"#;
+        let (d, seen) = stand_in(vec![("200 OK", more), ("200 OK", r#"{"newStartPageToken":"t2","changes":[]}"#), ("200 OK", more)]);
+        assert_eq!(d.changes_within("t1", 2).unwrap().map(|(c, t)| (c.len(), t)), Some((0, "t2".to_string())));
+        assert!(d.changes_within("t1", 1).unwrap().is_none());
+        assert_eq!(seen.join().unwrap().len(), 3);
     }
 }

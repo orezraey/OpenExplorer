@@ -146,6 +146,99 @@ pub fn arrived(s: &mut State, email: String, result: Result<Fetched, String>, no
     crate::tree::drive_changed(s, &email, &changes, root.as_deref());
 }
 
+/// Where `email`'s change log was last read up to, if it was: no later than now, so a listing
+/// started after this is valid at it (see [`crate::cache::Pos`]).
+pub fn token(s: &State, email: &str) -> Option<String> {
+    s.watch.get(email).and_then(|w| w.token.clone())
+}
+
+/// How long a listing proven unchanged by the change log alone is trusted before it's read
+/// whole again anyway, in seconds: a day.
+pub const MAX_AGE: u64 = 24 * 60 * 60;
+
+/// A folder whose cached listing the change log can vouch for: one in My Drive, reached through
+/// real folders. Changes to shared drives' files and to files only shared with the account
+/// aren't all sure to be in the account's log, so nothing reached through a view, a shortcut or
+/// a shared drive is.
+#[derive(Clone, Debug)]
+pub struct Provable {
+    /// The folder's id; `None` for My Drive's top, whose real id Drive is asked for.
+    pub folder: Option<String>,
+    /// The folders above it, from the top: a change to any of them (trashed, moved, deleted,
+    /// unshared) may change what it lists without a change to each item in it.
+    pub above: Vec<String>,
+}
+
+/// Whether `loc` is a [`Provable`] folder: in My Drive, and each folder on its path a real
+/// folder (not a shortcut) in the listing of the one above, as kept in `cache`.
+pub fn provable(cache: &crate::cache::Cache, loc: &Location) -> Option<Provable> {
+    let Location::Drive { email, space: Space::MyDrive, path } = loc else { return None };
+    for i in 0..path.len() {
+        let parent = Location::Drive { email: email.clone(), space: Space::MyDrive, path: path[..i].to_vec() };
+        let listing = cache.get(&crate::cache::key(&parent)?)?;
+        let id = path[i].0.as_str();
+        if !listing.entries.iter().any(|e| e.id == id && e.is_dir && e.target.is_none()) {
+            return None;
+        }
+    }
+    let mut ids: Vec<String> = path.iter().map(|(id, _)| id.clone()).collect();
+    let folder = ids.pop();
+    Some(Provable { folder, above: ids })
+}
+
+/// What opening a cached folder comes to.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Verdict {
+    /// The change log shows nothing that would change the listing: it stands, valid at the
+    /// new position.
+    Unchanged(crate::cache::Pos),
+    /// The folder must be listed again; the token, when the log was read, is where the new
+    /// listing will be valid at.
+    Fetch(Option<String>),
+}
+
+/// Decides whether `cached`, the listing of `folder`, still stands, reading the change log from
+/// its position with `changes(token, pages)` (as [`openexplorer_gdrive::Drive::changes_within`])
+/// and My Drive's top id with `root`. Anything in doubt is a [`Verdict::Fetch`]: no listing or
+/// position, one older than [`MAX_AGE`], a token Google turns down, more changes than reading
+/// the folder whole would cost, or any change to the folder, the folders above it, or what it
+/// holds. `now` is in seconds since 1970.
+pub fn verdict(
+    cached: Option<&crate::cache::Listing>,
+    folder: &Provable,
+    now: u64,
+    changes: impl FnOnce(&str, usize) -> Result<Option<(Vec<Change>, String)>, String>,
+    root: impl FnOnce() -> Result<String, String>,
+) -> Verdict {
+    let Some((listing, pos)) = cached.and_then(|l| Some((l, l.pos.as_ref()?))) else { return Verdict::Fetch(None) };
+    if now < pos.fetched || now - pos.fetched > MAX_AGE {
+        return Verdict::Fetch(None);
+    }
+    // Never more pages of changes than of the listing they'd spare (1,000 items each).
+    let pages = listing.entries.len().div_ceil(1000).max(1);
+    let (changes, next) = match changes(&pos.token, pages) {
+        Ok(Some(read)) => read,
+        Ok(None) => return Verdict::Fetch(None),
+        Err(e) => {
+            openexplorer_gdrive::log(&format!("mudanças desde a listagem guardada: {e}"));
+            return Verdict::Fetch(None);
+        }
+    };
+    let folder_id = match &folder.folder {
+        Some(f) => f.clone(),
+        None => match root() {
+            Ok(r) => r,
+            Err(_) => return Verdict::Fetch(Some(next)),
+        },
+    };
+    let touched = changes.iter().any(|c| c.file_id == folder_id || folder.above.contains(&c.file_id));
+    let shown: HashMap<&str, &Entry> = listing.entries.iter().map(|e| (e.id.as_str(), e)).collect();
+    if touched || folder_stale(&shown, &folder_id, &changes) {
+        return Verdict::Fetch(Some(next));
+    }
+    Verdict::Unchanged(crate::cache::Pos { token: next, fetched: pos.fetched })
+}
+
 /// Wakes the app in `secs`, for the next ask: nothing else may draw a frame meanwhile.
 fn wake_in(s: &State, secs: f64) {
     if let Some(wake) = s.waker.clone() {
@@ -239,6 +332,124 @@ mod tests {
         // Elsewhere: not this folder's business; another account's pane isn't asked.
         assert!(!is(&[change(file("x", "x.txt"), &["outra"])]));
         assert!(shows(&shown, "a@b") && !shows(&shown, "c@d"));
+    }
+
+    fn listing(files: &[DriveFile], token: Option<&str>, fetched: u64) -> crate::cache::Listing {
+        crate::cache::Listing {
+            entries: std::sync::Arc::new(files.iter().cloned().map(entry_of).collect()),
+            pos: token.map(|t| crate::cache::Pos { token: t.into(), fetched }),
+        }
+    }
+
+    const NOW: u64 = 1_800_000_000;
+
+    /// The verdict on `cached` for folder `pasta` (under `avo`, `pai`), the change log answering
+    /// `log`; also whether the log was read at all.
+    fn judge(cached: Option<&crate::cache::Listing>, log: Result<Option<Vec<Change>>, String>) -> (Verdict, bool) {
+        let folder = Provable { folder: Some("pasta".into()), above: vec!["avo".into(), "pai".into()] };
+        let mut asked = false;
+        let v = verdict(
+            cached,
+            &folder,
+            NOW,
+            |token, pages| {
+                asked = true;
+                assert_eq!((token, pages), ("t1", 1));
+                log.map(|l| l.map(|c| (c, "t2".to_string())))
+            },
+            || panic!("only My Drive's top needs its id"),
+        );
+        (v, asked)
+    }
+
+    #[test]
+    fn an_unchanged_folder_keeps_its_listing_and_moves_its_position() {
+        let cached = listing(&[file("a", "a.txt")], Some("t1"), NOW - 60);
+        let moved = Verdict::Unchanged(crate::cache::Pos { token: "t2".into(), fetched: NOW - 60 });
+        // Nothing changed; changes elsewhere; the same file changed back to as listed.
+        assert_eq!(judge(Some(&cached), Ok(Some(vec![]))), (moved.clone(), true));
+        assert_eq!(judge(Some(&cached), Ok(Some(vec![change(file("x", "x.txt"), &["outra"])]))).0, moved.clone());
+        assert_eq!(judge(Some(&cached), Ok(Some(vec![change(file("a", "a.txt"), &["pasta"])]))).0, moved);
+    }
+
+    #[test]
+    fn a_changed_folder_is_read_again_from_where_the_log_was_read() {
+        let cached = listing(&[file("a", "a.txt")], Some("t1"), NOW - 60);
+        let again = |log: Vec<Change>| judge(Some(&cached), Ok(Some(log))).0;
+        let fetch = Verdict::Fetch(Some("t2".into()));
+        assert_eq!(again(vec![change(file("n", "novo.txt"), &["pasta"])]), fetch);
+        assert_eq!(again(vec![change(file("a", "b.txt"), &["pasta"])]), fetch);
+        assert_eq!(again(vec![Change { file_id: "a".into(), file: None, parents: Vec::new(), trashed: false, drive: false }]), fetch);
+        // The folder itself or one above it changed (trashed, moved, unshared): its items may
+        // not each show a change.
+        assert_eq!(again(vec![Change { trashed: true, ..change(file("pasta", "Pasta"), &["pai"]) }]), fetch);
+        assert_eq!(again(vec![Change { file_id: "avo".into(), file: None, parents: Vec::new(), trashed: false, drive: false }]), fetch);
+    }
+
+    #[test]
+    fn without_a_trusted_position_the_folder_is_read_again() {
+        let fresh = listing(&[file("a", "a.txt")], Some("t1"), NOW - 60);
+        // No listing, or one without a position (from before positions, or unverified): the
+        // log isn't even read.
+        assert_eq!(judge(None, Ok(Some(vec![]))), (Verdict::Fetch(None), false));
+        assert_eq!(judge(Some(&listing(&[], None, NOW)), Ok(Some(vec![]))), (Verdict::Fetch(None), false));
+        // Too old, or from a clock that has gone back.
+        assert_eq!(judge(Some(&listing(&[], Some("t1"), NOW - MAX_AGE - 1)), Ok(Some(vec![]))), (Verdict::Fetch(None), false));
+        assert_eq!(judge(Some(&listing(&[], Some("t1"), NOW + 60)), Ok(Some(vec![]))), (Verdict::Fetch(None), false));
+        // A token Google turns down, no connection, or more changes than the listing's pages.
+        assert_eq!(judge(Some(&fresh), Err("Mudanças no Drive: HTTP 410: token expirado".into())), (Verdict::Fetch(None), true));
+        assert_eq!(judge(Some(&fresh), Err("sem conexão".into())), (Verdict::Fetch(None), true));
+        assert_eq!(judge(Some(&fresh), Ok(None)), (Verdict::Fetch(None), true));
+    }
+
+    #[test]
+    fn my_drive_s_top_is_judged_by_its_real_id_and_a_big_folder_reads_more_pages() {
+        let top = Provable { folder: None, above: Vec::new() };
+        let files: Vec<DriveFile> = (0..2500).map(|i| file(&format!("f{i}"), "x")).collect();
+        let cached = listing(&files, Some("t1"), NOW);
+        let log = |root: Result<String, String>, changes: Vec<Change>| {
+            verdict(
+                Some(&cached),
+                &top,
+                NOW,
+                |_, pages| {
+                    assert_eq!(pages, 3);
+                    Ok(Some((changes, "t2".into())))
+                },
+                || root,
+            )
+        };
+        assert!(matches!(log(Ok("raiz".into()), vec![change(file("x", "x"), &["outra"])]), Verdict::Unchanged(_)));
+        assert_eq!(log(Ok("raiz".into()), vec![change(file("n", "n"), &["raiz"])]), Verdict::Fetch(Some("t2".into())));
+        assert_eq!(log(Err("sem conexão".into()), vec![]), Verdict::Fetch(Some("t2".into())));
+    }
+
+    #[test]
+    fn only_my_drive_folders_reached_through_real_folders_are_provable() {
+        let mut cache = crate::cache::Cache::memory_only();
+        let at = |space: Space, path: &[&str]| Location::Drive { email: "a@b".into(), space, path: path.iter().map(|id| (id.to_string(), id.to_string())).collect() };
+        let folder = |id: &str| Entry { is_dir: true, mime: None, ..entry_of(file(id, id)) };
+        let put = |cache: &mut crate::cache::Cache, path: &[&str], entries: Vec<Entry>| cache.put(crate::cache::key(&at(Space::MyDrive, path)).unwrap(), std::sync::Arc::new(entries), None);
+        // My Drive's top always is; a folder in it once the top's listing shows it a folder.
+        assert!(provable(&cache, &at(Space::MyDrive, &[])).is_some_and(|p| p.folder.is_none()));
+        assert!(provable(&cache, &at(Space::MyDrive, &["fotos"])).is_none());
+        let shortcut = Entry { target: Some("alvo".into()), ..folder("atalho") };
+        put(&mut cache, &[], vec![folder("fotos"), shortcut, entry_of(file("doc", "doc"))]);
+        let p = provable(&cache, &at(Space::MyDrive, &["fotos"])).unwrap();
+        assert_eq!((p.folder.as_deref(), p.above.len()), (Some("fotos"), 0));
+        // Deeper: each folder on the way must be known.
+        assert!(provable(&cache, &at(Space::MyDrive, &["fotos", "2024"])).is_none());
+        put(&mut cache, &["fotos"], vec![folder("2024")]);
+        let p = provable(&cache, &at(Space::MyDrive, &["fotos", "2024"])).unwrap();
+        assert_eq!((p.folder.as_deref(), p.above), (Some("2024"), vec!["fotos".to_string()]));
+        // A shortcut's target (maybe in a shared drive, maybe only shared with the account), a
+        // file, a shared drive, a view, or a folder opened from one: the log may not cover it.
+        assert!(provable(&cache, &at(Space::MyDrive, &["alvo"])).is_none());
+        assert!(provable(&cache, &at(Space::MyDrive, &["doc"])).is_none());
+        assert!(provable(&cache, &at(Space::Shared { id: "0A".into(), name: "E".into() }, &[])).is_none());
+        assert!(provable(&cache, &at(Space::Starred, &["fotos"])).is_none());
+        assert!(provable(&cache, &at(Space::SharedWithMe, &[])).is_none());
+        assert!(provable(&cache, &Location::Mock(Vec::new())).is_none());
     }
 
     #[test]

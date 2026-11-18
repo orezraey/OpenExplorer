@@ -56,8 +56,12 @@ use model::{Entry, Location, MockDrive, Pane, SortCol, Space};
 const ROW_H: f32 = 22.0;
 
 enum Msg {
-    /// Part of a folder listing.
-    Listed { pane: usize, request: u64, part: Part, result: Result<Vec<Entry>, String> },
+    /// Part of a folder listing. `at`, on a Drive listing's last part: where in the change log
+    /// it's valid (see [`cache::Pos`]).
+    Listed { pane: usize, request: u64, part: Part, result: Result<Vec<Entry>, String>, at: Option<cache::Pos> },
+    /// The change log proved the cached listing pane `pane` shows still stands: no need to read
+    /// the folder again. It's kept as `listing`, valid at its new position.
+    Unchanged { pane: usize, request: u64, listing: cache::Listing },
     LoggedIn { pane: usize, attempt: u64, result: Result<(StoredAccount, Arc<Drive>), String> },
     /// An account a background job had to open, for `poll` to keep (see [`AccountRef::open`]).
     Opened { email: String, drive: Arc<Drive> },
@@ -450,7 +454,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             Msg::TreeKids { id, hidden, result } => tree::arrived(s, id, hidden, result),
             Msg::Servers { found, done } => tree::servers_found(s, found, done),
             Msg::ServerChecked { attempt, result, secret } => servers::checked(s, attempt, result, secret),
-            Msg::Listed { pane, request, part, result } => {
+            Msg::Listed { pane, request, part, result, at } => {
                 if s.live[pane].load(Ordering::Relaxed) != request {
                     continue;
                 }
@@ -484,11 +488,25 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     && part != Part::Cached
                     && let Some(k) = cache::key(&s.panes[pane].loc)
                 {
-                    let entries = s.panes[pane].entries.clone();
-                    s.cache.put(k, entries);
+                    let entries = Arc::new(s.panes[pane].entries.clone());
+                    s.cache.put(k, entries, at);
+                }
+            }
+            Msg::Unchanged { pane, request, listing } => {
+                if s.live[pane].load(Ordering::Relaxed) != request {
+                    continue;
+                }
+                // The pane already shows the cached listing: it only stops loading.
+                let p = &mut s.panes[pane];
+                p.loading = false;
+                p.prune_selection();
+                drop_stale_rename(s, pane);
+                if let Some(k) = cache::key(&s.panes[pane].loc) {
+                    s.cache.keep(k, listing);
                 }
             }
             Msg::Done { reload, result } => {
+                changed_here(s, &reload);
                 match &result {
                     Ok(msg) => openexplorer_gdrive::log(&format!("operação: {msg}")),
                     Err(msg) => openexplorer_gdrive::log(&format!("erro: {msg}")),
@@ -794,9 +812,36 @@ fn ask_quota(s: &mut State, email: &str) {
 // ---------------------------------------------------------------------------------------------
 // Navigation
 
-/// Lists the pane's current folder: in place for local and simulated folders, in the
-/// background for Drive.
+/// Lists the pane's current folder again, whole: Atualizar, and every reload after a change.
 fn load(s: &mut State, p: usize) {
+    list(s, p, true);
+}
+
+/// The app changed the folders at `reload` itself, and Drive's change log may not show it yet:
+/// their cached listings aren't trusted on the log's word until read again.
+fn changed_here(s: &mut State, reload: &[Location]) {
+    for k in reload.iter().filter_map(cache::key) {
+        s.cache.unverify(&k);
+    }
+}
+
+/// For a Drive folder at `loc`: whether its cached listing may be kept on the change log's word
+/// (only on opening it, not `fresh`), and whether a fresh listing of it records where in the
+/// log it's valid (any [`watch::Provable`] folder).
+fn checks(s: &State, loc: &Location, fresh: bool) -> (Option<watch::Provable>, Option<watch::Provable>) {
+    let provable = watch::provable(&s.cache, loc);
+    (provable.clone().filter(|_| !fresh), provable)
+}
+
+/// Seconds since 1970 by the system clock.
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Lists the pane's current folder: in place for local and simulated folders, in the
+/// background for Drive. Unless `fresh`, a Drive folder whose cached listing the change log
+/// proves unchanged keeps it instead of being read again.
+fn list(s: &mut State, p: usize, fresh: bool) {
     // Every load gets a new number, so a Drive answer for a folder left since is dropped,
     // whatever the pane shows now.
     let request = s.live[p].fetch_add(1, Ordering::Relaxed) + 1;
@@ -815,11 +860,11 @@ fn load(s: &mut State, p: usize) {
             background(s, move |emit| {
                 let alive = || live.load(Ordering::Relaxed) == request;                let mut first = true;
                 let result = catch_panic(t("pesquisar", "search"), || {
-                    finder::search_elsewhere(&f, show_hidden, &alive, &mut |entries, more| {                        emit(Msg::Listed { pane: p, request, part: Part::Page { first, more }, result: Ok(entries) });                        first = false;
+                    finder::search_elsewhere(&f, show_hidden, &alive, &mut |entries, more| {                        emit(Msg::Listed { pane: p, request, part: Part::Page { first, more }, result: Ok(entries), at: None });                        first = false;
                     })
                 });
                 if let Err(e) = result {
-                    emit(Msg::Listed { pane: p, request, part: Part::Page { first, more: false }, result: Err(e) });
+                    emit(Msg::Listed { pane: p, request, part: Part::Page { first, more: false }, result: Err(e), at: None });
                 }
             });
             return;
@@ -842,7 +887,7 @@ fn load(s: &mut State, p: usize) {
         pane.free = None;
         background(s, move |emit| {
             let result = catch_panic(t("listar", "list"), || model::read_local(&dir, show_hidden).map_err(|e| format!("{}: {e}", dir.display())));
-            emit(Msg::Listed { pane: p, request, part: Part::WHOLE, result });
+            emit(Msg::Listed { pane: p, request, part: Part::WHOLE, result, at: None });
         });
         return;
     }
@@ -868,27 +913,56 @@ fn load(s: &mut State, p: usize) {
     let account = AccountRef::of(s, &email);
     let key = cache::key(&s.panes[p].loc);
     // A folder seen this session shows at once; the fresh listing then replaces it whole.
-    let in_memory = key.as_ref().and_then(|k| s.cache.get(k)).map(|e| e.to_vec());
+    let in_memory = key.as_ref().and_then(|k| s.cache.get(k)).cloned();
+    // A folder in My Drive can keep its cached listing when the change log proves it unchanged
+    // (see [`watch::verdict`]); such a listing then records where in the log it's valid. Atualizar
+    // and every reload after a change read it whole all the same.
+    let (check, provable) = checks(s, &s.panes[p].loc, fresh);
+    let watched = provable.as_ref().and_then(|_| watch::token(s, &email));
     let pane = &mut s.panes[p];
     let mut quiet = in_memory.is_some();
-    if let Some(entries) = in_memory {
-        pane.set_entries(Ok(entries));
+    if let Some(listing) = &in_memory {
+        pane.set_entries(Ok(listing.entries.to_vec()));
     }
     pane.loading = true;
     pane.error = None;
     let live = s.live[p].clone();
     let folder = path.last().map(|(id, _)| id.clone());
     background(s, move |emit| {
-        let listed = |part, result| Msg::Listed { pane: p, request, part, result };
+        let listed = |part, result| Msg::Listed { pane: p, request, part, result, at: None };
         // Else one from an earlier run, read here off the UI thread.
-        if !quiet && let Some(entries) = key.as_ref().and_then(cache::load_disk) {
-            emit(listed(Part::Cached, Ok(entries)));
+        let mut cached = in_memory;
+        if !quiet && let Some(listing) = key.as_ref().and_then(cache::load_disk) {
+            emit(listed(Part::Cached, Ok(listing.entries.to_vec())));
             quiet = true;
+            cached = Some(listing);
         }
         let drive = match account.open(emit) {
             Ok(d) => d,
             Err(e) => return emit(listed(Part::Page { first: !quiet, more: false }, Err(e))),
         };
+        let started = now_secs();
+        let mut token = None;
+        if let Some(check) = &check {
+            let verdict = catch_panic(t("ler as mudanças do Drive", "read the changes in Drive"), || {
+                Ok(watch::verdict(cached.as_ref(), check, started, |token, pages| drive.changes_within(token, pages), || drive.root_id()))
+            });
+            match (verdict, cached.take()) {
+                (Ok(watch::Verdict::Unchanged(pos)), Some(listing)) => {
+                    openexplorer_gdrive::log(&format!("  sem mudanças: {} itens mantidos do cache", listing.entries.len()));
+                    return emit(Msg::Unchanged { pane: p, request, listing: cache::Listing { pos: Some(pos), ..listing } });
+                }
+                (Ok(watch::Verdict::Fetch(t)), _) => token = t,
+                _ => {}
+            }
+        }
+        drop(cached);
+        // Where the listing about to be read is valid: a point in the log from before its first
+        // page, so whatever changes while it's read is still ahead of it in the log.
+        if provable.is_some() {
+            token = token.or(watched).or_else(|| drive.start_page_token().ok());
+        }
+        let at = token.map(|token| cache::Pos { token, fetched: started });
         // Without a cached listing each page shows as soon as it lands, so a big folder fills
         // in instead of staying blank. With one, pages are gathered and replace it in one go,
         // so the list doesn't shrink to the first page and grow back.
@@ -899,10 +973,10 @@ fn load(s: &mut State, p: usize) {
             if quiet {
                 gathered.extend(entries);
                 if !more {
-                    emit(listed(Part::WHOLE, Ok(std::mem::take(&mut gathered))));
+                    emit(Msg::Listed { pane: p, request, part: Part::WHOLE, result: Ok(std::mem::take(&mut gathered)), at: at.clone() });
                 }
             } else {
-                emit(listed(Part::Page { first, more }, Ok(entries.collect())));
+                emit(Msg::Listed { pane: p, request, part: Part::Page { first, more }, result: Ok(entries.collect()), at: if more { None } else { at.clone() } });
                 first = false;
             }
             live.load(Ordering::Relaxed) == request
@@ -950,7 +1024,7 @@ fn switch(s: &mut State, p: usize, loc: Location) {
         s.renaming = None;
     }
     s.panes[p].go(loc);
-    load(s, p);
+    list(s, p, false);
     tree::follow(s, p);
 }
 
@@ -1946,12 +2020,59 @@ mod tests {
         let mut from = 0;
         for (i, n) in pages.iter().enumerate() {
             let part = Part::Page { first: i == 0, more: i + 1 < pages.len() };
-            s.outbox.send(Msg::Listed { pane: 1, request: 7, part, result: Ok(entries(from, *n)) }).unwrap();
+            s.outbox.send(Msg::Listed { pane: 1, request: 7, part, result: Ok(entries(from, *n)), at: None }).unwrap();
             from += n;
         }
         poll(&mut s, 0.0, &mut Tx::default());
         assert_eq!(s.panes[1].entries.len(), 5720);
         assert!(!s.panes[1].loading);
+    }
+
+    /// A fresh listing's last page keeps where in the change log it's valid; a cached listing
+    /// the log proved unchanged ends the loading without touching what the pane shows, and an
+    /// answer for a folder left since is dropped.
+    #[test]
+    fn listings_keep_their_position_and_an_unchanged_one_just_stops_loading() {
+        let mut s = init();
+        s.cache = cache::Cache::memory_only();
+        let loc = Location::Drive { email: "t@t".into(), space: Space::MyDrive, path: vec![("pasta".into(), "Pasta".into())] };
+        let k = cache::key(&loc).unwrap();
+        s.panes[1].go(loc);
+        s.live[1].store(7, Ordering::Relaxed);
+        let at = |token: &str| Some(cache::Pos { token: token.into(), fetched: 1 });
+        s.outbox.send(Msg::Listed { pane: 1, request: 7, part: Part::Page { first: true, more: true }, result: Ok(entries(0, 1000)), at: None }).unwrap();
+        s.outbox.send(Msg::Listed { pane: 1, request: 7, part: Part::Page { first: false, more: false }, result: Ok(entries(1000, 5)), at: at("t1") }).unwrap();
+        poll(&mut s, 0.0, &mut Tx::default());
+        assert_eq!(s.cache.get(&k).map(|l| (l.entries.len(), l.pos.clone())), Some((1005, at("t1"))));
+        // Opened again: the cached listing shows, then the log proves it unchanged.
+        s.panes[1].loading = true;
+        s.live[1].store(8, Ordering::Relaxed);
+        let listing = cache::Listing { pos: at("t2"), ..s.cache.get(&k).unwrap().clone() };
+        s.outbox.send(Msg::Unchanged { pane: 1, request: 7, listing: listing.clone() }).unwrap();
+        poll(&mut s, 0.0, &mut Tx::default());
+        assert!(s.panes[1].loading, "an answer for an older request is dropped");
+        s.outbox.send(Msg::Unchanged { pane: 1, request: 8, listing }).unwrap();
+        poll(&mut s, 0.0, &mut Tx::default());
+        assert!(!s.panes[1].loading);
+        assert_eq!(s.panes[1].entries.len(), 1005);
+        assert_eq!(s.cache.get(&k).unwrap().pos, at("t2"));
+        // The app changed the folder itself: on reopening it's read whole.
+        let here = s.panes[1].loc.clone();
+        changed_here(&mut s, &[here]);
+        assert_eq!(s.cache.get(&k).unwrap().pos, None);
+    }
+
+    /// Atualizar and every reload read a Drive folder whole; only opening it may skip that.
+    #[test]
+    fn only_opening_a_folder_may_keep_its_cached_listing() {
+        let mut s = init();
+        s.cache = cache::Cache::memory_only();
+        let loc = Location::Drive { email: "t@t".into(), space: Space::MyDrive, path: vec![] };
+        assert!(checks(&s, &loc, false).0.is_some());
+        let (check, provable) = checks(&s, &loc, true);
+        assert!(check.is_none() && provable.is_some(), "a refresh still records where its listing is valid");
+        let shared = Location::Drive { email: "t@t".into(), space: Space::Shared { id: "0A".into(), name: "E".into() }, path: vec![] };
+        assert!(checks(&s, &shared, false).0.is_none());
     }
 
     /// What a screen reader hears from the notice at app clock `now`.
