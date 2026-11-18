@@ -20,6 +20,7 @@ winit = { git = "https://github.com/anomalyco/rune", branch = "dev" }
 parley_engine = { git = "https://github.com/anomalyco/rune", branch = "dev" }
 wgpu-hal = { git = "https://github.com/anomalyco/rune", branch = "dev" }
 accesskit_windows = { git = "https://github.com/anomalyco/rune", branch = "dev" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", branch = "dev" }
 
 [profile.dev.package."*"]
 # Rune's renderer is slow unoptimized; keep our own crate debuggable.
