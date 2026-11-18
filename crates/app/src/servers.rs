@@ -18,6 +18,7 @@ use crate::actions::{Dialog, Then};
 use crate::model::{Entry, Location};
 use crate::ops::{self, CANCELLED, Progress};
 use crate::transfers::{self, End, Op};
+use crate::undo;
 use crate::{Msg, Part, State, background, catch_panic};
 
 /// The servers added, and their idle connections.
@@ -444,7 +445,8 @@ pub fn move_within(s: &mut State, from: &Location, items: Vec<Entry>, to: &Locat
     let Some((server, dst)) = target(to).map(|(sv, d)| (sv.clone(), d)) else { return };
     let paths: Vec<String> = items.iter().filter_map(|e| path_of(from, e)).collect();
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Move, items.iter().map(|e| (end(from, Some(&e.name)), end(to, None))));
-    job(s, &server, reload, move |c| {
+    let at = server.clone();
+    undo::server_job(s, &server, reload, |n| format!("mover {}", undo::items(n)), move |c, rec| {
         batch.run(|i, _| {
             let (e, path) = (&items[i], &paths[i]);
             let into = child(&dst, &e.name);
@@ -454,7 +456,9 @@ pub fn move_within(s: &mut State, from: &Location, items: Vec<Entry>, to: &Locat
             if e.is_dir && (dst == *path || dst.starts_with(&format!("{path}/"))) {
                 return Err(format!("Não dá para mover a pasta \"{}\" para dentro dela mesma.", e.name));
             }
-            c.rename(path, &into)
+            c.rename(path, &into)?;
+            rec.add([undo::Step::ServerMove { server: at.clone(), from: into, to: path.clone() }]);
+            Ok(())
         })
     });
 }
@@ -483,11 +487,21 @@ pub fn name(s: &mut State, loc: &Location, item: Option<Entry>, name: String) {
         Some(item) => {
             let Some(from) = path_of(loc, &item) else { return };
             let to = child(from.rsplit_once('/').map_or("", |(d, _)| d), &name);
-            job(s, server, reload, move |c| c.rename(&from, &to).map(|_| format!("Renomeado para \"{name}\".")));
+            let (what, at) = (format!("renomear “{}” para “{name}”", item.name), Server::clone(server));
+            undo::server_job(s, server, reload, move |_| what, move |c, rec| {
+                c.rename(&from, &to)?;
+                rec.add([undo::Step::ServerMove { server: at, from: to, to: from }]);
+                Ok(format!("Renomeado para \"{name}\"."))
+            });
         }
         None => {
             let to = child(&server.path(path), &name);
-            job(s, server, reload, move |c| c.mkdir(&to).map(|_| format!("Pasta \"{name}\" criada.")));
+            let (what, at) = (format!("criar a pasta “{name}”"), Server::clone(server));
+            undo::server_job(s, server, reload, move |_| what, move |c, rec| {
+                c.mkdir(&to)?;
+                rec.add([undo::Step::ServerRemoveDir { server: at, path: to }]);
+                Ok(format!("Pasta \"{name}\" criada."))
+            });
         }
     }
 }

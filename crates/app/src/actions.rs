@@ -13,6 +13,7 @@ use rune::{TextEdit, Tx};
 use crate::address::{self, Reached, Target};
 use crate::model::{Entry, Location, Space, shown, typed};
 use crate::transfers::{self, End, Op};
+use crate::undo::{self, Step};
 use crate::uploads::{Clash, Existing, Item, Put};
 use crate::{Msg, State, background, drive_task, open as open_entry, ops};
 
@@ -482,17 +483,28 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
                     p.size(size);
                 }
             }
-            drive_job(s, &email, reload, move |d| {
+            let who = email.clone();
+            undo::drive_job(s, &email, reload, move |n| transfer_words(op, n), move |d, rec| {
                 batch.run(|i, _| {
                     let e = &items[i];
                     // Shortcuts are copied as shortcuts, not followed into their target.
                     let file = DriveFile { is_dir: e.is_dir && e.target.is_none(), target: None, ..drive_file(e) };
+                    // Desfazer sends a copy to the trash, as Explorer sends one to the Recycle Bin.
+                    let copy = |name: &str| {
+                        let made = d.copy(&file, &dst, name)?;
+                        rec.add([Step::DriveTrash { email: who.clone(), id: made.id, name: made.name, empty: false }]);
+                        Ok(())
+                    };
                     match mode {
-                        ClipMode::Copy if src == dst => d.copy(&file, &dst, &format!("Cópia de {}", e.name)).map(|_| ()),
-                        ClipMode::Copy => d.copy(&file, &dst, &e.name).map(|_| ()),
+                        ClipMode::Copy if src == dst => copy(&format!("Cópia de {}", e.name)),
+                        ClipMode::Copy => copy(&e.name),
                         ClipMode::Cut if src == dst => Ok(()),
                         ClipMode::Cut if src.is_empty() => Err("Recortar precisa da pasta de origem.".into()),
-                        ClipMode::Cut => d.move_to(&e.id, &src, &dst).map(|_| ()),
+                        ClipMode::Cut => {
+                            d.move_to(&e.id, &src, &dst)?;
+                            rec.add([Step::DriveMove { email: who.clone(), id: e.id.clone(), name: e.name.clone(), from: dst.clone(), to: src.clone() }]);
+                            Ok(())
+                        }
                     }
                 })
             });
@@ -505,18 +517,41 @@ fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p:
 pub fn local_transfer(s: &mut State, op: Op, sources: Vec<PathBuf>, dst: PathBuf, reload: Vec<Location>) {
     let to = End::local(&dst);
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, sources.iter().map(|p| (End::local(p), to.clone())));
-    local_job(s, reload, move || {
+    // Copies where there's no Recycle Bin (a shared folder, WSL) aren't kept for Desfazer,
+    // which would have to delete them for good.
+    let recyclable = !crate::network::is_remote(&dst);
+    undo::local_job(s, reload, move |n| transfer_words(op, n), move |rec| {
         for (p, path) in batch.rows().iter().zip(&sources) {
             p.size(ops::measure(path, &|| p.cancelled()));
         }
         batch.run(|i, p| {
-            let moved = match op {
-                Op::Copy | Op::Upload | Op::Download => ops::copy_into(&sources[i], &dst, p),
-                Op::Move => ops::move_into(&sources[i], &dst, p),
-            };
-            moved.map(|_| ())
+            let src = &sources[i];
+            match op {
+                Op::Copy | Op::Upload | Op::Download => {
+                    let made = ops::copy_into(src, &dst, p)?;
+                    if recyclable {
+                        rec.add([Step::Recycle { path: made }]);
+                    }
+                }
+                Op::Move => {
+                    let to = ops::move_into(src, &dst, p)?;
+                    // Already there: nothing moved.
+                    if to != *src {
+                        rec.add([Step::Move { from: to, to: src.clone() }]);
+                    }
+                }
+            }
+            Ok(())
         })
     });
+}
+
+/// Desfazer's words for a copy or a move of `n` items.
+fn transfer_words(op: Op, n: usize) -> String {
+    match op {
+        Op::Move => format!("mover {}", count(n)),
+        _ => format!("copiar {}", count(n)),
+    }
 }
 
 /// An upload waiting for its names to be checked against the Drive folder it goes into.
@@ -718,11 +753,29 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Download, items.iter().map(|e| (End::drive(from, Some(&e.name)), to.clone())));
     let files: Vec<DriveFile> = items.iter().map(drive_file).collect();
     let (at_once, segmented) = (s.settings.downloads.into(), s.settings.segmented_downloads);
-    drive_job(s, &email, reload, move |d| {
-        let finish = |i: usize, path: &std::path::Path| match then {
-            Then::Nothing => Ok(()),
-            Then::Trash => d.trash(&files[i].id).map(|_| ()),
-            Then::Open => ops::open(path),
+    // Desfazer sends what arrived to the Recycle Bin (not where there's none), and after
+    // Recortar takes the originals out of the Drive trash. Abrir isn't kept.
+    let recyclable = !crate::network::is_remote(&dst);
+    let op = if then == Then::Trash { Op::Move } else { Op::Copy };
+    let who = email.clone();
+    undo::drive_job(s, &email, reload, move |n| transfer_words(op, n), move |d, rec| {
+        let finish = |i: usize, path: &std::path::Path| {
+            let f = &files[i];
+            let arrived = recyclable.then(|| Step::Recycle { path: path.to_path_buf() });
+            match then {
+                Then::Nothing => {
+                    if let Some(step) = arrived {
+                        rec.add([step]);
+                    }
+                    Ok(())
+                }
+                Then::Trash => {
+                    d.trash(&f.id)?;
+                    rec.add(arrived.into_iter().chain([Step::DriveRestore { email: who.clone(), id: f.id.clone(), name: f.name.clone(), empty: false }]));
+                    Ok(())
+                }
+                Then::Open => ops::open(path),
+            }
         };
         crate::downloads::run(d, &batch, &files, &dst, at_once, segmented, &finish)
     });
@@ -910,13 +963,24 @@ pub fn delete(s: &mut State) {
     match &loc {
         Location::Local(_) | Location::Found(_) => {
             let paths: Vec<PathBuf> = items.iter().filter_map(|e| loc.local_path(e)).collect();
-            local_job(s, vec![loc.clone()], move || ops::to_recycle_bin(&paths).map(|_| format!("Movido para a Lixeira: {}.", count(n))));
+            undo::local_job(s, vec![loc.clone()], to_the_trash, move |rec| {
+                // The Recycle Bin dates items to the second.
+                let since = undo::now_secs() - 1;
+                let sent = ops::to_recycle_bin(&paths);
+                // What left, even if the rest failed, can come back.
+                for path in paths.iter().filter(|p| std::fs::symlink_metadata(p).is_err()) {
+                    rec.add([Step::Unrecycle { path: path.clone(), since }]);
+                }
+                sent.map(|_| format!("Movido para a Lixeira: {}.", count(n)))
+            });
         }
         Location::Drive { email, .. } => {
             // Lixeira, if a pane shows it, gets the items too.
-            drive_job(s, email, account_panes(s, email), move |d| {
-                for e in &items {
+            let who = email.clone();
+            undo::drive_job(s, email, account_panes(s, email), to_the_trash, move |d, rec| {
+                for e in items {
                     d.trash(&e.id)?;
+                    rec.add([Step::DriveRestore { email: who.clone(), id: e.id, name: e.name, empty: false }]);
                 }
                 Ok(format!("Movido para a lixeira do Google Drive: {}.", count(n)))
             });
@@ -925,6 +989,11 @@ pub fn delete(s: &mut State) {
         Location::Mock(_) => return not_here(s, pane),
     }
     s.status = format!("Excluindo {}…", count(n));
+}
+
+/// Desfazer's words for sending `n` items to a trash.
+fn to_the_trash(n: usize) -> String {
+    format!("mover {} para a Lixeira", count(n))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1121,18 +1190,40 @@ pub fn apply_name(s: &mut State, pane: usize, item: Option<Entry>, name: String)
     match (&loc, item) {
         (Location::Local(_) | Location::Found(_), Some(item)) => {
             let Some(from) = loc.local_path(&item) else { return };
-            local_job(s, vec![loc.clone()], move || ops::rename(&from, &name).map(|_| format!("Renomeado para \"{name}\".")));
+            let what = format!("renomear “{}” para “{name}”", item.name);
+            undo::local_job(s, vec![loc.clone()], move |_| what, move |rec| {
+                let to = ops::rename(&from, &name)?;
+                rec.add([Step::Move { from: to, to: from }]);
+                Ok(format!("Renomeado para \"{name}\"."))
+            });
         }
         (Location::Local(dir), None) => {
             let dir = dir.clone();
-            local_job(s, vec![loc.clone()], move || ops::new_folder(&dir, &name).map(|_| format!("Pasta \"{name}\" criada.")));
+            let what = format!("criar a pasta “{name}”");
+            undo::local_job(s, vec![loc.clone()], move |_| what, move |rec| {
+                let path = ops::new_folder(&dir, &name)?;
+                rec.add([Step::RemoveDir { path }]);
+                Ok(format!("Pasta \"{name}\" criada."))
+            });
         }
         (Location::Drive { email, .. }, Some(item)) => {
-            drive_job(s, email, account_panes(s, email), move |d| d.rename(&item.id, &name).map(|_| format!("Renomeado para \"{shown_name}\".")));
+            let what = format!("renomear “{}” para “{shown_name}”", shown(&item.name));
+            let who = email.clone();
+            undo::drive_job(s, email, account_panes(s, email), move |_| what, move |d, rec| {
+                let file = d.rename(&item.id, &name)?;
+                rec.add([Step::DriveRename { email: who, id: item.id, from: file.name, to: item.name }]);
+                Ok(format!("Renomeado para \"{shown_name}\"."))
+            });
         }
         (Location::Drive { .. }, None) => {
             let Some((email, folder)) = drive_folder(&loc) else { return not_here(s, pane) };
-            drive_job(s, &email, vec![loc.clone()], move |d| d.create_folder(&name, &folder).map(|_| format!("Pasta \"{shown_name}\" criada.")));
+            let what = format!("criar a pasta “{shown_name}”");
+            let who = email.clone();
+            undo::drive_job(s, &email, vec![loc.clone()], move |_| what, move |d, rec| {
+                let made = d.create_folder(&name, &folder)?;
+                rec.add([Step::DriveTrash { email: who, id: made.id, name: made.name, empty: true }]);
+                Ok(format!("Pasta \"{shown_name}\" criada."))
+            });
         }
         (Location::Server { find: None, .. }, None) => crate::servers::name(s, &loc, None, name),
         (Location::Server { .. }, Some(item)) => crate::servers::name(s, &loc, Some(item), name),
@@ -1558,7 +1649,10 @@ mod tests {
         s.panes[0].selected.insert("nota.txt".into());
         copy_across(&mut s, 0, 1);
         let done = s.inbox.recv_timeout(std::time::Duration::from_secs(10)).expect("the copy answers");
-        assert!(matches!(done, Msg::Done { result: Ok(_), .. }));
+        // Desfazer would send the copy to the Recycle Bin.
+        let Msg::Undo(undo::Answer::Did { result: Ok(_), record: Some(record), .. }) = done else { panic!("the copy ends well, kept for Desfazer") };
+        assert_eq!(record.steps, [Step::Recycle { path: b.join("nota.txt") }]);
+        assert_eq!(record.what, "copiar 1 item");
         // Its row in the queue sized the file, filled up and is done.
         let [t] = s.transfers.as_slice() else { panic!("one transfer: {}", s.transfers.len()) };
         assert_eq!((t.op, &t.from, &t.to), (Op::Copy, &End::local(&a.join("nota.txt")), &End::local(&b)));
