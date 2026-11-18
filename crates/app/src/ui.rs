@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
 
-use rune::{Align, Color, Cursor, Cx, Drag, DragOutcome, El, GrowthSpec, Icon, KeyEvent, Phase, ScrollSpec, Tx, col, el, icon, row, text};
+use rune::{Align, Color, Cursor, Cx, Drag, DragOutcome, El, GrowthSpec, Icon, KeyEvent, Phase, ScrollSpec, Span, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, ScrollBar, ScrollBarStyle, Toast, ToastRegion, context_menu};
 
 use crate::model::{Kind, Location, SortCol, Space, crumbs, format_bytes, format_long, format_size, format_time, shown};
@@ -2417,8 +2417,20 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
         .clip_rounded(k.radius.sm)
         .on_key(move |s: &mut State, ev: &KeyEvent, tx: &mut Tx| key(s, p, ev, tx))
         .on_press(move |s: &mut State| s.active = p)
-        .on_drop_files(move |s: &mut State, files: &[PathBuf], _| dropped(s, p, files))
-        .on_drop_hover(move |s: &mut State, over, _| s.panes[p].drop_over = over)
+        .on_drop_files(move |s: &mut State, files: &[PathBuf], _| {
+            crate::autoscroll::left(&mut s.autoscroll, p);
+            dropped(s, p, files)
+        })
+        .on_drop_hover(move |s: &mut State, over, _| {
+            s.panes[p].drop_over = over;
+            if !over {
+                crate::autoscroll::left(&mut s.autoscroll, p);
+            }
+        })
+        // Held near the top or bottom of the list or the tree, the drag scrolls it.
+        .on_drop_move(move |s: &mut State, at: rune::PointerEvent, tx: &mut Tx| {
+            crate::autoscroll::moved(&mut s.autoscroll, p, (at.window_x, at.window_y), tx.clock(), tx)
+        })
         .child(navbar(s, k, p))
         .child(search_bar(s, k, p))
         .child(
@@ -2818,7 +2830,7 @@ fn tree(s: &State, k: &Kit, p: usize) -> El {
         .virtual_rows_version((s.tree.version, s.panes[p].moves, s.accounts.len(), s.servers.list.len()));
     let at = crate::tree::cursor(s, p).map(|c| format!("t:{c}")).unwrap_or_default();
     // Opening or closing a node lands at once, as in Explorer, rather than sliding its rows.
-    col()
+    let viewport = col()
         .key(tree_key(p))
         .role("tree")
         .label("Pastas")
@@ -2832,8 +2844,8 @@ fn tree(s: &State, k: &Kit, p: usize) -> El {
         .h_full()
         .fill(k.alpha(k.c.text_base, if k.dark { 0.02 } else { 0.015 }))
         .scroll(ScrollSpec { stick_bottom: false })
-        .child(rows)
-        .scroll_bar_styled(bar)
+        .child(rows);
+    s.edges[p].tree.on(viewport).scroll_bar_styled(bar)
 }
 // ---------------------------------------------------------------------------------------------
 // File list
@@ -2870,8 +2882,25 @@ fn bar_style(k: &Kit) -> ScrollBarStyle {
     ScrollBarStyle::from_kit(k).thumb(k.alpha(k.c.text_base, 0.3)).thumb_hover(k.alpha(k.c.text_base, 0.5)).width(8.0).hover_width(10.0)
 }
 
+/// The scroll view of pane `p`'s file list.
+pub(crate) fn list_key(p: usize) -> String {
+    format!("viewport-{p}")
+}
+
 /// The file list's column header, stuck to the top of its viewport.
-const HEADER_H: f32 = 24.0;
+pub(crate) const HEADER_H: f32 = 24.0;
+
+/// The words of the search whose results `loc` lists, folded as the search folds them; none
+/// for a folder.
+fn searched_words(loc: &Location) -> Vec<Vec<u8>> {
+    let text = match loc {
+        Location::Found(f) => &f.text,
+        Location::Server { find: Some(text), .. } => text,
+        Location::Drive { space: Space::Search(q), path, .. } if path.is_empty() => &q.text,
+        _ => return Vec::new(),
+    };
+    crate::finder::words(text)
+}
 
 fn list(s: &State, k: &Kit, p: usize) -> El {
     let pane = &s.panes[p];
@@ -2916,6 +2945,11 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let (text_c, muted_c) = (k.c.text_base, k.c.text_muted);
     let font = k.ty.text_small;
     let rename_look = RenameLook { font, ink: text_c, fill: k.c.bg_base, edge: k.c.border_focus, selection: k.selection() };
+    // A search's results show what matched each name in the accent colour: a colour-only span,
+    // so the name keeps its shape and width. The words are folded once here; each row finds
+    // its ranges as it's built, so only the rows on screen pay for them.
+    let words = std::rc::Rc::new(searched_words(&pane.loc));
+    let accent = k.c.text_accent;
     let build = move |s: &State, i: usize| -> El {
         let pane = &s.panes[p];
         let e = &pane.entries[i];
@@ -2936,7 +2970,11 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                 .child(entry_icon(s, &pane.loc, e, 16.0))
                 .child(match &s.renaming {
                     Some((rp, item)) if *rp == p && item.id == e.id => rename_field(s, rename_look),
-                    _ => text(shown(&e.name)).font(font).color(text_c).truncate().shrink().min_w(0.0),
+                    _ => {
+                        let name = shown(&e.name);
+                        let spans: Vec<Span> = crate::finder::match_ranges(&words, &name).into_iter().map(|r| Span::new(r.start, r.end).color(accent)).collect();
+                        text(name).font(font).color(text_c).spans(spans).truncate().shrink().min_w(0.0)
+                    }
                 }),
         )
         .child(cell(1).justify_end().child(muted(e.size.map(format_size).unwrap_or_default()).align(Align::End)))
@@ -3034,7 +3072,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     // Its key is the pane's own: the scroll bar keeps its state, and finds the viewport it
     // scrolls, by this key, so with one key for both panes each bar moved the left pane.
     let viewport = col()
-        .key(format!("viewport-{p}"))
+        .key(list_key(p))
         .w_full()
         .h_full()
         .scroll_xy()
@@ -3050,9 +3088,9 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
             tx.focus(pane_key(p), false);
             s.menu = Some((p, at));
         })
-        .child(table)
-        // The bar runs below the header, which stays put, as Explorer's does.
-        .scroll_bar_styled(bar);
+        .child(table);
+    // The bar runs below the header, which stays put, as Explorer's does.
+    let viewport = s.edges[p].list.on(viewport).scroll_bar_styled(bar);
     col().key("list").w(0.0).grow(1.0).h_full().min_w(0.0).child(viewport)
 }
 
