@@ -7,12 +7,16 @@
 //! A folder's arrow opens it. Its folders are read the first time it opens (from the disk on a
 //! thread, or from Drive) and kept, and refreshed whenever a pane lists that folder. Each pane
 //! opens its own tree down to the folder it shows and marks it.
+//!
+//! The tree is one Tab stop and goes by keyboard as a WAI-ARIA tree does: the arrows move a
+//! highlighted row (opening and closing nodes sideways), Home and End reach the ends, Enter and
+//! Space go where a click goes, and typing a name's first letters jumps to it (see [`key`]).
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use rune::Icon;
+use rune::{Icon, Key, KeyEvent, Tx};
 
 use crate::model::{DriveKind, Entry, Location, Space, shown};
 use crate::network::{self, WSL, is_wsl, server_path, share_path};
@@ -96,6 +100,12 @@ pub struct Tree {
     /// Rede was searched, and the search is still going.
     searched: bool,
     searching: bool,
+    /// Per pane: the row the keyboard is on, by its line's key.
+    cursor: [Option<String>; 2],
+    /// Per pane: the letters typed to jump to a row, and when the last one came (app clock).
+    typed: [(String, f64); 2],
+    /// Per pane: whether the tree has keyboard focus, so its row under the keyboard shows a ring.
+    pub focused: [bool; 2],
 }
 
 /// A row of a pane's tree.
@@ -793,6 +803,8 @@ pub fn to_reveal(s: &mut State, p: usize, lines: &[Line]) -> Option<String> {
     }
     if let Some(on) = lines.iter().find_map(|l| matches!(l, Line::Node { on: true, .. }).then(|| l.key())) {
         s.tree.follow[p] = false;
+        // The keyboard picks up from the folder shown, as Explorer's tree does.
+        set_cursor(s, p, on.clone());
         return Some(on);
     }
     if !lines.iter().any(|l| matches!(l, Line::Note { loading: true, .. })) {
@@ -805,6 +817,207 @@ pub fn to_reveal(s: &mut State, p: usize, lines: &[Line]) -> Option<String> {
 /// the disks.
 pub fn fixed_icons(places: &Places, drives: &[(PathBuf, DriveKind)]) -> Vec<IconKey> {
     places.desktop.iter().map(|(p, _)| p.clone()).chain(places.user.iter().map(|(p, _)| p.clone())).chain(drives.iter().map(|(d, _)| d.clone())).map(IconKey::Path).collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Keyboard
+
+/// How long typing may pause before the next letter starts a new name, in seconds.
+const TYPE_PAUSE: f64 = 0.8;
+
+/// Rows Page Up and Page Down move by.
+const PAGE: isize = 20;
+
+/// What a key does in a pane's tree.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Move {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    First,
+    Last,
+    /// →: opens a closed node, or goes to the first folder of an open one.
+    Open,
+    /// ←: closes an open node, or goes to the node holding this one.
+    Close,
+    /// Enter or Space: where a click on the row goes.
+    Go,
+    /// Letters typed, to jump to a row whose name starts with them.
+    Type(String),
+}
+
+/// The row the keyboard is on in pane `p`'s tree, by its key.
+pub fn cursor(s: &State, p: usize) -> Option<&str> {
+    s.tree.cursor[p].as_deref()
+}
+
+/// Puts the keyboard on a row (one clicked).
+pub fn set_cursor(s: &mut State, p: usize, key: String) {
+    if s.tree.cursor[p].as_ref() != Some(&key) {
+        s.tree.cursor[p] = Some(key);
+        s.tree.version += 1;
+    }
+}
+
+/// Whether letters typed in pane `p`'s tree are still making up a name at `now`: Space then
+/// types a space rather than going to the row.
+pub fn typing(s: &State, p: usize, now: f64) -> bool {
+    let (typed, at) = &s.tree.typed[p];
+    !typed.is_empty() && now - at <= TYPE_PAUSE
+}
+
+/// The keyboard came to or left pane `p`'s tree. Coming in, it lands on the folder shown (or the
+/// first row) when it isn't on a row that's still there.
+pub fn focus(s: &mut State, p: usize, on: bool) {
+    if s.tree.focused[p] == on {
+        return;
+    }
+    s.tree.focused[p] = on;
+    if on {
+        let lines = lines(s, p);
+        if let Some((i, false)) = resolve(&lines, s.tree.cursor[p].as_deref()) {
+            s.tree.cursor[p] = Some(lines[i].key());
+        }
+    }
+    s.tree.version += 1;
+}
+
+/// The node rows: `(index in lines, depth)`.
+fn nodes(lines: &[Line]) -> impl Iterator<Item = (usize, usize)> + '_ {
+    lines.iter().enumerate().filter_map(|(i, l)| match l {
+        Line::Node { depth, .. } => Some((i, *depth)),
+        _ => None,
+    })
+}
+
+/// The row `cursor` names, and whether it's still there; one gone (its node closed, its folder
+/// deleted) falls back to the folder shown, else the first row.
+fn resolve(lines: &[Line], cursor: Option<&str>) -> Option<(usize, bool)> {
+    if let Some(c) = cursor
+        && let Some((i, _)) = nodes(lines).find(|&(i, _)| lines[i].key() == c)
+    {
+        return Some((i, true));
+    }
+    let on = lines.iter().position(|l| matches!(l, Line::Node { on: true, .. }));
+    on.or_else(|| nodes(lines).next().map(|(i, _)| i)).map(|i| (i, false))
+}
+
+/// Does `m` in pane `p`'s tree at `now` (app clock, seconds): moves the keyboard's row, opens or
+/// closes a node, or goes to a node's place. The key of the keyboard's row, to bring into view.
+pub fn press(s: &mut State, p: usize, m: Move, now: f64) -> Option<String> {
+    let all = lines(s, p);
+    let (at, kept) = resolve(&all, s.tree.cursor[p].as_deref())?;
+    if !matches!(m, Move::Type(_)) {
+        s.tree.typed[p].0.clear();
+    }
+    let rows: Vec<(usize, usize)> = nodes(&all).collect();
+    let here = rows.iter().position(|(i, _)| *i == at).unwrap_or(0);
+    let step = |d: isize| rows[(here as isize + d).clamp(0, rows.len() as isize - 1) as usize].0;
+    let Line::Node { node, depth, open, empty, .. } = &all[at] else { return None };
+    let to = match m {
+        // The first arrow after the keyboard's row went away lands where `resolve` put it.
+        Move::Up | Move::Down if !kept => at,
+        Move::Up => step(-1),
+        Move::Down => step(1),
+        Move::PageUp => step(-PAGE),
+        Move::PageDown => step(PAGE),
+        Move::First => rows[0].0,
+        Move::Last => rows[rows.len() - 1].0,
+        Move::Open if node.opens && !*empty && !*open => {
+            let node = (**node).clone();
+            toggle(s, p, &node);
+            at
+        }
+        // Its first folder, once they're read: until then (a note shows), it stays.
+        Move::Open => match all.get(at + 1) {
+            Some(Line::Node { depth: d, .. }) if *open && *d == depth + 1 => at + 1,
+            _ => at,
+        },
+        Move::Close if *open => {
+            let node = (**node).clone();
+            toggle(s, p, &node);
+            at
+        }
+        Move::Close => rows[..here].iter().rev().find(|(_, d)| d < depth).map_or(at, |(i, _)| *i),
+        Move::Go => {
+            let node = (**node).clone();
+            match &node.to {
+                Some(to) => crate::navigate(s, p, to.clone()),
+                None => toggle(s, p, &node),
+            }
+            at
+        }
+        Move::Type(t) => find_typed(s, p, &all, here, &t, now).unwrap_or(at),
+    };
+    let key = all[to].key();
+    s.tree.cursor[p] = Some(key.clone());
+    s.tree.version += 1;
+    Some(key)
+}
+
+/// The row the letters typed so far lead to, `t` just typed: the next whose name (ignoring case
+/// and accents) starts with them, from the keyboard's row (`here`, among the node rows) while a
+/// name is being spelled out, or after it for a first letter. A letter pressed over and over goes
+/// through the rows starting with it, as in Explorer.
+fn find_typed(s: &mut State, p: usize, all: &[Line], here: usize, t: &str, now: f64) -> Option<usize> {
+    let (typed, at) = &mut s.tree.typed[p];
+    if now - *at > TYPE_PAUSE {
+        typed.clear();
+    }
+    *at = now;
+    typed.push_str(t);
+    let typed = String::from_utf8(fold(typed)).unwrap_or_default();
+    let first = typed.chars().next()?;
+    let repeated = typed.chars().all(|c| c == first);
+    let (wanted, from) = if repeated { (first.to_string().into_bytes(), here + 1) } else { (typed.into_bytes(), here) };
+    let rows: Vec<usize> = nodes(all).map(|(i, _)| i).collect();
+    let n = rows.len();
+    (0..n).map(|k| rows[(from + k) % n]).find(|&i| matches!(&all[i], Line::Node { node, .. } if fold(&node.label).starts_with(&wanted)))
+}
+
+fn fold(text: &str) -> Vec<u8> {
+    openexplorer_index::fold::fold(text)
+}
+
+/// Keys while pane `p`'s tree has focus. The tree takes those it moves by, and those that would
+/// act on the files beside it (Delete, F2, copying...), which mean nothing here; the pane's other
+/// keys (the address, Voltar, Atualizar, the search) go on to it.
+pub fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    let mods = ev.mods;
+    let plain = !mods.cmd && !mods.ctrl && !mods.alt && !mods.logo;
+    let m = match &ev.key {
+        Key::Up if plain => Move::Up,
+        Key::Down if plain => Move::Down,
+        Key::PageUp if plain => Move::PageUp,
+        Key::PageDown if plain => Move::PageDown,
+        Key::Home if plain => Move::First,
+        Key::End if plain => Move::Last,
+        Key::Right if plain => Move::Open,
+        Key::Left if plain => Move::Close,
+        Key::Enter if plain => Move::Go,
+        Key::Text(t) if plain && t == " " && !typing(s, p, s.now) => Move::Go,
+        Key::Text(t) if plain && !t.chars().any(char::is_control) => Move::Type(t.clone()),
+        // Out of the tree to the files beside it, either way: the tree sits between the path bar
+        // and the list, and Tab in the list goes on to the other pane.
+        Key::Tab => {
+            tx.focus(crate::pane_key(p), true);
+            return true;
+        }
+        // Voltar and Avançar work from anywhere in the pane.
+        Key::Left | Key::Right if mods.alt => return false,
+        // With modifiers these would move or open the files beside it.
+        Key::Up | Key::Down | Key::Left | Key::Right | Key::Home | Key::End | Key::PageUp | Key::PageDown | Key::Enter => return true,
+        Key::Delete | Key::Function(2) => return true,
+        _ if ['a', 'c', 'n', 'v', 'x'].iter().any(|&c| ev.is_command(c)) => return true,
+        _ => return false,
+    };
+    s.active = p;
+    s.tree.focused[p] = true;
+    if let Some(row) = press(s, p, m, s.now) {
+        tx.scroll_into_view_in(crate::ui::tree_key(p), format!("t:{row}"));
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1007,5 +1220,133 @@ mod tests {
         let drive = NodeId::Account("a@b".into());
         arrived(&mut s, drive.clone(), None, Ok(Vec::new()));
         assert!(matches!(s.tree.kids.get(&drive), Some(Kids::Ready(_))));
+    }
+
+    /// A scene whose pane 0 shows the simulated drive's top, with Área de Trabalho's folders
+    /// read and nothing of the user's accounts or servers: the rows are Área de Trabalho,
+    /// Downloads, Este Computador › Disco local, Linux, Pessoal, Projeto, Rede, then (under
+    /// Testes) Drive simulado.
+    fn keyboard_scene(name: &str) -> State {
+        let (mut s, _) = scene(name);
+        s.accounts.clear();
+        s.servers.list.clear();
+        let kids = desktop_kids(&s.places, true);
+        s.tree.kids.insert(NodeId::Desktop, Kids::Ready(kids));
+        s.panes[0].go(Location::Mock(Vec::new()));
+        s
+    }
+
+    /// The label of the row the keyboard is on.
+    fn on_row(s: &State) -> String {
+        let key = cursor(s, 0).expect("a row").to_string();
+        lines(s, 0)
+            .into_iter()
+            .find_map(|l| match l {
+                Line::Node { key: k, node, .. } if k == key => Some(node.label),
+                _ => None,
+            })
+            .expect("the row shows")
+    }
+
+    /// The arrows go row by row past headings, Home and End to the ends; coming in, the keyboard
+    /// lands on the folder shown.
+    #[test]
+    fn the_arrows_move_through_the_rows() {
+        let mut s = keyboard_scene("keys-move");
+        focus(&mut s, 0, true);
+        assert_eq!(on_row(&s), "Drive simulado");
+        press(&mut s, 0, Move::Up, 0.0);
+        assert_eq!(on_row(&s), "Rede", "the Testes heading is skipped");
+        press(&mut s, 0, Move::First, 0.0);
+        assert_eq!(on_row(&s), "Área de Trabalho");
+        press(&mut s, 0, Move::Up, 0.0);
+        assert_eq!(on_row(&s), "Área de Trabalho", "the first row is the end");
+        press(&mut s, 0, Move::Down, 0.0);
+        assert_eq!(on_row(&s), "Downloads");
+        press(&mut s, 0, Move::PageDown, 0.0);
+        assert_eq!(on_row(&s), "Drive simulado");
+        press(&mut s, 0, Move::First, 0.0);
+        let key = press(&mut s, 0, Move::Last, 0.0);
+        assert_eq!(on_row(&s), "Drive simulado");
+        assert_eq!(key.as_deref(), Some("m:"), "the row to bring into view");
+    }
+
+    /// → opens a closed node, then goes to its first folder; ← goes up to the node holding a
+    /// folder, then closes it; Enter goes to a folder, or opens and closes Este Computador.
+    #[test]
+    fn the_side_arrows_open_and_close_and_enter_goes() {
+        let mut s = keyboard_scene("keys-open");
+        focus(&mut s, 0, true);
+        press(&mut s, 0, Move::Open, 0.0);
+        assert!(s.tree.open[0].contains(&NodeId::Mock(Vec::new())));
+        assert_eq!(on_row(&s), "Drive simulado", "opening stays on the node");
+        press(&mut s, 0, Move::Open, 0.0);
+        assert_eq!(on_row(&s), "Documentos");
+        press(&mut s, 0, Move::Down, 0.0);
+        press(&mut s, 0, Move::Go, 0.0);
+        assert_eq!(s.panes[0].loc, Location::Mock(vec!["Fotos".into()]));
+        assert_eq!(on_row(&s), "Fotos");
+        press(&mut s, 0, Move::Close, 0.0);
+        assert_eq!(on_row(&s), "Drive simulado");
+        press(&mut s, 0, Move::Close, 0.0);
+        assert!(!s.tree.open[0].contains(&NodeId::Mock(Vec::new())));
+        press(&mut s, 0, Move::Close, 0.0);
+        assert_eq!(on_row(&s), "Drive simulado", "a closed top node has nowhere to go");
+
+        // Este Computador goes nowhere: Enter opens and closes it.
+        press(&mut s, 0, Move::First, 0.0);
+        press(&mut s, 0, Move::Down, 0.0);
+        press(&mut s, 0, Move::Down, 0.0);
+        assert_eq!(on_row(&s), "Este Computador");
+        press(&mut s, 0, Move::Go, 0.0);
+        assert!(!s.tree.open[0].contains(&NodeId::Computer));
+        press(&mut s, 0, Move::Go, 0.0);
+        assert!(s.tree.open[0].contains(&NodeId::Computer));
+        press(&mut s, 0, Move::Open, 0.0);
+        assert!(on_row(&s).starts_with("Disco local"));
+        press(&mut s, 0, Move::Close, 0.0);
+        assert_eq!(on_row(&s), "Este Computador");
+    }
+
+    /// Typing jumps to the next row whose name starts with the letters, ignoring case and
+    /// accents; the same letter again goes on to the next; a pause starts a new name.
+    #[test]
+    fn typing_jumps_to_a_row_by_its_name() {
+        let mut s = keyboard_scene("keys-type");
+        focus(&mut s, 0, true);
+        let typed = |s: &mut State, t: &str, now: f64| {
+            press(s, 0, Move::Type(t.into()), now);
+            on_row(s)
+        };
+        assert_eq!(typed(&mut s, "p", 10.0), "Pessoal", "after the row, going round");
+        assert_eq!(typed(&mut s, "p", 10.2), "Projeto");
+        assert_eq!(typed(&mut s, "P", 10.4), "Pessoal");
+        assert_eq!(typed(&mut s, "a", 20.0), "Área de Trabalho");
+        assert_eq!(typed(&mut s, "d", 30.0), "Downloads");
+        assert_eq!(typed(&mut s, "r", 30.3), "Drive simulado", "“dr” spelled out");
+        assert!(typing(&s, 0, 30.5), "Space types while a name is being spelled");
+        assert!(!typing(&s, 0, 32.0));
+        assert_eq!(typed(&mut s, "r", 32.0), "Rede", "a pause starts a new name");
+        assert_eq!(typed(&mut s, "x", 40.0), "Rede", "no match stays");
+        assert_eq!(typed(&mut s, "ESTE", 50.0), "Este Computador");
+    }
+
+    /// The keyboard's row gone (its node closed) falls back to the folder shown, and the first
+    /// arrow then lands there.
+    #[test]
+    fn a_row_gone_falls_back_to_the_folder_shown() {
+        let mut s = keyboard_scene("keys-gone");
+        focus(&mut s, 0, true);
+        press(&mut s, 0, Move::Open, 0.0);
+        press(&mut s, 0, Move::Open, 0.0);
+        assert_eq!(on_row(&s), "Documentos");
+        toggle(&mut s, 0, &mock_node(Vec::new()));
+        press(&mut s, 0, Move::Down, 0.0);
+        assert_eq!(on_row(&s), "Drive simulado");
+        // Leaving and coming back keeps a row that's still there.
+        press(&mut s, 0, Move::First, 0.0);
+        focus(&mut s, 0, false);
+        focus(&mut s, 0, true);
+        assert_eq!(on_row(&s), "Área de Trabalho");
     }
 }
