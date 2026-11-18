@@ -35,7 +35,8 @@ pub enum Kind {
 }
 
 impl Kind {
-    fn of(t: i64) -> Option<Kind> {
+    /// The kind of MEGA's number `t`.
+    pub(crate) fn of(t: i64) -> Option<Kind> {
         Some(match t {
             0 => Kind::File,
             1 => Kind::Folder,
@@ -44,6 +45,17 @@ impl Kind {
             4 => Kind::Rubbish,
             _ => return None,
         })
+    }
+
+    /// MEGA's number for it, which [`Kind::of`] reads back.
+    pub(crate) fn code(self) -> u8 {
+        match self {
+            Kind::File => 0,
+            Kind::Folder => 1,
+            Kind::Root => 2,
+            Kind::Vault => 3,
+            Kind::Rubbish => 4,
+        }
     }
 
     pub fn is_dir(self) -> bool {
@@ -360,12 +372,8 @@ impl Tree {
         for n in list {
             keys.learn_node(n);
         }
-        let mut tree = Tree { sn: f.get("sn").and_then(Value::as_str).unwrap_or_default().to_string(), ..Tree::default() };
-        // Room for some changes after it, so the first ones don't double it.
-        let room = list.len() + list.len() / 16;
-        tree.slots.reserve(room);
-        tree.ids.reserve(room);
-        tree.names.reserve(room);
+        let mut tree = Tree::with_capacity(list.len());
+        tree.sn = f.get("sn").and_then(Value::as_str).unwrap_or_default().to_string();
         for raw in list {
             match decode(keys, raw) {
                 Some(n) => tree.put(n),
@@ -381,7 +389,8 @@ impl Tree {
         tree
     }
 
-    /// An empty tree with room for `n` nodes and some changes after them.
+    /// An empty tree with room for `n` nodes and some changes after them, so the first changes
+    /// don't double it.
     pub fn with_capacity(n: usize) -> Tree {
         let room = n + n / 16;
         let mut tree = Tree::default();

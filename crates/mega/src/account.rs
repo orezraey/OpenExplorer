@@ -128,6 +128,11 @@ impl std::fmt::Debug for Account {
     }
 }
 
+/// The keys a session opens nodes with before any share key is known.
+fn session_keys(s: &Session) -> Keys {
+    Keys { user: s.user.clone(), master: s.master, rsa: s.rsa.clone(), shares: HashMap::new() }
+}
+
 /// The paths' segments, without empty ones.
 fn segments(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty()).collect()
@@ -147,8 +152,8 @@ impl Account {
 
     /// [`Account::start`] with the tree kept in `file`, or nowhere.
     pub fn start_kept(email: &str, api: Api, session: Session, file: Option<PathBuf>) -> Result<Account> {
-        let keys = Keys { user: session.user.clone(), master: session.master, rsa: session.rsa.clone(), shares: HashMap::new() };
         let kept = file.map(|f| (f, cache::Secret::of(&session.user, &session.master, &session.sek)));
+        let keys = session_keys(&session);
         let account = Account { email: session::normal_email(email), api, session, inner: Mutex::new(Inner { keys, tree: Tree::default(), refetch: false }), kept, saved: Mutex::default(), forgotten: AtomicBool::new(false), from_cache: AtomicBool::new(false) };
         if !account.resume_kept()? {
             account.fetch()?;
@@ -209,7 +214,7 @@ impl Account {
             Ok(caught) => {
                 crate::api::log(&format!("MEGA cache: o canal de mudanças não pôs a árvore em dia ({caught:?}), lendo a conta inteira"));
                 cache::forget_file(file);
-                self.lock().tree = Tree::default();
+                self.drop_kept();
                 Ok(false)
             }
             // The channel failing (no network, an answer it can't read) doesn't show the kept
@@ -217,10 +222,16 @@ impl Account {
             // reached, the file staying for the next try; and overwrites the file if it can.
             Err(e) => {
                 crate::api::log(&format!("MEGA cache: o canal de mudanças falhou ({e}), lendo a conta inteira"));
-                self.lock().tree = Tree::default();
+                self.drop_kept();
                 Ok(false)
             }
         }
+    }
+
+    /// Back to what a start without a kept tree has: no tree, and no share keys but what the
+    /// whole listing brings (the kept ones may be of shares that ended).
+    fn drop_kept(&self) {
+        *self.lock() = Inner { keys: session_keys(&self.session), tree: Tree::default(), refetch: false };
     }
 
     /// Keeps the tree on disk now, if this account keeps it. Encoded under the lock, sealed
@@ -233,13 +244,18 @@ impl Account {
             if inner.tree.root.is_none() || inner.refetch {
                 return;
             }
+            // Marked kept while the tree can't change: a change applied after this snapshot
+            // marks it changed again.
+            *self.saved.lock().unwrap_or_else(|e| e.into_inner()) = Saved { at: Some(Instant::now()), dirty: false };
             cache::encode(&inner.tree, &inner.keys.shares)
         };
         let encoded = started.elapsed();
-        *self.saved.lock().unwrap_or_else(|e| e.into_inner()) = Saved { at: Some(Instant::now()), dirty: false };
         match cache::write_unless(file, secret, body, &self.forgotten) {
             Ok(()) => crate::api::log(&format!("MEGA cache: árvore guardada em {} ms ({} ms montando)", started.elapsed().as_millis(), encoded.as_millis())),
-            Err(e) => crate::api::log(&format!("MEGA cache: não consegui guardar a árvore: {e}")),
+            Err(e) => {
+                crate::api::log(&format!("MEGA cache: não consegui guardar a árvore: {e}"));
+                self.saved.lock().unwrap_or_else(|e| e.into_inner()).dirty = true;
+            }
         }
     }
 
@@ -1133,8 +1149,10 @@ mod tests {
     fn keep(file: &std::path::Path, sek: u8) {
         let mut k = keys();
         let tree = { let l = listing(&k); Tree::from_listing(&mut k, &l) };
+        // The key of a share that may have ended since.
+        k.shares.insert("OLDSHARE".into(), [3; 16]);
         let s = test_session(sek);
-        cache::write(file, &cache::Secret::of(&s.user, &s.master, &s.sek), cache::encode(&tree, &k.shares)).unwrap();
+        cache::write(file,&cache::Secret::of(&s.user, &s.master, &s.sek), cache::encode(&tree, &k.shares)).unwrap();
     }
 
     /// The whole tree MEGA would send now: `listing` plus one folder made since.
@@ -1162,6 +1180,7 @@ mod tests {
         assert!(a.resolve("/Drive na nuvem/Fotos/nova.jpg").is_some(), "a change since it was kept is in");
         assert!(a.resolve("/Drive na nuvem/nota.txt").is_none(), "and so is a deletion");
         assert_eq!(a.lock().tree.sn, "SN000000002");
+        assert!(a.lock().keys.shares.contains_key("OLDSHARE"), "the kept share keys are taken in");
         // The changes are kept on the next save, with the new sequence number.
         a.save_cache_if_changed();
         let s = test_session(1);
@@ -1203,6 +1222,7 @@ mod tests {
             assert!(!a.started_from_cache(), "{name}");
             assert_eq!(mega.listings(), 1, "{name}: the whole listing read once");
             assert!(a.resolve("/Drive na nuvem/Feita depois").is_some(), "{name}: the fresh tree is shown");
+            assert!(!a.lock().keys.shares.contains_key("OLDSHARE"), "{name}: only the share keys the whole listing brings");
             let s = test_session(sek);
             let (kept, _) = cache::read(&file, &cache::Secret::of(&s.user, &s.master, &s.sek)).unwrap();
             assert_eq!(kept.sn, "SN000000009", "{name}: the fresh tree is kept");

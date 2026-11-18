@@ -28,7 +28,7 @@
 //! decrypting it.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -164,16 +164,6 @@ const HAS_OTHERS: u8 = 2;
 const HAS_INSHARE: u8 = 4;
 const HAS_LINK: u8 = 8;
 
-fn kind_byte(k: Kind) -> u8 {
-    match k {
-        Kind::File => 0,
-        Kind::Folder => 1,
-        Kind::Root => 2,
-        Kind::Vault => 3,
-        Kind::Rubbish => 4,
-    }
-}
-
 /// The tree and the share keys as the file's body: the sequence number, the share keys, the
 /// nodes no key opened yet (as MEGA sent them), then each node.
 pub fn encode(tree: &Tree, shares: &HashMap<String, [u8; 16]>) -> Vec<u8> {
@@ -195,7 +185,7 @@ pub fn encode(tree: &Tree, shares: &HashMap<String, [u8; 16]>) -> Vec<u8> {
     for n in tree.nodes() {
         out.extend_from_slice(&n.handle.0);
         out.extend_from_slice(&n.parent.0);
-        out.push(kind_byte(n.kind));
+        out.push(n.kind.code());
         let flag = |on: bool, f: u8| if on { f } else { 0 };
         let flags = flag(n.modified.is_some(), HAS_MODIFIED) | flag(n.others.is_some(), HAS_OTHERS) | flag(n.inshare.is_some(), HAS_INSHARE) | flag(n.link.is_some(), HAS_LINK);
         out.push(flags);
@@ -304,14 +294,7 @@ pub fn decode(body: &[u8]) -> Result<(Tree, HashMap<String, [u8; 16]>), Refusal>
     for _ in 0..count {
         let handle: Handle = r.id()?;
         let parent: Handle = r.id()?;
-        let kind = match r.byte()? {
-            0 => Kind::File,
-            1 => Kind::Folder,
-            2 => Kind::Root,
-            3 => Kind::Vault,
-            4 => Kind::Rubbish,
-            _ => return Err(Refusal::Malformed),
-        };
+        let kind = Kind::of(i64::from(r.byte()?)).ok_or(Refusal::Malformed)?;
         let flags = r.byte()?;
         if handle.is_empty() || flags & !(HAS_MODIFIED | HAS_OTHERS | HAS_INSHARE | HAS_LINK) != 0 {
             return Err(Refusal::Malformed);
@@ -359,14 +342,23 @@ pub fn seal(secret: &Secret, mut file: Vec<u8>) -> Vec<u8> {
     file
 }
 
-/// Opens a file [`seal`] made, in place: the body, after the header.
-pub fn open(secret: &Secret, file: &mut [u8]) -> Result<std::ops::Range<usize>, Refusal> {
-    if file.len() < HEADER + TAG || &file[..8] != MAGIC || file[8..12] != FORMAT.to_le_bytes() {
+/// Whether a file's first bytes are of this format and this session's.
+fn check_header(secret: &Secret, head: &[u8]) -> Result<(), Refusal> {
+    if head.len() < HEADER || &head[..8] != MAGIC || head[8..12] != FORMAT.to_le_bytes() {
         return Err(Refusal::Format);
     }
-    if file[12..28] != secret.id {
+    if head[12..28] != secret.id {
         return Err(Refusal::OtherSession);
     }
+    Ok(())
+}
+
+/// Opens a file [`seal`] made, in place: the body, after the header.
+pub fn open(secret: &Secret, file: &mut [u8]) -> Result<std::ops::Range<usize>, Refusal> {
+    if file.len() < HEADER + TAG {
+        return Err(Refusal::Format);
+    }
+    check_header(secret, &file[..HEADER])?;
     let end = file.len() - TAG;
     let tag: [u8; TAG] = file[end..].try_into().expect("16 bytes");
     let (head, rest) = file.split_at_mut(HEADER);
@@ -411,11 +403,23 @@ pub fn write_unless(file: &Path, secret: &Secret, body: Vec<u8>, forgotten: &Ato
 
 /// The tree and the share keys kept in `file`.
 pub fn read(file: &Path, secret: &Secret) -> Result<(Tree, HashMap<String, [u8; 16]>), Refusal> {
-    let mut data = match std::fs::read(file) {
-        Ok(d) => d,
+    let io = |e: std::io::Error| Refusal::Io(e.to_string());
+    let mut f = match std::fs::File::open(file) {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Refusal::Missing),
-        Err(e) => return Err(Refusal::Io(e.to_string())),
+        Err(e) => return Err(io(e)),
     };
+    // The header first: a file of another session or format is refused without reading the
+    // rest (over 100 MB on a big account).
+    let mut data = vec![0; HEADER];
+    match f.read_exact(&mut data) {
+        Ok(()) => check_header(secret, &data)?,
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err(Refusal::Format),
+        Err(e) => return Err(io(e)),
+    }
+    let len = f.metadata().map_err(io)?.len();
+    data.reserve(usize::try_from(len).unwrap_or(0).saturating_sub(HEADER));
+    f.read_to_end(&mut data).map_err(io)?;
     let body = open(secret, &mut data)?;
     decode(&data[body])
 }
