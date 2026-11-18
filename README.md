@@ -1,6 +1,6 @@
 # Open Explorer
 
-A dual-pane file manager for Windows with Google Drive, SFTP, FTP and WebDAV built in.
+A dual-pane file manager for Windows with Google Drive, MEGA, SFTP, FTP and WebDAV built in.
 Written in Rust.
 
 [Português](README.pt-BR.md)
@@ -10,10 +10,13 @@ Written in Rust.
 * Two panes, each with its own folder tree.
 * Google Drive: multiple accounts, shared drives, sharing, starred, trash. Open folders update
   when files change on the web.
+* MEGA: multiple accounts (two-factor login too), Cloud Drive, Rubbish Bin with restore,
+  incoming shares and public file links. Encrypted and decrypted on your computer; open folders
+  update when files change elsewhere.
 * SFTP, FTP/FTPS, WebDAV, Nextcloud and ownCloud.
 * Copy and move between any of them, with a transfer queue.
-* Instant file name search on local NTFS drives, similar to Everything. Drive and servers can be
-  searched too.
+* Instant file name search on local NTFS drives, similar to Everything. Drive, MEGA and servers
+  can be searched too.
 * Drag and drop to and from Windows Explorer.
 * Undo and redo for renames, moves, deletes and copies.
 * English and Portuguese.
