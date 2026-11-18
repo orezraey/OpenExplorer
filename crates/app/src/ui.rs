@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
 
-use rune::{Align, Color, Cursor, Cx, Drag, DragOutcome, El, GrowthSpec, Icon, KeyEvent, Phase, ScrollSpec, Tx, col, el, icon, row, text};
+use rune::{Align, Color, Cursor, Cx, Drag, DragOutcome, El, GrowthSpec, Icon, KeyEvent, LiveRegion, Phase, ScrollSpec, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, ScrollBar, ScrollBarStyle, Toast, ToastRegion, context_menu};
 
 use crate::model::{Kind, Location, SortCol, Space, crumbs, format_bytes, format_long, format_size, format_time, shown};
@@ -32,7 +32,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     // What the last action said, for a few seconds at the bottom right.
     if !s.status.is_empty() && s.now < s.status_until {
         let close = |s: &mut State| s.status_until = 0.0;
-        layer.push(ToastRegion::new().toast(Toast::new("notice", s.status.clone()).on_close(close).build(&k)).build(&k));
+        // Not a live region of its own: `notice` has each message said once, at once for errors.
+        let toast = Toast::new("notice", s.status.clone()).on_close(close).build(&k).live_region(LiveRegion::Off);
+        layer.push(ToastRegion::new().toast(toast).build(&k));
     }
     let body = col()
         .key("window")
@@ -2841,7 +2843,28 @@ fn bar_style(k: &Kit) -> ScrollBarStyle {
 }
 
 /// The file list's column header, stuck to the top of its viewport.
-const HEADER_H: f32 = 24.0;
+const HEADER_H: f32 = crate::lasso::HEADER_H;
+
+/// The scroll viewport of pane `p`'s file list.
+pub(crate) fn viewport_key(p: usize) -> String {
+    format!("viewport-{p}")
+}
+
+/// The rectangle a lasso in pane `p` draws, in the list's content (so it scrolls with the
+/// rows), cut to what the viewport shows.
+fn lasso_rect(s: &State, k: &Kit, p: usize) -> Option<El> {
+    let l = s.lasso.as_ref().filter(|l| l.pane == p && l.moved)?;
+    let view = &s.views[p];
+    let scroll = view.scroll.get();
+    let [x0, y0, x1, y1] = l.rect(scroll);
+    // Before the first layout says how big the viewport is, nothing is cut.
+    let known = |size: f32, minus: f32| if size > 0.0 { (size - minus).max(0.0) } else { f32::MAX / 4.0 };
+    let (left, right) = (scroll.x, scroll.x + known(view.rect[2], 0.0));
+    let (top, bottom) = (scroll.y, scroll.y + known(scroll.h, HEADER_H));
+    let (x0, x1) = (x0.clamp(left, right), x1.clamp(left, right));
+    let (y0, y1) = (y0.clamp(top, bottom), y1.clamp(top, bottom));
+    Some(el().key("lasso").absolute(x0, HEADER_H + y0).size(x1 - x0, y1 - y0).fill(k.alpha(k.c.text_accent, 0.14)).border(1.0, k.alpha(k.c.text_accent, 0.7)))
+}
 
 fn list(s: &State, k: &Kit, p: usize) -> El {
     let pane = &s.panes[p];
@@ -2891,7 +2914,8 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         let e = &pane.entries[i];
         let is_sel = pane.selected.contains(&e.id);
         let found = pane.loc.finds();
-        let mut r = row().key(row_key(&e.id)).role("row").label(shown(&e.name)).focus_selected(is_sel).w_full().h(ROW_H).center_y();
+        // As wide as the columns: past them is empty space, where a drag draws a rectangle.
+        let mut r = row().key(row_key(&e.id)).role("row").label(shown(&e.name)).focus_selected(is_sel).w(total).h(ROW_H).center_y();
         r = if is_sel { r.fill(selected) } else { r.hover(hover) };
         if s.active == p && pane.cursor.as_deref() == Some(e.id.as_str()) {
             r = r.outline(1.0, -1.0, ring);
@@ -2957,10 +2981,13 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let n = pane.entries.len();
     // The rows end where the scroll bar starts; the header runs on above it.
     let bar = bar_style(k).track_offset(HEADER_H, 0.0);
+    // Room under the last row, so a list that scrolls still has empty space to start a
+    // rectangle selection from.
     let rows = col()
         .key("rows")
         .w_full()
         .pr(bar.strip())
+        .pb(2.0 * ROW_H)
         .growth(GrowthSpec::default())
         .virtual_rows(n, ROW_H, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
         .virtual_rows_version((pane.version, w.map(f32::to_bits), s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))));
@@ -2999,15 +3026,23 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     // One viewport scrolls both ways: sideways when the columns are wider than the pane,
     // header and rows together, and up and down with the header stuck to the top. Its
     // vertical bar sits on the pane's right edge, wherever the columns end.
-    let table = col().key("table").w_full().min_w(total + bar.strip()).child(header).child(body);
-    // A right click on empty space opens the folder's menu (Colar, Nova pasta).
+    let table = col().key("table").w_full().min_w(total + bar.strip()).child(header).child(body).children(lasso_rect(s, k, p));
+    // A right click on empty space opens the folder's menu (Colar, Nova pasta); a drag there
+    // selects with a rectangle (see `crate::lasso`), which needs where the viewport is.
     // Its key is the pane's own: the scroll bar keeps its state, and finds the viewport it
     // scrolls, by this key, so with one key for both panes each bar moved the left pane.
+    let scrolled = s.views[p].scroll.clone();
     let viewport = col()
-        .key(format!("viewport-{p}"))
+        .key(viewport_key(p))
         .w_full()
         .h_full()
         .scroll_xy()
+        .on_scroll_offset(move |at| scrolled.set(at.into()))
+        .on_layout_tx(move |s: &mut State, r, tx: &mut Tx| {
+            s.views[p].rect = r;
+            tx.live_only();
+        })
+        .on_drag(move |s: &mut State, d: &mut Drag, tx: &mut Tx| crate::lasso::drag(s, p, d, tx))
         .on_secondary_press(move |s: &mut State, at: rune::PointerPress, tx: &mut Tx| {
             s.active = p;
             s.panes[p].selected.clear();

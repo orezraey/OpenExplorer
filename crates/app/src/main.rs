@@ -16,6 +16,7 @@ mod downloads;
 mod dragout;
 mod finder;
 mod icons;
+mod lasso;
 mod layout;
 mod model;
 mod network;
@@ -42,7 +43,7 @@ use std::time::SystemTime;
 
 use openexplorer_gdrive::store::{self, StoredAccount};
 use openexplorer_gdrive::{ClientConfig, Drive, DriveFile, Quota, oauth};
-use rune::{AppSpec, DragItem, Key, KeyEvent, Mods, Tx, Waker};
+use rune::{AppSpec, DragItem, Key, KeyEvent, LiveRegion, Mods, Tx, Waker};
 
 use model::{Entry, Location, MockDrive, Pane, SortCol, Space};
 
@@ -108,6 +109,11 @@ struct State {
     panes: [Pane; 2],
     /// The context menu: the pane it was opened in and where.
     menu: Option<(usize, rune::PointerPress)>,
+    /// A rectangle selection being dragged out in a file list.
+    lasso: Option<lasso::Lasso>,
+    /// Where each pane's file list viewport is and how far it's scrolled, for the rectangle
+    /// selection and the menu the keyboard opens.
+    views: [lasso::Viewport; 2],
     dialog: Option<actions::Dialog>,
     /// Uploads whose clash dialog waits for the one open (or another dialog) to close.
     clash_waiting: std::collections::VecDeque<actions::ClashAsk>,
@@ -174,6 +180,9 @@ struct State {
     /// The message the notice was last started for, and when it goes (app clock, seconds).
     status_seen: String,
     status_until: f64,
+    /// The error `status` shows, when it shows one: a screen reader says it at once rather
+    /// than when it's idle. Kept as the text, so a later message isn't taken for an error.
+    status_alert: String,
     /// The app clock at the last frame.
     now: f64,
     temp: PathBuf,
@@ -207,6 +216,8 @@ fn init() -> State {
     State {
         panes,
         menu: None,
+        lasso: None,
+        views: Default::default(),
         dialog: None,
         clash_waiting: Default::default(),
         name_edit: rune::TextEdit::new(""),
@@ -240,6 +251,7 @@ fn init() -> State {
         status: String::new(),
         status_seen: String::new(),
         status_until: 0.0,
+        status_alert: String::new(),
         now: 0.0,
         temp: std::env::temp_dir().join("OpenExplorer-drag"),
         inbox,
@@ -291,11 +303,20 @@ fn background(s: &State, work: impl FnOnce(&dyn Fn(Msg)) + Send + 'static) {
 /// Starts the notice for a new message, and takes it away when its time is up; a wake is
 /// set for then, as nothing else may draw a frame. The same message said again later shows
 /// again, as the expired one is cleared.
-fn notice(s: &mut State, now: f64) -> bool {
+///
+/// Each message the notice starts for is handed to `say` once, for a screen reader: at once
+/// (assertive) when it's the error [`State::status_alert`] names, else when the reader is idle.
+/// The notice itself isn't a live region (see `ui::view`), so nothing says it twice.
+fn notice(s: &mut State, now: f64, say: &mut dyn FnMut(String, LiveRegion)) -> bool {
     s.now = now;
     if s.status != s.status_seen {
         s.status_seen = s.status.clone();
         s.status_until = now + NOTICE_SECS;
+        if !s.status.is_empty() {
+            let alert = s.status == s.status_alert;
+            say(s.status.clone(), if alert { LiveRegion::Assertive } else { LiveRegion::Polite });
+        }
+        s.status_alert.clear();
         if let Some(wake) = s.waker.clone() {
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs_f64(NOTICE_SECS + 0.1));
@@ -310,6 +331,12 @@ fn notice(s: &mut State, now: f64) -> bool {
         return true;
     }
     false
+}
+
+/// Shows `msg` in the notice as an error (see [`State::status_alert`]).
+fn fail(s: &mut State, msg: String) {
+    s.status_alert = msg.clone();
+    s.status = msg;
 }
 
 /// Seconds a message stays on screen.
@@ -334,7 +361,9 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
     }
     let mut changed = s.icons.settle();
-    changed |= notice(s, now);
+    changed |= notice(s, now, &mut |text, how| tx.announce(text, how));
+    // A rectangle selection held past the list's edge scrolls it.
+    changed |= lasso::step(s, now, tx);
     // A local pane searches the computer as its field is typed in, once the keys pause.
     for p in 0..2 {
         if s.search[p].text != s.typed[p].0 {
@@ -402,7 +431,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     Ok(page) => p.append_entries(page),
                     // A later page, or the refresh of a cached listing, failed: keep what the pane
                     // shows and say so.
-                    Err(e) => s.status = format!("Não consegui terminar a listagem, mostrando o que chegou: {e}"),
+                    Err(e) => fail(s, format!("Não consegui terminar a listagem, mostrando o que chegou: {e}")),
                 }
                 let p = &mut s.panes[pane];
                 p.loading = ok && more;
@@ -431,7 +460,8 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     opt.refresh_logs();
                 }
                 match result {
-                    Ok(msg) | Err(msg) => s.status = msg,
+                    Ok(msg) => s.status = msg,
+                    Err(msg) => fail(s, msg),
                 }
                 for p in 0..2 {
                     if reload.contains(&s.panes[p].loc) {
@@ -476,9 +506,10 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
             Msg::Installed { reload, result } => {
                 s.installing_finder = false;
-                s.status = match result {
-                    Ok(m) | Err(m) => m,
-                };
+                match result {
+                    Ok(m) => s.status = m,
+                    Err(m) => fail(s, m),
+                }
                 for p in 0..2 {
                     if reload.contains(&s.panes[p].loc) {
                         load(s, p);
@@ -510,7 +541,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     }
                     Err(e) => {
                         openexplorer_gdrive::log(&format!("erro login Google: {e}"));
-                        s.status = e;
+                        fail(s, e);
                     }
                 }
             }
@@ -524,7 +555,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                         s.status.clear();
                         actions::arrive(s, pane, to);
                     }
-                    Err(e) => s.status = e,
+                    Err(e) => fail(s, e),
                 }
             }
         }
@@ -1005,6 +1036,10 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         })
     };
     let to = match &ev.key {
+        Key::ContextMenu | Key::Function(10) if menu_key(ev) => {
+            menu_from_keys(s, p, tx);
+            return true;
+        }
         _ if ev.is_command('c') => {
             actions::pick_up(s, p, actions::ClipMode::Copy);
             return true;
@@ -1094,6 +1129,33 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         tx.scroll_into_view_in(pane_key(p), row_key(&id));
     }
     true
+}
+
+/// The Menu key, or Shift+F10, with nothing else held: the context menu from the keyboard.
+fn menu_key(ev: &KeyEvent) -> bool {
+    let m = ev.mods;
+    let plain = !m.cmd && !m.ctrl && !m.alt && !m.logo;
+    plain && (ev.key == Key::ContextMenu || (ev.key == Key::Function(10) && m.shift))
+}
+
+/// Opens pane `p`'s context menu as a right click would: on the selection, under the cursor's
+/// row (or the first selected row, when the cursor is elsewhere), or on the folder at the top
+/// of the list when nothing is selected. The pane's focus is a parent of the list, so Rune's
+/// own handling of these keys never reaches the list's right-click handler.
+fn menu_from_keys(s: &mut State, p: usize, tx: &mut Tx) {
+    s.active = p;
+    let pane = &s.panes[p];
+    let row = if pane.selected.is_empty() {
+        None
+    } else {
+        let cursor = pane.cursor.as_deref().filter(|c| pane.selected.contains(*c)).and_then(|c| pane.index_of(c));
+        cursor.or_else(|| pane.entries.iter().position(|e| pane.selected.contains(&e.id)))
+    };
+    let (at, scroll) = lasso::menu_point(&s.views[p], row);
+    if let Some(y) = scroll {
+        tx.scroll_to_instant(ui::viewport_key(p), s.views[p].scroll.get().x, y);
+    }
+    s.menu = Some((p, at));
 }
 
 fn set_sort(s: &mut State, p: usize, col: SortCol) {
@@ -1734,5 +1796,72 @@ mod tests {
         poll(&mut s, 0.0, &mut Tx::default());
         assert_eq!(s.panes[1].entries.len(), 5720);
         assert!(!s.panes[1].loading);
+    }
+
+    /// What a screen reader hears from the notice at app clock `now`.
+    fn heard(s: &mut State, now: f64) -> Vec<(String, LiveRegion)> {
+        let mut said = Vec::new();
+        notice(s, now, &mut |text, how| said.push((text, how)));
+        said
+    }
+
+    /// Each message the notice starts for is said once: an error at once, anything else when
+    /// the reader is idle. Asked again while it shows, it isn't repeated; once it has gone, the
+    /// same words are said again.
+    #[test]
+    fn each_notice_is_announced_once() {
+        let mut s = init();
+        s.cache = cache::Cache::memory_only();
+        let polite = |m: &str| vec![(m.to_string(), LiveRegion::Polite)];
+        s.status = "Copiado: 3 itens.".into();
+        assert_eq!(heard(&mut s, 0.0), polite("Copiado: 3 itens."));
+        assert_eq!(heard(&mut s, 0.1), []);
+        s.status = "Copiado: 3 itens.".into();
+        assert_eq!(heard(&mut s, 1.0), []);
+        // An operation that failed interrupts; the message after it doesn't.
+        // (`Msg::Done` does this with its error; sent through `poll` it would write the log.)
+        fail(&mut s, "Sem permissão para excluir.".into());
+        assert_eq!(heard(&mut s, 1.6), [("Sem permissão para excluir.".to_string(), LiveRegion::Assertive)]);
+        s.status = "Movido: 1 item.".into();
+        assert_eq!(heard(&mut s, 2.0), polite("Movido: 1 item."));
+        // Gone after its time, then said again.
+        assert_eq!(heard(&mut s, 2.0 + NOTICE_SECS), []);
+        assert!(s.status.is_empty());
+        s.status = "Movido: 1 item.".into();
+        assert_eq!(heard(&mut s, 10.0), polite("Movido: 1 item."));
+    }
+
+    /// Shift+F10 and the Menu key open the list's context menu: on the folder at the top of
+    /// the rows with nothing selected, else under the cursor's row. F10 alone, or with Ctrl,
+    /// doesn't.
+    #[test]
+    fn the_keyboard_opens_the_context_menu() {
+        let mut s = init();
+        s.cache = cache::Cache::memory_only();
+        s.panes[1].set_entries(Ok(entries(0, 50)));
+        s.panes[1].selected.clear();
+        let h = lasso::HEADER_H + 10.0 * ROW_H;
+        s.views[1].rect = [400.0, 100.0, 600.0, h];
+        s.views[1].scroll.set(lasso::Scroll { x: 0.0, y: 0.0, max_y: 40.0 * ROW_H + 2.0 * ROW_H, h });
+        let mut tx = Tx::default();
+        let ev = |key, mods| KeyEvent { key, mods };
+        let shift = Mods { shift: true, ..Mods::default() };
+        assert!(!key(&mut s, 1, &ev(Key::Function(10), Mods::default()), &mut tx));
+        assert!(!key(&mut s, 1, &ev(Key::ContextMenu, Mods { cmd: true, ..Mods::default() }), &mut tx));
+        assert!(s.menu.is_none());
+        let top = 100.0 + lasso::HEADER_H;
+        s.active = 0;
+        assert!(key(&mut s, 1, &ev(Key::Function(10), shift), &mut tx));
+        assert_eq!(s.menu, Some((1, rune::PointerPress { x: 424.0, y: top })));
+        assert_eq!(s.active, 1);
+        s.menu = None;
+        click(&mut s, 1, "f2", Mods::default());
+        click(&mut s, 1, "f4", Mods { cmd: true, ..Mods::default() });
+        assert!(key(&mut s, 1, &ev(Key::ContextMenu, Mods::default()), &mut tx));
+        assert_eq!(s.menu, Some((1, rune::PointerPress { x: 424.0, y: top + 5.0 * ROW_H })));
+        // The cursor left the selection: the menu goes under the first selected row.
+        s.panes[1].cursor = Some("f9".into());
+        assert!(key(&mut s, 1, &ev(Key::ContextMenu, Mods::default()), &mut tx));
+        assert_eq!(s.menu, Some((1, rune::PointerPress { x: 424.0, y: top + 3.0 * ROW_H })));
     }
 }
