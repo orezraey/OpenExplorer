@@ -1746,7 +1746,7 @@ fn main() {
                 p(2).end(Err(ops::CANCELLED.into()));
                 p(3).size(900_000_000);
                 p(3).begin();
-                p(3).end(Err("Não há espaço suficiente no disco.".into()));
+                p(3).end(Err("Copiar \"Episódio 07.mkv\": Não há espaço suficiente no disco.".into()));
                 p(4).add_items(120);
                 p(4).size(640_000_000);
                 p(4).begin();

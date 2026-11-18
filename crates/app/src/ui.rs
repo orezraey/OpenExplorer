@@ -832,14 +832,20 @@ fn queue_row(s: &State, k: &Kit, t: &transfers::Transfer) -> El {
     };
     // A folder's row counts its items while running: "Em andamento · 120 de 1.946".
     let items = p.items.load(Relaxed);
+    let failed = p.stage() == Stage::Failed;
     let state = if p.stage() == Stage::Running && items > 1 {
         let (done, items) = (ui_count(p.items_done.load(Relaxed) as usize), ui_count(items as usize));
         tr!("{state} · {done} de {items}", "{state} · {done} of {items}")
+    } else if failed && !p.reason().is_empty() {
+        // The reason itself, not just "Erro": the whole message stays on hover.
+        p.reason()
     } else {
         state.to_string()
     };
-    let mut state_cell = queue_cell(w[3]).child(el().size(8.0, 8.0).radius(4.0).fill(dot)).child(muted(state.clone()).help_when_truncated(state));
-    if p.stage() == Stage::Failed {
+    let label = muted(state.clone());
+    let label = if failed { label.color(k.c.danger.fg) } else { label.help_when_truncated(state) };
+    let mut state_cell = queue_cell(w[3]).child(el().size(8.0, 8.0).radius(4.0).fill(dot)).child(label);
+    if failed {
         state_cell = state_cell.help(p.error());
     }
     let sized = p.sized.load(Relaxed);

@@ -93,6 +93,12 @@ impl Progress {
         self.error.lock().map(|e| e.clone()).unwrap_or_default()
     }
 
+    /// Why it failed, without what was being done to which item: the queue's row already
+    /// names it. `Enviar "foto.jpg": HTTP 403: …` reads `HTTP 403: …`.
+    pub fn reason(&self) -> String {
+        reason(&self.error()).to_string()
+    }
+
     /// Asks it to stop: one still waiting is cancelled at once and won't start; one running
     /// stops within a chunk.
     pub fn cancel(&self) {
@@ -492,9 +498,33 @@ pub fn attributes(meta: &std::fs::Metadata) -> Vec<&'static str> {
     }
 }
 
+/// `error` without its leading `Verb "item": ` contexts, however many are stacked.
+fn reason(mut error: &str) -> &str {
+    loop {
+        let Some((head, tail)) = error.split_once("\": ") else { return error };
+        // The context is words then one quoted name: `Enviar "foto.jpg"`.
+        if head.matches('"').count() != 1 || head.starts_with('"') || tail.trim().is_empty() {
+            return error;
+        }
+        error = tail;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_reason_drops_what_was_being_done() {
+        assert_eq!(
+            reason("Enviar \"WhatsApp Image 2026-11-18 at 11.49.49.jpeg\": HTTP 403: The user's Drive storage quota has been exceeded."),
+            "HTTP 403: The user's Drive storage quota has been exceeded."
+        );
+        assert_eq!(reason("Não consegui criar a pasta \"C:\\x\": Acesso negado. (os error 5)"), "Acesso negado. (os error 5)");
+        assert_eq!(reason("Copiar \"a\": Enviar \"b\": HTTP 500"), "HTTP 500");
+        assert_eq!(reason("HTTP 404: File not found"), "HTTP 404: File not found");
+        assert_eq!(reason("Enviar \"a\"b\": HTTP 500"), "Enviar \"a\"b\": HTTP 500");
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("openexplorer-ops-{tag}-{}", std::process::id()));
