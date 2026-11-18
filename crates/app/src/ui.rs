@@ -2975,7 +2975,10 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         // As wide as the columns: past them is empty space, where a drag draws a rectangle.
         let mut r = row().key(row_key(&e.id)).role("row").label(shown(&e.name)).focus_selected(is_sel).w(total).h(ROW_H).center_y();
         r = if is_sel { r.fill(selected) } else { r.hover(hover) };
-        if s.active == p && pane.cursor.as_deref() == Some(e.id.as_str()) {
+        // The keyboard's row is outlined only when it isn't selected (Ctrl+arrows moved it
+        // alone): a selected row already shows, and an outline on the end of a Shift range
+        // reads as a second kind of selection.
+        if s.active == p && !is_sel && pane.cursor.as_deref() == Some(e.id.as_str()) {
             r = r.outline(1.0, -1.0, ring);
         }
         let (id_press, id_open, id_drag, id_start) = (e.id.clone(), e.id.clone(), e.id.clone(), e.id.clone());
