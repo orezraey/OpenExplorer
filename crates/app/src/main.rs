@@ -10,6 +10,7 @@
 
 mod actions;
 mod address;
+mod autoscroll;
 mod cache;
 mod downloads;
 #[cfg(windows)]
@@ -168,6 +169,10 @@ struct State {
     /// The pane a drag started in and the files it carried, so a drop back on the same pane
     /// is ignored (the drop can arrive after the drag's end).
     last_drag: Option<(usize, Vec<PathBuf>)>,
+    /// A drag of files over a pane, which scrolls its list or tree near their edges, and where
+    /// each pane's list and tree are and how far they've scrolled.
+    autoscroll: Option<autoscroll::Drag>,
+    edges: [autoscroll::Pane; 2],
     /// What the last action said ("Copiado: 3 itens.", an error...), shown for a few seconds
     /// in a notice at the bottom right.
     status: String,
@@ -237,6 +242,8 @@ fn init() -> State {
         logins: 0,
         active: 0,
         last_drag: None,
+        autoscroll: None,
+        edges: Default::default(),
         status: String::new(),
         status_seen: String::new(),
         status_until: 0.0,
@@ -566,6 +573,8 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
         }
     }
+    // A drag of files held near the edge of a list or tree scrolls it.
+    autoscroll::tick(&mut s.autoscroll, &s.edges, |p| (ui::list_key(p), ui::tree_key(p)), ui::HEADER_H, now, tx);
     // An upload's clash dialog waiting for another dialog to close.
     if s.dialog.is_none() && !s.clash_waiting.is_empty() {
         actions::next_clash(s);

@@ -208,6 +208,43 @@ pub(crate) fn matches_in(words: &[Vec<u8>], name: &str, buf: &mut Vec<u8>) -> bo
     words.iter().all(|w| buf.windows(w.len()).any(|part| part == w.as_slice()))
 }
 
+/// Where in `name` the search `words` are, folded as [`matches_in`] folds them: the byte ranges
+/// of every place any word is found, each widened to whole characters (a folded letter can take
+/// fewer bytes than the accented one it came from), in order, those that overlap or touch made
+/// one. A results row draws them emphasized. Words a name doesn't hold are passed over: Drive
+/// matches names its own way, and some of its results hold a word only as Drive reads it.
+pub(crate) fn match_ranges(words: &[Vec<u8>], name: &str) -> Vec<std::ops::Range<usize>> {
+    if words.is_empty() {
+        return Vec::new();
+    }
+    // The name folded a character at a time, and for each folded byte the byte where its
+    // character starts in `name`.
+    let mut folded = Vec::with_capacity(name.len());
+    let mut from = Vec::with_capacity(name.len());
+    for (at, c) in name.char_indices() {
+        openexplorer_index::fold::fold_into(c.encode_utf8(&mut [0; 4]), &mut folded);
+        from.resize(folded.len(), at);
+    }
+    let end_of = |at: usize| at + name[at..].chars().next().map_or(0, char::len_utf8);
+    let mut found: Vec<std::ops::Range<usize>> = Vec::new();
+    for w in words.iter().filter(|w| !w.is_empty()) {
+        for (i, part) in folded.windows(w.len()).enumerate() {
+            if part == w.as_slice() {
+                found.push(from[i]..end_of(from[i + w.len() - 1]));
+            }
+        }
+    }
+    found.sort_by_key(|r| r.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(found.len());
+    for r in found {
+        match merged.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => merged.push(r),
+        }
+    }
+    merged
+}
+
 /// Hands results over in pages as they're found: a few hundred at a time, or what came in the
 /// last moment, so the list fills while a slow search goes on.
 pub(crate) struct Pager<'a> {
@@ -550,6 +587,49 @@ pub fn found(text: &str, within: Option<PathBuf>) -> Found {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The parts of `name` that searching `text` emphasizes.
+    fn emphasized<'a>(text: &str, name: &'a str) -> Vec<&'a str> {
+        match_ranges(&words(text), name).into_iter().map(|r| &name[r]).collect()
+    }
+
+    #[test]
+    fn what_matched_is_found_without_case_or_accents() {
+        assert_eq!(emphasized("relatorio", "Relatório Final.pdf"), ["Relatório"]);
+        assert_eq!(emphasized("ACAO", "plano de ação.txt"), ["ação"]);
+        assert_eq!(emphasized("ÇÃO", "Ação"), ["ção"]);
+        // A character that folds to more than itself is emphasized whole.
+        assert_eq!(emphasized("i", "İzmir"), ["İ", "i"]);
+        assert_eq!(emphasized("zmir", "İzmir"), ["zmir"]);
+    }
+
+    #[test]
+    fn every_word_and_every_place_it_is_found() {
+        assert_eq!(emphasized("final rel", "Relatório Final.pdf"), ["Rel", "Final"]);
+        assert_eq!(emphasized("foto", "foto da foto.jpg"), ["foto", "foto"]);
+        // A word the name doesn't hold leaves the others emphasized.
+        assert_eq!(emphasized("foto praia", "foto.jpg"), ["foto"]);
+        assert!(emphasized("", "foto.jpg").is_empty());
+        assert!(emphasized("praia", "foto.jpg").is_empty());
+    }
+
+    #[test]
+    fn words_that_overlap_or_touch_make_one_part() {
+        assert_eq!(emphasized("anan nana", "Banana"), ["anana"]);
+        assert_eq!(emphasized("ana", "Banana"), ["anana"]);
+        assert_eq!(emphasized("ab cd", "abcd e"), ["abcd"]);
+        assert_eq!(emphasized("relatório rio", "Relatório"), ["Relatório"]);
+    }
+
+    #[test]
+    fn a_name_matched_has_each_word_emphasized() {
+        let mut buf = Vec::new();
+        for (text, name) in [("relatorio 2025", "Relatório 2025.pdf"), ("acao", "AÇÃO"), ("e é", "Café")] {
+            let w = words(text);
+            assert!(matches_in(&w, name, &mut buf));
+            assert!(!match_ranges(&w, name).is_empty());
+        }
+    }
 
     #[test]
     fn results_become_entries_named_by_their_file() {
