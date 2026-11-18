@@ -205,7 +205,7 @@ pub fn pair(done: u64, total: u64) -> String {
         scale *= 1024.0;
         u += 1;
     }
-    let f = |b: u64| if u == 0 { b.to_string() } else { format!("{:.2}", b as f64 / scale).replace('.', ",") };
+    let f = |b: u64| if u == 0 { b.to_string() } else { openexplorer_i18n::decimal(format!("{:.2}", b as f64 / scale)) };
     format!("{} / {} {}", f(done), f(total), UNITS[u])
 }
 

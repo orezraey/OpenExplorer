@@ -3353,13 +3353,5 @@ fn whole_size(b: u64) -> String {
 
 /// A count with its thousands grouped: "1.946" in Portuguese, "1,946" in English.
 pub fn thousands(n: usize) -> String {
-    let d = n.to_string();
-    let sep = if openexplorer_i18n::english() { ',' } else { '.' };
-    d.chars().enumerate().fold(String::new(), |mut out, (i, ch)| {
-        if i > 0 && (d.len() - i).is_multiple_of(3) {
-            out.push(sep);
-        }
-        out.push(ch);
-        out
-    })
+    openexplorer_i18n::grouped(n as u64)
 }

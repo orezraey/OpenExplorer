@@ -601,9 +601,7 @@ pub fn format_size(b: u64) -> String {
         v /= 1024.0;
         u += 1;
     }
-    let size = format!("{v:.1} {}", UNITS[u]);
-    // A decimal comma in Portuguese.
-    if openexplorer_i18n::english() { size } else { size.replace('.', ",") }
+    openexplorer_i18n::decimal(format!("{v:.1} {}", UNITS[u]))
 }
 
 /// A date in full, as Windows' Properties shows it: "sexta-feira, 10 de fevereiro de 2023 20:19:35".
@@ -630,14 +628,7 @@ pub fn format_long(t: SystemTime) -> String {
 
 /// A size as "1,45 GB (1.553.451.055 bytes)", or just "512 bytes".
 pub fn format_bytes(b: u64) -> String {
-    let digits = b.to_string();
-    let grouped = digits.chars().enumerate().fold(String::new(), |mut out, (i, ch)| {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push('.');
-        }
-        out.push(ch);
-        out
-    });
+    let grouped = openexplorer_i18n::grouped(b);
     if b < 1024 {
         return format!("{grouped} bytes");
     }
@@ -648,7 +639,7 @@ pub fn format_bytes(b: u64) -> String {
         u += 1;
     }
     // Two decimals here, where the exact count follows; the list's one decimal is enough there.
-    format!("{} ({grouped} bytes)", format!("{v:.2} {}", UNITS[u]).replace('.', ","))
+    format!("{} ({grouped} bytes)", openexplorer_i18n::decimal(format!("{v:.2} {}", UNITS[u])))
 }
 
 pub fn format_time(t: SystemTime) -> String {

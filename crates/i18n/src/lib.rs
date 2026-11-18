@@ -40,6 +40,26 @@ macro_rules! tr {
     };
 }
 
+/// A number written with `.` as its decimal point (as `format!` writes it), with the decimal
+/// comma Portuguese uses.
+pub fn decimal(text: String) -> String {
+    if english() { text } else { text.replace('.', ",") }
+}
+
+/// `n` with its thousands grouped: 1,553,451,055 in English, 1.553.451.055 in Portuguese.
+pub fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let sep = if english() { ',' } else { '.' };
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(sep);
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Whether the system's own interface is in a language other than Portuguese, for the
 /// Automatic choice: English then, Portuguese for Portuguese.
 pub fn system_english() -> bool {
@@ -67,8 +87,10 @@ mod tests {
     fn words_follow_the_language() {
         let n = 2;
         assert_eq!((t("Sim", "Yes"), tr!("{n} itens", "{n} items")), ("Sim", "2 itens".to_string()));
+        assert_eq!((grouped(1_553_451_055), decimal("1.45 GB".into()), grouped(999)), ("1.553.451.055".into(), "1,45 GB".into(), "999".into()));
         set_english(true);
         assert_eq!((t("Sim", "Yes"), tr!("{n} itens", "{n} items")), ("Yes", "2 items".to_string()));
+        assert_eq!((grouped(1_553_451_055), decimal("1.45 GB".into())), ("1,553,451,055".into(), "1.45 GB".into()));
         set_english(false);
     }
 }
