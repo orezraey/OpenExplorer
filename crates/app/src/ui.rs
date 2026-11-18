@@ -2477,7 +2477,8 @@ fn path_bar(s: &State, k: &Kit, p: usize) -> El {
             })
             .on_input_key(move |s: &mut State, ev: &KeyEvent, tx: &mut Tx| {
                 if ev.key != rune::Key::Escape {
-                    return false;
+                    // ↑ and ↓: addresses reached before.
+                    return crate::history::address_key(s, p, ev);
                 }
                 s.address[p] = None;
                 tx.focus(pane_key(p), false);
@@ -2573,9 +2574,11 @@ fn search_box(s: &State, k: &Kit, p: usize) -> El {
         .on_input_key(move |s: &mut State, ev: &KeyEvent, _: &mut Tx| {
             if ev.key == rune::Key::Escape && !s.search[p].text.is_empty() {
                 s.search[p] = rune::TextEdit::new("");
+                s.history.search[p].reset();
                 true
             } else {
-                false
+                // ↑ and ↓: words searched for before.
+                crate::history::search_key(s, p, ev)
             }
         });
     row()
@@ -2714,7 +2717,8 @@ fn can_go_up(loc: &Location) -> bool {
 
 /// A row of a pane's tree: a heading, a note under a node being read, or a node with its arrow
 /// (which opens and closes it), icon and name (a click opens the folder; a double click opens
-/// or closes the node, as in Explorer).
+/// or closes the node, as in Explorer). The row the keyboard is on shows a ring while the tree
+/// has focus.
 fn tree_line(s: &State, k: &Kit, p: usize, line: &crate::tree::Line) -> El {
     use crate::tree::Line;
     let indent = |depth: usize| 4.0 + depth as f32 * 16.0;
@@ -2745,12 +2749,21 @@ fn tree_line(s: &State, k: &Kit, p: usize, line: &crate::tree::Line) -> El {
     } else {
         el().size(16.0, 16.0)
     };
-    let (go, flip) = (node.clone(), node.clone());
-    row()
+    let (go, flip, here) = (node.clone(), node.clone(), line.key());
+    let keyboard = s.tree.focused[p] && crate::tree::cursor(s, p) == Some(here.as_str());
+    let mut item = row()
         .key(format!("t:{}", line.key()))
         .role("treeitem")
         .label(node.label.clone())
-        .checked(on)
+        .level(depth as u32 + 1)
+        .checked(on);
+    if node.opens && !empty {
+        item = item.expanded(open);
+    }
+    if keyboard {
+        item = item.border(1.5, k.c.border_focus).radius(k.radius.sm);
+    }
+    item
         .w_full()
         .h(ROW_H)
         .pl(indent(depth))
@@ -2760,9 +2773,12 @@ fn tree_line(s: &State, k: &Kit, p: usize, line: &crate::tree::Line) -> El {
         .fill(if on { k.alpha(k.c.text_accent, if k.dark { 0.24 } else { 0.16 }) } else { Color::TRANSPARENT })
         .hover(if on { k.alpha(k.c.text_accent, 0.24) } else { k.alpha(k.c.text_base, 0.05) })
         .cursor(Cursor::Pointer)
-        .on_press(move |s: &mut State| match &go.to {
-            Some(to) => navigate(s, p, to.clone()),
-            None => crate::tree::toggle(s, p, &go),
+        .on_press(move |s: &mut State| {
+            crate::tree::set_cursor(s, p, here.clone());
+            match &go.to {
+                Some(to) => navigate(s, p, to.clone()),
+                None => crate::tree::toggle(s, p, &go),
+            }
         })
         .on_double_press(move |s: &mut State| crate::tree::toggle(s, p, &flip))
         .child(arrow)
@@ -2781,7 +2797,8 @@ pub(crate) fn tree_key(p: usize) -> String {
 }
 
 /// The tree beside pane `p` (see [`crate::tree`]): only the rows in view are built, so a node
-/// with thousands of folders opens at once.
+/// with thousands of folders opens at once. It's one Tab stop that keeps the keyboard itself
+/// (its rows come and go as it scrolls), naming the row the keyboard is on for screen readers.
 fn tree(s: &State, k: &Kit, p: usize) -> El {
     let lines = std::rc::Rc::new(crate::tree::lines(s, p));
     let (keys, kit, n) = (lines.clone(), k.clone(), lines.len());
@@ -2794,9 +2811,17 @@ fn tree(s: &State, k: &Kit, p: usize) -> El {
         .growth(GrowthSpec::default())
         .virtual_rows(n, ROW_H, move |_: &State, i| Cow::Owned(format!("t:{}", keys[i].key())), move |s: &State, i| tree_line(s, &kit, p, &lines[i]))
         .virtual_rows_version((s.tree.version, s.panes[p].moves, s.accounts.len(), s.servers.list.len()));
+    let at = crate::tree::cursor(s, p).map(|c| format!("t:{c}")).unwrap_or_default();
     // Opening or closing a node lands at once, as in Explorer, rather than sliding its rows.
     col()
         .key(tree_key(p))
+        .role("tree")
+        .label("Pastas")
+        .focusable(true)
+        // The row the keyboard is on shows focus with its own ring.
+        .no_focus_ring()
+        .active_descendant(at)
+        .on_key(move |s: &mut State, ev: &KeyEvent, tx: &mut Tx| crate::tree::key(s, p, ev, tx))
         .instant_changes()
         .w(s.layout.tree[p])
         .h_full()

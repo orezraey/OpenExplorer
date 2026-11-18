@@ -15,6 +15,7 @@ mod downloads;
 #[cfg(windows)]
 mod dragout;
 mod finder;
+mod history;
 mod icons;
 mod layout;
 mod model;
@@ -119,6 +120,8 @@ struct State {
     search: [rune::TextEdit; 2],
     /// Each pane's path bar while it's a field to type an address in.
     address: [Option<rune::TextEdit>; 2],
+    /// The addresses reached and searches run, which ↑ and ↓ bring back in those fields.
+    history: history::History,
     /// The path bar's right-click menu: the pane it was opened in and where.
     address_menu: Option<(usize, rune::PointerPress)>,
     /// Each local pane's field as last seen, and when it may be searched: typing searches the
@@ -213,6 +216,7 @@ fn init() -> State {
         renaming: None,
         search: [rune::TextEdit::new(""), rune::TextEdit::new("")],
         address: Default::default(),
+        history: history::History::load(),
         address_menu: None,
         typed: Default::default(),
         searched: Default::default(),
@@ -519,6 +523,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                 if s.panes[pane].moves != moves {
                     continue;
                 }
+                s.history.reached(pane, moves, result.is_ok());
                 match result {
                     Ok(to) => {
                         s.status.clear();
@@ -554,6 +559,13 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                 s.status = format!("“{name}” não está mais nesta pasta.");
                 changed = true;
             }
+        }
+    }
+    // A tree the keyboard left (a click elsewhere) stops showing its row's ring.
+    for p in 0..2 {
+        if s.tree.focused[p] && tx.focused() != Some(ui::tree_key(p).as_str()) {
+            tree::focus(s, p, false);
+            changed = true;
         }
     }
     // Each tree brings the folder its pane shows into view, once that's in the tree.
@@ -1066,6 +1078,12 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         }
         Key::Backspace => {
             go_up(s, p);
+            return true;
+        }
+        // Back to the tree beside the files, as in Explorer.
+        Key::Tab if ev.mods.shift => {
+            tree::focus(s, p, true);
+            tx.focus(ui::tree_key(p), true);
             return true;
         }
         Key::Tab => {

@@ -282,6 +282,7 @@ pub fn edit_address(s: &mut State, p: usize) {
     edit.set_selection(0, text.len());
     edit.focused = true;
     s.address[p] = Some(edit);
+    s.history.address[p].reset();
     s.active = p;
 }
 
@@ -295,7 +296,10 @@ pub fn go_to_address(s: &mut State, p: usize, typed: &str) -> bool {
         && let Some(a) = crate::servers::parse_address(typed.trim().trim_matches('"'))
     {
         match crate::servers::reach(&s.servers.list, &a) {
-            Ok(loc) => crate::navigate(s, p, loc),
+            Ok(loc) => {
+                s.history.add_address(typed);
+                crate::navigate(s, p, loc);
+            }
             Err(e) if e.is_empty() => {
                 s.dialog = Some(Dialog::Server(Box::new(crate::servers::Form::of_address(&a))));
                 s.status = "Esse servidor ainda não foi adicionado: confira os dados e clique em Salvar.".into();
@@ -318,8 +322,13 @@ pub fn go_to_address(s: &mut State, p: usize, typed: &str) -> bool {
         }
     };
     s.address[p] = None;
+    // Kept for ↑ once the pane gets there; the simulated drive's places are there at once.
+    s.history.asked(p, s.panes[p].moves, typed);
     match target {
-        Target::Mock(segs) => crate::navigate(s, p, Location::Mock(segs)),
+        Target::Mock(segs) => {
+            s.history.reached(p, s.panes[p].moves, true);
+            crate::navigate(s, p, Location::Mock(segs));
+        }
         Target::Local(path) => {
             let moves = s.panes[p].moves;
             background(s, move |emit| emit(Msg::Reached { pane: p, moves, result: crate::catch_panic("abrir o endereço", || address::reach_local(&path)) }));
@@ -732,6 +741,8 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
 /// under it, a whole shared drive, My Drive; from Drive's views, everything. A search from a
 /// search's results looks where that one did.
 pub fn search(s: &mut State, p: usize) {
+    let words = s.search[p].text.clone();
+    s.history.add_search(&words);
     if s.panes[p].loc.is_local() {
         return search_computer(s, p);
     }
