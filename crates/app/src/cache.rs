@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +79,8 @@ enum Job {
     /// listing already there, of `count` entries, stays), and the position (`None` removes it).
     Put { file: PathBuf, entries: Option<Arc<Vec<Entry>>>, count: usize, pos: Option<Pos> },
     Forget(PathBuf),
+    /// Deletes everything in the folder (see [`crate::caches::clear_dir`]) and says how it went.
+    Clear(PathBuf, Sender<Result<(), String>>),
 }
 
 #[derive(Default)]
@@ -117,8 +119,13 @@ fn hash(s: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
+/// The folder all accounts' listings are kept in.
+pub fn root() -> PathBuf {
+    openexplorer_gdrive::local_dir().join("cache")
+}
+
 fn account_dir(email: &str) -> PathBuf {
-    openexplorer_gdrive::local_dir().join("cache").join(hash(email))
+    root().join(hash(email))
 }
 
 fn path(k: &Key) -> PathBuf {
@@ -165,6 +172,9 @@ fn run(job: Job) {
         }
         Job::Forget(dir) => {
             let _ = std::fs::remove_dir_all(dir);
+        }
+        Job::Clear(dir, done) => {
+            let _ = done.send(crate::caches::clear_dir(&dir));
         }
     }
 }
@@ -229,6 +239,24 @@ impl Cache {
             None => 0,
         };
         self.disk(Job::Put { file: path(k), entries: None, count, pos: None });
+    }
+
+    /// Drops every listing, in memory now and on disk after the writes already asked for (Opções
+    /// › Cache). The answer says how the disk part went.
+    pub fn clear(&mut self) -> Receiver<Result<(), String>> {
+        self.clear_in(root())
+    }
+
+    fn clear_in(&mut self, dir: PathBuf) -> Receiver<Result<(), String>> {
+        self.mem.clear();
+        let (tx, rx) = channel();
+        #[cfg(test)]
+        if self.memory_only {
+            let _ = tx.send(Ok(()));
+            return rx;
+        }
+        self.disk(Job::Clear(dir, tx));
+        rx
     }
 
     /// Drops an account's listings, in memory and on disk (on disconnecting it).
@@ -313,6 +341,22 @@ mod tests {
         put(Some(entries(4)), 4, at("t4"));
         put(None, 4, None);
         assert_eq!(read(&file).map(|l| (l.entries.len(), l.pos)), Some((4, None)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clearing_empties_memory_and_the_folder_after_the_writes_before_it() {
+        let dir = std::env::temp_dir().join(format!("oe-cache-clear-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut c = Cache::default();
+        let k = key(&Location::drive("a@b", Space::MyDrive)).unwrap();
+        c.mem.insert(k.clone(), Listing { entries: entries(2), pos: None });
+        // A write queued before the clear lands first, so it's cleared too.
+        let file = dir.join("conta").join("pasta.json");
+        c.disk(Job::Put { file: file.clone(), entries: Some(entries(2)), count: 2, pos: None });
+        assert_eq!(c.clear_in(dir.clone()).recv().unwrap(), Ok(()));
+        assert!(c.get(&k).is_none());
+        assert!(!file.exists() && !dir.join("conta").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 

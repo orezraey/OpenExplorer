@@ -114,6 +114,44 @@ pub fn file_of(email: &str) -> Option<PathBuf> {
     dir().map(|d| file_in(&d, email))
 }
 
+/// How many clears ran, and the folder of each: an account notes the count as it starts (see
+/// [`mark`]), and no tree it holds is written into a folder cleared since.
+static CLEARS: Mutex<(u64, Vec<(u64, PathBuf)>)> = Mutex::new((0, Vec::new()));
+
+/// What an account notes as it starts, before reading its kept tree: [`cleared_since`] tells
+/// whether its file's folder was cleared after.
+pub fn mark() -> u64 {
+    CLEARS.lock().unwrap_or_else(|e| e.into_inner()).0
+}
+
+/// Whether the folder `file` is in was cleared after [`mark`] gave `mark`.
+pub fn cleared_since(mark: u64, file: &Path) -> bool {
+    CLEARS.lock().unwrap_or_else(|e| e.into_inner()).1.iter().any(|(n, dir)| *n > mark && file.starts_with(dir))
+}
+
+/// Runs `clear` on the folder set (see [`set_dir`]), with every write held off: a tree an
+/// account open now (or opening) holds is never written there again this run, so the folder
+/// stays clear; accounts opened later read the whole tree and keep it as usual. `None` with no
+/// folder set.
+pub fn clear_with<R>(clear: impl FnOnce(&Path) -> R) -> Option<R> {
+    let dir = dir()?;
+    Some(clear_in(&dir, clear))
+}
+
+/// [`clear_with`] on folder `dir`.
+pub fn clear_in<R>(dir: &Path, clear: impl FnOnce(&Path) -> R) -> R {
+    // Noted before waiting for a write in flight: a write that comes after sees it (it checks
+    // under the same lock), and one before lands first and is deleted with the rest.
+    {
+        let mut clears = CLEARS.lock().unwrap_or_else(|e| e.into_inner());
+        clears.0 += 1;
+        let n = clears.0;
+        clears.1.push((n, dir.to_path_buf()));
+    }
+    let _held = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    clear(dir)
+}
+
 /// Deletes account `email`'s file, after any write in flight.
 pub fn forget(email: &str) {
     if let Some(file) = file_of(email) {
@@ -373,16 +411,17 @@ pub fn open(secret: &Secret, file: &mut [u8]) -> Result<std::ops::Range<usize>, 
 /// Writes the tree to `file` whole: a temporary file renamed over the old one, so a crash
 /// midway leaves the old file or the new, never half of one.
 pub fn write(file: &Path, secret: &Secret, body: Vec<u8>) -> std::io::Result<()> {
-    write_unless(file, secret, body, &AtomicBool::new(false))
+    write_unless(file, secret, body, &AtomicBool::new(false), mark()).map(|_| ())
 }
 
-/// [`write`], unless `forgotten` is on by the time it's its turn to write (the account was
-/// removed meanwhile).
-pub fn write_unless(file: &Path, secret: &Secret, body: Vec<u8>, forgotten: &AtomicBool) -> std::io::Result<()> {
+/// [`write`], unless by the time it's its turn to write `forgotten` is on (the account was
+/// removed meanwhile) or the folder was cleared after `mark` (see [`clear_with`]). Whether it
+/// wrote.
+pub fn write_unless(file: &Path, secret: &Secret, body: Vec<u8>, forgotten: &AtomicBool, mark: u64) -> std::io::Result<bool> {
     let sealed = seal(secret, body);
     let _held = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-    if forgotten.load(Ordering::SeqCst) {
-        return Ok(());
+    if forgotten.load(Ordering::SeqCst) || cleared_since(mark, file) {
+        return Ok(false);
     }
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)?;
@@ -398,7 +437,7 @@ pub fn write_unless(file: &Path, secret: &Secret, body: Vec<u8>, forgotten: &Ato
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    result
+    result.map(|()| true)
 }
 
 /// The tree and the share keys kept in `file`.

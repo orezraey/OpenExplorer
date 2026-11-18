@@ -107,6 +107,9 @@ pub struct Account {
     saved: Mutex<Saved>,
     /// The account was removed: a save still on its way writes nothing.
     forgotten: AtomicBool,
+    /// [`cache::mark`] as it started: a clear of the cache folder since stops it keeping its
+    /// tree there for the rest of the run.
+    mark: u64,
     /// Whether this start read the kept tree (and only the changes since), not the whole one.
     from_cache: AtomicBool,
 }
@@ -152,9 +155,11 @@ impl Account {
 
     /// [`Account::start`] with the tree kept in `file`, or nowhere.
     pub fn start_kept(email: &str, api: Api, session: Session, file: Option<PathBuf>) -> Result<Account> {
+        // Noted before the kept tree is read: a clear from here on keeps this tree out.
+        let mark = cache::mark();
         let kept = file.map(|f| (f, cache::Secret::of(&session.user, &session.master, &session.sek)));
         let keys = session_keys(&session);
-        let account = Account { email: session::normal_email(email), api, session, inner: Mutex::new(Inner { keys, tree: Tree::default(), refetch: false }), kept, saved: Mutex::default(), forgotten: AtomicBool::new(false), from_cache: AtomicBool::new(false) };
+        let account = Account { email: session::normal_email(email), api, session, inner: Mutex::new(Inner { keys, tree: Tree::default(), refetch: false }), kept, saved: Mutex::default(), forgotten: AtomicBool::new(false), mark, from_cache: AtomicBool::new(false) };
         if !account.resume_kept()? {
             account.fetch()?;
         }
@@ -165,7 +170,7 @@ impl Account {
     #[cfg(test)]
     pub(crate) fn offline(keys: Keys, tree: Tree) -> Account {
         let session = Session { user: keys.user.clone(), master: keys.master, sek: [0; 16], sid: String::new(), rsa: None };
-        Account { email: "ana@exemplo.com".into(), api: Api::unreachable(), session, inner: Mutex::new(Inner { keys, tree, refetch: false }), kept: None, saved: Mutex::default(), forgotten: AtomicBool::new(false), from_cache: AtomicBool::new(false) }
+        Account { email: "ana@exemplo.com".into(), api: Api::unreachable(), session, inner: Mutex::new(Inner { keys, tree, refetch: false }), kept: None, saved: Mutex::default(), forgotten: AtomicBool::new(false), mark: cache::mark(), from_cache: AtomicBool::new(false) }
     }
 
     /// Whether this start read the kept tree and only the changes since, not the whole tree.
@@ -238,6 +243,11 @@ impl Account {
     /// and written after.
     pub fn save_cache(&self) {
         let Some((file, secret)) = &self.kept else { return };
+        if self.forgotten.load(Ordering::SeqCst) || cache::cleared_since(self.mark, file) {
+            // Not kept again this run: nothing to encode, and nothing left to keep at closing.
+            self.saved.lock().unwrap_or_else(|e| e.into_inner()).dirty = false;
+            return;
+        }
         let started = Instant::now();
         let body = {
             let inner = self.lock();
@@ -250,8 +260,9 @@ impl Account {
             cache::encode(&inner.tree, &inner.keys.shares)
         };
         let encoded = started.elapsed();
-        match cache::write_unless(file, secret, body, &self.forgotten) {
-            Ok(()) => crate::api::log(&format!("MEGA cache: árvore guardada em {} ms ({} ms montando)", started.elapsed().as_millis(), encoded.as_millis())),
+        match cache::write_unless(file, secret, body, &self.forgotten, self.mark) {
+            Ok(false) => {}
+            Ok(true) => crate::api::log(&format!("MEGA cache: árvore guardada em {} ms ({} ms montando)", started.elapsed().as_millis(), encoded.as_millis())),
             Err(e) => {
                 crate::api::log(&format!("MEGA cache: não consegui guardar a árvore: {e}"));
                 self.saved.lock().unwrap_or_else(|e| e.into_inner()).dirty = true;
@@ -1256,6 +1267,38 @@ mod tests {
         a.save_cache();
         assert!(!file.exists(), "a save after the account was removed writes nothing");
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn a_cleared_folder_isnt_written_again_by_a_tree_held_before_the_clear() {
+        let file = temp_file("cleared");
+        let other = temp_file("not-cleared");
+        let s = test_session(0);
+        let open = |file: &PathBuf| {
+            let mut k = keys();
+            let tree = { let l = listing(&k); Tree::from_listing(&mut k, &l) };
+            let mut a = Account::offline(k, tree);
+            a.kept = Some((file.clone(), cache::Secret::of(&s.user, &s.master, &s.sek)));
+            a
+        };
+        let (before, elsewhere) = (open(&file), open(&other));
+        before.save_cache();
+        assert!(file.exists());
+        let dir = file.parent().unwrap().to_path_buf();
+        cache::clear_in(&dir, |d| std::fs::remove_dir_all(d).unwrap());
+        // Changed since, then saved by polling or at closing: the folder stays clear.
+        before.saved.lock().unwrap().dirty = true;
+        before.save_cache_if_changed();
+        before.save_cache();
+        assert!(!file.exists(), "a tree held before the clear isn't kept again");
+        assert!(!before.saved.lock().unwrap().dirty, "nothing left to keep at closing");
+        // Another folder isn't affected, and an account opened after the clear keeps its tree.
+        elsewhere.save_cache();
+        assert!(other.exists());
+        open(&file).save_cache();
+        assert!(file.exists(), "an account opened after the clear keeps its tree");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(other.parent().unwrap());
     }
 
     #[test]

@@ -232,17 +232,19 @@ pub enum OptionsTab {
     #[default]
     General,
     Transfers,
+    Cache,
     Logs,
     Experimental,
 }
 
 impl OptionsTab {
-    pub const ALL: [OptionsTab; 4] = [OptionsTab::General, OptionsTab::Transfers, OptionsTab::Logs, OptionsTab::Experimental];
+    pub const ALL: [OptionsTab; 5] = [OptionsTab::General, OptionsTab::Transfers, OptionsTab::Cache, OptionsTab::Logs, OptionsTab::Experimental];
 
     pub fn label(self) -> &'static str {
         match self {
             OptionsTab::General => t("Geral", "General"),
             OptionsTab::Transfers => t("Transferências", "Transfers"),
+            OptionsTab::Cache => "Cache",
             OptionsTab::Logs => "Logs",
             OptionsTab::Experimental => "Experimental",
         }
@@ -252,6 +254,7 @@ impl OptionsTab {
         match self {
             OptionsTab::General => &crate::icons::SETTINGS,
             OptionsTab::Transfers => &crate::icons::OPT_TRANSFERS,
+            OptionsTab::Cache => &crate::icons::OPT_CACHE,
             OptionsTab::Logs => &crate::icons::OPT_LOGS,
             OptionsTab::Experimental => &crate::icons::OPT_EXPERIMENTAL,
         }
@@ -264,6 +267,8 @@ pub struct OptionsView {
     pub log_filter: TextEdit,
     pub log_lines: Vec<String>,
     pub log_bytes: u64,
+    /// The Cache page: what the caches take, and clearing them.
+    pub cache: crate::caches::Page,
 }
 
 pub const MAX_LOG_LINES: usize = 300;
@@ -271,7 +276,7 @@ pub const MAX_LOG_LINES: usize = 300;
 impl OptionsView {
     pub fn open(tab: OptionsTab) -> OptionsView {
         let (log_lines, log_bytes) = openexplorer_gdrive::read_log(MAX_LOG_LINES);
-        OptionsView { tab, log_filter: TextEdit::new(""), log_lines, log_bytes }
+        OptionsView { tab, log_filter: TextEdit::new(""), log_lines, log_bytes, cache: Default::default() }
     }
 
     pub fn refresh_logs(&mut self) {
@@ -325,6 +330,7 @@ mod tests {
                 "10:02:00.000 upload concluído".into(),
             ],
             log_bytes: 120,
+            cache: Default::default(),
         };
         assert_eq!(view.filtered_logs(), ["10:01:02.500 Erro ao conectar SFTP nas.local"]);
         view.log_filter = TextEdit::new("");
