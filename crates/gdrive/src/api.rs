@@ -86,6 +86,17 @@ pub struct Account {
     pub name: String,
 }
 
+/// What [`Drive::status`] says of a file.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+pub struct Status {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub parents: Vec<String>,
+    #[serde(default)]
+    pub trashed: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct DriveFile {
     pub id: String,
@@ -473,6 +484,23 @@ impl Drive {
     pub fn move_to(&self, id: &str, from: &str, to: &str) -> Result<DriveFile> {
         let path = format!("/files/{}", checked(id)?);
         self.file_call("PATCH", &path, &[("addParents", checked(to)?), ("removeParents", checked(from)?)], &serde_json::json!({}), "Mover")
+    }
+
+    /// Where file `id` stands now: its name, its folders and whether it's in the trash, which
+    /// Desfazer checks before changing anything back.
+    pub fn status(&self, id: &str) -> Result<Status> {
+        let v = self.get(&format!("/files/{}", checked(id)?), &[("fields", "name,parents,trashed"), ("supportsAllDrives", "true")], "Desfazer")?;
+        serde_json::from_value(v).map_err(|e| format!("Desfazer: resposta inesperada: {e}"))
+    }
+
+    /// Whether folder `id` holds anything (trashed items aside).
+    pub fn has_children(&self, id: &str) -> Result<bool> {
+        let mut any = false;
+        self.list(id, None, |page, _| {
+            any = !page.is_empty();
+            false
+        })?;
+        Ok(any)
     }
 
     /// A copy of file or folder `src` in folder `to`, named `name`. Drive copies files only, so

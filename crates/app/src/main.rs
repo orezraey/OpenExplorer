@@ -29,6 +29,7 @@ mod servers;
 mod sysicons;
 mod transfers;
 mod tree;
+mod undo;
 mod uploads;
 mod ui;
 mod watch;
@@ -84,6 +85,8 @@ enum Msg {
     /// Where pane `pane` goes (Mostrar na pasta, the address), looked up when it had made
     /// `moves` moves (see [`model::Pane::moves`]).
     Reached { pane: usize, moves: u64, result: Result<address::Reached, String> },
+    /// An action that can be undone ended, or an undo did (see [`undo::arrived`]).
+    Undo(undo::Answer),
     /// Installing the search service ended: search again in the panes `reload` shows.
     Installed { reload: Vec<Location>, result: Result<String, String> },
     /// A drag of Drive items `ids` out of pane `from` ended.
@@ -138,6 +141,8 @@ struct State {
     props_seq: u64,
     /// What Copiar or Recortar picked up.
     clip: Option<actions::Clip>,
+    /// What Desfazer can take back, and Refazer do again.
+    history: undo::History,
     /// Each pane's tree width, which its splitter changes.
     layout: layout::Layout,
     /// The disks "Este Computador" lists, read at start.
@@ -226,6 +231,7 @@ fn init() -> State {
         found_again: [0.0; 2],
         props_seq: 0,
         clip: None,
+        history: Default::default(),
         local_drives: model::local_drives(),
         places: places::places(),
         tree,
@@ -453,6 +459,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     ask_quota(s, email);
                 }
             }
+            Msg::Undo(answer) => undo::arrived(s, answer),
             Msg::Changes { email, result } => watch::arrived(s, email, result, now),
             Msg::Quota { email, result } => {
                 if s.accounts.iter().any(|a| a.email == email) {
@@ -1032,6 +1039,15 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             actions::paste(s, p);
             return true;
         }
+        // Ctrl+Shift+Z first: `is_command` matches whatever else is held.
+        _ if ev.is_command('y') || (ev.is_command('z') && ev.mods.shift) => {
+            undo::undo(s, true);
+            return true;
+        }
+        _ if ev.is_command('z') => {
+            undo::undo(s, false);
+            return true;
+        }
         _ if ev.is_command('n') && ev.mods.shift => {
             actions::ask_new_folder(s, p, tx);
             return true;
@@ -1483,6 +1499,19 @@ fn main() {
                 }
                 switch(s, 0, Location::Local(dir.clone()));
                 switch(s, 1, Location::Local(dir.join("Projetos")));
+            }),
+            // Right after a rename in a scratch folder: the notice offers Desfazer.
+            ("undo", |s| {
+                let dir = std::env::temp_dir().join("openexplorer-undo-scene");
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(dir.join("notas.txt"), "txt");
+                switch(s, 0, Location::Local(dir.clone()));
+                let steps = vec![undo::Step::Move { from: dir.join("notas.txt"), to: dir.join("nota.txt") }];
+                let record = undo::Record { what: "renomear “nota.txt” para “notas.txt”".into(), steps, reload: vec![Location::Local(dir)] };
+                let said = "Renomeado para \"notas.txt\".".to_string();
+                undo::arrived(s, undo::Answer::Did { record: Some(record), reload: Vec::new(), result: Ok(said.clone()) });
+                // Said at once, as the one frame drawn may come before `poll` reads the inbox.
+                s.status = said;
             }),
             // This computer's own shared folders (as the network shows them) and WSL's
             // distributions, read only.

@@ -32,7 +32,12 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     // What the last action said, for a few seconds at the bottom right.
     if !s.status.is_empty() && s.now < s.status_until {
         let close = |s: &mut State| s.status_until = 0.0;
-        layer.push(ToastRegion::new().toast(Toast::new("notice", s.status.clone()).on_close(close).build(&k)).build(&k));
+        let mut toast = Toast::new("notice", s.status.clone()).on_close(close);
+        // The latest action's notice offers to take it back (or to redo what was just undone).
+        if let Some(redo) = s.history.offers(&s.status) {
+            toast = toast.action(&k, if redo { "Refazer" } else { "Desfazer" }, false, move |s: &mut State, _| crate::undo::undo(s, redo));
+        }
+        layer.push(ToastRegion::new().toast(toast.build(&k)).build(&k));
     }
     let body = col()
         .key("window")
