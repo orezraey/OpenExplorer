@@ -181,7 +181,9 @@ fn empty(dir: &Path, failed: &mut Vec<(PathBuf, std::io::Error)>) {
         };
         let path = entry.path();
         // A link to a folder is removed as itself, never followed.
-        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        let kind = entry.file_type();
+        let is_dir = kind.as_ref().is_ok_and(|t| t.is_dir());
+        let is_link = kind.as_ref().is_ok_and(|t| t.is_symlink());
         let removed = if is_dir {
             let before = failed.len();
             empty(&path, failed);
@@ -191,7 +193,8 @@ fn empty(dir: &Path, failed: &mut Vec<(PathBuf, std::io::Error)>) {
             }
             std::fs::remove_dir(&path)
         } else {
-            std::fs::remove_file(&path)
+            // Windows removes a link to a folder (or a junction) as a folder.
+            std::fs::remove_file(&path).or_else(|e| if is_link { std::fs::remove_dir(&path) } else { Err(e) })
         };
         if let Err(e) = removed {
             failed.push((path, e));

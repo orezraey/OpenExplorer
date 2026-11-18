@@ -804,7 +804,6 @@ fn cache_page(k: &Kit, page: &crate::caches::Page, card: El, head: El) -> El {
         row().key(key).w_full().px(14.0).py(11.0).gap(12.0).center_y().child(words(title, desc)).child(text(size(bytes)).font(k.ty.text_small).color(ink(bytes.is_some())))
     };
     let divider = || el().w_full().h(1.0).fill(k.c.border_weak);
-    let root = openexplorer_gdrive::local_dir();
 
     let total_note = if page.clearing {
         t("Limpando…", "Clearing…")
@@ -825,7 +824,7 @@ fn cache_page(k: &Kit, page: &crate::caches::Page, card: El, head: El) -> El {
 
     let mut clear = Button::new(if page.clearing { t("Limpando…", "Clearing…") } else { t("Limpar cache", "Clear cache") })
         .variant(ButtonVariant::Danger)
-        .disabled(page.clearing || page.confirming || usage.is_some_and(|u| u.total() == 0));
+        .disabled(page.clearing || usage.is_some_and(|u| u.total() == 0));
     if !page.clearing {
         clear = clear.on_press(|s: &mut State| crate::caches::confirm(s, true));
     }
@@ -850,9 +849,9 @@ fn cache_page(k: &Kit, page: &crate::caches::Page, card: El, head: El) -> El {
     let card = card
         .child(total)
         .child(divider())
-        .child(line("cache-drive", t("Listagens do Google Drive", "Google Drive listings"), root.join("cache").display().to_string(), usage.map(|u| u.drive)))
+        .child(line("cache-drive", t("Listagens do Google Drive", "Google Drive listings"), crate::cache::root().display().to_string(), usage.map(|u| u.drive)))
         .child(divider())
-        .child(line("cache-mega", t("Contas MEGA", "MEGA accounts"), root.join("mega").display().to_string(), usage.map(|u| u.mega)))
+        .child(line("cache-mega", t("Contas MEGA", "MEGA accounts"), openexplorer_mega::cache::dir().map_or_else(String::new, |d| d.display().to_string()), usage.map(|u| u.mega)))
         .child(divider())
         .child(actions);
 
