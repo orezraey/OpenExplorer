@@ -33,7 +33,7 @@ jobs:
             os: ubuntu-22.04
           # Apple Silicon and Intel in one universal app.
           - name: macos-universal
-            os: macos-14
+            os: macos-latest
     defaults:
       run:
         shell: bash
