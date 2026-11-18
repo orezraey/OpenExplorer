@@ -188,13 +188,13 @@ pub fn open_file(s: &mut State, p: usize, item: &Entry) {
             if let Some(path) = loc.local_path(item)
                 && let Err(e) = ops::open(&path)
             {
-                s.status = e;
+                crate::fail(s, e);
             }
         }
         Location::Drive { .. } if item.mime.as_deref().is_some_and(|m| m.starts_with("application/vnd.google-apps.")) => {
             // ShellExecute opens a URL in the default browser.
             if let Err(e) = ops::open(std::path::Path::new(&format!("https://drive.google.com/open?id={}", item.id))) {
-                s.status = format!("Não consegui abrir o navegador: {e}");
+                crate::fail(s, format!("Não consegui abrir o navegador: {e}"));
             }
         }
         Location::Drive { .. } => {
@@ -205,12 +205,12 @@ pub fn open_file(s: &mut State, p: usize, item: &Entry) {
             let fresh = std::fs::metadata(&ready).ok().is_some_and(|m| Some(m.len()) == item.size && item.modified.is_some() && m.modified().ok() == item.modified);
             if fresh {
                 if let Err(e) = ops::open(&ready) {
-                    s.status = e;
+                    crate::fail(s, e);
                 }
                 return;
             }
             if let Err(e) = std::fs::create_dir_all(&dir) {
-                s.status = format!("Não consegui criar a pasta temporária: {e}");
+                crate::fail(s, format!("Não consegui criar a pasta temporária: {e}"));
                 return;
             }
             // An older copy goes, so the new one takes its name.
@@ -307,7 +307,7 @@ pub fn go_to_address(s: &mut State, p: usize, typed: &str) -> bool {
             }
             // The field stays, to fix what was typed.
             Err(e) => {
-                s.status = e;
+                crate::fail(s, e);
                 return false;
             }
         }
@@ -318,7 +318,7 @@ pub fn go_to_address(s: &mut State, p: usize, typed: &str) -> bool {
     let target = match address::parse(typed, &s.panes[p].loc, &accounts) {
         Ok(t) => t,
         Err(e) => {
-            s.status = e;
+            crate::fail(s, e);
             return false;
         }
     };
@@ -606,7 +606,7 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
 pub fn clashes_listed(s: &mut State, up: Upload, result: Result<Vec<Entry>, String>) {
     match result {
         Ok(existing) => ask_clashes(s, up, existing),
-        Err(e) => s.status = format!("Não consegui ver o que já existe no destino: {e}"),
+        Err(e) => crate::fail(s, format!("Não consegui ver o que já existe no destino: {e}")),
     }
 }
 

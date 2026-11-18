@@ -192,12 +192,12 @@ pub fn open_file(s: &mut State, p: usize, item: &Entry) {
     let fresh = std::fs::metadata(&ready).ok().is_some_and(|m| Some(m.len()) == item.size && item.modified.is_some() && m.modified().ok() == item.modified);
     if fresh {
         if let Err(e) = ops::open(&ready) {
-            s.status = e;
+            crate::fail(s, e);
         }
         return;
     }
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        s.status = format!("Não consegui criar a pasta temporária: {e}");
+        crate::fail(s, format!("Não consegui criar a pasta temporária: {e}"));
         return;
     }
     let _ = std::fs::remove_file(&ready);
@@ -1308,7 +1308,7 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
 /// Forgets a server and its password; panes on it go home.
 pub fn remove(s: &mut State, id: &str) {
     if let Err(e) = s.servers.store.remove(id) {
-        s.status = e;
+        crate::fail(s, e);
         return;
     }
     s.servers.pool.forget(id);

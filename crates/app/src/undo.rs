@@ -149,7 +149,7 @@ fn text(result: &Result<String, String>) -> String {
 /// An answer arrived: its records join the lists, then it's handled as any [`Msg::Done`]
 /// (its message, the panes to reload), sent back through the inbox so that stays in one place.
 pub fn arrived(s: &mut State, answer: Answer) {
-    let h = &mut s.history;
+    let h = &mut s.undo;
     let (reload, result) = match answer {
         Answer::Did { record, reload, result } => {
             if let Some(r) = record {
@@ -225,17 +225,17 @@ pub fn server_job(
 /// Ctrl+Z (or with `redo`, Ctrl+Y): undoes the latest action, or redoes the latest undone, on a
 /// background thread.
 pub fn undo(s: &mut State, redo: bool) {
-    if s.history.busy {
+    if s.undo.busy {
         s.status = format!("Espere: ainda {} a última ação.", if redo { "refazendo" } else { "desfazendo" });
         return;
     }
-    let list = if redo { &mut s.history.undone } else { &mut s.history.done };
+    let list = if redo { &mut s.undo.undone } else { &mut s.undo.done };
     let Some(record) = list.pop() else {
         s.status = if redo { "Nada para refazer." } else { "Nada para desfazer." }.into();
         return;
     };
-    s.history.busy = true;
-    s.history.offer = None;
+    s.undo.busy = true;
+    s.undo.offer = None;
     s.status = format!("{} {}…", if redo { "Refazendo:" } else { "Desfazendo:" }, record.what);
     let mut accounts: Vec<AccountRef> = Vec::new();
     for step in &record.steps {
@@ -1046,19 +1046,19 @@ mod tests {
         crate::actions::apply_name(&mut s, 0, Some(item), "b.txt".into());
         settle(&mut s);
         assert_eq!(s.status, "Renomeado para \"b.txt\".");
-        assert_eq!(s.history.offers(&s.status), Some(false), "the notice offers Desfazer");
+        assert_eq!(s.undo.offers(&s.status), Some(false), "the notice offers Desfazer");
 
         undo(&mut s, false);
         assert_eq!(s.status, "Desfazendo: renomear “a.txt” para “b.txt”…");
         settle(&mut s);
         assert_eq!(s.status, "Desfeito: renomear “a.txt” para “b.txt”.");
         assert!(dir.join("a.txt").exists() && !dir.join("b.txt").exists());
-        assert_eq!(s.history.offers(&s.status), Some(true), "and then Refazer");
+        assert_eq!(s.undo.offers(&s.status), Some(true), "and then Refazer");
 
         undo(&mut s, true);
         settle(&mut s);
         assert!(dir.join("b.txt").exists() && !dir.join("a.txt").exists());
-        assert_eq!(s.history.lens(), (1, 0));
+        assert_eq!(s.undo.lens(), (1, 0));
 
         // A new folder, then Ctrl+Z: it goes, and the rename is next.
         crate::actions::apply_name(&mut s, 0, None, "Nova pasta".into());
@@ -1067,7 +1067,7 @@ mod tests {
         undo(&mut s, false);
         settle(&mut s);
         assert!(!dir.join("Nova pasta").exists());
-        assert_eq!(s.history.lens(), (1, 1));
+        assert_eq!(s.undo.lens(), (1, 1));
         undo(&mut s, false);
         settle(&mut s);
         assert!(dir.join("a.txt").exists());
