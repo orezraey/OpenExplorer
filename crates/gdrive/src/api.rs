@@ -167,8 +167,9 @@ impl Drive {
         }
     }
 
-    /// My Drive's top folder's id ("root" is only its alias), asked for the first time.
-    fn root_id(&self) -> Result<String> {
+    /// My Drive's top folder's id ("root" is only its alias), asked for the first time. A
+    /// change names a file's folders by their real ids, this one included.
+    pub fn root_id(&self) -> Result<String> {
         if let Some(id) = self.root.get() {
             return Ok(id.clone());
         }
@@ -761,7 +762,7 @@ fn parse_time(t: &str) -> Option<SystemTime> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -821,7 +822,7 @@ mod tests {
 
     /// A stand-in for the Drive API that answers each request in turn with the next of
     /// `answers` (status line, body), and hands back the first line of every request it got.
-    fn stand_in(answers: Vec<(&'static str, &'static str)>) -> (Drive, std::thread::JoinHandle<Vec<String>>) {
+    pub(crate) fn stand_in(answers: Vec<(&'static str, &'static str)>) -> (Drive, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{BufRead, BufReader, Read, Write};
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", server.local_addr().unwrap());

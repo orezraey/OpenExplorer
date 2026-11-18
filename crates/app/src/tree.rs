@@ -449,6 +449,65 @@ fn subfolders(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<PathBuf>> {
     folders_in(dir, show_hidden)
 }
 
+/// Takes in what changed in `email`'s Drive (see `watch`): the folder lists a changed folder
+/// now sits in or sat in, and the list of shared drives when one changed, are dropped, and
+/// read again where a tree has them open. `root` is Meu Drive's real id, which changes use.
+pub fn drive_changed(s: &mut State, email: &str, changes: &[openexplorer_gdrive::Change], root: Option<&str>) {
+    let mut stale: HashSet<String> = HashSet::new();
+    // Which of the account's lists hold each folder, looked up once rather than per change.
+    let mut holders: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (id, kids) in &s.tree.kids {
+        if let (NodeId::Drive(e, folder), Kids::Ready(nodes)) = (id, kids)
+            && e == email
+        {
+            for n in nodes {
+                if let NodeId::Drive(_, k) = &n.id {
+                    holders.entry(k.as_str()).or_default().push(folder.as_str());
+                }
+            }
+        }
+    }
+    for c in changes {
+        if c.drive {
+            stale.insert("shared-drives".into());
+            continue;
+        }
+        // The tree lists folders only; something gone for good may have been one.
+        if c.file.as_ref().is_some_and(|f| !f.is_dir) {
+            continue;
+        }
+        if !c.trashed {
+            stale.extend(c.parents.iter().map(|p| if Some(p.as_str()) == root { "root".to_string() } else { p.clone() }));
+        }
+        stale.extend(holders.get(c.file_id.as_str()).into_iter().flatten().map(|f| f.to_string()));
+    }
+    let stale: Vec<NodeId> = stale.into_iter().map(|f| NodeId::Drive(email.to_string(), f)).filter(|id| s.tree.kids.contains_key(id)).collect();
+    if stale.is_empty() {
+        return;
+    }
+    // The nodes to read again, found before their lists are dropped.
+    let opened: HashSet<&NodeId> = s.tree.open[0].iter().chain(s.tree.open[1].iter()).collect();
+    let again: Vec<Node> = stale
+        .iter()
+        .filter(|id| opened.contains(id))
+        .filter_map(|id| match id {
+            NodeId::Drive(_, f) if f == "root" => Some(space_node(email, Space::MyDrive)),
+            NodeId::Drive(_, f) if f == "shared-drives" => Some(space_node(email, Space::SharedDrives)),
+            _ => s.tree.kids.values().find_map(|k| match k {
+                Kids::Ready(nodes) => nodes.iter().find(|n| n.id == *id).cloned(),
+                _ => None,
+            }),
+        })
+        .collect();
+    for id in &stale {
+        s.tree.kids.remove(id);
+    }
+    s.tree.version += 1;
+    for node in again {
+        load(s, &node);
+    }
+}
+
 /// Re-reads open local and server nodes in the tree after `show_hidden` changes.
 pub fn refresh_hidden(s: &mut State) {
     s.tree.kids.retain(|id, _| !matches!(id, NodeId::Desktop | NodeId::Local(_) | NodeId::Server(..)));
@@ -905,6 +964,33 @@ mod tests {
         s.tree.open[1].insert(NodeId::Account("a@b".into()));
         s.tree.forget("a@b");
         assert!(s.tree.kids.keys().all(|id| !matches!(id, NodeId::Drive(..))) && !s.tree.open[1].contains(&NodeId::Account("a@b".into())));
+    }
+
+    /// A folder moved on the website drops the lists it left and joined; a file changes no tree.
+    #[test]
+    fn a_folder_changed_in_drive_drops_the_lists_it_left_and_joined() {
+        let (mut s, _) = scene("drive-changed");
+        let (root, dest, other) = (NodeId::Drive("a@b".into(), "root".into()), NodeId::Drive("a@b".into(), "p2".into()), NodeId::Drive("a@b".into(), "p3".into()));
+        let moved = drive_folder_node("a@b", Space::MyDrive, vec![("f1".into(), "Fotos".into())]);
+        s.tree.kids.insert(root.clone(), Kids::Ready(vec![moved]));
+        s.tree.kids.insert(dest.clone(), Kids::Ready(Vec::new()));
+        s.tree.kids.insert(other.clone(), Kids::Ready(Vec::new()));
+        let folder = |id: &str, dir: bool| openexplorer_gdrive::DriveFile {
+            id: id.into(),
+            name: id.into(),
+            is_dir: dir,
+            size: None,
+            modified: None,
+            mime: String::new(),
+            target: None,
+            starred: false,
+            md5: None,
+        };
+        let change = |id: &str, dir: bool, parent: &str| openexplorer_gdrive::Change { file_id: id.into(), file: Some(folder(id, dir)), parents: vec![parent.into()], trashed: false, drive: false };
+        drive_changed(&mut s, "a@b", &[change("x", false, "p3")], Some("R"));
+        assert!(s.tree.kids.contains_key(&other), "a file changes no folder list");
+        drive_changed(&mut s, "a@b", &[change("f1", true, "p2")], Some("R"));
+        assert!(!s.tree.kids.contains_key(&root) && !s.tree.kids.contains_key(&dest) && s.tree.kids.contains_key(&other));
     }
 
     /// Folders read before Exibir arquivos ocultos changed don't land over the ones read after.

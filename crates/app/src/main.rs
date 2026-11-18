@@ -30,6 +30,7 @@ mod transfers;
 mod tree;
 mod uploads;
 mod ui;
+mod watch;
 mod work;
 
 use std::collections::HashMap;
@@ -71,6 +72,8 @@ enum Msg {
     Clashes { up: actions::Upload, result: Result<Vec<Entry>, String> },
     /// An account's storage, for the status bar.
     Quota { email: String, result: Result<Quota, String> },
+    /// What changed in `email`'s Drive since it was last asked (see [`watch`]).
+    Changes { email: String, result: Result<watch::Fetched, String> },
     /// Something the Compartilhar dialog for Drive item `item` was waiting for.
     Share { item: String, update: sharing::Update },
     /// What Copiar link found out about an item's access.
@@ -155,6 +158,8 @@ struct State {
     /// Each account's storage, asked for when its pane first opens and again after changes
     /// there: `None` while the first answer is on its way, or when it failed.
     quotas: HashMap<String, Option<Quota>>,
+    /// Each account's place in its Drive change log, which keeps the panes current.
+    watch: HashMap<String, watch::Watch>,
     /// The login waiting for the browser, numbered from `logins`. Clicking again starts a new
     /// one; an older attempt's error is then dropped, its success still kept.
     login: Option<u64>,
@@ -227,6 +232,7 @@ fn init() -> State {
         servers: servers::Servers::load(),
         drives: HashMap::new(),
         quotas: HashMap::new(),
+        watch: HashMap::new(),
         login: None,
         logins: 0,
         active: 0,
@@ -439,6 +445,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     ask_quota(s, email);
                 }
             }
+            Msg::Changes { email, result } => watch::arrived(s, email, result, now),
             Msg::Quota { email, result } => {
                 if s.accounts.iter().any(|a| a.email == email) {
                     match result {
@@ -522,6 +529,9 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
         }
     }
+    // Accounts on screen are asked what changed elsewhere, every few seconds; after the
+    // messages, so a listing that just ended is read again here if changes came during it.
+    changed |= watch::tick(s, now);
     for p in 0..2 {
         // The address field closes when the keyboard leaves it (a click elsewhere).
         if s.address[p].as_ref().is_some_and(|a| !a.focused) {
@@ -665,6 +675,7 @@ fn disconnect(s: &mut State, email: &str) {
     s.quotas.remove(email);
     s.cache.forget(email);
     s.tree.forget(email);
+    s.watch.remove(email);
     s.accounts.retain(|a| a.email != email);
     for p in 0..2 {
         let gone = |l: &Location| matches!(l, Location::Drive { email: e, .. } if e == email);
