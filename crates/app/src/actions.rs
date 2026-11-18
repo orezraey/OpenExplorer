@@ -49,6 +49,8 @@ pub enum Dialog {
     Share(Box<crate::sharing::Share>),
     /// Copiar link on a private item: open it to anyone with the link first?
     MakePublic(Box<crate::sharing::MakePublic>),
+    /// Copiar link on a MEGA file with no link yet: make one?
+    MegaLink(Box<crate::mega::MakeLink>),
     /// Adicionar servidor, or Editar servidor.
     Server(Box<crate::servers::Form>),
 }
@@ -89,7 +91,7 @@ pub fn editable(loc: &Location) -> bool {
         Location::Local(dir) => !crate::network::is_server(dir),
         Location::Mock(_) | Location::Found(_) => false,
         Location::Drive { .. } => drive_folder(loc).is_some(),
-        Location::Server { find, .. } => find.is_none(),
+        Location::Server { find, .. } => find.is_none() && crate::mega::why_not(loc).is_none(),
     }
 }
 
@@ -99,6 +101,7 @@ pub fn editable(loc: &Location) -> bool {
 pub fn items_editable(loc: &Location) -> bool {
     match loc {
         Location::Drive { space: Space::SharedDrives | Space::Trash, .. } => false,
+        Location::Server { .. } if crate::mega::items_fixed(loc) => false,
         Location::Drive { .. } | Location::Found(_) | Location::Server { .. } => true,
         _ => editable(loc),
     }
@@ -107,11 +110,14 @@ pub fn items_editable(loc: &Location) -> bool {
 /// Lixeira itself, where Restaurar and Excluir permanentemente apply (not a trashed folder's
 /// contents, which come back with it).
 pub fn in_trash(loc: &Location) -> bool {
-    matches!(loc, Location::Drive { space: Space::Trash, path, .. } if path.is_empty())
+    matches!(loc, Location::Drive { space: Space::Trash, path, .. } if path.is_empty()) || crate::mega::bin_top(loc)
 }
 
 /// Why `loc` doesn't take what was asked (pasting, a new folder, cutting).
 fn why_not(loc: &Location) -> String {
+    if let Some(why) = crate::mega::why_not(loc) {
+        return why;
+    }
     match loc {
         Location::Drive { space: Space::SharedDrives, .. } => {
             t("Drives compartilhados lista os drives: abra um deles para trabalhar nas pastas.", "Shared drives lists the drives: open one of them to work in its folders.").into()
@@ -191,7 +197,7 @@ fn local_job(s: &State, reload: Vec<Location>, work: impl FnOnce() -> Result<Str
 }
 
 /// How many items, in words: "1 item", "3 itens".
-fn count(n: usize) -> String {
+pub(crate) fn count(n: usize) -> String {
     if n == 1 { "1 item".into() } else { tr!("{n} itens", "{n} items") }
 }
 
@@ -1021,7 +1027,9 @@ pub fn ask_delete(s: &mut State, p: usize) {
     // The network and WSL have no Lixeira: Del deletes for good there, after asking (as
     // Explorer does). By the items' own paths, so a search's results there count too.
     let loc = &s.panes[p].loc;
-    if (loc.is_local() && s.settings.skip_recycle_bin) || matches!(loc, Location::Server { .. }) || items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_remote(&path)) {
+    // A MEGA account has its own Rubbish Bin; deleting inside it is for good.
+    let mega_bin = crate::mega::at(loc).is_some() && !crate::mega::in_bin(loc);
+    if (loc.is_local() && s.settings.skip_recycle_bin) || (matches!(loc, Location::Server { .. }) && !mega_bin) || items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_remote(&path)) {
         s.dialog = Some(Dialog::Purge { pane: p, items });
         return;
     }
@@ -1057,6 +1065,7 @@ pub fn delete(s: &mut State) {
                 Ok(tr!("Movido para a lixeira do Google Drive: {}.", "Moved to the Google Drive trash: {}.", count(n)))
             });
         }
+        Location::Server { server, .. } if server.is_mega() => crate::mega::trash(s, &loc, items),
         Location::Server { .. } => crate::servers::delete(s, &loc, items, vec![loc.clone()]),
         Location::Mock(_) => return not_here(s, pane),
     }
@@ -1078,6 +1087,9 @@ fn to_the_drive_trash(n: usize) -> String {
 
 /// Restaurar: the selected items in Lixeira go back where they were.
 pub fn restore(s: &mut State, p: usize) {
+    if crate::mega::bin_top(&s.panes[p].loc) {
+        return crate::mega::restore(s, p);
+    }
     let items = selected(s, p);
     let loc = s.panes[p].loc.clone();
     let (false, true, Some(email)) = (items.is_empty(), in_trash(&loc), account(&loc)) else { return };
@@ -1129,6 +1141,12 @@ pub fn purge(s: &mut State) {
 /// Esvaziar lixeira: asks first, as it can't be undone.
 pub fn ask_empty_trash(s: &mut State, p: usize) {
     let loc = &s.panes[p].loc;
+    if crate::mega::bin_top(loc)
+        && let Some((server, _)) = crate::mega::at(loc)
+    {
+        s.dialog = Some(Dialog::EmptyTrash { email: server.id.clone() });
+        return;
+    }
     if let (true, Some(email)) = (in_trash(loc), account(loc)) {
         s.dialog = Some(Dialog::EmptyTrash { email: email.to_string() });
     }
@@ -1138,6 +1156,9 @@ pub fn ask_empty_trash(s: &mut State, p: usize) {
 /// trash.
 pub fn empty_trash(s: &mut State) {
     let Some(Dialog::EmptyTrash { email }) = s.dialog.take() else { return };
+    if email.starts_with("mega:") {
+        return crate::mega::empty_bin(s, &email);
+    }
     drive_job(s, &email, account_panes(s, &email), |d| d.empty_trash().map(|_| t("Lixeira esvaziada.", "Trash emptied.").into()));
     s.status = t("Esvaziando a lixeira…", "Emptying the trash…").into();
 }
@@ -1614,6 +1635,39 @@ mod tests {
         assert!(items_editable(&drive(Space::Recent, &[])) && !editable(&drive(Space::Recent, &[])));
         assert!(!items_editable(&drive(Space::Trash, &[])));
         assert!(in_trash(&drive(Space::Trash, &[])) && !in_trash(&drive(Space::Trash, &["f1"])));
+    }
+
+    /// In a MEGA account, Excluir sends to its Rubbish Bin (no "for good" question), and in the
+    /// Rubbish Bin it asks before deleting for good; the bin's top offers Restaurar and Esvaziar.
+    /// The account's top and Compartilhados comigo take nothing new.
+    #[test]
+    fn mega_deletes_to_its_rubbish_bin() {
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        let sv = openexplorer_remote::Server::mega("ana@exemplo.com");
+        let at = |path: &[&str]| crate::servers::folder(&sv, path.iter().map(|p| p.to_string()).collect());
+        let e = |id: &str| Entry { id: id.into(), name: id.into(), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false };
+        for (path, purge) in [(&["Drive na nuvem"][..], false), (&["Drive na nuvem", "Fotos"], false), (&["Lixeira"], true), (&["Lixeira", "Velha"], true)] {
+            s.dialog = None;
+            s.panes[1].go(at(path));
+            s.panes[1].set_entries(Ok(vec![e("a.txt")]));
+            s.panes[1].selected = ["a.txt".to_string()].into();
+            ask_delete(&mut s, 1);
+            match &s.dialog {
+                Some(Dialog::Purge { .. }) => assert!(purge, "{path:?} deletes for good"),
+                Some(Dialog::Delete { .. }) => assert!(!purge, "{path:?} sends to the bin"),
+                _ => panic!("no dialog at {path:?}"),
+            }
+        }
+        assert!(in_trash(&at(&["Lixeira"])) && !in_trash(&at(&["Lixeira", "Velha"])));
+        s.dialog = None;
+        s.panes[1].go(at(&["Lixeira"]));
+        ask_empty_trash(&mut s, 1);
+        assert!(matches!(&s.dialog, Some(Dialog::EmptyTrash { email }) if email == "mega:ana@exemplo.com"));
+        assert!(editable(&at(&["Drive na nuvem"])) && editable(&at(&["Compartilhados comigo", "Deles"])));
+        assert!(!editable(&at(&[])) && !editable(&at(&["Compartilhados comigo"])) && !editable(&at(&["Lixeira"])));
+        assert!(!items_editable(&at(&[])) && items_editable(&at(&["Drive na nuvem"])));
+        assert!(why_not(&at(&["Lixeira"])).contains("Lixeira do MEGA"));
     }
 
     #[test]

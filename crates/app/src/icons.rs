@@ -108,6 +108,11 @@ icon32!(
     r##"<path d="M11.6 4.5L16 12.1L7.2 12.1Z" fill="#00832D"/><path d="M7.2 12.1L16 12.1L11.6 19.7L2.8 19.7Z" fill="#00AC47"/><path d="M2.8 19.7L11.6 19.7L7.2 27.3Z" fill="#0066DA"/><path d="M11.6 19.7L20.4 19.7L24.8 27.3L7.2 27.3Z" fill="#2684FC"/><path d="M20.4 19.7L29.2 19.7L24.8 27.3Z" fill="#EA4335"/><path d="M11.6 4.5L20.4 4.5L29.2 19.7L20.4 19.7Z" fill="#FFBA00"/>"##
 );
 icon32!(
+    PROVIDER_MEGA,
+    "provider-mega",
+    r##"<circle cx="16" cy="16" r="14" fill="#D9272E"/><path d="M9.2 21.5V10.8L16 17.6L22.8 10.8V21.5" fill="none" stroke="#FFFFFF" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>"##
+);
+icon32!(
     PROVIDER_NEXTCLOUD,
     "provider-nextcloud",
     r##"<rect x="2" y="2" width="28" height="28" rx="7" fill="#0082C9"/><circle cx="8.2" cy="16" r="2.9" fill="none" stroke="#FFFFFF" stroke-width="2.2"/><circle cx="23.8" cy="16" r="2.9" fill="none" stroke="#FFFFFF" stroke-width="2.2"/><circle cx="16" cy="16" r="4.5" fill="none" stroke="#FFFFFF" stroke-width="2.4"/>"##

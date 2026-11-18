@@ -53,6 +53,10 @@ pub enum Step {
     ServerMakeDir { server: Server, path: String },
     /// The folder at `path` on `server` goes, only while it's empty.
     ServerRemoveDir { server: Server, path: String },
+    /// MEGA node `node` of account `server`, named `name`, goes to the Rubbish Bin.
+    MegaTrash { server: Server, node: String, name: String },
+    /// MEGA node `node`, named `name`, comes back from the Rubbish Bin to the folder it was in.
+    MegaRestore { server: Server, node: String, name: String },
 }
 
 /// What undoes one action, or redoes one undone.
@@ -204,6 +208,22 @@ pub fn drive_job(
     drive_task(s, email, t("operar no Drive", "work in Drive"), move |d| Ok(work(d, &job)), move |result| did(&rec, what, reload, result.and_then(|r| r)));
 }
 
+/// [`local_job`] with MEGA account `server`.
+pub fn mega_job(
+    s: &State,
+    server: &Server,
+    reload: Vec<Location>,
+    what: impl FnOnce(usize) -> String + Send + 'static,
+    work: impl FnOnce(&openexplorer_mega::Account, &Rec) -> Result<String, String> + Send + 'static,
+) {
+    let email = server.user.clone();
+    background(s, move |emit| {
+        let rec = Rec::default();
+        let result = catch_panic(t("operar no MEGA", "work on MEGA"), || openexplorer_mega::reach(&email).and_then(|a| work(&a, &rec)));
+        emit(did(&rec, what, reload, result));
+    });
+}
+
 /// [`local_job`] with a connection to `server`.
 pub fn server_job(
     s: &State,
@@ -249,7 +269,7 @@ pub fn undo(s: &mut State, redo: bool) {
     let pool = s.servers.pool.clone();
     background(s, move |emit| {
         let reload = record.reload.clone();
-        let mut live = Live { accounts, open: HashMap::new(), pool, emit };
+        let mut live = Live { accounts, open: HashMap::new(), megas: HashMap::new(), pool, emit };
         let replayed = catch_panic(if redo { t("refazer", "redo") } else { t("desfazer", "undo") }, || Ok(replay(record, &mut live, redo)));
         let (back, left, result) = match replayed {
             Ok(r) => (r.back, r.left, r.result),
@@ -298,10 +318,41 @@ pub fn replay(record: Record, reach: &mut dyn Reach, redo: bool) -> Replayed {
     Replayed { back: Some(Record { what, steps: back, reload }), left: None, result: Ok(result) }
 }
 
-/// The Drive accounts and servers a replay reaches.
+/// The Drive accounts, servers and MEGA accounts a replay reaches.
 pub trait Reach {
     fn drive(&mut self, email: &str) -> Result<&dyn DriveSide, String>;
     fn server(&mut self, server: &Server, work: &mut dyn FnMut(&mut dyn Conn) -> Result<(), String>) -> Result<(), String>;
+    fn mega(&mut self, server: &Server) -> Result<&dyn MegaSide, String>;
+}
+
+/// Where a MEGA node is now: its name, and whether it's in the Rubbish Bin.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MegaStatus {
+    pub name: String,
+    pub in_bin: bool,
+}
+
+/// What a replay asks of a MEGA account.
+pub trait MegaSide {
+    /// `None` when the node is gone for good.
+    fn status(&self, node: &str) -> Result<Option<MegaStatus>, String>;
+    fn trash(&self, node: &str) -> Result<(), String>;
+    fn restore(&self, node: &str) -> Result<(), String>;
+}
+
+impl MegaSide for openexplorer_mega::Account {
+    fn status(&self, node: &str) -> Result<Option<MegaStatus>, String> {
+        let path = openexplorer_mega::handle_path(node);
+        Ok(self.node(&path).ok().map(|n| MegaStatus { name: n.name, in_bin: self.in_rubbish(&path) }))
+    }
+    fn trash(&self, node: &str) -> Result<(), String> {
+        let n = self.node(&openexplorer_mega::handle_path(node))?;
+        openexplorer_mega::Account::trash(self, &n)
+    }
+    fn restore(&self, node: &str) -> Result<(), String> {
+        let n = self.node(&openexplorer_mega::handle_path(node))?;
+        openexplorer_mega::Account::restore(self, &n).map(|_| ())
+    }
 }
 
 /// What a replay asks of a Drive account.
@@ -345,6 +396,7 @@ impl DriveSide for Drive {
 struct Live<'a> {
     accounts: Vec<AccountRef>,
     open: HashMap<String, Arc<Drive>>,
+    megas: HashMap<String, Arc<openexplorer_mega::Account>>,
     pool: Arc<Pool>,
     emit: &'a dyn Fn(Msg),
 }
@@ -361,6 +413,13 @@ impl Reach for Live<'_> {
 
     fn server(&mut self, server: &Server, work: &mut dyn FnMut(&mut dyn Conn) -> Result<(), String>) -> Result<(), String> {
         crate::servers::with(&self.pool, server, work)
+    }
+
+    fn mega(&mut self, server: &Server) -> Result<&dyn MegaSide, String> {
+        if !self.megas.contains_key(&server.id) {
+            self.megas.insert(server.id.clone(), openexplorer_mega::reach(&server.user)?);
+        }
+        Ok(&**self.megas.get(&server.id).expect("opened above"))
     }
 }
 
@@ -575,6 +634,17 @@ impl Step {
                 Some(_) => Err(tr!("já existe “{}” no servidor.", "“{}” already exists on the server.", server_name(path))),
                 None => Ok(()),
             }),
+            Step::MegaTrash { server, node, name } => match reach.mega(server)?.status(node)? {
+                None => Err(tr!("“{name}” não está mais no MEGA.", "“{name}” is no longer on MEGA.")),
+                Some(st) if st.in_bin => Err(tr!("“{name}” já está na Lixeira do MEGA.", "“{name}” is already in the MEGA Rubbish Bin.")),
+                Some(st) if st.name != *name => Err(tr!("“{name}” mudou de nome no MEGA (agora “{}”).", "“{name}” was renamed on MEGA (now “{}”).", st.name)),
+                Some(_) => Ok(()),
+            },
+            Step::MegaRestore { server, node, name } => match reach.mega(server)?.status(node)? {
+                None => Err(tr!("“{name}” foi apagado para sempre do MEGA.", "“{name}” was deleted from MEGA for good.")),
+                Some(st) if !st.in_bin => Err(tr!("“{name}” não está mais na Lixeira do MEGA.", "“{name}” is no longer in the MEGA Rubbish Bin.")),
+                Some(_) => Ok(()),
+            },
             Step::ServerRemoveDir { server, path } => reach.server(server, &mut |c| match c.stat(path)? {
                 None => Err(tr!("“{}” não está mais no servidor.", "“{}” is no longer on the server.", server_name(path))),
                 Some(it) if !it.is_dir || it.link => Err(tr!("“{}” não é mais uma pasta.", "“{}” is no longer a folder.", server_name(path))),
@@ -652,6 +722,14 @@ impl Step {
                 // An empty folder only: the server refuses one that isn't.
                 reach.server(server, &mut |c| c.remove_dir(path))?;
                 Step::ServerMakeDir { server: server.clone(), path: path.clone() }
+            }
+            Step::MegaTrash { server, node, name } => {
+                reach.mega(server)?.trash(node)?;
+                Step::MegaRestore { server: server.clone(), node: node.clone(), name: name.clone() }
+            }
+            Step::MegaRestore { server, node, name } => {
+                reach.mega(server)?.restore(node)?;
+                Step::MegaTrash { server: server.clone(), node: node.clone(), name: name.clone() }
             }
         })
     }
@@ -796,6 +874,7 @@ mod tests {
     struct Fake {
         drive: FakeDrive,
         conn: FakeConn,
+        mega: FakeMega,
     }
 
     impl Reach for Fake {
@@ -804,6 +883,27 @@ mod tests {
         }
         fn server(&mut self, _: &Server, work: &mut dyn FnMut(&mut dyn Conn) -> Result<(), String>) -> Result<(), String> {
             work(&mut self.conn)
+        }
+        fn mega(&mut self, _: &Server) -> Result<&dyn MegaSide, String> {
+            Ok(&self.mega)
+        }
+    }
+
+    /// A MEGA account in memory: each node's name and whether it's in the Rubbish Bin.
+    #[derive(Default)]
+    struct FakeMega(std::cell::RefCell<BTreeMap<String, MegaStatus>>);
+
+    impl MegaSide for FakeMega {
+        fn status(&self, node: &str) -> Result<Option<MegaStatus>, String> {
+            Ok(self.0.borrow().get(node).cloned())
+        }
+        fn trash(&self, node: &str) -> Result<(), String> {
+            self.0.borrow_mut().get_mut(node).ok_or("não existe")?.in_bin = true;
+            Ok(())
+        }
+        fn restore(&self, node: &str) -> Result<(), String> {
+            self.0.borrow_mut().get_mut(node).ok_or("não existe")?.in_bin = false;
+            Ok(())
         }
     }
 
@@ -1023,6 +1123,29 @@ mod tests {
         undo_then_redo(record("criar a pasta", vec![new.clone()]), &mut reach, |r| assert!(!r.conn.0.contains_key("/nova")));
         reach.conn.0.insert("/nova/x".into(), false);
         assert!(replay(record("criar a pasta", vec![new]), &mut reach, false).result.unwrap_err().contains("não está mais vazia"));
+    }
+
+    /// A MEGA item sent to the Rubbish Bin comes back by Desfazer and goes again by Refazer; one
+    /// deleted for good, or renamed, is reported instead.
+    #[test]
+    fn mega_trash_and_restore_undo_each_other() {
+        let server = Server::mega("ana@exemplo.com");
+        let mut reach = Fake::default();
+        let status = |name: &str, in_bin: bool| MegaStatus { name: name.into(), in_bin };
+        reach.mega.0.borrow_mut().insert("H1".into(), status("a.txt", true));
+        let trashed = Step::MegaRestore { server: server.clone(), node: "H1".into(), name: "a.txt".into() };
+        undo_then_redo(record("mover 1 item para a Lixeira do MEGA", vec![trashed.clone()]), &mut reach, |r| assert!(!r.mega.0.borrow()["H1"].in_bin));
+        assert!(reach.mega.0.borrow()["H1"].in_bin);
+
+        // Restored on the website meanwhile: nothing to take back.
+        reach.mega.0.borrow_mut().insert("H1".into(), status("a.txt", false));
+        assert!(replay(record("lixeira", vec![trashed.clone()]), &mut reach, false).result.unwrap_err().contains("não está mais na Lixeira"));
+        // Renamed before Refazer sends it back.
+        let restored = Step::MegaTrash { server: server.clone(), node: "H1".into(), name: "a.txt".into() };
+        reach.mega.0.borrow_mut().insert("H1".into(), status("b.txt", false));
+        assert!(replay(record("restaurar", vec![restored]), &mut reach, false).result.unwrap_err().contains("mudou de nome"));
+        reach.mega.0.borrow_mut().clear();
+        assert!(replay(record("lixeira", vec![trashed]), &mut reach, false).result.unwrap_err().contains("para sempre"));
     }
 
     /// Drains `s`'s inbox as `poll` does for Desfazer, up to the next Done: answers join the
