@@ -84,6 +84,10 @@ impl Conn for Mega {
         self.account.copy(from, to).map(|_| true)
     }
 
+    fn pin(&mut self, path: &str) -> Result<String> {
+        self.account.pin(path)
+    }
+
     fn alive(&mut self) -> bool {
         true
     }

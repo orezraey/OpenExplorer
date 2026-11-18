@@ -286,6 +286,13 @@ pub trait Conn: Send {
         remove_tree(self, path)
     }
 
+    /// A path that keeps naming the item at `path` while the items around it change, for a
+    /// batch that works through several: the path itself, except where a listing's names can
+    /// shift as items go (MEGA's twins, shown as "name (2)").
+    fn pin(&mut self, path: &str) -> Result<String> {
+        Ok(path.to_string())
+    }
+
     /// Whether the connection still answers, to reuse it from the pool.
     fn alive(&mut self) -> bool;
 

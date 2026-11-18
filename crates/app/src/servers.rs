@@ -98,6 +98,12 @@ pub fn with<T>(pool: &Pool, server: &Server, work: impl FnOnce(&mut dyn Conn) ->
     out
 }
 
+/// The paths of a batch's items as [`Conn::pin`] keeps them, looked up before any of them
+/// changes.
+pub(crate) fn pin_all(c: &mut dyn Conn, paths: &[String]) -> Result<Vec<String>, String> {
+    paths.iter().map(|p| c.pin(p)).collect()
+}
+
 /// A cancelled transfer says so in the app's words.
 fn cancelled(e: String) -> String {
     if e == remote::CANCELLED { CANCELLED.into() } else { e }
@@ -301,10 +307,12 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
         for (p, (is_dir, size, path)) in batch.rows().iter().zip(&sizes) {
             p.size(if *is_dir { measure(c, path, &|| p.cancelled()) } else { size.unwrap_or(0) });
         }
+        // Each item as it is now, whatever Recortar does to the others meanwhile.
+        let paths = pin_all(c, &paths)?;
         // The names the rows took in `dst`, before their files are made.
-        Ok(std::sync::Mutex::new(HashSet::<PathBuf>::new()))
+        Ok((std::sync::Mutex::new(HashSet::<PathBuf>::new()), paths))
     };
-    let step = move |c: &mut dyn Conn, claimed: &std::sync::Mutex<HashSet<PathBuf>>, i: usize, p: &Progress| {
+    let step = move |c: &mut dyn Conn, (claimed, paths): &(std::sync::Mutex<HashSet<PathBuf>>, Vec<String>), i: usize, p: &Progress| {
         let e = &items[i];
         let local = {
             let mut claimed = claimed.lock().unwrap_or_else(|e| e.into_inner());
@@ -457,6 +465,7 @@ pub fn move_within(s: &mut State, from: &Location, items: Vec<Entry>, to: &Locat
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Move, items.iter().map(|e| (end(from, Some(&e.name)), end(to, None))));
     let at = server.clone();
     undo::server_job(s, &server, reload, |n| tr!("mover {}", "move {}", undo::items(n)), move |c, rec| {
+        let pinned = pin_all(c, &paths)?;
         batch.run(|i, _| {
             let (e, path) = (&items[i], &paths[i]);
             let into = child(&dst, &e.name);
@@ -466,7 +475,7 @@ pub fn move_within(s: &mut State, from: &Location, items: Vec<Entry>, to: &Locat
             if e.is_dir && (dst == *path || dst.starts_with(&format!("{path}/"))) {
                 return Err(tr!("Não dá para mover a pasta \"{}\" para dentro dela mesma.", "Can't move the folder \"{}\" into itself.", e.name));
             }
-            c.rename(path, &into)?;
+            c.rename(&pinned[i], &into)?;
             rec.add([undo::Step::ServerMove { server: at.clone(), from: into, to: path.clone() }]);
             Ok(())
         })
@@ -479,8 +488,9 @@ pub fn delete(s: &mut State, loc: &Location, items: Vec<Entry>, reload: Vec<Loca
     let paths: Vec<(String, bool)> = items.iter().filter_map(|e| path_of(loc, e).map(|p| (p, e.is_dir))).collect();
     let n = paths.len();
     job(s, server, reload, move |c| {
-        for (i, (path, is_dir)) in paths.iter().enumerate() {
-            c.remove(path, *is_dir).map_err(|e| {
+        let pinned = pin_all(c, &paths.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>())?;
+        for (i, ((path, is_dir), at)) in paths.iter().zip(&pinned).enumerate() {
+            c.remove(at, *is_dir).map_err(|e| {
                 let done = if i == 0 { String::new() } else { tr!(" (já excluídos para sempre: {i})", " (already deleted for good: {i})") };
                 tr!("Não consegui excluir {path}: {e}{done}", "Couldn't delete {path}: {e}{done}")
             })?;

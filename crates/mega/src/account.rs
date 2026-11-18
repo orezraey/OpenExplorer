@@ -227,6 +227,21 @@ impl Account {
         }
     }
 
+    /// A path that keeps naming what `path` names while the items around it change: a twin's
+    /// shown name ("name (2)") moves to the other twin once one goes, so a twin is named by its
+    /// handle; any other item by `path` itself.
+    pub fn pin(&self, path: &str) -> Result<String> {
+        let inner = self.lock();
+        match resolve(&inner.tree, path) {
+            Some(Place::Node(h)) => {
+                let n = inner.tree.get(&h).expect("a resolved node");
+                Ok(if !n.parent.is_empty() && inner.tree.same_name(&n.parent, &n.name).len() > 1 { handle_path(&h) } else { path.to_string() })
+            }
+            Some(_) => Ok(path.to_string()),
+            None => Err(tr!("“{}” não está mais no MEGA.", "“{}” is no longer on MEGA.", last_name(path))),
+        }
+    }
+
     /// The node at `path`, for the app's own calls (links, restore).
     pub fn node(&self, path: &str) -> Result<Node> {
         self.node_at(path)
@@ -823,6 +838,31 @@ mod tests {
         }
         assert_eq!(a.resolve("/Drive na nuvem/foto 7 (2).jpg"), Some(Place::Node("TWIN0000".into())));
         eprintln!("5000 lookups + stats: {} ms", started.elapsed().as_millis());
+    }
+
+    /// A twin is pinned by its handle, so it's still found once the other twin is gone; other
+    /// items keep their paths.
+    #[test]
+    fn twins_are_pinned_by_handle() {
+        let mut k = keys();
+        let mut l = listing(&k);
+        let own = (k.user.clone(), k.master);
+        let mut twin = crate::nodes::tests::raw(&k, "TWIN0001", "ROOT0000", 0, "nota.txt", (own.0.as_str(), own.1));
+        twin["ts"] = 500.into();
+        l["f"].as_array_mut().unwrap().push(twin);
+        let tree = Tree::from_listing(&mut k, &l);
+        let a = Account::offline(k, tree);
+        assert_eq!(a.pin("/Drive na nuvem/Fotos").unwrap(), "/Drive na nuvem/Fotos");
+        assert_eq!(a.pin("/Drive na nuvem").unwrap(), "/Drive na nuvem");
+        let first = a.pin("/Drive na nuvem/nota.txt").unwrap();
+        let second = a.pin("/Drive na nuvem/nota (2).txt").unwrap();
+        assert_eq!((first.as_str(), second.as_str()), (handle_path("FILE0002").as_str(), handle_path("TWIN0001").as_str()));
+        // The first twin goes: "nota (2).txt" no longer names anything, its pin still does.
+        a.lock().tree.remove("FILE0002", true);
+        assert!(a.resolve("/Drive na nuvem/nota (2).txt").is_none());
+        assert_eq!(a.resolve(&second), Some(Place::Node("TWIN0001".into())));
+        assert_eq!(a.resolve(&format!("{second}/../x")), None);
+        assert!(a.pin("/Drive na nuvem/nada").is_err());
     }
 
     #[test]
