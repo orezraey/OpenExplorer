@@ -1,152 +1,58 @@
 # Open Explorer
 
-Gerenciador de arquivos de dois painéis para nuvem (começando pelo Google Drive), em Rust com
-[Rune](https://github.com/anomalyco/rune). Cada painel mostra o disco local, um drive
-**simulado** em memória ou uma conta do Google Drive conectada: Meu Drive e Drives compartilhados (por enquanto só listagem).
+A dual-pane file manager for Windows with Google Drive, SFTP, FTP and WebDAV built in.
+Written in Rust.
 
-## Conectar o Google Drive
+[Português](README.pt-BR.md)
 
-Para ler todo o Drive, o Google exige uma verificação de segurança do app. Até lá, cada pessoa
-usa o próprio cliente OAuth (gratuito):
+## Features
 
-1. Em <https://console.cloud.google.com>, crie um projeto e ative a **Google Drive API**
-   (APIs e serviços → Biblioteca).
-2. Em **Tela de permissão OAuth** (Google Auth Platform), escolha público **Externo**, deixe em
-   modo **Teste** e adicione o seu e-mail em **Usuários de teste**.
-3. Em **Clientes** (Credenciais), crie um ID do cliente OAuth do tipo **App para computador** e
-   baixe o JSON.
-4. Salve o JSON como `%APPDATA%\OpenExplorer\google-client.json`, defina
-   `OPENEXPLORER_GOOGLE_CLIENT_ID` e `OPENEXPLORER_GOOGLE_CLIENT_SECRET`, ou cole o JSON/credenciais
-   diretamente na etapa do Google Drive dentro de **Adicionar conta**.
-5. No app, clique em **Adicionar conta** → **Google Drive**: o navegador abre, você autoriza e a
-   conta aparece em **Contas**, na árvore. Dá para conectar várias contas.
+* Two panes, each with its own folder tree.
+* Google Drive: multiple accounts, shared drives, sharing, starred, trash. Open folders update
+  when files change on the web.
+* SFTP, FTP/FTPS, WebDAV, Nextcloud and ownCloud.
+* Copy and move between any of them, with a transfer queue.
+* Instant file name search on local NTFS drives, similar to Everything. Drive and servers can be
+  searched too.
+* Drag and drop to and from Windows Explorer.
+* Undo and redo for renames, moves, deletes and copies.
+* English and Portuguese.
 
-O token de renovação fica no Gerenciador de Credenciais do Windows (nunca em arquivo);
-`%APPDATA%\OpenExplorer\accounts.json` guarda só e-mail e nome. Em modo Teste, o Google expira
-o acesso a cada 7 dias: o app pede para conectar de novo.
+## Installation
 
-## Contas e servidores (Nextcloud, ownCloud, SFTP, FTP/FTPS e WebDAV)
+Download the latest build from [Releases](../../releases). The executable isn't code-signed yet,
+so Windows SmartScreen will warn the first time you run it.
 
-**Adicionar conta**, na barra de cima, unifica os provedores em categorias (**Todos**, **Nuvem**,
-**NAS** e **Protocolos**), com busca rápida e suporte a colar o endereço completo logo na busca.
-Ao escolher **Nextcloud**, **ownCloud**, **SFTP**, **FTP** ou **WebDAV**, abre o formulário
-específico com endereço, porta, usuário, senha, opção de criptografia SSL/TLS (FTPS / HTTPS) e
-pasta inicial (`/remote.php/webdav` automático no Nextcloud e ownCloud); colar um endereço inteiro
-(`sftp://ana@nas:2222/home/ana`) no campo Servidor preenche o resto. O app faz o login antes de
-guardar: a conta só entra na lista (em **Contas**, na árvore) quando funcionou. Digitar
-na barra de endereço o endereço de um servidor que ainda não está na lista abre esse diálogo
-preenchido.
+Linux and macOS builds are provided but experimental. Computer search isn't available on macOS.
 
-- A lista fica em `%APPDATA%\OpenExplorer\servers.json`, sem senha; a senha fica no Gerenciador
-  de Credenciais do Windows.
-- SFTP aceita senha, uma chave (a senha vira a da chave) ou, sem nenhuma das duas, as chaves de
-  `~/.ssh`. A chave do servidor é guardada na primeira conexão; se ela mudar, o app recusa
-  conectar (remova e adicione o servidor de novo se a mudança for esperada).
-- FTPS (explícito ou implícito) e WebDAV com https aceitam um certificado de autoridade
-  conhecida; um certificado próprio (comum em NAS) aparece com a impressão digital SHA-256 e só
-  é aceito com **Confiar e salvar**. Se depois ele mudar, o app recusa conectar até você editar o
-  servidor e confiar no novo.
-- **Conexões simultâneas** (1 a 10, 4 se vazio) limita quantas conexões o app abre com o
-  servidor; envios e downloads usam todas menos uma, que fica para as listagens.
-- Servidores não têm lixeira: Excluir apaga para sempre, depois de perguntar.
-- Dá para abrir arquivos, copiar e recortar entre o servidor e o computador, entre servidores,
-  dentro do mesmo servidor e entre servidor e Google Drive, renomear, criar pastas, pesquisar pelo
-  nome (lendo as pastas, enquanto você digita) e arrastar do painel do servidor para o Explorer
-  ou para o outro painel. Entre servidores os dados passam direto, sem tocar o disco; o WebDAV
-  copia dentro de si mesmo sozinho; de e para o Google Drive cada arquivo passa por um arquivo
-  temporário.
+The first local search offers to install the search service, which needs administrator rights
+once. To remove it, run as administrator:
 
-Testes contra servidores de verdade (precisam do [rclone](https://rclone.org) e do `openssl` no
-`PATH`): `cargo test -p openexplorer-remote -- --ignored` e
-`cargo test -p openexplorer -- --ignored real::`. O teste de FTPS explícito usa um servidor
-pyftpdlib (`crates/remote/tests/ftps_server.py`): `OE_FTPS_PYTHON` aponta para um Python com
-`pyftpdlib` e `pyopenssl` instalados (num venv, por exemplo).
-
-## Pesquisar no computador
-
-O campo de pesquisa de um painel local procura pelo nome em todos os discos NTFS fixos enquanto
-você digita, como o Everything: um serviço do Windows lê a tabela de arquivos (MFT) de cada disco
-para a memória e a mantém em dia pelo diário USN do NTFS; o app o consulta por um pipe. O serviço
-não é um programa à parte: é o próprio `openexplorer.exe` iniciado como `openexplorer index …`
-(como o `Everything.exe -svc` do Everything). Na primeira pesquisa o painel oferece **Instalar o
-serviço de pesquisa**: o Windows pede permissão de administrador uma vez, o executável é copiado
-para `%ProgramFiles%\OpenExplorer\openexplorer-index.exe` (onde só administradores o alteram) e
-o serviço inicia com o Windows. Para remover:
-`"%ProgramFiles%\OpenExplorer\openexplorer-index.exe" index uninstall` como administrador.
-
-No Linux não há MFT: o serviço (o próprio `openexplorer`, do usuário, sem root) lista as pastas em
-paralelo, vigia cada uma com o inotify e escuta num socket em `$XDG_RUNTIME_DIR`. O app o inicia
-na primeira pesquisa; `openexplorer index install` faz o systemd do usuário iniciá-lo com a
-sessão (`index uninstall` desfaz). O índice fica salvo em `~/.cache/openexplorer` e responde na
-hora enquanto os discos são listados de novo, a cada início. Ficam de fora sistemas de arquivos
-do kernel, de memória (`tmpfs`), de rede e imagens (`squashfs`).
-
-No Windows, sem administrador, para testar: `cargo run -- index console --walk` (lista as pastas
-em vez de ler a MFT) e o app com `OE_INDEX_CONSOLE=1`. Tempos de busca:
-`cargo run -p openexplorer-index --release --example index_timing -- C:\ D:\`.
-
-## Rodar
-
-```sh
-cargo run --release
+```
+"%ProgramFiles%\OpenExplorer\openexplorer-index.exe" index uninstall
 ```
 
-O projeto usa o Rust 1.99.1 (`rust-toolchain.toml`), instalado pelo rustup. Se `rustc --version`
-mostrar outra versão, há um Rust instalado fora do rustup antes dele no `PATH`: ponha
-`%USERPROFILE%\.cargo\bin` primeiro ou desinstale o outro.
+## Google Drive
 
-Para ver a interface sem abrir janela: `cargo run -- --snap tela.png --scene stress` (abre a pasta
-de 50.000 arquivos) ou `--scene account` (uma conta de exemplo, sem rede). `--scene add-account`
-mostra o catálogo unificado de provedores (e `--scene add-server`, `--scene add-server-ftp`,
-`--scene add-nextcloud` e `--scene add-gdrive` cada etapa de configuração); `--scene server` e
-`--scene server-search` abrem um servidor WebDAV local (`rclone serve webdav <pasta> --addr 127.0.0.1:28095`).
+Until the app passes Google's verification, you need your own OAuth client (free):
 
-## Publicar uma versão
+1. Create a project in the [Google Cloud console](https://console.cloud.google.com) and enable
+   the Google Drive API.
+2. Set up the OAuth consent screen as External, in Testing, with your account as a test user.
+3. Create an OAuth client ID of type Desktop app and download the JSON.
+4. In Open Explorer, go to Add account → Google Drive and paste the JSON.
 
-As versões são compiladas no GitHub Actions (`.github/workflows/release.yml`), para Windows
-(o `.exe`, que já traz o serviço de pesquisa), Linux (`.tar.gz` com o executável, que guarda a
-permissão de execução) e macOS (`.zip` com o app universal, Apple Silicon e Intel). Para
-publicar:
+In Testing mode Google signs you out after 7 days.
 
-1. Mude `version` em `[workspace.package]` no `Cargo.toml` da raiz, rode `cargo update --workspace`
-   e faça o commit.
-2. Crie e envie a tag da mesma versão: `git tag v0.1.0` e `git push origin v0.1.0`.
+## Building from source
 
-A tag dispara a compilação nos três sistemas e cria a página da versão em **Releases** com os
-pacotes; o andamento aparece em **Actions**. Uma tag com hífen (`v0.2.0-beta.1`) sai como
-pré-lançamento. Para só testar a compilação, sem publicar: **Actions → Release → Run workflow**
-(os pacotes ficam nos artefatos da execução).
+Install Rust with [rustup](https://rustup.rs). The toolchain version is pinned in
+`rust-toolchain.toml`.
 
-Os executáveis não são assinados: o Windows (SmartScreen) e o macOS (Gatekeeper) avisam na
-primeira vez que abrem. No macOS, clique com o botão direito no app e em **Abrir**.
+```
+cargo build --release
+cargo test --workspace
+```
 
-## Código
-
-- `crates/app`: a janela (Rune): painéis, seleção, arrastar e soltar.
-- `crates/index`: o índice dos arquivos do computador e o serviço que o mantém (MFT, diário
-  USN, pipe).
-- `crates/gdrive`: login OAuth (PKCE com redirecionamento para 127.0.0.1), contas e tokens,
-  chamadas da Drive API v3. `cargo test -p openexplorer-gdrive` testa o login sem rede.
-- `crates/remote`: FTP/FTPS (suppaftp), SFTP (russh) e WebDAV (ureq): uma conexão comum aos três,
-  as conexões reaproveitadas (no máximo as que o servidor permite), a confiança em certificados
-  próprios e a lista de servidores com as senhas no cofre. `crates/app/src/relay.rs`: cópias entre
-  servidores e Google Drive, e o arrastar de servidor para fora.
-
-## O que o protótipo testa
-
-- Lista virtualizada (50.000 itens em *Meu Drive/Teste 50.000 arquivos*), ordenação por coluna.
-- Seleção com clique, Ctrl, Shift, setas, Home/End, Ctrl+A; Enter abre pasta, Backspace sobe,
-  Tab troca de painel.
-- Arrastar entre painéis: local → Drive "envia" (simulado); Drive → local copia um arquivo de
-  exemplo.
-- Soltar arquivos vindos do Explorer em qualquer painel (no painel local eles são **copiados**
-  para a pasta aberta, sem sobrescrever).
-- Arrastar do app para o Explorer. Arquivos do Drive simulado viram arquivos de exemplo em
-  `%TEMP%\OpenExplorer-drag` antes do arrasto, como um download faria.
-
-## Rune
-
-Não há versão estável do Rune: o projeto segue a branch `dev`, com o commit fixado no
-`Cargo.lock`. Para atualizar: `cargo update -p rune`. O Rune exige que o app repita a tabela
-`[patch.crates-io]` dele; se uma atualização adicionar uma entrada lá, adicione no `Cargo.toml`
-daqui também.
+The UI framework, [Rune](https://github.com/anomalyco/rune), is used from its `dev` branch and
+pinned in `Cargo.lock`.
