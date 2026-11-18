@@ -280,7 +280,7 @@ pub fn trash(s: &mut State, loc: &Location, items: Vec<Entry>) {
     undo::mega_job(s, &server, reload, move |n| tr!("mover {} para a Lixeira do MEGA", "move {} to the MEGA Rubbish Bin", crate::actions::count(n)), move |a, rec| {
         for (i, node) in nodes_of(a, &loc, &items)?.into_iter().enumerate() {
             a.trash(&node).map_err(|err| if i == 0 { err } else { tr!("{err} (já na Lixeira: {i})", "{err} (already in the Rubbish Bin: {i})") })?;
-            rec.add([Step::MegaRestore { server: at_server.clone(), node: node.handle, name: node.name }]);
+            rec.add([Step::MegaRestore { server: at_server.clone(), node: node.handle.to_string(), name: node.name }]);
         }
         Ok(tr!("Movido para a Lixeira do MEGA: {}.", "Moved to the MEGA Rubbish Bin: {}.", crate::actions::count(n)))
     });
@@ -320,7 +320,7 @@ pub fn restore(s: &mut State, p: usize) {
     undo::mega_job(s, &server, reload, move |n| tr!("restaurar {}", "restore {}", crate::actions::count(n)), move |a, rec| {
         for node in nodes_of(a, &loc, &items)? {
             a.restore(&node)?;
-            rec.add([Step::MegaTrash { server: at_server.clone(), node: node.handle, name: node.name }]);
+            rec.add([Step::MegaTrash { server: at_server.clone(), node: node.handle.to_string(), name: node.name }]);
         }
         Ok(tr!("Restaurado: {}.", "Restored: {}.", crate::actions::count(n)))
     });

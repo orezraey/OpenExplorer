@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::Result;
 use crate::account::{Account, Inner};
 use crate::api::{ESID, Fail};
-use crate::crypto::{attr_key, decrypt_attrs, fingerprint_mtime};
+use crate::crypto::{attr_key, decrypt_attrs};
 
 /// What changed since the last ask.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -108,10 +108,8 @@ fn apply(inner: &mut Inner, packets: &[Value], changes: &mut Changes) {
                 let (Some(h), Some(at)) = (p.get("n").and_then(Value::as_str), p.get("at").and_then(Value::as_str)) else { continue };
                 let Some(mut n) = tree.get(h).cloned() else { continue };
                 let Some(attrs) = decrypt_attrs(&attr_key(&n.key), at) else { continue };
-                n.name = attrs.get("n").and_then(Value::as_str).unwrap_or_default().to_string();
-                n.modified = attrs.get("c").and_then(Value::as_str).and_then(fingerprint_mtime);
-                n.attrs = attrs;
-                changes.folders.insert(n.parent.clone());
+                n.set_attrs(attrs);
+                changes.folders.insert(n.parent.to_string());
                 tree.put(n);
             }
             // Deleted, or moved away (`m`: a `t` brings it to its new folder).
@@ -119,7 +117,7 @@ fn apply(inner: &mut Inner, packets: &[Value], changes: &mut Changes) {
                 let Some(h) = p.get("n").and_then(Value::as_str) else { continue };
                 let moved = p.get("m").and_then(Value::as_i64) == Some(1);
                 if let Some(n) = tree.get(h) {
-                    changes.folders.insert(n.parent.clone());
+                    changes.folders.insert(n.parent.to_string());
                     if n.kind.is_dir() {
                         changes.folders.insert(h.to_string());
                     }
@@ -154,6 +152,29 @@ mod tests {
         Account::offline(k, tree)
     }
 
+    /// A rename made elsewhere keeps the attributes it doesn't touch: the fingerprint and
+    /// whatever else MEGA's apps put there.
+    #[test]
+    fn a_rename_keeps_the_other_attributes() {
+        let a = account();
+        let k = keys();
+        let mut attrs = serde_json::Map::new();
+        attrs.insert("n".into(), "foto.jpg".into());
+        attrs.insert("c".into(), crate::crypto::fingerprint(&[2; 16], 1_600_000_000).into());
+        attrs.insert("fav".into(), 1.into());
+        let new = crate::nodes::tests::raw_with(&k, "NEWFILE1", "ROOT0000", 0, attrs, (k.user.as_str(), k.master));
+        a.apply_packets(&[json!({"a": "t", "t": {"f": [new]}})]);
+        let node = a.node("/Drive na nuvem/foto.jpg").unwrap();
+        let mut renamed = node.attrs();
+        renamed.insert("n".into(), "praia.jpg".into());
+        renamed.insert("rr".into(), "FOLDER01".into());
+        a.apply_packets(&[json!({"a": "u", "n": "NEWFILE1", "at": encrypt_attrs(&attr_key(&node.key), &renamed)})]);
+        let after = a.node("/Drive na nuvem/praia.jpg").unwrap();
+        assert_eq!(after.attrs(), renamed);
+        assert_eq!(after.modified, Some(1_600_000_000));
+        assert!(a.node("/Drive na nuvem/foto.jpg").is_err());
+    }
+
     #[test]
     fn new_renamed_moved_and_deleted_items_touch_their_folders() {
         let a = account();
@@ -164,7 +185,7 @@ mod tests {
         assert!(a.resolve("/Drive na nuvem/Fotos/nova.jpg").is_some());
 
         let node = a.node("/Drive na nuvem/nota.txt").unwrap();
-        let mut attrs = node.attrs.clone();
+        let mut attrs = node.attrs();
         attrs.insert("n".into(), "renomeada.txt".into());
         let at = encrypt_attrs(&attr_key(&node.key), &attrs);
         let c = a.apply_packets(&[json!({"a": "u", "n": "FILE0002", "at": at})]);
@@ -173,7 +194,7 @@ mod tests {
 
         // A move: out of Cloud Drive's top, into Fotos, children and all.
         let mut moved = a.node("/Drive na nuvem/Fotos").unwrap();
-        moved.parent = "BIN00000".into();
+        moved.parent = crate::nodes::tests::h("BIN00000");
         let c = a.apply_packets(&[json!({"a": "d", "n": "FOLDER01", "m": 1})]);
         assert!(c.touches("ROOT0000") && c.touches("FOLDER01"));
         a.lock().tree.put(moved);

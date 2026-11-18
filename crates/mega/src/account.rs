@@ -18,7 +18,7 @@ use serde_json::{Map, Value, json};
 
 use crate::api::{Api, Fail, request_id};
 use crate::crypto::{attr_key, b64, ecb_encrypt, encrypt_attrs, random};
-use crate::nodes::{Keys, Kind, Node, Tree};
+use crate::nodes::{Handle, Keys, Kind, Node, Tree};
 use crate::session::{self, Refused, Session};
 use crate::{Result, store};
 
@@ -76,7 +76,7 @@ pub struct Item {
 impl Item {
     fn of(name: String, n: &Node) -> Item {
         let is_dir = n.kind.is_dir();
-        Item { name, handle: Some(n.handle.clone()), is_dir, size: (!is_dir).then_some(n.size), modified: n.modified.or(Some(n.created).filter(|t| *t > 0)) }
+        Item { name, handle: Some(n.handle.to_string()), is_dir, size: (!is_dir).then_some(n.size), modified: n.modified.or(Some(n.created).filter(|t| *t > 0)) }
     }
 
     fn area(a: Area) -> Item {
@@ -235,7 +235,7 @@ impl Account {
         match resolve(&inner.tree, path) {
             Some(Place::Node(h)) => {
                 let n = inner.tree.get(&h).expect("a resolved node");
-                Ok(if !n.parent.is_empty() && inner.tree.same_name(&n.parent, &n.name).len() > 1 { handle_path(&h) } else { path.to_string() })
+                Ok(if !n.parent.is_empty() && inner.tree.same_name(&n.parent, &n.name).nth(1).is_some() { handle_path(&h) } else { path.to_string() })
             }
             Some(_) => Ok(path.to_string()),
             None => Err(tr!("“{}” não está mais no MEGA.", "“{}” is no longer on MEGA.", last_name(path))),
@@ -290,7 +290,7 @@ impl Account {
                 return Err(t("Esta pasta foi compartilhada com você só para leitura.", "This folder was shared with you as read-only.").into());
             }
             // Without the share's key, whoever shares it couldn't open what goes in.
-            if !inner.keys.shares.contains_key(&top.handle) {
+            if !inner.keys.shares.contains_key(top.handle.as_str()) {
                 return Err(t("O Open Explorer não tem a chave desta pasta compartilhada, então quem compartilhou não conseguiria abrir o que fosse colocado nela. Use o site do MEGA para isso.", "Open Explorer doesn't have this shared folder's key, so whoever shared it couldn't open what goes in. Use the MEGA website for this.").into());
             }
         }
@@ -301,7 +301,7 @@ impl Account {
     /// tell the two apart).
     fn free(&self, parent: &str, name: &str, except: Option<&str>) -> Result<()> {
         let inner = self.lock();
-        if inner.tree.same_name(parent, name).iter().any(|h| Some(h.as_str()) != except) {
+        if inner.tree.same_name(parent, name).any(|n| Some(n.handle.as_str()) != except) {
             return Err(tr!("Já existe “{name}” nessa pasta do MEGA.", "“{name}” already exists in that MEGA folder."));
         }
         Ok(())
@@ -312,7 +312,7 @@ impl Account {
     /// nodes' keys, by their place in the command's list.
     fn share_keys_for(&self, target: &str, keys: &[Vec<u8>]) -> Option<Value> {
         let inner = self.lock();
-        let shares: Vec<(String, [u8; 16])> = inner.tree.ancestry(target).into_iter().filter_map(|n| inner.keys.shares.get(&n.handle).map(|k| (n.handle.clone(), *k))).collect();
+        let shares: Vec<(String, [u8; 16])> = inner.tree.ancestry(target).into_iter().filter_map(|n| inner.keys.shares.get(n.handle.as_str()).map(|k| (n.handle.to_string(), *k))).collect();
         if shares.is_empty() || keys.is_empty() {
             return None;
         }
@@ -379,17 +379,15 @@ impl Account {
     fn apply_attrs(&self, h: &str, attrs: Map<String, Value>) {
         let mut inner = self.lock();
         if let Some(mut n) = inner.tree.get(h).cloned() {
-            n.name = attrs.get("n").and_then(Value::as_str).unwrap_or_default().to_string();
-            n.modified = attrs.get("c").and_then(Value::as_str).and_then(crate::crypto::fingerprint_mtime);
-            n.attrs = attrs;
+            n.set_attrs(attrs);
             inner.tree.put(n);
         }
     }
 
     fn apply_parent(&self, h: &str, parent: &str) {
         let mut inner = self.lock();
-        if let Some(mut n) = inner.tree.get(h).cloned() {
-            n.parent = parent.to_string();
+        if let (Some(mut n), Some(parent)) = (inner.tree.get(h).cloned(), Handle::new(parent)) {
+            n.parent = parent;
             inner.tree.put(n);
         }
     }
@@ -401,9 +399,9 @@ impl Account {
             return Ok(());
         }
         if !n.parent.is_empty() && !self.lock().tree.in_rubbish(&n.handle) {
-            self.free(&n.parent, name, Some(&n.handle))?;
+            self.free(&n.parent, name, Some(n.handle.as_str()))?;
         }
-        let mut attrs = n.attrs.clone();
+        let mut attrs = n.attrs();
         attrs.insert("n".into(), name.into());
         self.set_attrs(n, attrs)
     }
@@ -446,7 +444,7 @@ impl Account {
             // MEGA moves only within one tree: the account's own folders, or one share.
             let (from, into) = {
                 let inner = self.lock();
-                (inner.tree.top_of(&n.handle).map(|t| t.handle.clone()), inner.tree.top_of(&parent.handle).map(|t| (t.handle.clone(), t.inshare.is_some())))
+                (inner.tree.top_of(&n.handle).map(|t| t.handle), inner.tree.top_of(&parent.handle).map(|t| (t.handle, t.inshare.is_some())))
             };
             let other_tree = match (&from, &into) {
                 (Some(f), Some((t, shared))) => f != t && (*shared || self.in_share(&n.handle)),
@@ -457,7 +455,7 @@ impl Account {
             }
             self.writable(&parent)?;
             if !keep_own {
-                self.free(&parent.handle, &name, Some(&n.handle))?;
+                self.free(&parent.handle, &name, Some(n.handle.as_str()))?;
             }
             self.move_node(&n, &parent)?;
         }
@@ -472,8 +470,8 @@ impl Account {
         if self.lock().tree.in_rubbish(&n.handle) {
             return Ok(());
         }
-        let mut attrs = n.attrs.clone();
-        attrs.insert("rr".into(), n.parent.clone().into());
+        let mut attrs = n.attrs();
+        attrs.insert("rr".into(), n.parent.to_string().into());
         let at = encrypt_attrs(&attr_key(&n.key), &attrs);
         let answers = self.api.batch(&[json!({"a": "m", "n": n.handle, "t": bin, "i": request_id()}), json!({"a": "a", "n": n.handle, "at": at, "i": request_id()})]).map_err(String::from)?;
         if let Some(code) = answers.first().and_then(Value::as_i64).filter(|c| *c < 0) {
@@ -491,14 +489,14 @@ impl Account {
     pub fn restore(&self, n: &Node) -> Result<Node> {
         let to = {
             let inner = self.lock();
-            let back = n.attrs.get("rr").and_then(Value::as_str).and_then(|h| inner.tree.get(h)).filter(|p| p.kind.is_dir() && !inner.tree.in_rubbish(&p.handle)).cloned();
+            let back = n.attrs().get("rr").and_then(Value::as_str).and_then(|h| inner.tree.get(h)).filter(|p| p.kind.is_dir() && !inner.tree.in_rubbish(&p.handle)).cloned();
             match back {
                 Some(p) => p,
                 None => inner.tree.root.as_ref().and_then(|r| inner.tree.get(r)).cloned().ok_or(t("A conta não tem Drive na nuvem.", "The account has no Cloud Drive."))?,
             }
         };
         self.move_node(n, &to)?;
-        let mut attrs = n.attrs.clone();
+        let mut attrs = n.attrs();
         if attrs.remove("rr").is_some() {
             let n = self.lock().tree.get(&n.handle).cloned().unwrap_or_else(|| n.clone());
             // Restored even if this fails: the attribute only says where it came from.
@@ -567,15 +565,15 @@ impl Account {
             let mut keys = Vec::new();
             for n in inner.tree.subtree(&src.handle) {
                 // A file keeps its key; a folder gets a new one.
-                let key = if n.kind == Kind::File { n.key.clone() } else { random::<16>().to_vec() };
-                let mut attrs = n.attrs.clone();
+                let key = if n.kind == Kind::File { n.key.to_vec() } else { random::<16>().to_vec() };
+                let mut attrs = n.attrs();
                 attrs.remove("rr");
                 if n.handle == src.handle {
                     attrs.insert("n".into(), name.clone().into());
                 }
                 let mut node = json!({"h": n.handle, "t": if n.kind == Kind::File { 0 } else { 1 }, "a": encrypt_attrs(&attr_key(&key), &attrs), "k": self.wrap(&key)});
                 if n.handle != src.handle {
-                    node["p"] = n.parent.clone().into();
+                    node["p"] = n.parent.to_string().into();
                 }
                 nodes.push(node);
                 keys.push(key);
@@ -602,8 +600,8 @@ pub(crate) fn resolve(tree: &Tree, path: &str) -> Option<Place> {
                 Area::Rubbish => Place::Node(tree.rubbish.clone()?),
                 Area::Incoming => Place::Shares,
             },
-            Place::Shares => Place::Node(tree.inshares().into_iter().find(|(name, _)| name == seg)?.1.handle.clone()),
-            Place::Node(h) => Place::Node(tree.child_named(&h, seg)?.handle.clone()),
+            Place::Shares => Place::Node(tree.inshares().into_iter().find(|(name, _)| name == seg)?.1.handle.to_string()),
+            Place::Node(h) => Place::Node(tree.child_named(&h, seg)?.handle.to_string()),
         };
     }
     Some(at)
@@ -832,7 +830,11 @@ mod tests {
     #[ignore = "benchmark"]
     fn resolving_every_item_of_a_big_folder() {
         let mut tree = Tree::default();
-        let node = |h: String, p: &str, kind: Kind, name: String, created: i64| Node { handle: h, parent: p.into(), kind, name, size: 1, created, modified: None, key: vec![0; 32], attrs: Map::new(), owner: String::new(), inshare: None, link: None };
+        let node = |h: String, p: &str, kind: Kind, name: String, created: i64| {
+            let mut n = Node::bare(&h, p, kind, &name).unwrap();
+            (n.size, n.created, n.key) = (1, created, crate::nodes::NodeKey::new(&[0; 32]));
+            n
+        };
         tree.put(node("ROOT0000".into(), "", Kind::Root, String::new(), 0));
         for i in 0..5000 {
             tree.put(node(format!("H{i:07}"), "ROOT0000", Kind::File, format!("foto {i}.jpg"), i));
