@@ -1410,6 +1410,17 @@ fn decode(s: &str) -> String {
 /// Reads `scheme://[user[:password]@]host[:port][/path]`; `None` for any other text.
 pub fn parse_address(text: &str) -> Option<Address> {
     let (scheme, rest) = text.trim().split_once("://")?;
+    // A MEGA account's own address (`mega://ana@exemplo.com/Drive na nuvem`), which only
+    // reaches an account already connected: the e-mail is the whole authority.
+    if scheme.eq_ignore_ascii_case("mega") {
+        let (email, path) = rest.split_once('/').map_or((rest, "/"), |(e, p)| (e, p));
+        let email = decode(email).trim().to_lowercase();
+        if !email.contains('@') {
+            return None;
+        }
+        let path = format!("/{}", decode(path).trim_start_matches('/'));
+        return Some(Address { protocol: Protocol::Mega, user: email, password: None, host: "mega.nz".into(), port: None, path });
+    }
     let protocol = Protocol::from_scheme(scheme)?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -1518,6 +1529,14 @@ mod tests {
         let loc = folder(&list[0], vec!["Fotos".into()]);
         assert_eq!(address_text(&loc), "sftp://ana@nas/home/ana/Fotos");
         assert_eq!(reach(&list, &parse_address(&address_text(&loc)).unwrap()), Ok(loc));
+        // A MEGA account's folder goes there and back too.
+        let mega = Server::mega("ana@exemplo.com");
+        let at = folder(&mega, vec!["Drive na nuvem".into(), "Fotos 2024".into()]);
+        assert_eq!(address_text(&at), "mega://ana@exemplo.com/Drive na nuvem/Fotos 2024");
+        let list = [list.to_vec(), vec![mega]].concat();
+        assert_eq!(reach(&list, &parse_address(&address_text(&at)).unwrap()), Ok(at));
+        assert_eq!(reach(&list, &parse_address("mega://bia@exemplo.com/").unwrap()), Err(String::new()), "an account not connected");
+        assert!(parse_address("mega://semarroba/x").is_none());
     }
 
     #[test]

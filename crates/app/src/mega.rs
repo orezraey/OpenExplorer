@@ -53,6 +53,16 @@ pub fn in_bin(loc: &Location) -> bool {
     at(loc).is_some_and(|(_, path)| area_of(path) == Some(Area::Rubbish))
 }
 
+/// Whether deleting in `loc` is for good: in the Rubbish Bin, and inside a folder shared with
+/// the account (what's there belongs to whoever shares it).
+pub fn deletes_for_good(loc: &Location) -> bool {
+    at(loc).is_some_and(|(_, path)| match area_of(path) {
+        Some(Area::Rubbish) => true,
+        Some(Area::Incoming) => path.len() >= 2,
+        _ => false,
+    })
+}
+
 /// The Rubbish Bin itself, where Restaurar, Excluir permanentemente and Esvaziar apply.
 pub fn bin_top(loc: &Location) -> bool {
     matches!(loc, Location::Server { server, path, find: None } if server.is_mega() && path.len() == 1 && area_of(path) == Some(Area::Rubbish))
@@ -264,6 +274,27 @@ pub fn trash(s: &mut State, loc: &Location, items: Vec<Entry>) {
         }
         Ok(tr!("Movido para a Lixeira do MEGA: {}.", "Moved to the MEGA Rubbish Bin: {}.", crate::actions::count(n)))
     });
+}
+
+/// Excluir permanentemente, confirmed: each item is found by what the pane shows (a twin in the
+/// bin can't take its place) and deleted for good.
+pub fn purge(s: &mut State, loc: &Location, items: Vec<Entry>) {
+    let Some((server, _)) = at(loc) else { return };
+    let server = server.clone();
+    let reload = panes_on(s, &server.id);
+    let (n, loc) = (items.len(), loc.clone());
+    task(
+        s,
+        &server,
+        "excluir do MEGA",
+        move |a| {
+            for (i, e) in items.iter().enumerate() {
+                node_of(a, &loc, e).and_then(|node| a.delete(&node)).map_err(|err| if i == 0 { err } else { tr!("{err} (já excluídos para sempre: {i})", "{err} (already deleted for good: {i})") })?;
+            }
+            Ok(tr!("Excluído para sempre: {}.", "Deleted for good: {}.", crate::actions::count(n)))
+        },
+        move |result| Msg::Done { reload, result },
+    );
 }
 
 /// Restaurar in the Rubbish Bin: each item goes back to the folder it was in (or Cloud Drive's
@@ -508,6 +539,8 @@ mod tests {
         assert!(bin_top(&at_path(&["Lixeira"])) && bin_top(&at_path(&["Rubbish Bin"])));
         assert!(!bin_top(&at_path(&["Lixeira", "velha"])) && in_bin(&at_path(&["Lixeira", "velha"])));
         assert!(!in_bin(&at_path(&["Drive na nuvem"])));
+        assert!(deletes_for_good(&at_path(&["Lixeira", "x"])) && deletes_for_good(&at_path(&["Compartilhados comigo", "Deles"])));
+        assert!(!deletes_for_good(&at_path(&["Drive na nuvem"])) && !deletes_for_good(&at_path(&["Compartilhados comigo"])));
         assert!(why_not(&at_path(&[])).is_some());
         assert!(why_not(&at_path(&["Compartilhados comigo"])).is_some());
         assert!(why_not(&at_path(&["Compartilhados comigo", "Deles"])).is_none());

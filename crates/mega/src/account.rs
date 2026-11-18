@@ -142,7 +142,10 @@ impl Account {
         match self.api.call(json!({"a": "uga", "u": keys.user, "ua": "^!keys", "v": 1})) {
             Ok(v) => match v.get("av").and_then(Value::as_str).map(crate::crypto::unb64) {
                 Some(Ok(raw)) => match crate::crypto::share_keys(&keys.master, &raw) {
-                    Ok(found) => keys.shares.extend(found),
+                    Ok(found) => {
+                        crate::api::log(&format!("MEGA ^!keys: {} chaves de compartilhamento", found.len()));
+                        keys.shares.extend(found)
+                    }
                     Err(e) => crate::api::log(&format!("MEGA ^!keys: {e}")),
                 },
                 _ => crate::api::log("MEGA ^!keys: sem valor"),
@@ -415,6 +418,18 @@ impl Account {
             return if n.name == name { Ok(()) } else { self.rename_node(&n, &name) };
         }
         if parent.handle != n.parent {
+            // MEGA moves only within one tree: the account's own folders, or one share.
+            let (from, into) = {
+                let inner = self.lock();
+                (inner.tree.top_of(&n.handle).map(|t| t.handle.clone()), inner.tree.top_of(&parent.handle).map(|t| (t.handle.clone(), t.inshare.is_some())))
+            };
+            let other_tree = match (&from, &into) {
+                (Some(f), Some((t, shared))) => f != t && (*shared || self.in_share(&n.handle)),
+                _ => false,
+            };
+            if other_tree {
+                return Err(tr!("O MEGA não move “{}” entre uma pasta compartilhada com você e as suas: copie e depois exclua.", "MEGA doesn't move “{}” between a folder shared with you and your own: copy it, then delete.", n.name));
+            }
             self.writable(&parent)?;
             self.free(&parent.handle, &name, Some(&n.handle))?;
             self.move_node(&n, &parent)?;
@@ -472,13 +487,20 @@ impl Account {
         Ok(())
     }
 
-    /// Deletes the item at `path`: to the Rubbish Bin, or for good when it's already there.
+    /// Whether node `handle` is inside a folder someone else shares: what's there belongs to
+    /// them, and can't go to this account's Rubbish Bin.
+    pub fn in_share(&self, handle: &str) -> bool {
+        self.lock().tree.top_of(handle).is_some_and(|t| t.inshare.is_some())
+    }
+
+    /// Deletes the item at `path`: to the Rubbish Bin, or for good when it's already there or in
+    /// a folder shared with this account (MEGA moves nothing between the two).
     pub fn remove(&self, path: &str) -> Result<()> {
         let n = self.node_at(path)?;
         if n.parent.is_empty() || n.inshare.is_some() {
             return Err(tr!("“{}” não pode ser excluído daqui.", "“{}” can't be deleted from here.", n.name));
         }
-        if self.lock().tree.in_rubbish(&n.handle) { self.delete(&n) } else { self.trash(&n) }
+        if self.lock().tree.in_rubbish(&n.handle) || self.in_share(&n.handle) { self.delete(&n) } else { self.trash(&n) }
     }
 
     /// Deletes the empty folder at `path` for good (undoing a new folder).
@@ -715,6 +737,9 @@ mod tests {
         assert_eq!(a.list("/Compartilhados comigo").unwrap()[0].name, "Deles");
         assert!(a.mkdir("/Compartilhados comigo/Deles/Nova").unwrap_err().contains("leitura"));
         assert!(a.remove("/Compartilhados comigo/Deles").is_err());
+        assert!(a.in_share("INSHARE1") && !a.in_share("FILE0001"));
+        // MEGA moves only within one tree: out of a share into Cloud Drive, or back, is refused here.
+        assert!(a.rename("/Drive na nuvem/nota.txt", "/Compartilhados comigo/Deles/nota.txt").unwrap_err().contains("copie"));
     }
 
     #[test]

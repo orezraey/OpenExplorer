@@ -58,6 +58,7 @@ pub fn login(api: &Api, email: &str, password: &str, code: Option<&str>) -> std:
     let email = normal_email(email);
     let failed = |f: Fail| Refused::Failed(f.text());
     let pre = api.call(json!({"a": "us0", "user": email})).map_err(failed)?;
+    crate::api::log(&format!("MEGA login: conta v{}", pre.get("v").and_then(Value::as_i64).unwrap_or(0)));
     let (pkey, uh) = match (pre.get("v").and_then(Value::as_i64), pre.get("s").and_then(Value::as_str)) {
         (Some(2), Some(salt)) => {
             let salt = unb64(salt).map_err(Refused::Failed)?;

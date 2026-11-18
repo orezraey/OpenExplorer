@@ -1028,7 +1028,7 @@ pub fn ask_delete(s: &mut State, p: usize) {
     // Explorer does). By the items' own paths, so a search's results there count too.
     let loc = &s.panes[p].loc;
     // A MEGA account has its own Rubbish Bin; deleting inside it is for good.
-    let mega_bin = crate::mega::at(loc).is_some() && !crate::mega::in_bin(loc);
+    let mega_bin = crate::mega::at(loc).is_some() && !crate::mega::deletes_for_good(loc);
     if (loc.is_local() && s.settings.skip_recycle_bin) || (matches!(loc, Location::Server { .. }) && !mega_bin) || items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_remote(&path)) {
         s.dialog = Some(Dialog::Purge { pane: p, items });
         return;
@@ -1119,6 +1119,11 @@ pub fn purge(s: &mut State) {
     if loc.is_local() {
         let paths: Vec<PathBuf> = items.iter().filter_map(|e| loc.local_path(e)).collect();
         local_job(s, vec![loc.clone()], move || ops::delete_forever(&paths).map(|_| tr!("Excluído permanentemente: {}.", "Deleted forever: {}.", count(n))));
+        s.status = tr!("Excluindo permanentemente {}…", "Deleting forever {}…", count(n));
+        return;
+    }
+    if crate::mega::at(&loc).is_some() {
+        crate::mega::purge(s, &loc, items);
         s.status = tr!("Excluindo permanentemente {}…", "Deleting forever {}…", count(n));
         return;
     }
@@ -1647,7 +1652,7 @@ mod tests {
         let sv = openexplorer_remote::Server::mega("ana@exemplo.com");
         let at = |path: &[&str]| crate::servers::folder(&sv, path.iter().map(|p| p.to_string()).collect());
         let e = |id: &str| Entry { id: id.into(), name: id.into(), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false };
-        for (path, purge) in [(&["Drive na nuvem"][..], false), (&["Drive na nuvem", "Fotos"], false), (&["Lixeira"], true), (&["Lixeira", "Velha"], true)] {
+        for (path, purge) in [(&["Drive na nuvem"][..], false), (&["Drive na nuvem", "Fotos"], false), (&["Lixeira"], true), (&["Lixeira", "Velha"], true), (&["Compartilhados comigo", "Deles"], true)] {
             s.dialog = None;
             s.panes[1].go(at(path));
             s.panes[1].set_entries(Ok(vec![e("a.txt")]));

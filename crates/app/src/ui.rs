@@ -1136,6 +1136,8 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 .into()
             } else if s.panes[*pane].loc.is_local() {
                 t("Aqui não há Lixeira: os itens serão apagados para sempre. Isso não pode ser desfeito.", "There's no Recycle Bin here: the items will be deleted for good. This can't be undone.").into()
+            } else if crate::mega::at(&s.panes[*pane].loc).is_some() && !crate::mega::in_bin(&s.panes[*pane].loc) {
+                t("Itens de uma pasta compartilhada com você pertencem a quem compartilhou: serão apagados para sempre, sem passar pela Lixeira. Isso não pode ser desfeito.", "Items in a folder shared with you belong to whoever shared it: they'll be deleted for good, skipping the Rubbish Bin. This can't be undone.").into()
             } else if crate::mega::in_bin(&s.panes[*pane].loc) {
                 t("Os itens serão apagados para sempre da Lixeira do MEGA. Isso não pode ser desfeito.", "The items will be deleted from the MEGA Rubbish Bin for good. This can't be undone.").into()
             } else if let Location::Server { server, .. } = &s.panes[*pane].loc {
