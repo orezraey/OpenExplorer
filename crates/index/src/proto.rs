@@ -27,6 +27,10 @@ pub struct Request {
     /// `within`. Absent (an older app): everything, as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skip_hidden: bool,
+    /// Answers in English rather than Portuguese: the app's language, which the service, a
+    /// process of its own, doesn't otherwise know. Absent (an older app): Portuguese.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub english: bool,
 }
 
 /// One volume's state.
@@ -111,7 +115,7 @@ mod tests {
 
     #[test]
     fn requests_and_answers_round_trip() {
-        let req = Request { text: "relatório 2025".into(), within: Some("C:\\Users\\Ana Maria".into()), limit: 100, skip_hidden: true };
+        let req = Request { text: "relatório 2025".into(), within: Some("C:\\Users\\Ana Maria".into()), limit: 100, skip_hidden: true, english: true };
         let mut buf = Vec::new();
         write_request(&mut buf, &req).unwrap();
         assert_eq!(read_request(&mut buf.as_slice()).unwrap(), req);

@@ -96,7 +96,7 @@ fn service() -> Service {
 #[cfg(windows)]
 pub fn search(f: &Found, show_hidden: bool) -> (Result<Vec<Entry>, String>, Info) {
     use openexplorer_index::proto::Request;
-    let req = Request { text: f.text.clone(), within: f.within.as_ref().map(|w| w.display().to_string()), limit: LIMIT, skip_hidden: !show_hidden };
+    let req = Request { text: f.text.clone(), within: f.within.as_ref().map(|w| w.display().to_string()), limit: LIMIT, skip_hidden: !show_hidden, english: openexplorer_i18n::english() };
     match openexplorer_index::pipe::ask(&req) {
         Ok(a) => {
             let raw_len = a.rows.len();
@@ -144,7 +144,7 @@ pub fn search(f: &Found, show_hidden: bool) -> (Result<Vec<Entry>, String>, Info
 #[cfg(target_os = "linux")]
 pub fn search(f: &Found, show_hidden: bool) -> (Result<Vec<Entry>, String>, Info) {
     use openexplorer_index::proto::Request;
-    let req = Request { text: f.text.clone(), within: f.within.as_ref().map(|w| w.display().to_string()), limit: LIMIT, skip_hidden: !show_hidden };
+    let req = Request { text: f.text.clone(), within: f.within.as_ref().map(|w| w.display().to_string()), limit: LIMIT, skip_hidden: !show_hidden, english: openexplorer_i18n::english() };
     match openexplorer_index::unix::ask(&req) {
         Ok(a) => {
             let info = Info { total: a.header.total, shown: a.rows.len(), indexing: a.header.volumes.iter().filter(|v| v.indexing).map(|v| v.root.clone()).collect(), service: Service::Running };

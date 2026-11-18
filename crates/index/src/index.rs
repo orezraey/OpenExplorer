@@ -95,6 +95,8 @@ impl Index {
     }
 
     pub fn answer(&self, req: &Request) -> Answer {
+        // In the app's language. One app asks this service, so its requests all agree.
+        openexplorer_i18n::set_english(req.english);
         let t = Instant::now();
         let volumes = self.vols.iter().map(|v| v.describe()).collect();
         let Some(query) = Query::new(&req.text) else { return Answer { header: Header { volumes, ..Header::default() }, rows: Vec::new() } };
