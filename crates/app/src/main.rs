@@ -12,6 +12,7 @@ mod actions;
 mod address;
 mod autoscroll;
 mod cache;
+mod caches;
 mod downloads;
 #[cfg(windows)]
 mod dragout;
@@ -98,6 +99,8 @@ enum Msg {
     Undo(undo::Answer),
     /// Something background work on a MEGA account brought back.
     Mega(mega::Answer),
+    /// What the caches take, measured or cleared for Opções › Cache.
+    Caches(caches::Answer),
     /// Installing the search service ended: search again in the panes `reload` shows.
     Installed { reload: Vec<Location>, result: Result<String, String> },
     /// A drag of Drive items `ids` out of pane `from` ended.
@@ -538,6 +541,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
             Msg::Undo(answer) => undo::arrived(s, answer),
             Msg::Mega(answer) => mega::arrived(s, answer, tx, now),
+            Msg::Caches(answer) => caches::arrived(s, answer),
             Msg::Changes { email, result } => watch::arrived(s, email, result, now),
             Msg::Quota { email, result } => {
                 if s.accounts.iter().any(|a| a.email == email) {
@@ -1612,6 +1616,14 @@ fn clash_scene(s: &mut State, all: bool) {
     s.dialog = Some(actions::Dialog::Clash(Box::new(actions::ClashAsk { up, existing, clashes: vec![0, 1, 2], chosen, all })));
 }
 
+/// Opções open on Cache, its sizes fixed, then `then` applied to the page.
+fn cache_scene(s: &mut State, then: fn(&mut caches::Page)) {
+    let mut v = settings::OptionsView::open(settings::OptionsTab::Cache);
+    v.cache.usage = Some(caches::Usage { drive: 3_565_158, mega: 48_211_968 });
+    then(&mut v.cache);
+    s.dialog = Some(actions::Dialog::Options(Box::new(v)));
+}
+
 /// The scenes' server: `rclone serve webdav <folder> --addr 127.0.0.1:28095`.
 fn server_scene(s: &mut State, find: Option<&str>) {
     let server = openexplorer_remote::Server {
@@ -1771,6 +1783,20 @@ fn main() {
             ("options", |s| s.dialog = Some(actions::Dialog::Options(Box::new(settings::OptionsView::open(settings::OptionsTab::General))))),
             ("options-transfers", |s| s.dialog = Some(actions::Dialog::Options(Box::new(settings::OptionsView::open(settings::OptionsTab::Transfers))))),
             ("options-experimental", |s| s.dialog = Some(actions::Dialog::Options(Box::new(settings::OptionsView::open(settings::OptionsTab::Experimental))))),
+            // Opções › Cache with fixed sizes (not the real folders'), as measured, asking to
+            // clear, and after a clear that left a file in use.
+            ("options-cache", |s| cache_scene(s, |_| {})),
+            ("options-cache-confirm", |s| cache_scene(s, |p| p.confirming = true)),
+            ("options-cache-error", |s| {
+                cache_scene(s, |p| {
+                    p.usage = Some(caches::Usage { drive: 0, mega: 48_211_968 });
+                    p.error = Some(tr!(
+                        "Não foi possível apagar {}: O arquivo já está sendo usado por outro processo. (os error 32). Feche o que estiver usando o arquivo e tente de novo.",
+                        "Couldn't delete {}: The process cannot access the file because it is being used by another process. (os error 32). Close whatever is using the file and try again.",
+                        r"C:\Users\voce\AppData\Local\OpenExplorer\mega\3f9a0c1b.tree"
+                    ));
+                })
+            }),
             ("options-logs", |s| {
                 let mut v = settings::OptionsView::open(settings::OptionsTab::Logs);
                 if v.log_lines.is_empty() {

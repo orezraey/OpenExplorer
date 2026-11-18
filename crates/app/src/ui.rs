@@ -139,6 +139,9 @@ fn set_options_tab(s: &mut State, tab: crate::settings::OptionsTab) {
             opt.refresh_logs();
         }
     }
+    if tab == crate::settings::OptionsTab::Cache {
+        crate::caches::measure(s);
+    }
 }
 
 /// The Opções body's height: 530 points, or less in a window too short for that (the dialog
@@ -580,6 +583,18 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .child(speed_card)
                 .child(info_box)
         }
+        OptionsTab::Cache => cache_page(
+            k,
+            &opt.cache,
+            card_box("card-cache"),
+            section_head(
+                "Cache",
+                t(
+                    "Cópias locais das pastas do Google Drive e das contas MEGA, para que abram sem esperar pela rede.",
+                    "Local copies of Google Drive folders and MEGA accounts, so they open without waiting for the network.",
+                ),
+            ),
+        ),
         OptionsTab::Logs => {
             let visible = opt.filtered_logs();
             let size_badge = if opt.log_bytes > 0 { format_size(opt.log_bytes) } else { t("Vazio", "Empty").into() };
@@ -765,6 +780,134 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
         .child(right_col);
 
     Modal::new("options", t("Opções", "Options")).open(true).child(body).width(750.0).fit().on_close(close).build(k, layer);
+}
+
+/// Opções › Cache: what each cache takes, and Limpar cache with its confirmation and what it
+/// couldn't delete. `card` and `head` are the page's card and title, as the other pages draw them.
+fn cache_page(k: &Kit, page: &crate::caches::Page, card: El, head: El) -> El {
+    let usage = page.usage;
+    let size = |n: Option<u64>| match n {
+        Some(n) => format_size(n),
+        None => t("Calculando…", "Measuring…").into(),
+    };
+    let ink = |known: bool| if known { k.c.text_base } else { k.c.text_faint };
+    let words = |title: &str, desc: String| {
+        col()
+            .grow(1.0)
+            .w(0.0)
+            .min_w(0.0)
+            .gap(2.0)
+            .child(text(title.to_string()).font(k.ty.text_small_medium).color(k.c.text_base))
+            .child(text(desc).font(k.ty.caption()).color(k.c.text_muted).wrap_anywhere().w_full().min_w(0.0))
+    };
+    let line = |key: &'static str, title: &str, desc: String, bytes: Option<u64>| {
+        row().key(key).w_full().px(14.0).py(11.0).gap(12.0).center_y().child(words(title, desc)).child(text(size(bytes)).font(k.ty.text_small).color(ink(bytes.is_some())))
+    };
+    let divider = || el().w_full().h(1.0).fill(k.c.border_weak);
+    let root = openexplorer_gdrive::local_dir();
+
+    let total_note = if page.clearing {
+        t("Limpando…", "Clearing…")
+    } else if page.waiting != 0 && usage.is_some() {
+        t("Atualizando…", "Updating…")
+    } else {
+        t("As duas pastas abaixo somadas.", "Both folders below added up.")
+    };
+    let total = row()
+        .key("cache-total")
+        .w_full()
+        .px(14.0)
+        .py(12.0)
+        .gap(12.0)
+        .center_y()
+        .child(words(t("Espaço usado pelo cache", "Space used by the cache"), total_note.into()))
+        .child(text(size(usage.map(crate::caches::Usage::total))).font(k.ty.body_medium).color(ink(usage.is_some())));
+
+    let mut clear = Button::new(if page.clearing { t("Limpando…", "Clearing…") } else { t("Limpar cache", "Clear cache") })
+        .variant(ButtonVariant::Danger)
+        .disabled(page.clearing || page.confirming || usage.is_some_and(|u| u.total() == 0));
+    if !page.clearing {
+        clear = clear.on_press(|s: &mut State| crate::caches::confirm(s, true));
+    }
+    let actions = row()
+        .key("cache-actions")
+        .w_full()
+        .px(14.0)
+        .py(11.0)
+        .gap(12.0)
+        .center_y()
+        .child(
+            text(t("Contas, sessões e configurações não são apagadas.", "Accounts, sessions and settings aren't deleted."))
+                .font(k.ty.caption())
+                .color(k.c.text_muted)
+                .wrap()
+                .grow(1.0)
+                .w(0.0)
+                .min_w(0.0),
+        )
+        .child(clear.build(k).key("cache-clear"));
+
+    let card = card
+        .child(total)
+        .child(divider())
+        .child(line("cache-drive", t("Listagens do Google Drive", "Google Drive listings"), root.join("cache").display().to_string(), usage.map(|u| u.drive)))
+        .child(divider())
+        .child(line("cache-mega", t("Contas MEGA", "MEGA accounts"), root.join("mega").display().to_string(), usage.map(|u| u.mega)))
+        .child(divider())
+        .child(actions);
+
+    let mut out = col().key("page-cache").w_full().gap(12.0).child(head).child(card);
+
+    if page.confirming {
+        let ask = col()
+            .key("cache-confirm")
+            .role("alertdialog")
+            .label(t("Limpar o cache?", "Clear the cache?"))
+            .w_full()
+            .px(14.0)
+            .py(12.0)
+            .gap(10.0)
+            .radius(k.radius.md)
+            .fill(k.alpha(k.c.warning.fg, if k.dark { 0.10 } else { 0.07 }))
+            .border(1.0, k.alpha(k.c.warning.fg, 0.30))
+            .child(text(t("Limpar o cache?", "Clear the cache?")).font(k.ty.text_small_medium).color(k.c.text_base))
+            .child(
+                text(t(
+                    "As pastas do Google Drive e as contas MEGA apenas voltarão a ser lidas pela rede na próxima vez que forem abertas, o que pode demorar um pouco mais. Contas, sessões e configurações continuam como estão.",
+                    "Google Drive folders and MEGA accounts will just be read from the network again the next time they're opened, which may take a little longer. Accounts, sessions and settings stay as they are.",
+                ))
+                .font(k.ty.caption())
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full()
+                .min_w(0.0),
+            )
+            .child(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .child(el().grow(1.0))
+                    .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(|s: &mut State| crate::caches::confirm(s, false)).build(k).key("cache-cancel"))
+                    .child(Button::new(t("Limpar cache", "Clear cache")).variant(ButtonVariant::Danger).on_press(crate::caches::clear).build(k).key("cache-clear-yes")),
+            );
+        out = out.child(ask);
+    }
+
+    if let Some(e) = &page.error {
+        out = out.child(
+            row()
+                .key("cache-error")
+                .role("alert")
+                .w_full()
+                .px(12.0)
+                .py(10.0)
+                .radius(k.radius.md)
+                .fill(k.alpha(k.c.danger.fg, if k.dark { 0.10 } else { 0.06 }))
+                .border(1.0, k.alpha(k.c.danger.fg, 0.30))
+                .child(text(e.clone()).font(k.ty.caption()).color(k.c.danger.fg).selectable(true).selection_color(k.selection()).wrap_anywhere().w_full().min_w(0.0)),
+        );
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------------------------
