@@ -230,7 +230,11 @@ fn init() -> State {
         settings.language.apply();
     }
     let mock = MockDrive::new();
-    let mut panes = [Pane::new(Location::home()), Pane::new(Location::Mock(Vec::new()))];
+    // Both panes open on the Desktop, at the top, as a first run does: nothing of where the last
+    // run was is kept. The simulated drive stays in the tree, for trying things out.
+    let places = places::places();
+    let start = places.desktop.as_ref().map_or_else(Location::home, |(dir, _)| Location::Local(dir.clone()));
+    let mut panes = [Pane::new(start.clone()), Pane::new(start)];
     for p in &mut panes {
         p.load_now(&mock, settings.show_hidden);
     }
@@ -258,7 +262,7 @@ fn init() -> State {
         clip: None,
         undo: Default::default(),
         local_drives: model::local_drives(),
-        places: places::places(),
+        places,
         tree,
         layout: layout::Layout::load(),
         live: Default::default(),
