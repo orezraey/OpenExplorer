@@ -182,6 +182,14 @@ impl Progress {
         self.bytes.fetch_add(n, Ordering::Relaxed);
         self.tick(false);
     }
+
+    /// A transfer that had reached `*reached` bytes says it's at `now`: what's new is added,
+    /// and a count that goes back (a part sent again) adds nothing until it passes `*reached`
+    /// again, so the bar neither wraps around nor counts the part twice.
+    pub fn reached(&self, reached: &mut u64, now: u64) {
+        self.add_bytes(now.saturating_sub(*reached));
+        *reached = (*reached).max(now);
+    }
 }
 
 /// Characters Windows doesn't allow in a file name.

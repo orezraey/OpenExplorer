@@ -393,8 +393,7 @@ fn fetch(c: &mut dyn Conn, path: &str, is_dir: bool, modified: Option<SystemTime
     let mut file = std::fs::File::create_new(local).map_err(|e| tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", local.display()))?;
     let mut last = 0;
     let got = c.download(path, &mut file, &mut |n| {
-        p.add_bytes(n - last);
-        last = n;
+        p.reached(&mut last, n);
         !p.cancelled()
     });
     if let Err(e) = got {
@@ -459,8 +458,7 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
                 let mut last = vec![0u64; rows.len()];
                 c.upload_files(&files, &mut |k, n| {
                     let p = rows[k].1;
-                    p.add_bytes(n.saturating_sub(last[k]));
-                    last[k] = last[k].max(n);
+                    p.reached(&mut last[k], n);
                     !p.cancelled()
                 })
                 .into_iter()
@@ -525,8 +523,7 @@ fn send(c: &mut dyn Conn, src: &Path, target: &str, p: &Progress) -> Result<(), 
             }
             let mut last = vec![0u64; files.len()];
             let sent = c.upload_files(files, &mut |k, n| {
-                p.add_bytes(n.saturating_sub(last[k]));
-                last[k] = last[k].max(n);
+                p.reached(&mut last[k], n);
                 !p.cancelled()
             });
             if let Some(e) = sent.into_iter().find_map(Result::err) {
@@ -537,8 +534,7 @@ fn send(c: &mut dyn Conn, src: &Path, target: &str, p: &Progress) -> Result<(), 
     }
     let mut last = 0;
     c.upload_file(target, src, &mut |n| {
-        p.add_bytes(n - last);
-        last = n;
+        p.reached(&mut last, n);
         !p.cancelled()
     })
     .map_err(cancelled)
@@ -1694,8 +1690,77 @@ pub fn reach(servers: &[Server], a: &Address) -> Result<Location, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A connection whose transfers report the counts given, in turn: a count that goes back
+    /// is what a service sending a part again reports (OneDrive's upload session past 4 MiB).
+    pub(crate) struct Resends(pub Vec<u64>);
+
+    impl Resends {
+        fn report(&self, progress: remote::Progress) -> remote::Result<()> {
+            for &n in &self.0 {
+                if !progress(n) {
+                    return Err(CANCELLED.into());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Conn for Resends {
+        fn list(&mut self, _: &str) -> remote::Result<Vec<Item>> {
+            Ok(Vec::new())
+        }
+        fn stat(&mut self, _: &str) -> remote::Result<Option<Item>> {
+            Ok(None)
+        }
+        fn mkdir(&mut self, _: &str) -> remote::Result<()> {
+            Ok(())
+        }
+        fn rename(&mut self, _: &str, _: &str) -> remote::Result<()> {
+            Ok(())
+        }
+        fn remove_file(&mut self, _: &str) -> remote::Result<()> {
+            Ok(())
+        }
+        fn remove_dir(&mut self, _: &str) -> remote::Result<()> {
+            Ok(())
+        }
+        fn download(&mut self, _: &str, _: &mut dyn std::io::Write, progress: remote::Progress) -> remote::Result<()> {
+            self.report(progress)
+        }
+        fn upload(&mut self, _: &str, _: &mut dyn std::io::Read, _: u64, progress: remote::Progress) -> remote::Result<()> {
+            self.report(progress)
+        }
+        fn home(&mut self) -> remote::Result<String> {
+            Ok("/".into())
+        }
+        fn is_link(&mut self, _: &str) -> remote::Result<bool> {
+            Ok(false)
+        }
+        fn alive(&mut self) -> bool {
+            true
+        }
+    }
+
+    /// A transfer whose count goes back (a part sent again) neither wraps the queue's bytes
+    /// around nor counts the part twice: the row ends at the file's size.
+    #[test]
+    fn a_count_that_goes_back_neither_wraps_nor_counts_twice() {
+        let dir = std::env::temp_dir().join(format!("oe-servers-resend-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = dir.join("x.bin");
+        std::fs::write(&local, [0u8; 30]).unwrap();
+        let p = Progress::new(None);
+        send(&mut Resends(vec![10, 20, 5, 30]), &local, "/x.bin", &p).unwrap();
+        assert_eq!(p.bytes.load(Ordering::Relaxed), 30);
+        let p = Progress::new(None);
+        fetch(&mut Resends(vec![10, 20, 5, 30]), "/x.bin", false, None, &dir.join("y.bin"), &p, 0).unwrap();
+        assert_eq!(p.bytes.load(Ordering::Relaxed), 30);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn server(protocol: Protocol, host: &str, root: &str) -> Server {
         Server { id: format!("{host}{root}"), name: host.into(), protocol, brand: None, host: host.into(), port: protocol.default_port(), user: "ana".into(), root: root.into(), key: None, host_key: None, cert: None, connections: 4, implicit: false }

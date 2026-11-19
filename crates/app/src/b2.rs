@@ -731,8 +731,7 @@ fn resume_upload(s: &mut State, id: &str) {
                 crate::servers::with(&pool, &server, |c| {
                     let mut last = 0;
                     c.upload_file(&path, &local, &mut |n| {
-                        p.add_bytes(n.saturating_sub(last));
-                        last = last.max(n);
+                        p.reached(&mut last, n);
                         !p.cancelled()
                     })
                 })

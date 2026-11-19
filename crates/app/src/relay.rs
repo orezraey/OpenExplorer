@@ -120,8 +120,7 @@ fn stream(a: &mut dyn Conn, from: &str, b: &mut dyn Conn, to: &str, len: u64, p:
         let mut out = PipeOut { rx, chunk: Vec::new(), at: 0 };
         let mut last = 0;
         let sent = b.upload(to, &mut out, len, &mut |n| {
-            p.add_bytes(n - last);
-            last = n;
+            p.reached(&mut last, n);
             !p.cancelled()
         });
         // The upload stopping closes the pipe, which stops the download.
@@ -143,8 +142,7 @@ fn relay(c: &mut dyn Conn, from: &str, to: &str, len: u64, p: &Progress) -> Resu
     // The bar counts both ways (its size is twice the file's): down, then up.
     let mut last = 0;
     c.download(from, &mut file, &mut |n| {
-        p.add_bytes(n - last);
-        last = n;
+        p.reached(&mut last, n);
         !p.cancelled()
     })
     .map_err(|e| if p.cancelled() { CANCELLED.into() } else { e })?;
@@ -152,8 +150,7 @@ fn relay(c: &mut dyn Conn, from: &str, to: &str, len: u64, p: &Progress) -> Resu
     let mut file = std::fs::File::open(&tmp.0).map_err(|e| tr!("Não consegui ler o arquivo temporário: {e}", "Couldn't read the temporary file: {e}"))?;
     let mut last = 0;
     c.upload(to, &mut file, len, &mut |n| {
-        p.add_bytes(n - last);
-        last = n;
+        p.reached(&mut last, n);
         !p.cancelled()
     })
     .map_err(|e| if p.cancelled() { CANCELLED.into() } else { e })
@@ -395,16 +392,14 @@ fn up(c: &mut dyn Conn, d: &Drive, path: &str, is_dir: bool, parent: &str, name:
     let mut file = std::fs::File::create(&tmp.0).map_err(|e| tr!("Não consegui criar o arquivo temporário: {e}", "Couldn't create the temporary file: {e}"))?;
     let mut last = 0;
     c.download(path, &mut file, &mut |n| {
-        p.add_bytes(n - last);
-        last = n;
+        p.reached(&mut last, n);
         !p.cancelled()
     })
     .map_err(|e| if p.cancelled() { CANCELLED.into() } else { e })?;
     drop(file);
     let mut last = 0;
     d.upload(&tmp.0, parent, name, &mut |n| {
-        p.add_bytes(n.saturating_sub(last));
-        last = n;
+        p.reached(&mut last, n);
         !p.cancelled()
     })
     .map(|_| ())
@@ -495,16 +490,14 @@ fn down(c: &mut dyn Conn, d: &Drive, f: &DriveFile, target: &str, shared: Option
     let mut last = 0;
     let len = d
         .download(f, &tmp.0, false, &mut |n| {
-            p.add_bytes(n.saturating_sub(last));
-            last = n;
+            p.reached(&mut last, n);
             !p.cancelled()
         })
         .map_err(|e| if p.cancelled() { CANCELLED.into() } else { e })?;
     let mut file = std::fs::File::open(&tmp.0).map_err(|e| tr!("Não consegui ler o arquivo temporário: {e}", "Couldn't read the temporary file: {e}"))?;
     let mut last = 0;
     c.upload(target, &mut file, len, &mut |n| {
-        p.add_bytes(n - last);
-        last = n;
+        p.reached(&mut last, n);
         !p.cancelled()
     })
     .map(|_| 0)
@@ -601,4 +594,25 @@ fn described(
         described(c, &child(path, &it.name), &it.name, it.is_dir, it.size, it.modified, &at, &mut inner, out, stop, depth + 1)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+    use crate::servers::tests::Resends;
+
+    /// Between two servers, or down and up again within one, a count that goes back (a part
+    /// sent again) neither wraps the row's bytes around nor counts the part twice.
+    #[test]
+    fn a_count_that_goes_back_neither_wraps_nor_counts_twice() {
+        let p = Progress::new(None);
+        stream(&mut Resends(vec![10, 20, 5, 30]), "/a", &mut Resends(vec![10, 20, 5, 30]), "/b", 30, &p).unwrap();
+        assert_eq!(p.bytes.load(Ordering::Relaxed), 30);
+        // Down, then up: the bar counts both ways.
+        let p = Progress::new(None);
+        relay(&mut Resends(vec![10, 20, 5, 30]), "/a", "/b", 30, &p).unwrap();
+        assert_eq!(p.bytes.load(Ordering::Relaxed), 60);
+    }
 }

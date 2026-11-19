@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use openexplorer_b2::{Account, Uploads};
 
-use crate::{CANCELLED, Conn, Item, Progress, Result, Server};
+use crate::{CANCELLED, Conn, Item, Progress, Result, Server, onward};
 
 /// The B2 key `server` stands for: its key ID is the server's user.
 pub struct B2 {
@@ -34,17 +34,6 @@ fn item(i: openexplorer_b2::Item) -> Item {
 /// The crate's word for a cancelled transfer is the same as ours; kept apart in case it changes.
 fn same_cancel(e: String) -> String {
     if e == openexplorer_b2::CANCELLED { CANCELLED.into() } else { e }
-}
-
-/// An upload's progress that never goes back: a part or a file sent again after a busy answer
-/// starts its count over, and the queue's rows add what's new since the last count (a count
-/// going back would wrap around).
-fn onward(progress: Progress<'_>) -> impl FnMut(u64) -> bool + '_ {
-    let mut top = 0;
-    move |n| {
-        top = top.max(n);
-        progress(top)
-    }
 }
 
 impl Conn for B2 {
@@ -79,7 +68,7 @@ impl Conn for B2 {
     }
 
     fn download(&mut self, path: &str, out: &mut dyn Write, progress: Progress) -> Result<()> {
-        self.account.download(path, out, progress).map_err(same_cancel)
+        self.account.download(path, out, &mut onward(progress)).map_err(same_cancel)
     }
 
     fn upload(&mut self, path: &str, src: &mut dyn Read, len: u64, progress: Progress) -> Result<()> {
@@ -107,23 +96,5 @@ impl Conn for B2 {
 
     fn alive(&mut self) -> bool {
         true
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn upload_progress_never_goes_back() {
-        let mut seen = Vec::new();
-        let mut report = |n| {
-            seen.push(n);
-            true
-        };
-        let mut onward = super::onward(&mut report);
-        for n in [10, 20, 0, 5, 30] {
-            onward(n);
-        }
-        drop(onward);
-        assert_eq!(seen, [10, 20, 20, 20, 30]);
     }
 }

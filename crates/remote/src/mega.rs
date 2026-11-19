@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use openexplorer_mega::Account;
 
-use crate::{CANCELLED, Conn, Item, Progress, Result, Server};
+use crate::{CANCELLED, Conn, Item, Progress, Result, Server, onward};
 
 /// The MEGA account `server` stands for: its e-mail is the server's user.
 pub struct Mega {
@@ -64,11 +64,11 @@ impl Conn for Mega {
     }
 
     fn download(&mut self, path: &str, out: &mut dyn Write, progress: Progress) -> Result<()> {
-        self.account.download(path, out, progress).map_err(same_cancel)
+        self.account.download(path, out, &mut onward(progress)).map_err(same_cancel)
     }
 
     fn upload(&mut self, path: &str, src: &mut dyn Read, len: u64, progress: Progress) -> Result<()> {
-        self.account.upload(path, src, len, progress).map(|_| ()).map_err(same_cancel)
+        self.account.upload(path, src, len, &mut onward(progress)).map(|_| ()).map_err(same_cancel)
     }
 
     fn home(&mut self) -> Result<String> {

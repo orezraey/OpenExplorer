@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use openexplorer_dropbox::{Account, Entry};
 
-use crate::{CANCELLED, Conn, Item, Progress, Result, Server};
+use crate::{CANCELLED, Conn, Item, Progress, Result, Server, onward, onward_each};
 
 /// The Dropbox account `server` stands for: its e-mail is the server's user.
 pub struct Dropbox {
@@ -67,11 +67,11 @@ impl Conn for Dropbox {
     }
 
     fn download(&mut self, path: &str, out: &mut dyn Write, progress: Progress) -> Result<()> {
-        self.account.download(path, out, progress).map_err(same_cancel)
+        self.account.download(path, out, &mut onward(progress)).map_err(same_cancel)
     }
 
     fn upload(&mut self, path: &str, src: &mut dyn Read, len: u64, progress: Progress) -> Result<()> {
-        self.account.upload(path, src, len, progress).map(|_| ()).map_err(same_cancel)
+        self.account.upload(path, src, len, &mut onward(progress)).map(|_| ()).map_err(same_cancel)
     }
 
     /// Not sent when the same bytes are already there (same size and `content_hash`), as the
@@ -110,7 +110,7 @@ impl Conn for Dropbox {
     /// Small files together, a few requests for up to 250 of them; bigger ones each alone. A
     /// file whose same bytes are already there isn't sent.
     fn upload_files(&mut self, files: &[(String, PathBuf)], progress: &mut dyn FnMut(usize, u64) -> bool) -> Vec<Result<()>> {
-        self.account.upload_many(files, progress).into_iter().map(|r| r.map(|_| ()).map_err(same_cancel)).collect()
+        self.account.upload_many(files, &mut onward_each(progress)).into_iter().map(|r| r.map(|_| ()).map_err(same_cancel)).collect()
     }
 
     fn batches(&self) -> (usize, u64) {

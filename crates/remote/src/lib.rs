@@ -312,8 +312,34 @@ pub struct Item {
     pub link: bool,
 }
 
-/// Called with the bytes moved so far; `false` stops the transfer with [`CANCELLED`].
+/// Called with the bytes moved so far, never fewer than before (see [`onward`]); `false` stops
+/// the transfer with [`CANCELLED`].
 pub type Progress<'a> = &'a mut dyn FnMut(u64) -> bool;
+
+/// A transfer's progress that never goes back, as every [`Conn`] hands it on: a part or a file
+/// a cloud service is sent again (after a busy answer, or OneDrive's upload session past
+/// 4 MiB) starts its count over, and the queue's rows add what's new since the last count.
+/// SFTP, FTP and WebDAV count up by themselves (see [`pump`]); the cloud accounts' connections
+/// pass what their crates report through this.
+pub(crate) fn onward(progress: Progress<'_>) -> impl FnMut(u64) -> bool + '_ {
+    let mut top = 0;
+    move |n| {
+        top = top.max(n);
+        progress(top)
+    }
+}
+
+/// [`onward`] for each file of a batch ([`Conn::upload_files`]).
+pub(crate) fn onward_each(progress: &mut dyn FnMut(usize, u64) -> bool) -> impl FnMut(usize, u64) -> bool + '_ {
+    let mut top: Vec<u64> = Vec::new();
+    move |i, n| {
+        if top.len() <= i {
+            top.resize(i + 1, 0);
+        }
+        top[i] = top[i].max(n);
+        progress(i, top[i])
+    }
+}
 
 /// A logged-in connection. FTP serves one command at a time, so a connection is never shared:
 /// each job takes one from the [`Pool`] and gives it back.
@@ -712,6 +738,33 @@ mod tests {
 
     fn server(protocol: Protocol, port: u16) -> Server {
         Server { id: "x".into(), name: "x".into(), protocol, brand: None, host: "nas".into(), port, user: "ana@casa".into(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false }
+    }
+
+    #[test]
+    fn progress_handed_on_never_goes_back() {
+        let mut seen = Vec::new();
+        let mut report = |n| {
+            seen.push(n);
+            true
+        };
+        let mut onward = onward(&mut report);
+        for n in [10, 20, 0, 5, 30] {
+            onward(n);
+        }
+        drop(onward);
+        assert_eq!(seen, [10, 20, 20, 20, 30]);
+        // Each file of a batch on its own.
+        let mut seen = Vec::new();
+        let mut report = |i, n| {
+            seen.push((i, n));
+            true
+        };
+        let mut each = onward_each(&mut report);
+        for (i, n) in [(1, 10), (0, 4), (1, 3), (0, 8), (1, 12)] {
+            each(i, n);
+        }
+        drop(each);
+        assert_eq!(seen, [(1, 10), (0, 4), (1, 10), (0, 8), (1, 12)]);
     }
 
     #[test]
