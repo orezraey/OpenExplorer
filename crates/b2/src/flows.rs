@@ -617,3 +617,59 @@ fn new_folders_are_markers_and_go_back_empty() {
     a.remove_dir("/fotos/Nova").unwrap();
     assert!(!names(&a, "/fotos").contains(&"Nova/".to_string()));
 }
+
+/// A folder of 12 files and, last in name order (so the 8 at once have all started the others
+/// before it), one B2 refuses to change; and one hidden before, which no undo may bring back.
+fn batch_mock() -> Mock {
+    let m = mock();
+    {
+        let mut st = m.lock();
+        for i in 0..12 {
+            st.add("bkt_fotos", &format!("lote/a{i:02}.txt"), b"x");
+        }
+        st.add("bkt_fotos", "lote/antes.txt", b"velho");
+        st.hide("bkt_fotos", "lote/antes.txt");
+        st.add("bkt_fotos", "lote/z.txt", b"z");
+    }
+    m.faults.refused.lock().unwrap().push("lote/z.txt".into());
+    m
+}
+
+#[test]
+fn a_folder_delete_that_stops_midway_says_from_when_to_bring_back() {
+    let m = batch_mock();
+    let a = m.account();
+    let stopped = a.hide("/fotos/lote", true).unwrap_err();
+    assert!(stopped.error.contains("feitos antes do erro"), "{}", stopped.error);
+    let since = stopped.since.expect("what was hidden before the error");
+    assert_eq!(names(&a, "/fotos/lote"), ["z.txt"]);
+    // Desfazer from that time brings back what was hidden, not what was hidden before.
+    assert_eq!(a.unhide("/fotos/lote", true, since).unwrap(), 12);
+    let mut want: Vec<String> = (0..12).map(|i| format!("a{i:02}.txt")).collect();
+    want.push("z.txt".into());
+    assert_eq!(names(&a, "/fotos/lote"), want);
+    // Refused before hiding anything: nothing to bring back.
+    let stopped = a.hide("/fotos/lote/z.txt", false).unwrap_err();
+    assert_eq!(stopped.since, None);
+    m.faults.refused.lock().unwrap().push("vazia/.bzEmpty".into());
+    assert_eq!(a.hide("/fotos/vazia", true).unwrap_err().since, None);
+}
+
+#[test]
+fn a_copy_or_rename_that_fails_midway_takes_back_what_it_made() {
+    let m = batch_mock();
+    let a = m.account();
+    let before = names(&a, "/fotos/lote");
+    m.faults.refused.lock().unwrap().push("copia/z.txt".into());
+    assert!(a.copy("/fotos/lote", "/docs/copia").is_err());
+    assert!(!m.lock().versions.iter().any(|v| v.name.starts_with("copia/")), "deleted, not left hidden");
+    m.faults.refused.lock().unwrap().push("movida/z.txt".into());
+    assert!(a.rename("/fotos/lote", "/fotos/movida").is_err());
+    assert!(!m.lock().versions.iter().any(|v| v.name.starts_with("movida/")));
+    assert_eq!(names(&a, "/fotos/lote"), before, "the original as it was");
+    // All copied, but an old name that won't leave: said, and nothing lost.
+    let e = a.rename("/fotos/lote", "/fotos/nova").unwrap_err();
+    assert!(e.contains("Tudo foi copiado") && e.contains("1 de 13"), "{e}");
+    assert_eq!(names(&a, "/fotos/nova"), before);
+    assert_eq!(names(&a, "/fotos/lote"), ["z.txt"]);
+}

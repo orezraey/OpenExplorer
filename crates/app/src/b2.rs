@@ -492,12 +492,30 @@ pub fn hide(s: &mut State, loc: &Location, items: Vec<Entry>) {
     let paths: Vec<(String, bool)> = items.iter().filter_map(|e| path_of(loc, e).map(|p| (p, e.is_dir))).collect();
     let at_server = server.clone();
     job(s, &server, reload, |n| tr!("excluir {} do B2", "delete {} from B2", crate::actions::count(n)), move |a, rec| {
-        for (i, (path, is_dir)) in paths.iter().enumerate() {
-            let since = a.hide(path, *is_dir).map_err(|e| if i == 0 { e } else { tr!("{e} (já excluídos: {i})", "{e} (already deleted: {i})") })?;
-            rec.add([Step::B2Unhide { server: at_server.clone(), path: path.clone(), is_dir: *is_dir, since }]);
-        }
-        Ok(tr!("Excluído do B2 (escondido): {}.", "Deleted from B2 (hidden): {}.", crate::actions::count(paths.len())))
+        hide_each(&paths, |path, is_dir| a.hide(path, is_dir), |path, is_dir, since| rec.add([Step::B2Unhide { server: at_server.clone(), path: path.to_string(), is_dir, since }]))
     });
+}
+
+/// Hides each of `paths` in turn, `record`ing how to bring back what each hid, the part of a
+/// folder hidden before an error included: what's gone from the pane always has its Desfazer.
+fn hide_each(paths: &[(String, bool)], hide: impl Fn(&str, bool) -> Result<i64, b2::HideStopped>, mut record: impl FnMut(&str, bool, i64)) -> Result<String, String> {
+    for (i, (path, is_dir)) in paths.iter().enumerate() {
+        match hide(path, *is_dir) {
+            Ok(since) => record(path, *is_dir, since),
+            Err(stopped) => {
+                let e = stopped.error;
+                let e = if i == 0 { e } else { tr!("{e} (já excluídos: {i})", "{e} (already deleted: {i})") };
+                if stopped.since.is_none() && i == 0 {
+                    return Err(e);
+                }
+                if let Some(since) = stopped.since {
+                    record(path, *is_dir, since);
+                }
+                return Err(tr!("{e} — Desfazer traz de volta o que já foi excluído.", "{e} — Undo brings back what was already deleted."));
+            }
+        }
+    }
+    Ok(tr!("Excluído do B2 (escondido): {}.", "Deleted from B2 (hidden): {}.", crate::actions::count(paths.len())))
 }
 
 /// Excluir todas as versões, from the menu: asks first.
@@ -568,8 +586,21 @@ pub fn run(step: &Step) -> Result<Step, String> {
             Ok(Step::B2Hide { server: server.clone(), path: path.clone(), is_dir: *is_dir })
         }
         Step::B2Hide { server, path, is_dir } => {
-            let since = b2::reach(&server.user)?.hide(path, *is_dir)?;
-            Ok(Step::B2Unhide { server: server.clone(), path: path.clone(), is_dir: *is_dir, since })
+            let a = b2::reach(&server.user)?;
+            match a.hide(path, *is_dir) {
+                Ok(since) => Ok(Step::B2Unhide { server: server.clone(), path: path.clone(), is_dir: *is_dir, since }),
+                // The step stays to be tried again whole, and its Desfazer brings back from one
+                // time on: what this try hid comes back first, or it would be left out of it.
+                Err(stopped) => match stopped.since.map(|since| a.unhide(path, *is_dir, since)) {
+                    Some(Err(back)) => Err(tr!(
+                        "{} (e parte de “{}” ficou escondida: {back})",
+                        "{} (and part of “{}” stayed hidden: {back})",
+                        stopped.error,
+                        short(path)
+                    )),
+                    _ => Err(stopped.error),
+                },
+            }
         }
         other => Ok(other.clone()),
     }
@@ -1086,6 +1117,29 @@ mod tests {
         cancel_all_uploads(&mut s);
         let Some(Dialog::B2Unfinished(d)) = &s.dialog else { panic!("no dialog") };
         assert!(d.busy, "the second cancels");
+    }
+
+    /// Excluir that stops midway keeps the Desfazer of what it hid: the items before, and the
+    /// part of the folder hidden before the error; nothing hidden, nothing to record.
+    #[test]
+    fn a_delete_that_stops_midway_keeps_the_undo_of_what_it_hid() {
+        let paths: Vec<(String, bool)> = vec![("/fotos/a.txt".into(), false), ("/fotos/2024".into(), true), ("/fotos/b.txt".into(), false)];
+        let hide = |path: &str, _: bool| match path {
+            "/fotos/2024" => Err(b2::HideStopped { since: Some(20), error: "recusado".into() }),
+            _ => Ok(10),
+        };
+        let mut got = Vec::new();
+        let e = hide_each(&paths, hide, |p, d, since| got.push((p.to_string(), d, since))).unwrap_err();
+        assert_eq!(got, [("/fotos/a.txt".to_string(), false, 10), ("/fotos/2024".to_string(), true, 20)]);
+        assert!(e.starts_with("recusado") && e.contains("Desfazer"), "{e}");
+        // Refused before hiding anything: the error alone.
+        let mut got = Vec::new();
+        let e = hide_each(&paths[1..2], |_, _| Err(b2::HideStopped { since: None, error: "recusado".into() }), |p, d, s| got.push((p.to_string(), d, s))).unwrap_err();
+        assert!(got.is_empty());
+        assert_eq!(e, "recusado");
+        let mut got = Vec::new();
+        assert!(hide_each(&paths, |_, _| Ok(5), |p, d, s| got.push((p.to_string(), d, s))).is_ok());
+        assert_eq!(got.len(), 3);
     }
 
     #[test]

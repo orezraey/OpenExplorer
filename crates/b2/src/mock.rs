@@ -148,6 +148,9 @@ pub struct Faults {
     pub latency_ms: AtomicU64,
     /// Bytes a second one connection's upload body is read at (0: as fast as it comes).
     pub upload_speed: AtomicU64,
+    /// File names whose hide, copy (to the name) and version delete are refused (403), every
+    /// time: a batch that fails midway, at a known item.
+    pub refused: Mutex<Vec<String>>,
 }
 
 pub struct Mock {
@@ -415,6 +418,10 @@ fn serve(conn: TcpStream, state: &Mutex<State>, faults: &Faults, url: &str) -> s
         return json_reply(&mut conn, s, &v);
     }
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
+    if matches!(call.as_str(), "b2_hide_file" | "b2_copy_file" | "b2_delete_file_version") && faults.refused.lock().unwrap().iter().any(|n| n == s(&body, "fileName")) {
+        let (s, v) = error(403, "access_denied", "refused for the test");
+        return json_reply(&mut conn, s, &v);
+    }
     let (s, v) = api(&call, &body, state, url);
     json_reply(&mut conn, s, &v)
 }

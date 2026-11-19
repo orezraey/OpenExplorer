@@ -618,8 +618,9 @@ impl Account {
         Ok(done)
     }
 
-    /// Copies version `v` (5 GB or more) to `name` in `into` in parts, on B2's side.
-    pub(crate) fn copy_large(&self, v: &Version, into: &Bucket, name: &str) -> Result<()> {
+    /// Copies version `v` (5 GB or more) to `name` in `into` in parts, on B2's side. Gives the
+    /// new version's id.
+    pub(crate) fn copy_large(&self, v: &Version, into: &Bucket, name: &str) -> Result<String> {
         let auth = self.api.auth()?;
         let part = auth.recommended_part.max(auth.minimum_part).max(v.size.div_ceil(MAX_PARTS));
         let content_type = v.content_type.clone().unwrap_or_else(|| "b2/x-auto".into());
@@ -649,7 +650,7 @@ impl Account {
         if joined.is_err() {
             let _ = self.cancel_large(&file_id);
         }
-        joined.map(|_| ())
+        joined.map(|v| v.id)
     }
 }
 

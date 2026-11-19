@@ -214,8 +214,29 @@ pub fn check_name(name: &str) -> Result<()> {
 /// Runs `work` on each of `items`, [`AT_ONCE`] at a time; stops starting new ones after the
 /// first error, which is what comes back (with how many were done before it).
 pub(crate) fn each<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> Result<R> + Sync) -> Result<Vec<R>> {
+    match each_done(items, work) {
+        (done, None) => Ok(done),
+        (done, Some(e)) => Err(with_done(e, done.len())),
+    }
+}
+
+/// An error that stopped a batch, with how many were done before it.
+pub(crate) fn with_done(e: String, done: usize) -> String {
+    if done == 0 { e } else { tr!("{e} (feitos antes do erro: {done})", "{e} (done before the error: {done})") }
+}
+
+/// Like [`each`], but what was done before the error comes back with it (in the items'
+/// order): a batch that changes B2 must know what it changed even when it stopped midway.
+pub(crate) fn each_done<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> Result<R> + Sync) -> (Vec<R>, Option<String>) {
     if items.len() <= 1 {
-        return items.iter().map(&work).collect();
+        let mut done = Vec::new();
+        for item in items {
+            match work(item) {
+                Ok(v) => done.push(v),
+                Err(e) => return (done, Some(e)),
+            }
+        }
+        return (done, None);
     }
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
@@ -233,17 +254,38 @@ pub(crate) fn each<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> Result<R>
             });
         }
     });
-    let results = out.into_inner().unwrap_or_else(|e| e.into_inner());
-    let done = results.iter().filter(|r| matches!(r, Some(Ok(_)))).count();
-    let mut ok = Vec::with_capacity(items.len());
-    for r in results.into_iter().flatten() {
+    let mut done = Vec::with_capacity(items.len());
+    let mut error = None;
+    for r in out.into_inner().unwrap_or_else(|e| e.into_inner()).into_iter().flatten() {
         match r {
-            Ok(v) => ok.push(v),
-            Err(e) if done == 0 => return Err(e),
-            Err(e) => return Err(tr!("{e} (feitos antes do erro: {done})", "{e} (done before the error: {done})")),
+            Ok(v) => done.push(v),
+            Err(e) => {
+                error.get_or_insert(e);
+            }
         }
     }
-    Ok(ok)
+    (done, error)
+}
+
+/// A delete ([`Account::hide`]) that stopped midway: `since` is the time of the earliest hide
+/// marker it made before stopping, from which [`Account::unhide`] brings back what it hid
+/// (`None`: it hid nothing), and `error` why it stopped.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HideStopped {
+    pub since: Option<i64>,
+    pub error: String,
+}
+
+impl HideStopped {
+    fn before_any(error: String) -> HideStopped {
+        HideStopped { since: None, error }
+    }
+}
+
+impl From<HideStopped> for String {
+    fn from(h: HideStopped) -> String {
+        h.error
+    }
 }
 
 pub struct Account {
@@ -717,7 +759,12 @@ impl Account {
 
     /// Deletes one version for good; one already gone is fine.
     pub(crate) fn delete_version(&self, v: &Version) -> Result<()> {
-        match self.api.call("b2_delete_file_version", &json!({"fileName": v.name, "fileId": v.id})) {
+        self.delete_id(&v.name, &v.id)
+    }
+
+    /// Deletes version `id` of the file `name` for good; one already gone is fine.
+    fn delete_id(&self, name: &str, id: &str) -> Result<()> {
+        match self.api.call("b2_delete_file_version", &json!({"fileName": name, "fileId": id})) {
             Ok(_) => Ok(()),
             Err(f) if f.code() == "file_not_present" || f.status() == 404 => Ok(()),
             Err(f) => Err(f.text()),
@@ -733,20 +780,27 @@ impl Account {
     /// listings, and what it held stays as a hidden version for as long as the bucket's
     /// lifecycle rules keep it. Gives the time of the earliest hide marker (milliseconds since
     /// 1970, B2's clock), from which [`Account::unhide`] brings it back.
-    pub fn hide(&self, path: &str, is_dir: bool) -> Result<i64> {
-        let s = Self::spot_for_change(path)?;
-        let bucket = self.bucket(&s.bucket)?;
-        let since = if is_dir {
-            let files = self.files_under(&bucket, &s.prefix())?;
-            let stamps = each(&files, |f| self.hide_name(&bucket, &f.name));
+    ///
+    /// A folder's files are hidden several at once; one refused stops the rest, and the error
+    /// then says from when what was hidden before it can be brought back, so it isn't left
+    /// hidden with no Desfazer.
+    pub fn hide(&self, path: &str, is_dir: bool) -> std::result::Result<i64, HideStopped> {
+        let s = Self::spot_for_change(path).map_err(HideStopped::before_any)?;
+        let bucket = self.bucket(&s.bucket).map_err(HideStopped::before_any)?;
+        if is_dir {
+            let files = self.files_under(&bucket, &s.prefix()).map_err(HideStopped::before_any)?;
+            let (stamps, error) = each_done(&files, |f| self.hide_name(&bucket, &f.name));
             self.changed(&s, true);
-            stamps?.into_iter().min().unwrap_or_else(|| cache::now() as i64 * 1000)
+            let since = stamps.iter().copied().min();
+            match error {
+                None => Ok(since.unwrap_or_else(|| cache::now() as i64 * 1000)),
+                Some(e) => Err(HideStopped { since, error: with_done(e, stamps.len()) }),
+            }
         } else {
             let stamp = self.hide_name(&bucket, &s.key);
             self.changed(&s, false);
-            stamp?
-        };
-        Ok(since)
+            stamp.map_err(HideStopped::before_any)
+        }
     }
 
     /// The hide markers at `path` (or under it) made at `since` or after that are their name's
@@ -813,6 +867,10 @@ impl Account {
 
     /// Copies what's at `src` (`found` there) to `dst` on B2's side: a file, or each file of a
     /// folder. Gives the versions copied.
+    ///
+    /// A copy that stops midway takes back what it made: the place was free, so each copy made
+    /// there is deleted (hidden, by a key that may not delete) and nothing half copied stays,
+    /// neither on screen nor billed as a hidden version.
     fn copy_spot(&self, src: &Spot, dst: &Spot, found: Found) -> Result<Vec<Version>> {
         let (from, into) = (self.bucket(&src.bucket)?, self.bucket(&dst.bucket)?);
         let is_dir = matches!(found, Found::Dir);
@@ -827,18 +885,34 @@ impl Account {
                 (f, name)
             })
             .collect();
-        let copied = each(&names, |(f, name)| self.copy_version(f, &into, name).map(|_| f.clone()));
+        let (made, error) = each_done(&names, |(f, name)| self.copy_version(f, &into, name).map(|id| (f.clone(), name.clone(), id)));
+        let result = match error {
+            None => Ok(made.into_iter().map(|(f, ..)| f).collect()),
+            Some(e) => {
+                let (_, left) = each_done(&made, |(_, name, id)| match self.delete_id(name, id) {
+                    Ok(()) => Ok(()),
+                    Err(d) => {
+                        crate::api::log(&format!("B2: não apaguei a cópia {name} ({d}), escondendo"));
+                        self.hide_name(&into, name).map(|_| ())
+                    }
+                });
+                Err(match left {
+                    None => e,
+                    Some(l) => tr!("{e} (e parte da cópia ficou em “{}”: {l})", "{e} (and part of the copy stayed in “{}”: {l})", last(&dst.key)),
+                })
+            }
+        };
         self.changed(dst, is_dir);
-        copied
+        result
     }
 
-    /// Copies version `v` to `name` in `into`, on B2's side.
-    pub(crate) fn copy_version(&self, v: &Version, into: &Bucket, name: &str) -> Result<()> {
+    /// Copies version `v` to `name` in `into`, on B2's side. Gives the new version's id.
+    pub(crate) fn copy_version(&self, v: &Version, into: &Bucket, name: &str) -> Result<String> {
         if v.size >= COPY_WHOLE_BELOW {
             return self.copy_large(v, into, name);
         }
-        self.api.run("b2_copy_file", &json!({"sourceFileId": v.id, "destinationBucketId": into.id, "fileName": name, "metadataDirective": "COPY"}))?;
-        Ok(())
+        let made = self.api.run("b2_copy_file", &json!({"sourceFileId": v.id, "destinationBucketId": into.id, "fileName": name, "metadataDirective": "COPY"}))?;
+        made.get("fileId").and_then(Value::as_str).map(str::to_string).ok_or_else(|| t("Resposta inesperada do B2 ao copiar.", "Unexpected answer from B2 copying.").into())
     }
 
     /// Copies the file or folder at `from` to `to` on B2's side: no bytes go through the app.
@@ -848,27 +922,38 @@ impl Account {
     }
 
     /// Renames or moves the item at `from` to `to`, within the account: a copy on B2's side,
-    /// then the old name retired (see the crate docs).
+    /// then the old name retired (see the crate docs). A copy that fails takes itself back
+    /// (nothing changed); old names that fail to leave after the whole copy went are said, as
+    /// what's at `to` is then the only copy of those already gone.
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
         let (src, dst, found) = self.source_and_target(from, to)?;
         let is_dir = matches!(found, Found::Dir);
         let copied = self.copy_spot(&src, &dst, found)?;
         let result = self.retire(&src, is_dir, &copied);
         self.changed(&src, is_dir);
-        result
+        result.map_err(|(left, e)| {
+            tr!(
+                "Tudo foi copiado para “{}”, mas {left} de {} item(ns) ficaram também em “{}”: {e}",
+                "Everything was copied to “{}”, but {left} of {} item(s) also stayed in “{}”: {e}",
+                last(to),
+                copied.len(),
+                last(from)
+            )
+        })
     }
 
     /// The names of `copied` (just copied from `src`) leave: the copied version is deleted when
-    /// it was its name's only version, else the name is hidden, its history kept.
-    fn retire(&self, src: &Spot, is_dir: bool, copied: &[Version]) -> Result<()> {
-        let bucket = self.bucket(&src.bucket)?;
-        let all = if is_dir { self.versions(&bucket, &src.prefix(), true)? } else { self.versions(&bucket, &src.key, false)? };
+    /// it was its name's only version, else the name is hidden, its history kept. Stopped
+    /// midway, how many are left, and why.
+    fn retire(&self, src: &Spot, is_dir: bool, copied: &[Version]) -> std::result::Result<(), (usize, String)> {
+        let bucket = self.bucket(&src.bucket).map_err(|e| (copied.len(), e))?;
+        let all = if is_dir { self.versions(&bucket, &src.prefix(), true) } else { self.versions(&bucket, &src.key, false) }.map_err(|e| (copied.len(), e))?;
         let mut count: HashMap<&str, usize> = HashMap::new();
         for v in &all {
             *count.entry(v.name.as_str()).or_default() += 1;
         }
         let only = |v: &Version| count.get(v.name.as_str()) == Some(&1) && all.iter().any(|a| a.id == v.id);
-        each(copied, |v| {
+        let (done, error) = each_done(copied, |v| {
             if only(v) {
                 match self.delete_version(v) {
                     Ok(()) => return Ok(()),
@@ -877,8 +962,11 @@ impl Account {
                 }
             }
             self.hide_name(&bucket, &v.name).map(|_| ())
-        })
-        .map(|_| ())
+        });
+        match error {
+            None => Ok(()),
+            Some(e) => Err((copied.len() - done.len(), e)),
+        }
     }
 }
 
