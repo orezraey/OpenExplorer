@@ -265,7 +265,9 @@ pub(crate) fn measure(c: &mut dyn Conn, path: &str, stop: &dyn Fn() -> bool) -> 
 
 /// Runs `batch`'s rows on `server`, up to `at_once` at a time, each worker with a connection of
 /// its own, one connection left over for the panes' listings; then reloads `reload` and says how
-/// it went. `prepare` runs first, on one connection, and gives what the rows share.
+/// it went. `prepare` runs first, on one connection, and gives what the rows share. A worker
+/// takes a run of rows that `joins` (up to the connection's [`Conn::batches`]) for one `step`,
+/// which gives each its result; the others one at a time.
 #[allow(clippy::too_many_arguments)]
 fn transfer<P: Send + Sync + 'static>(
     s: &State,
@@ -274,7 +276,8 @@ fn transfer<P: Send + Sync + 'static>(
     at_once: usize,
     batch: transfers::Batch,
     prepare: impl FnOnce(&mut dyn Conn, &transfers::Batch) -> Result<P, String> + Send + 'static,
-    step: impl Fn(&mut dyn Conn, &P, usize, &Progress) -> Result<(), String> + Send + Sync + 'static,
+    joins: impl Fn(&P, usize) -> bool + Send + Sync + 'static,
+    step: impl Fn(&mut dyn Conn, &P, &[(usize, &Progress)]) -> Vec<Result<(), String>> + Send + Sync + 'static,
 ) {
     let workers = at_once.min(server.limit().saturating_sub(1)).min(batch.rows().len()).max(1);
     let (pool, server) = (s.servers.pool.clone(), server.clone());
@@ -287,8 +290,23 @@ fn transfer<P: Send + Sync + 'static>(
                 for _ in 0..workers {
                     scope.spawn(|| {
                         let ran = with(&pool, &server, |c| {
-                            while let Some((i, p)) = batch.next(&next) {
-                                p.end(step(c, &shared, i, p));
+                            let most = c.batches().0.max(1);
+                            // A row taken that doesn't join the run before it starts the next.
+                            let mut held = None;
+                            while let Some(first) = held.take().or_else(|| batch.next(&next)) {
+                                let mut rows = vec![first];
+                                while joins(&shared, first.0) && rows.len() < most {
+                                    match batch.next(&next) {
+                                        Some(r) if joins(&shared, r.0) => rows.push(r),
+                                        other => {
+                                            held = other;
+                                            break;
+                                        }
+                                    }
+                                }
+                                for ((_, p), r) in rows.iter().zip(step(c, &shared, &rows)) {
+                                    p.end(r);
+                                }
                             }
                             Ok(())
                         });
@@ -326,7 +344,7 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
         // The names the rows took in `dst`, before their files are made.
         Ok((std::sync::Mutex::new(HashSet::<PathBuf>::new()), paths))
     };
-    let step = move |c: &mut dyn Conn, (claimed, paths): &(std::sync::Mutex<HashSet<PathBuf>>, Vec<String>), i: usize, p: &Progress| {
+    let one = move |c: &mut dyn Conn, (claimed, paths): &(std::sync::Mutex<HashSet<PathBuf>>, Vec<String>), i: usize, p: &Progress| {
         let e = &items[i];
         let local = {
             let mut claimed = claimed.lock().unwrap_or_else(|e| e.into_inner());
@@ -347,7 +365,8 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
             Then::Open => ops::open(&local),
         }
     };
-    transfer(s, server, reload, at_once, batch, prepare, step);
+    let step = move |c: &mut dyn Conn, shared: &(std::sync::Mutex<HashSet<PathBuf>>, Vec<String>), rows: &[(usize, &Progress)]| rows.iter().map(|(i, p)| one(c, shared, *i, p)).collect();
+    transfer(s, server, reload, at_once, batch, prepare, |_, _| false, step);
 }
 
 /// A file or a folder and all it holds, from `path` on the server to `local`, `depth` folders
@@ -402,37 +421,68 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
     let measured = sources.clone();
     let listed = dir.clone();
     let prepare = move |c: &mut dyn Conn, batch: &transfers::Batch| {
+        // Each row's size, and which are files small enough to go in one batch with others.
+        let largest = c.batches().1;
+        let mut small = Vec::new();
         for (p, src) in batch.rows().iter().zip(&measured) {
-            p.size(ops::measure(src, &|| p.cancelled()));
+            let size = ops::measure(src, &|| p.cancelled());
+            p.size(size);
+            small.push(!src.is_dir() && size <= largest);
         }
         // Lowercased: a server on Windows (or many NAS) takes "Nota.txt" and "nota.txt" for one
         // file, and an upload under the other spelling would replace it.
         let taken: HashSet<String> = c.list(&listed)?.into_iter().map(|i| i.name.to_lowercase()).collect();
-        Ok(std::sync::Mutex::new(taken))
+        Ok((std::sync::Mutex::new(taken), small))
     };
-    let step = move |c: &mut dyn Conn, taken: &std::sync::Mutex<HashSet<String>>, i: usize, p: &Progress| {
-        let src = &sources[i];
-        let is_dir = src.is_dir();
-        let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let name = {
-            let mut taken = taken.lock().unwrap_or_else(|e| e.into_inner());
-            let name = free_name(&name, is_dir, &taken);
-            taken.insert(name.to_lowercase());
-            name
-        };
-        let target = child(&dir, &name);
-        if let Err(e) = send(c, src, &target, p) {
-            if e == CANCELLED {
-                let _ = c.remove(&target, is_dir);
+    let step = move |c: &mut dyn Conn, (taken, _): &(std::sync::Mutex<HashSet<String>>, Vec<bool>), rows: &[(usize, &Progress)]| {
+        // Each row's name, taken before any is sent.
+        let targets: Vec<(String, bool)> = rows
+            .iter()
+            .map(|(i, _)| {
+                let src = &sources[*i];
+                let is_dir = src.is_dir();
+                let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let mut taken = taken.lock().unwrap_or_else(|e| e.into_inner());
+                let name = free_name(&name, is_dir, &taken);
+                taken.insert(name.to_lowercase());
+                (child(&dir, &name), is_dir)
+            })
+            .collect();
+        let sent: Vec<Result<(), String>> = match rows {
+            [(i, p)] => vec![send(c, &sources[*i], &targets[0].0, p)],
+            // Small files, together.
+            _ => {
+                let files: Vec<(String, PathBuf)> = rows.iter().zip(&targets).map(|((i, _), (to, _))| (to.clone(), sources[*i].clone())).collect();
+                let mut last = vec![0u64; rows.len()];
+                c.upload_files(&files, &mut |k, n| {
+                    let p = rows[k].1;
+                    p.add_bytes(n.saturating_sub(last[k]));
+                    last[k] = last[k].max(n);
+                    !p.cancelled()
+                })
+                .into_iter()
+                .map(|r| r.map_err(cancelled))
+                .collect()
             }
-            return Err(e);
-        }
-        if remove {
-            trash::delete(src).map_err(|e| tr!("Enviado, mas não consegui mover o original para a Lixeira: {e}", "Uploaded, but couldn't move the original to the Recycle Bin: {e}"))?;
-        }
-        Ok(())
+        };
+        rows.iter()
+            .zip(&targets)
+            .zip(sent)
+            .map(|(((i, _), (target, is_dir)), r)| {
+                if let Err(e) = r {
+                    if e == CANCELLED {
+                        let _ = c.remove(target, *is_dir);
+                    }
+                    return Err(e);
+                }
+                if remove {
+                    trash::delete(&sources[*i]).map_err(|e| tr!("Enviado, mas não consegui mover o original para a Lixeira: {e}", "Uploaded, but couldn't move the original to the Recycle Bin: {e}"))?;
+                }
+                Ok(())
+            })
+            .collect()
     };
-    transfer(s, &server, reload, at_once, batch, prepare, step);
+    transfer(s, &server, reload, at_once, batch, prepare, |(_, small): &(_, Vec<bool>), i| small[i], step);
 }
 
 /// `name`, or the first "nome (2).ext" whose lowercase isn't in `taken` (lowercased names).
@@ -455,9 +505,30 @@ fn send(c: &mut dyn Conn, src: &Path, target: &str, p: &Progress) -> Result<(), 
     if src.is_dir() {
         c.mkdir(target)?;
         let items = std::fs::read_dir(src).map_err(|e| tr!("Não consegui ler {}: {e}", "Couldn't read {}: {e}", src.display()))?;
+        // Where the server takes files in batches, the folder's small files go together.
+        let (most, largest) = c.batches();
+        let mut small = Vec::new();
         for item in items {
             let item = item.map_err(|e| tr!("Não consegui ler {}: {e}", "Couldn't read {}: {e}", src.display()))?;
-            send(c, &item.path(), &child(target, &item.file_name().to_string_lossy()), p)?;
+            let (from, to) = (item.path(), child(target, &item.file_name().to_string_lossy()));
+            match item.metadata() {
+                Ok(m) if most > 1 && m.is_file() && m.len() <= largest => small.push((to, from)),
+                _ => send(c, &from, &to, p)?,
+            }
+        }
+        for files in small.chunks(most.max(1)) {
+            if p.cancelled() {
+                return Err(CANCELLED.into());
+            }
+            let mut last = vec![0u64; files.len()];
+            let sent = c.upload_files(files, &mut |k, n| {
+                p.add_bytes(n.saturating_sub(last[k]));
+                last[k] = last[k].max(n);
+                !p.cancelled()
+            });
+            if let Some(e) = sent.into_iter().find_map(Result::err) {
+                return Err(cancelled(e));
+            }
         }
         return Ok(());
     }
@@ -478,19 +549,39 @@ pub fn move_within(s: &mut State, from: &Location, items: Vec<Entry>, to: &Locat
     let at = server.clone();
     undo::server_job(s, &server, reload, |n| tr!("mover {}", "move {}", undo::items(n)), move |c, rec| {
         let pinned = pin_all(c, &paths);
-        batch.run(|i, _| {
-            let (e, path) = (&items[i], &paths[i]);
-            let into = child(&dst, &e.name);
-            if *path == into {
-                return Ok(());
+        // As many at once as the server takes in a batch (Dropbox's), else one at a time.
+        let most = c.batches().0.max(1);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let mut more = true;
+        while more {
+            let mut rows = Vec::new();
+            while rows.len() < most {
+                let Some((i, p)) = batch.next(&next) else {
+                    more = false;
+                    break;
+                };
+                let (e, path) = (&items[i], &paths[i]);
+                let into = child(&dst, &e.name);
+                if *path == into {
+                    p.end(Ok(()));
+                } else if e.is_dir && (dst == *path || dst.starts_with(&format!("{path}/"))) {
+                    p.end(Err(tr!("Não dá para mover a pasta \"{}\" para dentro dela mesma.", "Can't move the folder \"{}\" into itself.", e.name)));
+                } else {
+                    rows.push((i, p, into));
+                }
             }
-            if e.is_dir && (dst == *path || dst.starts_with(&format!("{path}/"))) {
-                return Err(tr!("Não dá para mover a pasta \"{}\" para dentro dela mesma.", "Can't move the folder \"{}\" into itself.", e.name));
+            if rows.is_empty() {
+                continue;
             }
-            c.rename(&pinned[i], &into)?;
-            rec.add([undo::Step::ServerMove { server: at.clone(), from: into, to: path.clone() }]);
-            Ok(())
-        })
+            let moves: Vec<(String, String)> = rows.iter().map(|(i, _, into)| (pinned[*i].clone(), into.clone())).collect();
+            for ((i, p, into), moved) in rows.into_iter().zip(c.rename_many(&moves)) {
+                if moved.is_ok() {
+                    rec.add([undo::Step::ServerMove { server: at.clone(), from: into, to: paths[i].clone() }]);
+                }
+                p.end(moved);
+            }
+        }
+        batch.summary()
     });
 }
 

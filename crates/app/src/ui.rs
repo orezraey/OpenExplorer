@@ -1241,6 +1241,10 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             .item(item(t("Remover link", "Remove link"), &icons::M_LINK, "", true, crate::onedrive::remove_link));
     }
     menu = menu.separator().item(item(t("Nova pasta", "New folder"), &icons::M_NEW_FOLDER, "Ctrl+Shift+N", editable, actions::ask_new_folder));
+    // What was deleted from a Dropbox folder, to bring back.
+    if n == 0 && crate::dropbox::shows_folder(s, p) {
+        menu = menu.item(item(t("Itens excluídos…", "Deleted items…"), &icons::M_RESTORE, "", true, crate::dropbox::show_deleted));
+    }
     if n > 0 {
         menu = menu.separator().item(item(t("Propriedades", "Properties"), &icons::M_PROPERTIES, "Alt+Enter", true, |s, p, _| actions::properties(s, p)));
     }
@@ -1403,6 +1407,7 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
         Dialog::MakePublic(m) => crate::sharing::public_dialog(k, m, layer),
         Dialog::MegaLink(m) => crate::mega::link_dialog(k, m, layer),
         Dialog::DropboxLink(m) => crate::dropbox::link_dialog(k, m, layer),
+        Dialog::DropboxDeleted(v) => crate::dropbox::deleted_dialog(k, v, layer),
         Dialog::OneDriveLink(m) => crate::onedrive::link_dialog(k, m, layer),
         Dialog::Server(f) => account_dialog(s, k, f, window_h, layer),
     }

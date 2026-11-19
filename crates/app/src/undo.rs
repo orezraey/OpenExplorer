@@ -61,8 +61,8 @@ pub enum Step {
     /// it among its deleted files).
     DropboxDelete { server: Server, path: String, name: String },
     /// What was deleted from `path` comes back: the file at revision `rev`, or (no `rev`) the
-    /// folder, with the files deleted from it at `since` (seconds since 1970) or later.
-    DropboxRestore { server: Server, path: String, name: String, rev: Option<String>, since: i64 },
+    /// folder, with what was deleted in it from `since` to `until` (Dropbox's clock, seconds).
+    DropboxRestore { server: Server, path: String, name: String, rev: Option<String>, since: i64, until: i64 },
     /// On B2 key `server`, the file (or every file of the folder) at `path` is hidden.
     B2Hide { server: Server, path: String, is_dir: bool },
     /// What was hidden at `path` at `since` (milliseconds, B2's clock) or later comes back.
