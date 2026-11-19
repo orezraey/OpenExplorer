@@ -11,8 +11,8 @@
 //!   The `content_hash` Dropbox computes is checked against the one computed here. (Files up to
 //!   150 MiB once went in one streamed request, which a 429 midway lost for good.)
 //! - Many small files go together (see [`crate::batch`]).
-//! - [`Account::same_content`] tells a file already on Dropbox with the same bytes, so it isn't
-//!   sent again.
+//! - [`Account::same_content`] tells, from a kept listing known current and without a request, a
+//!   file already on Dropbox with the same bytes, so it isn't sent again.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -231,9 +231,14 @@ impl Account {
     }
 
     /// Whether the file at `path` on Dropbox has the same bytes as `local` (same size, same
-    /// `content_hash`): then it needn't be sent. Reads `local` only when the sizes agree.
+    /// `content_hash`): then it needn't be sent. Answered from the kept listing of its folder
+    /// alone, and only while that's known current (a watcher waiting, the log just read): no
+    /// request, ever. A file sent into a new folder or under a free name (the panes' usual case)
+    /// would only pay a `get_metadata` to hear "not there"; the case it saves, a file sent again
+    /// over the same bytes, is one the pane showing that folder has just listed. Reads `local`
+    /// only when the sizes agree.
     pub fn same_content(&self, path: &str, local: &Path, stop: &dyn Fn() -> bool) -> Result<bool> {
-        let Some(there) = self.stat(path)? else { return Ok(false) };
+        let Some(Some(there)) = self.known(path) else { return Ok(false) };
         let len = std::fs::metadata(local).map(|m| m.len()).unwrap_or(u64::MAX);
         if there.dir || there.size != len || there.hash.is_empty() {
             return Ok(false);
@@ -309,13 +314,23 @@ mod tests {
         std::fs::write(&local, &data).unwrap();
         fake.put_file("/x.bin", &data);
         let a = fake.account();
+        a.list("/").unwrap();
+        a.catch_up().unwrap();
+        let before = fake.calls();
         assert!(a.same_content("/x.bin", &local, &|| false).unwrap());
+        assert!(fake.calls_since(&before).is_empty(), "answered from the kept listing");
         let mut other = data.clone();
         other[10] ^= 1;
         fake.put_file("/x.bin", &other);
-        a.reload("/").unwrap();
+        a.catch_up().unwrap();
         assert!(!a.same_content("/x.bin", &local, &|| false).unwrap());
         assert!(!a.same_content("/nada.bin", &local, &|| false).unwrap());
+        // Not known current: sent, without asking first.
+        fake.put_file("/x.bin", &data);
+        a.forget_fresh();
+        let before = fake.calls();
+        assert!(!a.same_content("/x.bin", &local, &|| false).unwrap());
+        assert!(fake.calls_since(&before).is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 

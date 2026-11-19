@@ -76,7 +76,8 @@ impl Conn for Dropbox {
         self.account.upload(path, src, len, progress).map(|_| ()).map_err(same_cancel)
     }
 
-    /// Not sent when the same bytes are already there (same size and `content_hash`).
+    /// Not sent when the same bytes are already there (same size and `content_hash`), as the
+    /// folder's kept listing tells while it's known current: no request is spent asking.
     fn upload_file(&mut self, path: &str, local: &Path, progress: Progress) -> Result<()> {
         if self.account.same_content(path, local, &|| false).unwrap_or(false) {
             let len = std::fs::metadata(local).map(|m| m.len()).unwrap_or(0);
@@ -125,7 +126,8 @@ impl Conn for Dropbox {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Protocol, Server, Store};
+    use super::Dropbox;
+    use crate::{Conn, Protocol, Server, Store};
 
     #[test]
     fn accounts_show_as_servers_of_their_own_and_stay_out_of_the_list() {
@@ -139,5 +141,83 @@ mod tests {
         assert!(store.save(sv, None).is_err());
         assert!(store.servers().is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_file_sent_again_over_the_same_bytes_costs_nothing_and_a_new_one_no_question() {
+        use std::sync::atomic::Ordering;
+        let fake = openexplorer_dropbox::fake::Fake::start();
+        let email = format!("same-{}@exemplo.com", std::process::id());
+        let account = std::sync::Arc::new(fake.account());
+        openexplorer_dropbox::account::adopt(&email, account.clone());
+        let dir = std::env::temp_dir().join(format!("oe-remote-dropbox-same-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = dir.join("a.bin");
+        std::fs::write(&local, b"os mesmos bytes").unwrap();
+        fake.put_file("/D/a.bin", b"os mesmos bytes");
+        let mut c = Dropbox::connect(&Server::dropbox(&email)).unwrap();
+        c.list("/D").unwrap();
+        // The pane showing the folder keeps it known current (here: the log just read).
+        account.catch_up().unwrap();
+        let before = account.api.requests.load(Ordering::Relaxed);
+        c.upload_file("/D/a.bin", &local, &mut |_| true).unwrap();
+        assert_eq!(account.api.requests.load(Ordering::Relaxed), before);
+        // A new name: sent at once, nothing asked first.
+        let before = fake.calls();
+        c.upload_file("/D/b.bin", &local, &mut |_| true).unwrap();
+        assert_eq!(fake.calls_since(&before), ["files/upload"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Requests to send `n` local files each over 8 MiB through `upload_file`, against the
+    /// stand-in: into a folder just made (as Copiar a folder does) and into a folder whose
+    /// listing is kept but not known current (no watcher waiting).
+    fn send_costs(n: usize) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        let fake = openexplorer_dropbox::fake::Fake::start();
+        let email = format!("bench-{}-{n}@exemplo.com", std::process::id());
+        let account = std::sync::Arc::new(fake.account());
+        openexplorer_dropbox::account::adopt(&email, account.clone());
+        let dir = std::env::temp_dir().join(format!("oe-remote-dropbox-bench-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let data: Vec<u8> = (0..(9usize << 20)).map(|i| (i * 7 % 251) as u8).collect();
+        let locals: Vec<std::path::PathBuf> = (0..n)
+            .map(|i| {
+                let f = dir.join(format!("f{i}.bin"));
+                std::fs::write(&f, &data).unwrap();
+                f
+            })
+            .collect();
+        let mut c = Dropbox::connect(&Server::dropbox(&email)).unwrap();
+        // A folder just made.
+        c.list("/").unwrap();
+        c.mkdir("/Nova").unwrap();
+        let before = account.api.requests.load(Ordering::Relaxed);
+        for (i, l) in locals.iter().enumerate() {
+            c.upload_file(&format!("/Nova/f{i}.bin"), l, &mut |_| true).unwrap();
+        }
+        let new_folder = account.api.requests.load(Ordering::Relaxed) - before;
+        // A kept folder, its listing not known current.
+        fake.make_dir("/Kept");
+        c.list("/Kept").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let before = account.api.requests.load(Ordering::Relaxed);
+        for (i, l) in locals.iter().enumerate() {
+            c.upload_file(&format!("/Kept/f{i}.bin"), l, &mut |_| true).unwrap();
+        }
+        let kept = account.api.requests.load(Ordering::Relaxed) - before;
+        let _ = std::fs::remove_dir_all(dir);
+        (new_folder, kept)
+    }
+
+    /// Run with `cargo test -p openexplorer-remote --lib dropbox::tests::upload_file_costs -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a benchmark: run it by name"]
+    fn upload_file_costs() {
+        println!("files of 9 MiB | requests, into a folder just made | requests, into a kept folder not known current");
+        for n in [1usize, 5, 20] {
+            let (new_folder, kept) = send_costs(n);
+            println!("{n:>14} | {new_folder:>33} | {kept:>47}");
+        }
     }
 }

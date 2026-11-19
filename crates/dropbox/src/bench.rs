@@ -112,7 +112,8 @@ fn batch_costs() {
                         s.spawn(|| {
                             while let Some(f) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 let to = format!("/Destino/{}", f.file_name().unwrap().to_string_lossy());
-                                if a.same_content(&to, f, &|| false).unwrap() {
+                                // Asked about first, as the panes did then (none is there).
+                                if a.stat(&to).unwrap().is_some() {
                                     continue;
                                 }
                                 let mut src = std::fs::File::open(f).unwrap();

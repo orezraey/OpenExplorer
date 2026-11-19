@@ -333,16 +333,24 @@ impl Account {
         if k.is_empty() {
             return Ok(Some(Entry { name: String::new(), lower: String::new(), dir: true, size: 0, modified: None, rev: String::new(), hash: String::new() }));
         }
-        if self.fresh()
-            && let Some(f) = self.lists().get(parent(&k), now())
-        {
-            return Ok(f.entries.iter().find(|e| e.lower == k).cloned());
+        if let Some(found) = self.known(path) {
+            return Ok(found);
         }
         match self.api.rpc("files/get_metadata", &json!({"path": api_path(path)})) {
             Ok(v) => Ok(entry(&v)),
             Err(f) if f.is("not_found") => Ok(None),
             Err(f) => Err(about(path, f)),
         }
+    }
+
+    /// The item at `path` as the kept listing of its folder has it, when that listing is kept
+    /// and known current: `Some(None)` for nothing there. `None` when only asking would tell.
+    pub fn known(&self, path: &str) -> Option<Option<Entry>> {
+        let k = key(path);
+        if k.is_empty() || !self.fresh() {
+            return None;
+        }
+        self.lists().get(parent(&k), now()).map(|f| f.entries.iter().find(|e| e.lower == k).cloned())
     }
 
     // -----------------------------------------------------------------------------------------

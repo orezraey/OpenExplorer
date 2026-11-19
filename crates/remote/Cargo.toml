@@ -24,3 +24,7 @@ tokio = { version = "1", features = ["rt", "net", "time", "io-util"] }
 ureq = "3"
 percent-encoding = "2"
 webpki-roots = "1"
+
+[dev-dependencies]
+# The Dropbox crate's stand-in for the API, for the tests and the benchmark of `dropbox.rs`.
+openexplorer-dropbox = { path = "../dropbox", features = ["fake"] }
