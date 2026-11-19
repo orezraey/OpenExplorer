@@ -1233,6 +1233,10 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     if n > 0 && changeable && crate::b2::at(&s.panes[p].loc).is_some() {
         menu = menu.min_width(250.0).item(item(t("Excluir todas as versões", "Delete every version"), &icons::M_DELETE, "", true, crate::b2::ask_purge).danger(true));
     }
+    // A B2 bucket's large uploads that stopped midway.
+    if crate::b2::menu_bucket(s, p).is_some() {
+        menu = menu.separator().item(item(t("Envios inacabados…", "Unfinished uploads…"), &icons::M_PROPERTIES, "", true, crate::b2::ask_unfinished));
+    }
     // Sharing links, for one OneDrive item.
     if n == 1 && changeable && crate::onedrive::at(&s.panes[p].loc).is_some() && !crate::onedrive::in_bin(&s.panes[p].loc) {
         menu = menu
@@ -1419,6 +1423,7 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
         Dialog::MegaLink(m) => crate::mega::link_dialog(k, m, layer),
         Dialog::DropboxLink(m) => crate::dropbox::link_dialog(k, m, layer),
         Dialog::OneDriveLink(m) => crate::onedrive::link_dialog(k, m, layer),
+        Dialog::B2Unfinished(d) => crate::b2::unfinished_dialog(k, d, layer),
         Dialog::Server(f) => account_dialog(s, k, f, window_h, layer),
     }
 }

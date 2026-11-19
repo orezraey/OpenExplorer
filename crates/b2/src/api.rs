@@ -6,12 +6,14 @@
 //!   the call is sent again (`401 expired_auth_token` or `bad_auth_token`);
 //! - `429 too_many_requests`, `503 service_unavailable`, the other 5xx and `408` are sent again
 //!   after `Retry-After` when B2 gives one, else after a growing pause (1, 2, 4… s, at most 32);
-//!   so is a request that got no answer;
+//!   so is a request that got no answer; a 429 or a 503 also holds the reads the app makes on
+//!   its own for that long (see [`crate::watch`]), and those are never sent again by themselves;
 //! - `403` caps (`transaction_cap_exceeded` and the like) stop at once, saying where to raise them;
 //! - every request says who sends it in `User-Agent`.
 //!
 //! Uploads go to URLs of their own (see [`crate::upload`]), whose failures ask for a new URL.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -83,6 +85,25 @@ impl Fail {
     /// The token is no longer taken: authorize again.
     pub fn expired(&self) -> bool {
         self.status() == 401 && matches!(self.code(), "expired_auth_token" | "bad_auth_token")
+    }
+
+    /// A cap the account set itself (Caps & Alerts) was reached: nothing more of the kind goes
+    /// until it's raised or the day turns.
+    pub fn capped(&self) -> bool {
+        self.status() == 403 && matches!(self.code(), "transaction_cap_exceeded" | "cap_exceeded" | "download_cap_exceeded" | "storage_cap_exceeded")
+    }
+
+    /// What `Retry-After` said, in seconds.
+    pub fn retry_after(&self) -> Option<u64> {
+        match self {
+            Fail::Status { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    /// B2 asked to slow down, or is busy (429, 503).
+    pub fn busy(&self) -> bool {
+        matches!(self.status(), 429 | 503)
     }
 
     /// Worth sending again after a pause.
@@ -176,7 +197,13 @@ pub struct Api {
     pub(crate) attempts: u32,
     /// `X-Bz-Test-Mode`, for tests against B2 itself.
     pub(crate) test_mode: Option<String>,
+    /// Until when (seconds since 1970) B2 asked for a pause, by a 429 or a 503 to any call: the
+    /// reads the app makes on its own wait for it (see [`crate::watch`]).
+    pause_until: AtomicU64,
 }
+
+/// The pause after a 429 or a 503 that gave no `Retry-After`, in seconds.
+pub const PAUSE: u64 = 60;
 
 impl Api {
     pub fn new(key_id: &str, key: &str) -> Api {
@@ -195,6 +222,20 @@ impl Api {
             backoff: Duration::from_secs(1),
             attempts: 6,
             test_mode: None,
+            pause_until: AtomicU64::new(0),
+        }
+    }
+
+    /// How long B2 asked to be left alone still (by a 429 or a 503 to any call), if it did.
+    pub fn paused(&self, now: u64) -> Option<u64> {
+        let until = self.pause_until.load(Ordering::SeqCst);
+        (until > now).then(|| until - now)
+    }
+
+    fn note_busy(&self, f: &Fail) {
+        if f.busy() {
+            let until = crate::cache::now() + f.retry_after().unwrap_or(PAUSE).max(1);
+            self.pause_until.fetch_max(until, Ordering::SeqCst);
         }
     }
 
@@ -243,7 +284,7 @@ impl Api {
     fn authorize(&self, generation: u64) -> std::result::Result<Auth, Fail> {
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", self.key_id, self.key));
         let url = format!("{}/{V}/b2_authorize_account", self.auth_base);
-        let v = self.retrying("b2_authorize_account", || {
+        let v = self.retrying("b2_authorize_account", self.attempts, || {
             let mut req = self.agent.get(&url).header("Authorization", &format!("Basic {basic}"));
             if let Some(m) = &self.test_mode {
                 req = req.header("X-Bz-Test-Mode", m);
@@ -258,14 +299,18 @@ impl Api {
         parse_auth(&v, generation).ok_or_else(|| Fail::Other(t("Resposta inesperada do B2 ao autorizar a chave.", "Unexpected answer from B2 authorizing the key.").into()))
     }
 
-    /// Runs `send` until it succeeds, its error isn't worth another try, or the tries are up.
-    pub(crate) fn retrying<T>(&self, what: &str, mut send: impl FnMut() -> std::result::Result<T, Fail>) -> std::result::Result<T, Fail> {
+    /// Runs `send` until it succeeds, its error isn't worth another try, or `attempts` are up.
+    pub(crate) fn retrying<T>(&self, what: &str, attempts: u32, mut send: impl FnMut() -> std::result::Result<T, Fail>) -> std::result::Result<T, Fail> {
         let mut delay = self.backoff;
         let mut attempt = 1;
         loop {
-            match send() {
+            let result = send();
+            if let Err(f) = &result {
+                self.note_busy(f);
+            }
+            match result {
                 Ok(v) => return Ok(v),
-                Err(f) if f.transient() && attempt < self.attempts => {
+                Err(f) if f.transient() && attempt < attempts => {
                     let wait = match &f {
                         Fail::Status { retry_after: Some(s), .. } => Duration::from_secs(*s).min(Duration::from_secs(120)),
                         _ => delay,
@@ -283,13 +328,21 @@ impl Api {
     /// Calls `name` with the JSON `body`: sent again when B2 is busy, and with a new token when
     /// the one in use expired.
     pub fn call(&self, name: &str, body: &Value) -> std::result::Result<Value, Fail> {
+        self.call_with(name, body, true)
+    }
+
+    /// [`Api::call`]; unless `patient`, a busy answer (429, 503, no answer) isn't sent again but
+    /// comes back at once, for reads the app makes on its own, which wait for their next turn
+    /// instead (an expired token is still renewed).
+    pub fn call_with(&self, name: &str, body: &Value, patient: bool) -> std::result::Result<Value, Fail> {
         let bytes = serde_json::to_vec(body).expect("a JSON body");
+        let attempts = if patient { self.attempts } else { 1 };
         let mut renewed = 0;
         loop {
             let auth = self.auth()?;
             let url = format!("{}/{V}/{name}", auth.api_url);
             let started = Instant::now();
-            let result = self.retrying(name, || {
+            let result = self.retrying(name, attempts, || {
                 let mut req = self.agent.post(&url).header("Authorization", &auth.token).header("Content-Type", "application/json");
                 if let Some(m) = &self.test_mode {
                     req = req.header("X-Bz-Test-Mode", m);

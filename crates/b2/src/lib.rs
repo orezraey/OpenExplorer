@@ -33,18 +33,22 @@
 //! `b2_list_file_names` gives). Deleting hides (`b2_hide_file`): the name leaves the listing and
 //! what it held stays as a hidden version until the bucket's lifecycle rules delete it (never,
 //! with B2's default "keep all versions"), so it can be brought back by deleting the hide marker
-//! (Desfazer). "Delete every version" deletes each version of the name for good. A rename
+//! (Desfazer): `b2_delete_file_version` on a name's latest version makes the most recent older
+//! one its current version again, as Backblaze's reference for that call says. "Delete every version" deletes each version of the name for good. A rename
 //! retires the old name by deleting the version just copied when it was the name's only one
 //! (nothing of its history is lost), and by hiding it otherwise.
 //!
-//! See [`cache`] for how listings are kept, and when they're read again.
+//! See [`cache`] for how listings are kept and when they're read again, and [`watch`] for the
+//! readings the app makes on its own so changes made elsewhere show.
 
 pub mod account;
 pub mod api;
 pub mod cache;
 pub mod download;
+pub mod notes;
 pub mod store;
 pub mod upload;
+pub mod watch;
 
 #[cfg(test)]
 mod bench;
@@ -53,11 +57,13 @@ mod flows;
 #[cfg(test)]
 pub(crate) mod mock;
 
-pub use account::{Account, Bucket, Item, Rule, cached, connect, disconnect, reach, save_caches};
+pub use account::{Account, Bucket, Fresh, Item, Rule, cached, connect, disconnect, reach, save_caches};
+pub use watch::Polled;
 pub use api::{Allowed, set_log};
 pub use cache::set_dir as set_cache_dir;
+pub use notes::set_file as set_notes_file;
 pub use store::Store;
-pub use upload::Uploads;
+pub use upload::{Unfinished, Uploads};
 
 /// Errors are shown to the user as they are, so they're plain sentences in the interface's
 /// language (see `openexplorer_i18n`).

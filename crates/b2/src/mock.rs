@@ -69,6 +69,8 @@ pub struct State {
     pub capabilities: Vec<String>,
     pub recommended: u64,
     pub minimum: u64,
+    /// What a 429 says in `Retry-After`, in seconds.
+    pub retry_after: u64,
 }
 
 impl State {
@@ -77,8 +79,11 @@ impl State {
         1_700_000_000_000 + self.clock
     }
 
+    /// Unique across every stand-in of the run, as B2's ids are (the uploads this app is sending
+    /// are known by id, process-wide).
     fn id(&mut self) -> String {
-        self.next += 1;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        self.next = NEXT.fetch_add(1, Ordering::SeqCst) + 1;
         format!("4_z{:08}", self.next)
     }
 
@@ -127,8 +132,14 @@ pub struct Faults {
     pub expire: AtomicUsize,
     /// The next API calls answer 503.
     pub busy: AtomicUsize,
-    /// The next API calls answer 429.
+    /// The next API calls answer 429 (with `State::retry_after`).
     pub too_many: AtomicUsize,
+    /// The next API calls answer 403 `transaction_cap_exceeded`.
+    pub capped: AtomicUsize,
+    /// The next `b2_copy_part` calls answer 400.
+    pub copy_part_refused: AtomicUsize,
+    /// The next `b2_list_parts` calls answer 400, as for a file finished or cancelled meanwhile.
+    pub parts_gone: AtomicUsize,
     /// The next uploads (files and parts) answer 503.
     pub upload_busy: AtomicUsize,
     /// The next download sends only this many bytes, then closes.
@@ -388,6 +399,19 @@ fn serve(conn: TcpStream, state: &Mutex<State>, faults: &Faults, url: &str) -> s
     }
     if take(&faults.too_many) {
         let (s, v) = error(429, "too_many_requests", "");
+        let wait = state.lock().unwrap().retry_after;
+        return respond(&mut conn, s, &[("Content-Type", "application/json".into()), ("Retry-After", wait.to_string())], v.to_string().as_bytes());
+    }
+    if call == "b2_list_parts" && take(&faults.parts_gone) {
+        let (s, v) = error(400, "bad_request", "no such file");
+        return json_reply(&mut conn, s, &v);
+    }
+    if call == "b2_copy_part" && take(&faults.copy_part_refused) {
+        let (s, v) = error(400, "bad_request", "range out of the file");
+        return json_reply(&mut conn, s, &v);
+    }
+    if take(&faults.capped) {
+        let (s, v) = error(403, "transaction_cap_exceeded", "Transaction cap exceeded");
         return json_reply(&mut conn, s, &v);
     }
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
@@ -404,8 +428,14 @@ fn upload(req: &Request, state: &Mutex<State>) -> (u16, Value) {
     if let Some(bucket) = req.path.strip_prefix("/upload/") {
         let name = decode(req.headers.get("x-bz-file-name").map(String::as_str).unwrap_or(""));
         let id = st.add(bucket, &name, &req.body);
-        let v = st.versions.iter().find(|v| v.id == id).unwrap().json();
-        return (200, v);
+        let v = st.versions.iter_mut().find(|v| v.id == id).unwrap();
+        // File info comes in X-Bz-Info-* headers (here lowercased, as read).
+        for (k, value) in &req.headers {
+            if let Some(key) = k.strip_prefix("x-bz-info-") {
+                v.info.insert(key.to_string(), decode(value).into());
+            }
+        }
+        return (200, v.json());
     }
     let file_id = req.path.trim_start_matches("/upload_part/").to_string();
     let n: u64 = req.headers.get("x-bz-part-number").and_then(|n| n.parse().ok()).unwrap_or(0);
@@ -575,19 +605,30 @@ fn api(call: &str, b: &Value, state: &Mutex<State>, url: &str) -> (u16, Value) {
             st.large.insert(id.clone(), Large { bucket: s(b, "bucketId").into(), name: s(b, "fileName").into(), info: info.clone(), parts: BTreeMap::new(), ts });
             (200, json!({"fileId": id, "fileName": s(b, "fileName"), "bucketId": s(b, "bucketId"), "action": "start", "fileInfo": info, "uploadTimestamp": ts, "contentLength": 0, "contentSha1": "none"}))
         }
+        // Oldest first, at most 100 a page, from `startFileId` (as B2 documents).
         "b2_list_unfinished_large_files" => {
-            let files: Vec<Value> = st
-                .large
+            let mut all: Vec<(&String, &Large)> = st.large.iter().filter(|(_, l)| l.bucket == s(b, "bucketId") && l.name.starts_with(s(b, "namePrefix"))).collect();
+            all.sort_by_key(|(id, l)| (l.ts, (*id).clone()));
+            if let Some(i) = all.iter().position(|(id, _)| id.as_str() == s(b, "startFileId")) {
+                all.drain(..i);
+            }
+            let count = count.min(100);
+            let next = all.get(count).map(|(id, _)| (*id).clone());
+            let files: Vec<Value> = all
                 .iter()
-                .filter(|(_, l)| l.bucket == s(b, "bucketId") && l.name.starts_with(s(b, "namePrefix")))
+                .take(count)
                 .map(|(id, l)| json!({"fileId": id, "fileName": l.name, "bucketId": l.bucket, "action": "start", "fileInfo": l.info, "uploadTimestamp": l.ts, "contentLength": 0, "contentSha1": "none"}))
                 .collect();
-            (200, json!({"files": files, "nextFileId": null}))
+            (200, json!({"files": files, "nextFileId": next}))
         }
         "b2_list_parts" => match st.large.get(s(b, "fileId")) {
             Some(l) => {
-                let parts: Vec<Value> = l.parts.iter().map(|(n, (d, sha1))| json!({"fileId": s(b, "fileId"), "partNumber": n, "contentLength": d.len(), "contentSha1": sha1, "uploadTimestamp": 1})).collect();
-                (200, json!({"parts": parts, "nextPartNumber": null}))
+                let from = b.get("startPartNumber").and_then(Value::as_u64).unwrap_or(1);
+                let most = b.get("maxPartCount").and_then(Value::as_u64).unwrap_or(1000).min(1000) as usize;
+                let all: Vec<_> = l.parts.range(from..).collect();
+                let next = all.get(most).map(|(n, _)| **n);
+                let parts: Vec<Value> = all.iter().take(most).map(|(n, (d, sha1))| json!({"fileId": s(b, "fileId"), "partNumber": n, "contentLength": d.len(), "contentSha1": sha1, "uploadTimestamp": 1})).collect();
+                (200, json!({"parts": parts, "nextPartNumber": next}))
             }
             None => error(400, "bad_request", "no such file"),
         },

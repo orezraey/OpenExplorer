@@ -71,18 +71,139 @@ fn buckets_and_folders_list_by_delimiter_and_markers_stay_hidden() {
 }
 
 #[test]
-fn a_recent_listing_is_reused_and_stat_reads_it() {
+fn a_kept_listing_shows_while_b2_is_asked_again_and_changes_elsewhere_come_through() {
     let m = mock();
     let a = m.account();
     names(&a, "/fotos/2024");
     m.reset_counts();
-    names(&a, "/fotos/2024");
-    assert!(a.stat("/fotos/2024/praia.jpg").unwrap().is_some());
-    assert!(a.stat("/fotos/2024/outra.jpg").unwrap().is_none());
-    assert_eq!(m.lock().requests, 0, "nothing asked of B2");
-    // A fresh read asks again.
-    a.list_fresh("/fotos/2024").unwrap();
+    // Kept: there at once, nothing asked.
+    assert_eq!(a.cached("/fotos/2024").unwrap().items.len(), 2);
+    assert_eq!(m.lock().requests, 0);
+    // Read again: the same, one request.
+    assert_eq!(a.reread("/fotos/2024").unwrap(), crate::Fresh::Same);
     assert_eq!(m.calls("b2_list_file_names"), 1);
+    // A file added and one hidden elsewhere: the next reading says so, and keeps it.
+    {
+        let mut st = m.lock();
+        st.add("bkt_fotos", "2024/de-fora.jpg", b"x");
+        st.hide("bkt_fotos", "2024/praia.jpg");
+    }
+    let crate::Fresh::Changed(items) = a.reread("/fotos/2024").unwrap() else { panic!("the change isn't seen") };
+    let mut got: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+    got.sort();
+    assert_eq!(got, ["de-fora.jpg", "ferias"]);
+    assert_eq!(a.cached("/fotos/2024").unwrap().items, items);
+    // Before writing, B2 is asked, never the kept listing: a name taken elsewhere counts.
+    m.lock().add("bkt_fotos", "2024/tomado.jpg", b"t");
+    m.reset_counts();
+    assert!(a.stat("/fotos/2024/tomado.jpg").unwrap().is_some());
+    assert!(a.stat("/fotos/2024/outra.jpg").unwrap().is_none());
+    assert!(a.stat("/fotos/2024/ferias").unwrap().unwrap().is_dir);
+    assert_eq!(m.lock().requests, 3, "one request each");
+    assert!(a.mkdir(&mut Uploads::default(), "/fotos/2024/tomado.jpg").is_err());
+}
+
+#[test]
+fn a_walk_reads_a_whole_tree_in_one_request() {
+    let m = mock();
+    let a = m.account();
+    a.buckets_fresh().unwrap();
+    m.reset_counts();
+    let mut got = Vec::new();
+    a.walk("/fotos", &mut |page| {
+        got.extend(page.into_iter().map(|(rel, item)| (rel, item.name, item.size)));
+        true
+    })
+    .unwrap();
+    got.sort();
+    let want = [("2024/ferias/a.jpg", "a.jpg", 3), ("2024/praia.jpg", "praia.jpg", 5), ("leia-me.txt", "leia-me.txt", 2), ("vazia/.bzEmpty", ".bzEmpty", 0)];
+    assert_eq!(got, want.map(|(r, n, s)| (r.to_string(), n.to_string(), Some(s))));
+    assert_eq!(m.lock().requests, 1);
+    let mut under = Vec::new();
+    a.walk("/fotos/2024", &mut |page| {
+        under.extend(page.into_iter().map(|(rel, _)| rel));
+        false
+    })
+    .unwrap();
+    under.sort();
+    assert_eq!(under, ["ferias/a.jpg", "praia.jpg"]);
+}
+
+#[test]
+fn a_name_between_a_file_and_its_folder_is_still_found_in_one_or_two_requests() {
+    let m = mock();
+    {
+        let mut st = m.lock();
+        // Names sorting between "x" and "x/": "x (2)", "x.txt"...; then the folder "x/".
+        for i in 0..150 {
+            st.add("bkt_docs", &format!("x.{i:03}"), b"");
+        }
+        st.add("bkt_docs", "x/dentro.txt", b"d");
+    }
+    let a = m.account();
+    a.buckets_fresh().unwrap();
+    m.reset_counts();
+    assert!(a.stat("/docs/x").unwrap().unwrap().is_dir);
+    assert_eq!(m.lock().requests, 2, "the page of names between, then the folder alone");
+    m.reset_counts();
+    assert!(a.stat("/docs/x.007").unwrap().is_some_and(|i| !i.is_dir));
+    assert!(a.stat("/docs/y").unwrap().is_none());
+    assert_eq!(m.lock().requests, 2);
+}
+
+#[test]
+fn the_apps_own_readings_say_what_changed_and_keep_within_their_budget() {
+    let m = mock();
+    let a = m.account();
+    names(&a, "/fotos/2024");
+    assert_eq!(a.poll("/fotos/2024"), crate::Polled::Same);
+    m.lock().add("bkt_fotos", "2024/nova.jpg", b"n");
+    assert!(matches!(a.poll("/fotos/2024"), crate::Polled::Changed(items) if items.len() == 3));
+    // The top isn't read on its own.
+    m.reset_counts();
+    assert_eq!(a.poll("/"), crate::Polled::Same);
+    assert_eq!(m.lock().requests, 0);
+    assert_eq!(a.polls_spent(), (2, 2));
+    // A 429 isn't sent again: the reading waits its Retry-After, and so do the next ones.
+    m.faults.too_many.store(1, Ordering::SeqCst);
+    m.lock().retry_after = 30;
+    let crate::Polled::Wait(w) = a.poll("/fotos/2024") else { panic!("no wait") };
+    assert!((29..=30).contains(&w), "{w}");
+    assert_eq!(m.calls("b2_list_file_names"), 1, "tried once");
+    assert!(matches!(a.poll("/fotos/2024"), crate::Polled::Wait(_)));
+    assert_eq!(m.calls("b2_list_file_names"), 1, "held while paused");
+}
+
+#[test]
+fn a_cap_stops_the_apps_own_readings_until_the_user_reads() {
+    let m = mock();
+    let a = m.account();
+    names(&a, "/fotos/2024");
+    m.faults.capped.store(1, Ordering::SeqCst);
+    assert!(matches!(a.poll("/fotos/2024"), crate::Polled::Stopped(why) if why.contains("Caps & Alerts")));
+    m.reset_counts();
+    assert!(matches!(a.poll("/fotos/2024"), crate::Polled::Stopped(_)));
+    assert_eq!(m.lock().requests, 0);
+    // Atualizar goes through: the readings start again.
+    a.list_fresh("/fotos/2024").unwrap();
+    assert_eq!(a.poll("/fotos/2024"), crate::Polled::Same);
+}
+
+#[test]
+fn a_listing_read_across_an_own_change_isnt_kept() {
+    let m = mock();
+    let a = std::sync::Arc::new(m.account());
+    names(&a, "/fotos");
+    m.faults.latency_ms.store(300, Ordering::SeqCst);
+    let reader = {
+        let a = a.clone();
+        std::thread::spawn(move || a.list_fresh("/fotos/2024").unwrap())
+    };
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // While it's read, the app makes a change there.
+    a.changed(&crate::account::Spot::of("/fotos/2024/x").unwrap(), false);
+    reader.join().unwrap();
+    assert!(a.cached("/fotos/2024").is_none(), "what was read may predate the change");
 }
 
 #[test]
@@ -124,9 +245,10 @@ fn listings_survive_a_restart_sealed_under_the_key() {
     }
     m.reset_counts();
     let a = Account::new(m.api(), Some(file.clone()));
-    assert_eq!(names(&a, "/fotos/2024"), ["ferias/", "praia.jpg"]);
+    assert_eq!(a.cached("/fotos/2024").unwrap().items.len(), 2);
     assert_eq!(a.known_buckets().len(), 2, "the buckets come back from the kept top");
-    assert_eq!(m.lock().requests, 0, "a restart reopens a recent folder without asking B2");
+    assert_eq!(m.lock().requests, 0, "a restart shows a folder seen before without waiting for B2");
+    assert_eq!(a.reread("/fotos/2024").unwrap(), crate::Fresh::Same);
     // Another application key under the same id opens nothing.
     let other = Account::new(crate::api::Api::at(&m.url, crate::mock::KEY_ID, "K000outra"), Some(file.clone()));
     assert!(other.cached("/fotos/2024").is_none());
@@ -270,6 +392,88 @@ fn a_large_upload_that_failed_resumes_with_the_parts_b2_has() {
 }
 
 #[test]
+fn unfinished_uploads_show_what_b2_holds_and_go_on_or_are_cancelled() {
+    let _one = crate::notes::TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("oe-b2-flows-unfinished-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::notes::set_file(Some(dir.join("b2-uploads.json")));
+    let m = mock();
+    small_parts(&m);
+    let a = m.account();
+    let mut up = Uploads::default();
+    let data = noise(6 * (1 << 20));
+    let len = data.len() as u64;
+    let local = dir.join("video.bin");
+    std::fs::write(&local, &data).unwrap();
+    // This app sent the file from here and stopped midway (as upload_file notes it).
+    crate::notes::begin(crate::mock::KEY_ID, "fotos", "video.bin", len, &local);
+    let mut broken = Breaks { data: &data, at: 0, stop_at: 3 * (1 << 20) + 10 };
+    assert!(a.upload(&mut up, "/fotos/video.bin", &mut broken, len, &mut |_| true).is_err());
+    // Another program's, older, with one part.
+    let part = std::sync::Arc::new(vec![1u8; 100]);
+    m.lock().large.insert("4_zoutro".into(), crate::mock::Large { bucket: "bkt_fotos".into(), name: "de-outro.bin".into(), info: Default::default(), parts: [(1, (part.clone(), crate::api::sha1_hex(&part)))].into(), ts: 1 });
+    let list = a.unfinished_uploads("fotos").unwrap();
+    assert_eq!(list.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(), ["de-outro.bin", "video.bin"], "oldest first");
+    assert_eq!((list[0].size, list[0].local.as_ref(), list[0].sent, list[0].parts), (None, None, 100, 1));
+    let mine = &list[1];
+    assert_eq!((mine.size, mine.local.as_ref(), mine.sending), (Some(len), Some(&local), false));
+    assert!(mine.parts >= 1 && mine.sent == mine.parts as u64 * (1 << 20), "{mine:?}");
+    // Taken up again from the file on this computer: only the parts B2 doesn't hold go.
+    m.reset_counts();
+    a.upload_file(&mut up, "/fotos/video.bin", &local, &mut |_| true).unwrap();
+    assert_eq!(m.calls("b2_upload_part"), 6 - mine.parts);
+    assert_eq!(get(&a, "/fotos/video.bin"), data);
+    assert_eq!(crate::notes::local_of(crate::mock::KEY_ID, "fotos", "video.bin", len), None, "its note went with it");
+    // One being sent now isn't cancelled from the list; otherwise it is, its parts deleted.
+    let busy = crate::upload::InFlight::new("4_zoutro");
+    assert_eq!(a.cancel_unfinished(&["4_zoutro".into()]).unwrap(), 0);
+    drop(busy);
+    assert_eq!(a.cancel_unfinished(&["4_zoutro".into()]).unwrap(), 1);
+    assert!(m.lock().large.is_empty() && a.unfinished_uploads("fotos").unwrap().is_empty());
+    crate::notes::set_file(None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_file_from_the_computer_keeps_its_own_time_small_or_large() {
+    let m = mock();
+    small_parts(&m);
+    let a = m.account();
+    let mut up = Uploads::default();
+    let dir = std::env::temp_dir().join(format!("oe-b2-flows-dated-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_600_000_000_123);
+    for (name, len) in [("pequeno.txt", 10), ("grande.bin", 3 * (1 << 20) + 5)] {
+        let local = dir.join(name);
+        std::fs::write(&local, noise(len)).unwrap();
+        std::fs::File::options().write(true).open(&local).unwrap().set_modified(when).unwrap();
+        a.upload_file(&mut up, &format!("/fotos/{name}"), &local, &mut |_| true).unwrap();
+        assert_eq!(a.stat(&format!("/fotos/{name}")).unwrap().unwrap().modified, Some(1_600_000_000_123), "{name}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn unfinished_uploads_list_past_a_page_and_parts_past_theirs() {
+    let m = mock();
+    let a = m.account();
+    {
+        let mut st = m.lock();
+        for i in 0..130u64 {
+            let parts = if i == 0 { (1..=1500u64).map(|n| (n, (std::sync::Arc::new(vec![0u8; 2]), String::new()))).collect() } else { Default::default() };
+            st.large.insert(format!("4_zl{i:04}"), crate::mock::Large { bucket: "bkt_docs".into(), name: format!("l{i}"), info: Default::default(), parts, ts: i as i64 });
+        }
+    }
+    let list = a.unfinished_uploads("docs").unwrap();
+    assert_eq!(list.len(), 130);
+    assert_eq!((list[0].parts, list[0].sent), (1500, 3000));
+    assert_eq!(m.calls("b2_list_unfinished_large_files"), 2);
+    // One that ended between the listing and its parts is left out; the rest still show.
+    m.faults.parts_gone.store(1, Ordering::SeqCst);
+    assert_eq!(a.unfinished_uploads("docs").unwrap().len(), 129);
+}
+
+#[test]
 fn cancelling_a_large_upload_cancels_it_on_b2() {
     let m = mock();
     small_parts(&m);
@@ -392,7 +596,12 @@ fn copies_stay_on_b2_and_big_ones_go_in_parts() {
     assert_eq!(v.id, id);
     a.copy_large(&v, &bucket, "enorme.iso").unwrap();
     assert_eq!(m.calls("b2_copy_part"), 3);
+    assert_eq!(m.calls("b2_list_parts"), 0, "the parts' SHA-1 come with b2_copy_part");
     assert_eq!(get(&a, "/docs/enorme.iso"), data);
+    // A copy that fails midway is cancelled: its parts don't stay unfinished, billed.
+    m.faults.copy_part_refused.store(1, Ordering::SeqCst);
+    assert!(a.copy_large(&v, &bucket, "outra.iso").is_err());
+    assert!(m.lock().large.is_empty());
 }
 
 #[test]

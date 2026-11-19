@@ -1,17 +1,20 @@
-//! Folder listings kept between openings and between runs, so reopening a folder seen a moment
-//! ago asks B2 nothing.
+//! Folder listings kept between openings and between runs, so a folder seen before shows at
+//! once, without waiting for B2.
 //!
 //! # When a listing is read again
 //!
 //! B2 has no change log nor any way to ask "what changed since": a listing can't be proved
-//! current, only young. So:
-//! - opening a folder whose listing is younger than [`FRESH`] (5 minutes) shows it and asks B2
-//!   nothing; an older one shows at once and is read again behind it;
-//! - Atualizar (and every reload after the app's own changes) reads the folder again;
+//! current, and listing is free (see [`crate::watch`]). So a kept listing is only ever shown
+//! while B2 is asked again:
+//! - opening a folder shows its kept listing at once and always reads it again behind it; the
+//!   pane changes only if B2's answer differs (`Account::reread`);
+//! - while a pane shows a folder and the window has the focus, the folder is read again every
+//!   45 seconds or so, within a budget (`Account::poll`, [`crate::watch`]);
+//! - anything that checks before writing (a name taken, a folder's names before an upload) asks
+//!   B2, never the kept listing (`Account::list`, `Account::stat`);
 //! - the app's own changes drop the listings they touch at once (the folder an item left or
-//!   entered, and every folder under one moved, copied or deleted), so they never show stale;
-//! - what others change (the website, another computer, a sync tool) shows once the listing is
-//!   older than [`FRESH`], or on Atualizar.
+//!   entered, every folder above it, and every folder under one moved, copied or deleted), and
+//!   a listing read across one of them isn't kept.
 //!
 //! Listings older than [`KEEP`] (30 days) are dropped from the disk.
 //!
@@ -46,8 +49,6 @@ use sha2::Digest;
 
 use crate::account::Item;
 
-/// How long a listing stands without asking B2 again.
-pub const FRESH: Duration = Duration::from_secs(5 * 60);
 /// How long a listing stays on disk at all.
 pub const KEEP: Duration = Duration::from_secs(30 * 24 * 3600);
 /// The items a key keeps in memory at most, over all its listings: the oldest listings go first.
@@ -76,10 +77,6 @@ pub struct Listing {
 impl Listing {
     pub fn age(&self) -> Duration {
         Duration::from_secs(now().saturating_sub(self.fetched))
-    }
-
-    pub fn fresh(&self) -> bool {
-        self.age() < FRESH
     }
 }
 
@@ -255,6 +252,20 @@ impl Listings {
         }
         self.save_soon();
         listing
+    }
+
+    /// B2 listed `prefix` in `bucket` at `fetched` just as kept. The listing's time moves in
+    /// memory only (the file isn't written again for it), and at most once an hour, as it only
+    /// orders which listings go first past [`MOST_ITEMS`] and which leave the disk past [`KEEP`].
+    pub fn touch(&self, bucket: &str, prefix: &str, fetched: u64) {
+        let mut inner = self.lock();
+        let key = (bucket.to_string(), prefix.to_string());
+        if let Some(old) = inner.map.get(&key)
+            && fetched.saturating_sub(old.fetched) >= 3600
+        {
+            let moved = Arc::new(Listing { items: old.items.clone(), fetched });
+            inner.map.insert(key, moved);
+        }
     }
 
     /// Drops the listings `drop` picks.

@@ -56,7 +56,7 @@ fn bench_reopen() {
         m.reset_counts();
         for _ in 0..5 {
             let t = Instant::now();
-            assert_eq!(a.list("/fotos/fotos").unwrap().len(), items);
+            assert_eq!(a.cached("/fotos/fotos").unwrap().items.len(), items);
             warm.push(t.elapsed());
         }
         let warm_req = m.lock().requests;
@@ -64,7 +64,7 @@ fn bench_reopen() {
         for _ in 0..5 {
             let t = Instant::now();
             let b = Account::new(m.api(), Some(file.clone()));
-            assert_eq!(b.list("/fotos/fotos").unwrap().len(), items);
+            assert_eq!(b.cached("/fotos/fotos").unwrap().items.len(), items);
             disk.push(t.elapsed());
         }
         let disk_req = m.lock().requests;
@@ -149,4 +149,150 @@ fn bench_upload() {
     run("large file, 8 MiB parts, 1 at a time", 8 << 20, 1);
     run("large file, 8 MiB parts, 4 at a time", 8 << 20, 4);
     run("large file, 5 MiB parts, 4 at a time", 5 << 20, 4);
+}
+
+/// Opening a folder the way the app's pane does (`crates/app/src/b2.rs`, `load`): what it shows
+/// at once, and what it shows once B2 answered. Gives the items shown last, the ms until the
+/// first show and until the last.
+fn open_like_the_pane(a: &Account, path: &str) -> (Vec<crate::Item>, f64, f64) {
+    let t = Instant::now();
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+    let kept = a.cached(path);
+    let first = kept.as_ref().map(|_| ms(t));
+    let items = match (a.reread(path).unwrap(), kept) {
+        (crate::Fresh::Same, Some(kept)) => kept.items.clone(),
+        (crate::Fresh::Same, None) => unreachable!("nothing kept is never the same"),
+        (crate::Fresh::Changed(items), _) => items,
+    };
+    let last = ms(t);
+    (items, first.unwrap_or(last), last)
+}
+
+/// How soon a change made elsewhere (the website, another computer) shows, and what checking
+/// costs: reopening a folder whose kept listing is a minute or ten minutes old, after a file
+/// was added elsewhere; and asking about a free name before writing to it.
+#[test]
+#[ignore]
+fn bench_freshness() {
+    println!("\nA file added elsewhere, then the folder reopened; B2 answering after {LATENCY_MS} ms\n");
+    println!("{:>7} | {:>13} | {:>8} | {:>14} | {:>14} | the new file shows", "items", "listing age", "requests", "first show ms", "last show ms");
+    for items in [1_000, 25_000] {
+        for age in [60u64, 600] {
+            let m = Mock::start();
+            folder(&m, items);
+            let a = m.account();
+            a.buckets_fresh().unwrap();
+            a.api.auth().unwrap();
+            a.list_fresh("/fotos/fotos").unwrap();
+            // The kept listing is `age` seconds old, and a file came in from elsewhere since.
+            let kept = a.cached("/fotos/fotos").unwrap();
+            a.lists.put("fotos", "fotos/", kept.items.clone(), cache::now() - age);
+            m.lock().add("bkt_fotos", "fotos/de-outro-lugar.jpg", b"x");
+            m.faults.latency_ms.store(LATENCY_MS, Ordering::SeqCst);
+            m.reset_counts();
+            let (shown, first, last) = open_like_the_pane(&a, "/fotos/fotos");
+            let seen = shown.iter().any(|i| i.name == "de-outro-lugar.jpg");
+            println!("{items:>7} | {age:>11} s | {:>8} | {first:>14.1} | {last:>14.1} | {}", m.lock().requests, if seen { "yes" } else { "no" });
+        }
+    }
+    // Before writing: is the name free? (Nova pasta, a copy or move's target.)
+    let m = Mock::start();
+    folder(&m, 1_000);
+    let a = m.account();
+    a.buckets_fresh().unwrap();
+    a.api.auth().unwrap();
+    a.list_fresh("/fotos/fotos").unwrap();
+    m.lock().add("bkt_fotos", "fotos/livre.jpg", b"x");
+    m.faults.latency_ms.store(LATENCY_MS, Ordering::SeqCst);
+    for (label, path) in [("a name taken elsewhere a moment ago", "/fotos/fotos/livre.jpg"), ("a free name", "/fotos/fotos/nada.jpg")] {
+        m.reset_counts();
+        let t = Instant::now();
+        let found = a.stat(path).unwrap().is_some();
+        println!("stat, {label:<36}: {} requests, {:>6.1} ms, says {}", m.lock().requests, t.elapsed().as_secs_f64() * 1000.0, if found { "taken" } else { "free" });
+    }
+    // Moving a file within the bucket, both folders listed a moment before.
+    a.list_fresh("/fotos").unwrap();
+    m.reset_counts();
+    let t = Instant::now();
+    a.rename("/fotos/fotos/livre.jpg", "/fotos/movido.jpg").unwrap();
+    println!("moving a file in the bucket                : {} requests, {:>6.1} ms", m.lock().requests, t.elapsed().as_secs_f64() * 1000.0);
+}
+
+/// Searching a bucket of 200 folders of 20 files: folder by folder, as the servers' search reads
+/// any server (one listing a folder), against one walk of every name.
+#[test]
+#[ignore]
+fn bench_search() {
+    let m = Mock::start();
+    {
+        let mut st = m.lock();
+        for f in 0..200 {
+            for i in 0..20 {
+                st.add("bkt_fotos", &format!("album {f:03}/sub/IMG_{i:04}.jpg"), b"");
+            }
+        }
+    }
+    let a = m.account();
+    a.buckets_fresh().unwrap();
+    a.api.auth().unwrap();
+    m.faults.latency_ms.store(LATENCY_MS, Ordering::SeqCst);
+    println!("\nSearching a bucket of 200 folders (each with a subfolder) of 20 files; B2 answering after {LATENCY_MS} ms\n");
+    m.reset_counts();
+    let t = Instant::now();
+    let mut todo = std::collections::VecDeque::from([String::from("/fotos")]);
+    let mut names = 0;
+    while let Some(dir) = todo.pop_front() {
+        for it in a.list(&dir).unwrap() {
+            names += 1;
+            if it.is_dir {
+                todo.push_back(format!("{dir}/{}", it.name));
+            }
+        }
+    }
+    println!("folder by folder: {names} names, {} requests, {:.0} ms", m.lock().requests, t.elapsed().as_secs_f64() * 1000.0);
+    m.reset_counts();
+    let t = Instant::now();
+    let mut files = 0;
+    a.walk("/fotos", &mut |page| {
+        files += page.len();
+        true
+    })
+    .unwrap();
+    println!("one walk:         {files} files, {} requests, {:.0} ms", m.lock().requests, t.elapsed().as_secs_f64() * 1000.0);
+}
+
+/// While a pane stays on a folder: how soon a change made elsewhere shows, and what the
+/// readings cost an hour.
+#[test]
+#[ignore]
+fn bench_pane_left_open() {
+    println!("\nA pane left on a folder, a file added elsewhere; B2 answering after {LATENCY_MS} ms\n");
+    for items in [1_000, 25_000] {
+        let m = Mock::start();
+        folder(&m, items);
+        let a = m.account();
+        a.buckets_fresh().unwrap();
+        a.api.auth().unwrap();
+        a.list_fresh("/fotos/fotos").unwrap();
+        m.faults.latency_ms.store(LATENCY_MS, Ordering::SeqCst);
+        m.reset_counts();
+        let t = Instant::now();
+        assert_eq!(a.poll("/fotos/fotos"), crate::Polled::Same);
+        let same = (m.lock().requests, t.elapsed().as_secs_f64() * 1000.0);
+        m.lock().add("bkt_fotos", "fotos/de-outro-lugar.jpg", b"x");
+        m.reset_counts();
+        let t = Instant::now();
+        assert!(matches!(a.poll("/fotos/fotos"), crate::Polled::Changed(_)));
+        let changed = (m.lock().requests, t.elapsed().as_secs_f64() * 1000.0);
+        let every = crate::watch::every(items).as_secs();
+        println!(
+            "{items:>7} items: read again every {every} s; unchanged {} requests {:.1} ms, changed {} requests {:.1} ms; shows within {every} s + {:.0} ms; {} requests an hour",
+            same.0,
+            same.1,
+            changed.0,
+            changed.1,
+            changed.1,
+            3600 / every * u64::from(crate::watch::cost(items))
+        );
+    }
 }

@@ -658,6 +658,10 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         tx.wake_at(at);
     }
     onedrive::tick(s, now);
+    b2::tick(s, now);
+    if let Some(at) = b2::next_ask(s) {
+        tx.wake_at(at);
+    }
     if let Some(at) = mega::next_ask(s).into_iter().chain(onedrive::next_ask(s)).reduce(f64::min) {
         tx.wake_at(at);
     }
@@ -1733,8 +1737,10 @@ fn main() {
     // Each Dropbox account's listings, sealed, so a folder opened before isn't read again.
     openexplorer_dropbox::cache::set_dir(Some(openexplorer_gdrive::local_dir().join("dropbox")));
     openexplorer_b2::set_log(openexplorer_gdrive::log);
-    // Each B2 key's folder listings, sealed, so a recent folder reopens without asking B2.
+    // Each B2 key's folder listings, sealed, so a folder seen before shows at once.
     openexplorer_b2::set_cache_dir(Some(b2::cache_dir()));
+    // Which file each large B2 upload sends, to take one that stopped up again.
+    openexplorer_b2::set_notes_file(Some(b2::notes_file()));
     // Each OneDrive account's listings and delta position, sealed, so a start reads one page.
     openexplorer_onedrive::set_log(openexplorer_gdrive::log);
     openexplorer_onedrive::set_cache_dir(Some(openexplorer_gdrive::local_dir().join("onedrive")));
@@ -2019,6 +2025,8 @@ fn main() {
                 f.error = Some(openexplorer_i18n::t("O ID da chave ou a chave de aplicação estão errados (ou a chave foi apagada).", "The key ID or the application key is wrong (or the key was deleted).").into());
                 s.dialog = Some(actions::Dialog::Server(Box::new(f)));
             }),
+            // A B2 bucket's unfinished uploads, without a network.
+            ("b2-unfinished", b2::unfinished_scene),
             // A OneDrive account's files with its storage, without a network.
             ("onedrive", |s| {
                 let sv = openexplorer_remote::Server::onedrive("b!exemplo", "voce@exemplo.com");
@@ -2091,6 +2099,8 @@ fn main() {
     })
     .font_smoothing(initial.text_render.smoothing())
     .args(rune_args(std::env::args().skip(1)))
+    // B2 folders on screen are read again only while the window is in front.
+    .on_focus(b2::window_focus)
     // The app ends without returning from `run`: what MEGA changed since its trees were last
     // kept is kept here, so the next start has less to catch up on.
     .on_quit(|_, _| {
