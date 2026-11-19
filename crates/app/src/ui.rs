@@ -9,7 +9,7 @@ use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, ScrollBar,
 
 use crate::model::{Kind, Location, SortCol, Space, crumbs, format_bytes, format_long, format_size, format_time, shown};
 use crate::actions::{self, ClipMode, Dialog};
-use crate::{State, click, disconnect, drag_item, dragged_ids, dropped, go_back, go_forward, go_up, key, load, navigate, open, pane_key, paths_for, row_key, set_sort};
+use crate::{State, click, disconnect, drag_item, dragged_ids, dropped, go_back, go_forward, go_up, key, load, navigate, open, pane_key, paths_for, refresh, row_key, set_sort};
 use crate::icons;
 use crate::ops::Stage;
 use openexplorer_i18n::{t, tr};
@@ -2700,7 +2700,7 @@ fn toolbar(s: &State, k: &Kit) -> El {
         (None, None) => bar,
     };
     bar.child(sep())
-        .child(tool(k, "reload-all", &icons::REFRESH, t("Atualizar", "Refresh"), true, |s: &mut State, _| load(s, s.active)))
+        .child(tool(k, "reload-all", &icons::REFRESH, t("Atualizar", "Refresh"), true, |s: &mut State, _| refresh(s, s.active)))
         .child(el().grow(1.0))
         .child(tool(k, "options", &icons::SETTINGS, t("Opções", "Options"), true, |s: &mut State, _| {
             s.dialog = Some(Dialog::Options(Box::new(crate::settings::OptionsView::open(crate::settings::OptionsTab::General))));
@@ -2982,7 +2982,7 @@ fn navbar(s: &State, k: &Kit, p: usize) -> El {
         .child(nav_button(k, "up", &icons::UP, t("Acima (Backspace)", "Up (Backspace)"), can_go_up(&pane.loc), move |s: &mut State| go_up(s, p)))
         .child(path_bar(s, k, p).mx(4.0))
         .child(search_box(s, k, p))
-        .child(nav_button(k, "reload", &icons::REFRESH, t("Atualizar (Ctrl+R)", "Refresh (Ctrl+R)"), true, move |s: &mut State| load(s, p)))
+        .child(nav_button(k, "reload", &icons::REFRESH, t("Atualizar (Ctrl+R)", "Refresh (Ctrl+R)"), true, move |s: &mut State| refresh(s, p)))
 }
 
 /// The search field of a Drive pane: Enter searches where the pane is (see

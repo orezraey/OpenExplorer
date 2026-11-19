@@ -833,6 +833,12 @@ fn load(s: &mut State, p: usize) {
     list(s, p, true);
 }
 
+/// Atualizar: [`load`], with a Dropbox folder read whole rather than from its kept listing.
+fn refresh(s: &mut State, p: usize) {
+    dropbox::forget_shown(s, p);
+    load(s, p);
+}
+
 /// The app changed the folders at `reload` itself, and Drive's change log may not show it yet:
 /// their cached listings aren't trusted on the log's word until read again.
 fn changed_here(s: &mut State, reload: &[Location]) {
@@ -1332,7 +1338,7 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             return true;
         }
         _ if ev.is_command('r') => {
-            load(s, p);
+            refresh(s, p);
             return true;
         }
         _ => return false,

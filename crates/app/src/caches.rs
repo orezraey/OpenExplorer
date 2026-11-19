@@ -96,6 +96,8 @@ pub fn clear(s: &mut State) {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     *page = Page { usage: page.usage, waiting: id, clearing: true, confirming: false, error: None };
     let drive = s.cache.clear();
+    // Dropbox listings held in memory go too, not only their files.
+    openexplorer_dropbox::forget_kept();
     openexplorer_gdrive::log("cache: limpando as listagens do Google Drive e as árvores do MEGA");
     crate::background(s, move |emit| {
         // No answer only if the Drive cache's disk thread is gone: clear it from here.
