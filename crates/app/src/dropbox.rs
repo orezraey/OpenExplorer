@@ -45,6 +45,16 @@ pub fn top(server: &Server) -> Location {
     folder(server, Vec::new())
 }
 
+/// Atualizar on pane `p`: a Dropbox folder's kept listing goes, so it's read whole (the reloads
+/// after changes keep using it, brought up to date by the account's change log).
+pub fn forget_shown(s: &State, p: usize) {
+    if let Some((server, path)) = at(&s.panes[p].loc)
+        && let Some(a) = dropbox::cached(&server.user)
+    {
+        a.forget(&server.path(path));
+    }
+}
+
 /// The panes' places on account `id`, reloaded after a change there.
 fn panes_on(s: &State, id: &str) -> Vec<Location> {
     s.panes.iter().map(|p| p.loc.clone()).filter(|l| matches!(l, Location::Server { server, .. } if server.id == id)).collect()
