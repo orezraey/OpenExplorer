@@ -25,7 +25,10 @@
 //! is read for what just arrived and each item is matched by its name, its folder (`DirName`,
 //! compared from the library on, so the site's address doesn't matter) and the time it was
 //! deleted. The match is kept by the item's Graph id, so the app's undo steps stay the same for
-//! both kinds of account.
+//! both kinds of account. Only what just arrived is read: `$filter` on `DeletedDate`, else the
+//! newest first (`$orderby`, `$top`), the whole bin only where SharePoint takes neither (both
+//! are SharePoint REST's OData options; its documentation doesn't say the recycle bin follows
+//! them, so an answer that isn't newest first is caught and the whole bin read).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -42,6 +45,23 @@ use crate::{PendingLogin, Result, log};
 const AT_ONCE: usize = 4;
 /// How far the clocks of this machine and SharePoint's may disagree, in seconds.
 const SKEW: i64 = 300;
+/// The fields of a bin item read.
+const SELECT: &str = "$select=Id,LeafName,DirName,DeletedDate,ItemState,ItemType,Size";
+/// More items newer than a delete than this, read newest first, and the whole bin is read.
+const MOST_RECENT: usize = 5000;
+
+/// How what just arrived in the bin is read (see [`Account::read_recent`]): each way tried
+/// until SharePoint takes one, and that one kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Recent {
+    /// `$filter` on `DeletedDate`.
+    #[default]
+    Filter,
+    /// `$orderby=DeletedDate desc` and `$top`, stopping at the first older item.
+    Newest,
+    /// The whole bin.
+    Whole,
+}
 
 /// An item in the recycle bin, as the Lixeira shows it.
 #[derive(Clone, Debug, PartialEq)]
@@ -328,6 +348,8 @@ pub(crate) struct Side {
     /// The collection the bin is read from: `site/RecycleBin`, or `web/RecycleBin` where the
     /// site collection's is refused.
     web_only: Mutex<bool>,
+    /// How what just arrived in the bin is read, as SharePoint turned out to take it.
+    recent: Mutex<Recent>,
     digest: Mutex<Option<String>>,
     /// What the Lixeira listed last, and whether it can be reached.
     shown: Mutex<Listed>,
@@ -421,23 +443,23 @@ impl Account {
         if *lock(&self.bin.web_only) { "web/RecycleBin" } else { "site/RecycleBin" }
     }
 
-    /// The bin's items as SharePoint has them now, `since` (seconds since 1970) on if given.
-    fn read_bin(&self, since: Option<i64>) -> Res<Vec<BinItem>> {
-        let site = self.site()?;
+    /// The bin's raw items for `query` (after the `?`), page by page while `more` says the page
+    /// just read calls for the next. The site collection's bin refused, the site's is read
+    /// instead (and from then on); refused there too, what to grant.
+    fn bin_pages(&self, query: &str, mut more: impl FnMut(&[Value]) -> bool) -> Res<Vec<Value>> {
         let what = t("Ler a lixeira", "Read the recycle bin");
-        let select = "$select=Id,LeafName,DirName,DeletedDate,ItemState,ItemType,Size";
-        let filter = since.and_then(|s| chrono::DateTime::from_timestamp(s, 0)).map(|d| format!("&$filter=DeletedDate%20ge%20datetime%27{}%27", d.format("%Y-%m-%dT%H:%M:%SZ"))).unwrap_or_default();
-        let mut url = format!("{}?{select}{filter}", self.collection());
+        let mut url = format!("{}?{query}", self.collection());
         let mut raw: Vec<Value> = Vec::new();
-        let mut filtered = !filter.is_empty();
         let mut retried_web = false;
         loop {
             match self.sp("GET", &url, what) {
                 Ok(v) => {
-                    raw.extend(v.get("value").and_then(Value::as_array).into_iter().flatten().cloned());
+                    let page: &[Value] = v.get("value").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+                    let go_on = more(page);
+                    raw.extend(page.iter().cloned());
                     match v.get("odata.nextLink").or_else(|| v.get("@odata.nextLink")).and_then(Value::as_str) {
-                        Some(next) => url = next.to_string(),
-                        None => break,
+                        Some(next) if go_on => url = next.to_string(),
+                        _ => break,
                     }
                 }
                 // The site collection's bin refused: the site's own (the first stage).
@@ -446,7 +468,7 @@ impl Account {
                     *lock(&self.bin.web_only) = true;
                     retried_web = true;
                     raw.clear();
-                    url = format!("{}?{select}{filter}", self.collection());
+                    url = format!("{}?{query}", self.collection());
                 }
                 // Refused on both: the token holds a SharePoint permission that isn't enough
                 // (another than AllSites.Write): what to grant, with SharePoint's words.
@@ -454,16 +476,79 @@ impl Account {
                     lock(&self.bin.shown).0 = Access::NeedsConsent(f.text.clone());
                     return Err(Fail { text: consent_help(), ..f });
                 }
-                Err(f) if f.code == NEEDS_CONSENT => return Err(f),
-                // A filter it can't take (whatever it answers): the whole bin, filtered here.
-                Err(_) if filtered => {
-                    filtered = false;
-                    raw.clear();
-                    url = format!("{}?{select}", self.collection());
-                }
                 Err(f) => return Err(f),
             }
         }
+        Ok(raw)
+    }
+
+    /// The whole bin as SharePoint has it now, `since` (seconds since 1970) on if given.
+    fn read_bin(&self, since: Option<i64>) -> Res<Vec<BinItem>> {
+        let raw = self.bin_pages(SELECT, |_| true)?;
+        self.bin_of(&raw, since)
+    }
+
+    /// What arrived in the bin `since` on, about `want` items (what was just deleted), read as
+    /// cheaply as SharePoint lets: with `$filter` on `DeletedDate`; where that's refused, the
+    /// newest first (`$orderby` and `$top`), stopping at the first one older than `since`;
+    /// where that's refused or not followed (the answer isn't newest first), the whole bin.
+    /// What SharePoint refused is remembered, so a delete doesn't pay a failed request first.
+    /// Also how it was read.
+    fn read_recent(&self, since: i64, want: usize) -> Res<(Vec<BinItem>, Recent)> {
+        let refused = |f: &Fail| f.code == NEEDS_CONSENT || matches!(f.status, 401 | 403);
+        if *lock(&self.bin.recent) == Recent::Filter {
+            let filter = chrono::DateTime::from_timestamp(since, 0).map(|d| format!("&$filter=DeletedDate%20ge%20datetime%27{}%27", d.format("%Y-%m-%dT%H:%M:%SZ"))).unwrap_or_default();
+            match self.bin_pages(&format!("{SELECT}{filter}"), |_| true) {
+                Ok(raw) => return Ok((self.bin_of(&raw, Some(since))?, Recent::Filter)),
+                Err(f) if refused(&f) => return Err(f),
+                // A filter it can't take (whatever it answers): not asked again.
+                Err(f) => {
+                    log(&format!("OneDrive {}: a lixeira não aceita $filter ({}); lendo as mais novas primeiro", self.meta.id, f.status));
+                    *lock(&self.bin.recent) = Recent::Newest;
+                }
+            }
+        }
+        if *lock(&self.bin.recent) == Recent::Newest {
+            // What was deleted, and room for what others deleted meanwhile.
+            let mut top = want + 20;
+            loop {
+                let (mut last, mut sorted, mut reached, mut count) = (i64::MAX, true, false, 0usize);
+                let read = self.bin_pages(&format!("{SELECT}&$orderby=DeletedDate%20desc&$top={top}"), |page| {
+                    for v in page {
+                        let d = time(v.get("DeletedDate"));
+                        sorted &= d <= last;
+                        reached |= d < since;
+                        last = d;
+                        count += 1;
+                    }
+                    sorted && !reached
+                });
+                match read {
+                    // Newest first, down to one older than `since` or to the bin's end.
+                    Ok(raw) if sorted && (reached || count < top) => return Ok((self.bin_of(&raw, Some(since))?, Recent::Newest)),
+                    // All of them new: more of them.
+                    Ok(_) if sorted && top < MOST_RECENT => top *= 4,
+                    Ok(_) if sorted => break,
+                    Ok(_) => {
+                        log(&format!("OneDrive {}: a lixeira não veio das mais novas para as mais velhas; lendo-a inteira", self.meta.id));
+                        *lock(&self.bin.recent) = Recent::Whole;
+                        break;
+                    }
+                    Err(f) if refused(&f) => return Err(f),
+                    Err(f) => {
+                        log(&format!("OneDrive {}: a lixeira não aceita $orderby ({}); lendo-a inteira", self.meta.id, f.status));
+                        *lock(&self.bin.recent) = Recent::Whole;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok((self.read_bin(Some(since))?, Recent::Whole))
+    }
+
+    /// Raw bin items as the Lixeira shows them, `since` on if given.
+    fn bin_of(&self, raw: &[Value], since: Option<i64>) -> Res<Vec<BinItem>> {
+        let site = self.site()?;
         let mut items: Vec<BinItem> = raw
             .iter()
             .filter_map(|v| {
@@ -619,18 +704,36 @@ impl Account {
                 gone.insert(id.clone(), Gone { leaf: leaf.clone(), folder: folder.clone(), bin: None });
             }
         }
-        let (site, found) = match self.site().and_then(|s| self.read_bin(Some(since - SKEW)).map(|f| (s, f))) {
+        let since = since - SKEW;
+        let (site, (found, how)) = match self.site().and_then(|s| self.read_recent(since, items.len()).map(|f| (s, f))) {
             Ok(x) => x,
             Err(f) => {
                 log(&format!("OneDrive {}: sem a lixeira para desfazer ({})", self.meta.id, f.text));
                 return;
             }
         };
+        let missed = self.match_gone(&site, &found, items);
+        // Read newest first and something missing: SharePoint may have taken `$top` without
+        // ordering by date. The whole bin settles it, and if it finds what that missed, the
+        // whole bin is read from then on.
+        if missed > 0 && how == Recent::Newest
+            && let Ok(all) = self.read_bin(Some(since))
+            && self.match_gone(&site, &all, items) < missed
+        {
+            log(&format!("OneDrive {}: a lixeira lida das mais novas deixou itens de fora; lendo-a inteira daqui em diante", self.meta.id));
+            *lock(&self.bin.recent) = Recent::Whole;
+        }
+    }
+
+    /// Matches the deleted `items` not matched yet with bin items among `found`: how many
+    /// are left without one.
+    fn match_gone(&self, site: &Site, found: &[BinItem], items: &[(String, String, String)]) -> usize {
         let mut gone = lock(&self.bin.gone);
         // A bin item already matched to another deletion isn't this one.
         let mut taken: Vec<String> = gone.values().filter_map(|g| g.bin.clone()).collect();
+        let mut missed = 0;
         for (id, _, _) in items {
-            let Some(g) = gone.get_mut(id) else { continue };
+            let Some(g) = gone.get_mut(id).filter(|g| g.bin.is_none()) else { continue };
             let key = site.key(&g.folder);
             let full = site.full(&g.folder);
             let named: Vec<&BinItem> = found.iter().filter(|b| !taken.contains(&b.id) && b.leaf.eq_ignore_ascii_case(&g.leaf)).collect();
@@ -642,9 +745,13 @@ impl Account {
                     taken.push(b.id.clone());
                     g.bin = Some(b.id.clone());
                 }
-                None => log(&format!("OneDrive {}: não achei “{}” na lixeira", self.meta.id, g.leaf)),
+                None => {
+                    missed += 1;
+                    log(&format!("OneDrive {}: não achei “{}” na lixeira", self.meta.id, g.leaf));
+                }
             }
         }
+        missed
     }
 
     /// Whether Desfazer can bring item `id` back from the recycle bin.

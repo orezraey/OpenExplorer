@@ -71,6 +71,10 @@ pub struct State {
     pub sp_web_refused: bool,
     /// Recycle bin items per page (`odata.nextLink`), all at once if 0.
     pub sp_page: usize,
+    /// `$orderby` and `$top` refused (400).
+    pub sp_no_orderby: bool,
+    /// `$orderby` taken but not followed: the bin comes oldest first (`$top` still cuts it).
+    pub sp_ignore_orderby: bool,
     /// The recycle bin, oldest first.
     pub bin: Vec<FBin>,
     /// Requests to SharePoint's REST API.
@@ -712,7 +716,19 @@ fn sharepoint(req: &Req, st: &mut State, rest: &str, base: &str) -> Resp {
             Some(f) => f.split("datetime'").nth(1).map(|s| s.trim_end_matches('\'').to_string()),
             None => None,
         };
-        let all: Vec<&FBin> = st.bin.iter().filter(|b| visible(b) && since.as_ref().is_none_or(|s| b.deleted >= *s)).collect();
+        let ordered = req.query.contains_key("$orderby") || req.query.contains_key("$top");
+        if ordered && st.sp_no_orderby {
+            return sp_error(400, "-1, Microsoft.SharePoint.Client.InvalidClientQueryException", "The query is not valid.");
+        }
+        let mut all: Vec<&FBin> = st.bin.iter().filter(|b| visible(b) && since.as_ref().is_none_or(|s| b.deleted >= *s)).collect();
+        if !st.sp_ignore_orderby && req.query.get("$orderby").is_some_and(|o| o == "DeletedDate desc") {
+            // Newest first; of the same date, the one put in last first.
+            all.reverse();
+            all.sort_by(|a, b| b.deleted.cmp(&a.deleted));
+        }
+        if let Some(top) = req.query.get("$top").and_then(|t| t.parse::<usize>().ok()) {
+            all.truncate(top);
+        }
         let skip: usize = req.query.get("$skiptoken").and_then(|s| s.parse().ok()).unwrap_or(0);
         let take = if st.sp_page == 0 { usize::MAX } else { st.sp_page };
         let page: Vec<Value> = all
