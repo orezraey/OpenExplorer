@@ -82,6 +82,11 @@ pub fn failure(status: u16, body: &str, what: &str) -> Fail {
         (_, "accessDenied") | (403, _) => tr!("{what}: o OneDrive negou o acesso ({message}).", "{what}: OneDrive denied access ({message})."),
         (_, "quotaLimitReached") | (507, _) => tr!("{what}: não há espaço livre no OneDrive.", "{what}: there's no free space on OneDrive."),
         (423, _) => tr!("{what}: o item está bloqueado (aberto em outro lugar?).", "{what}: the item is locked (open elsewhere?)."),
+        // The Personal Vault: Graph turns away every app but Microsoft's own from what it holds.
+        (400, _) if message.contains("ObjectHandle is Invalid") => tr!(
+            "{what}: este é o Cofre Pessoal do OneDrive, que a Microsoft só deixa abrir no site ou no app do OneDrive.",
+            "{what}: this is the OneDrive Personal Vault, which Microsoft only lets you open on the website or in the OneDrive app."
+        ),
         _ => tr!("{what}: o OneDrive respondeu {status}: {message}", "{what}: OneDrive answered {status}: {message}"),
     };
     Fail { status, code, text }

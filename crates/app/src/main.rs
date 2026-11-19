@@ -839,9 +839,11 @@ fn load(s: &mut State, p: usize) {
     list(s, p, true);
 }
 
-/// Atualizar: [`load`], with a Dropbox folder read whole rather than from its kept listing.
+/// Atualizar: [`load`], with a Dropbox or OneDrive folder read whole rather than from its kept
+/// listing.
 fn refresh(s: &mut State, p: usize) {
     dropbox::forget_shown(s, p);
+    onedrive::forget_shown(s, p);
     load(s, p);
 }
 

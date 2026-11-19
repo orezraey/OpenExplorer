@@ -33,6 +33,56 @@ fn measure(fake: &Fake, mut run: impl FnMut()) -> (usize, usize, f64) {
     ((fake.requests() - r0) / RUNS, (fake.count.bytes.load(Ordering::SeqCst) - b0) / RUNS, ms)
 }
 
+/// Browsing a small drive as the app does, the change watcher polling every 15 s: Meus arquivos
+/// (4 folders), into one, back, into it again, into one of its folders, back up. Each step
+/// comes some seconds after the poll before it (the delta feed's last word). Requests per step,
+/// and the time they'd take at 500 ms each (what Graph answered in from Brazil, the log says).
+/// Run with `cargo test -p openexplorer-onedrive --lib bench_browse -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn bench_browse() {
+    let fake = Fake::start();
+    fake.with(|st| {
+        for f in ["Documentos", "Fotos", "Música", "Trabalho"] {
+            let dir = st.add(ROOT, f, true, &[]);
+            for s in ["2023", "2024", "2025", "Outros"] {
+                let sub = st.add(&dir, s, true, &[]);
+                for i in 0..5 {
+                    st.add(&sub, &format!("arquivo {i}.pdf"), false, &[]);
+                }
+            }
+        }
+    });
+    let a = on(fake.ends(), Kind::Personal, None).unwrap();
+    let steps = [
+        ("Meus arquivos", "/Meus arquivos"),
+        ("entrar em Fotos (1ª vez)", "/Meus arquivos/Fotos"),
+        ("voltar a Meus arquivos", "/Meus arquivos"),
+        ("entrar em Fotos de novo", "/Meus arquivos/Fotos"),
+        ("entrar em Fotos/2024 (1ª vez)", "/Meus arquivos/Fotos/2024"),
+        ("voltar a Fotos", "/Meus arquivos/Fotos"),
+        ("entrar em Documentos (1ª vez)", "/Meus arquivos/Documentos"),
+    ];
+    a.poll().unwrap();
+    let (mut waited, mut behind) = (0, 0);
+    println!("passo | pedidos esperando | a 500 ms | pedidos em segundo plano");
+    for (name, path) in steps {
+        // Six seconds since the watcher's last poll.
+        a.age(std::time::Duration::from_secs(6));
+        let before = fake.requests();
+        a.list(path).unwrap();
+        let n = fake.requests() - before;
+        // What the app asks next, in the background, once a folder shows.
+        let before = fake.requests();
+        a.prefetch(path);
+        let m = fake.requests() - before;
+        (waited, behind) = (waited + n, behind + m);
+        println!("{name} | {n} | {} ms | {m}", n * 500);
+        a.poll().unwrap();
+    }
+    println!("total | {waited} | {} ms | {behind}", waited * 500);
+}
+
 #[test]
 #[ignore]
 fn bench() {

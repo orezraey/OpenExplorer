@@ -25,6 +25,12 @@ pub use crate::tree::Changes;
 
 /// A folder checked against the delta feed this recently is taken as current without asking.
 const FRESH: Duration = Duration::from_secs(3);
+/// While the app polls the delta feed (every 15 s while a pane shows the account), the tree is
+/// as current as the last poll, and a poll this recent spares an opening its own delta request:
+/// what changes elsewhere reaches the panes through the poll itself, as MEGA's does.
+const WATCHED: Duration = Duration::from_secs(20);
+/// Folders read ahead at most after one opens (see [`Account::prefetch`]): one `$batch` of 20.
+const AHEAD: usize = 20;
 /// More pages of changes than this and the listings are read again instead.
 const MOST_PAGES: usize = 20;
 /// How often a tree that changed is written down while the account is used.
@@ -186,6 +192,10 @@ pub struct Account {
     from_cache: bool,
     /// A work account's recycle bin, through SharePoint (see `bin.rs`).
     pub(crate) bin: crate::bin::Side,
+    /// When the app's change watcher last polled the delta feed (see [`WATCHED`]).
+    watched: Mutex<Option<Instant>>,
+    /// Folders Atualizar asked to read whole at their next opening, by id.
+    stale: Mutex<HashSet<String>>,
 }
 
 fn parts(path: &str) -> Vec<String> {
@@ -234,10 +244,10 @@ impl Account {
         });
         let from_cache = kept.is_some();
         let st = St { tree: kept.unwrap_or_default(), checked: None, epoch: 0, dirty: !from_cache, saved: Instant::now() };
-        let a = Account { meta, graph, st: Mutex::new(st), catching: Mutex::new(()), forgotten: AtomicBool::new(false), keep, mark, from_cache, bin: Default::default() };
-        if from_cache {
-            a.catch_up()?;
-        } else {
+        let a = Account { meta, graph, st: Mutex::new(st), catching: Mutex::new(()), forgotten: AtomicBool::new(false), keep, mark, from_cache, bin: Default::default(), watched: Mutex::new(None), stale: Mutex::default() };
+        // A kept tree is brought up to date by the first listing (`fresh`), so the panes can
+        // show what it holds before any request; a new one needs its position now.
+        if !from_cache {
             a.establish()?;
         }
         Ok(a)
@@ -344,9 +354,14 @@ impl Account {
         Ok(Changes { all: false, folders: touched })
     }
 
-    /// Brought up to date unless it was a moment ago.
+    /// Brought up to date unless it was a moment ago, or the app's watcher keeps it so.
     fn fresh(&self) -> Res<()> {
-        if self.st().checked.is_some_and(|c| c.elapsed() < FRESH) {
+        let checked = self.st().checked;
+        if checked.is_some_and(|c| c.elapsed() < FRESH) {
+            return Ok(());
+        }
+        let watched = *self.watched.lock().unwrap_or_else(|e| e.into_inner());
+        if watched.is_some_and(|w| w.elapsed() < WATCHED) && checked.is_some_and(|c| c.elapsed() < WATCHED) {
             return Ok(());
         }
         self.catch_up_unless(Some(FRESH)).map(|_| ())
@@ -356,8 +371,81 @@ impl Account {
     /// shows the account), the tree written down when due.
     pub fn poll(&self) -> Result<Changes> {
         let c = self.catch_up()?;
+        *self.watched.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         self.save_if_due();
         Ok(c)
+    }
+
+    /// Atualizar on folder `path`: the next opening asks the delta feed and reads the folder
+    /// whole, whatever is kept.
+    pub fn forget(&self, path: &str) {
+        self.st().checked = None;
+        *self.watched.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if let Some(id) = self.folder_id(path) {
+            self.stale.lock().unwrap_or_else(|e| e.into_inner()).insert(id);
+        }
+    }
+
+    /// Folder `path`'s items as the kept tree holds them, with no request: what a pane shows at
+    /// once while [`Account::list`] brings them up to date. `None` when it isn't kept (not
+    /// listed yet, in a shared folder, or not in Meus arquivos).
+    pub fn kept_list(&self, path: &str) -> Option<Vec<Item>> {
+        let segs = parts(path);
+        if self.area(segs.first()?)? != Area::Files {
+            return None;
+        }
+        let st = self.st();
+        let Walk::Found(ix) = st.tree.walk(&segs[1..]) else { return None };
+        let kids = st.tree.children(ix)?;
+        Some(kids.iter().map(|k| self.own_loc(&st.tree, *k).item).collect())
+    }
+
+    /// Reads ahead the folders inside folder `path` that aren't listed yet (up to [`AHEAD`]),
+    /// in one `$batch`, so opening one of them shows it at once. Nothing when the tree holds
+    /// them all, and no error: an opening reads what this couldn't.
+    pub fn prefetch(&self, path: &str) {
+        let segs = parts(path);
+        if segs.first().and_then(|f| self.area(f)) != Some(Area::Files) {
+            return;
+        }
+        let (epoch, ids) = {
+            let st = self.st();
+            let Walk::Found(ix) = st.tree.walk(&segs[1..]) else { return };
+            let Some(kids) = st.tree.children(ix) else { return };
+            let ids: Vec<String> = kids
+                .iter()
+                .map(|k| st.tree.get(*k))
+                .filter(|n| n.is_dir && n.remote.is_none() && n.children.is_none())
+                .take(AHEAD)
+                .map(|n| n.id.to_string())
+                .collect();
+            (st.epoch, ids)
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let subs: Vec<Sub> = ids.iter().map(|id| Sub { method: "GET", url: format!("/drives/{}/items/{}/children?$select={SELECT}&$top={PAGE}", segment(self.drive()), segment(id)), body: None }).collect();
+        let answers = self.graph.batch(&subs, t("Listar a pasta", "List the folder"));
+        let mut st = self.st();
+        // Changes taken in meanwhile may make these listings out of date: an opening reads them.
+        if st.epoch != epoch {
+            return;
+        }
+        for (id, answer) in ids.iter().zip(answers) {
+            let Ok((200, v)) = answer else { continue };
+            // A folder with more than a page isn't kept from here: its opening reads it whole.
+            if v.get("@odata.nextLink").is_some() {
+                continue;
+            }
+            let seen: Vec<Seen> = v.get("value").and_then(Value::as_array).into_iter().flatten().filter_map(Seen::of).collect();
+            if let Some(ix) = st.tree.find(id)
+                && st.tree.get(ix).is_dir
+                && st.tree.get(ix).children.is_none()
+            {
+                st.tree.set_listing(ix, &seen);
+                st.dirty = true;
+            }
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -514,6 +602,10 @@ impl Account {
             return Err(tr!("{path} não é uma pasta.", "{path} isn't a folder."));
         }
         if loc.own {
+            // Atualizar asked for this folder whole.
+            if self.stale.lock().unwrap_or_else(|e| e.into_inner()).remove(&loc.addr.id) {
+                return Ok(self.list_own(&loc.addr.id)?.iter().map(item_of).collect());
+            }
             // Found again by id: the tree may have changed since `locate` let it go.
             let st = self.st();
             if let Some(kids) = st.tree.find(&loc.addr.id).and_then(|ix| st.tree.children(ix)) {
@@ -1041,6 +1133,15 @@ pub fn disconnect(id: &str) {
 
 #[cfg(test)]
 impl Account {
+    /// As if `by` had passed since the tree was last brought up to date and the watcher last
+    /// polled (tests, benchmarks).
+    pub(crate) fn age(&self, by: Duration) {
+        let mut st = self.st();
+        st.checked = st.checked.map(|c| c.checked_sub(by).unwrap_or(c));
+        let mut w = self.watched.lock().unwrap_or_else(|e| e.into_inner());
+        *w = w.map(|c| c.checked_sub(by).unwrap_or(c));
+    }
+
     /// Folder `id`'s whole listing from Graph, not kept: what opening it costs without the tree.
     pub(crate) fn list_fresh(&self, id: &str) -> Vec<Item> {
         let url = format!("/drives/{}/items/{}/children?$select={SELECT}&$top={PAGE}", segment(self.drive()), segment(id));
@@ -1059,6 +1160,62 @@ pub(crate) fn on(ends: Endpoints, kind: Kind, keep: Option<(PathBuf, cache::Secr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fake::{Fake, ROOT};
+
+    /// A drive of 2 folders with a folder and a file each.
+    fn small(fake: &Fake) {
+        fake.with(|st| {
+            for f in ["A", "B"] {
+                let d = st.add(ROOT, f, true, &[]);
+                let sub = st.add(&d, "sub", true, &[]);
+                st.add(&sub, "x.txt", false, b"x");
+            }
+        });
+    }
+
+    #[test]
+    fn a_watched_tree_opens_folders_without_asking_and_reads_ahead() {
+        let fake = Fake::start();
+        small(&fake);
+        let a = on(fake.ends(), Kind::Personal, None).unwrap();
+        a.list("/Meus arquivos").unwrap();
+        a.prefetch("/Meus arquivos");
+        a.poll().unwrap();
+        a.age(Duration::from_secs(10));
+        // Watched 10 s ago: no delta request, and A was read ahead.
+        let before = fake.requests();
+        assert_eq!(a.list("/Meus arquivos/A").unwrap().len(), 1);
+        assert_eq!(fake.requests(), before);
+        // Not watched for a while: the feed is asked again.
+        a.age(Duration::from_secs(30));
+        let before = fake.requests();
+        a.list("/Meus arquivos/A").unwrap();
+        assert_eq!(fake.requests(), before + 1);
+    }
+
+    #[test]
+    fn the_kept_listing_shows_without_a_request_and_atualizar_reads_whole() {
+        let fake = Fake::start();
+        small(&fake);
+        let a = on(fake.ends(), Kind::Personal, None).unwrap();
+        assert!(a.kept_list("/Meus arquivos/A").is_none());
+        a.list("/Meus arquivos/A").unwrap();
+        let before = fake.requests();
+        assert_eq!(a.kept_list("/Meus arquivos/A").unwrap()[0].name, "sub");
+        assert!(a.kept_list("/Lixeira").is_none() && a.kept_list("/").is_none());
+        assert_eq!(fake.requests(), before);
+        // Atualizar: the feed and the folder itself.
+        a.forget("/Meus arquivos/A");
+        a.list("/Meus arquivos/A").unwrap();
+        assert_eq!(fake.requests(), before + 2);
+    }
+
+    #[test]
+    fn the_personal_vault_says_what_it_is() {
+        let body = r#"{"error":{"code":"invalidRequest","message":"ObjectHandle is Invalid"}}"#;
+        let f = crate::graph::failure(400, body, "Listar a pasta");
+        assert!(f.text.contains("Cofre Pessoal") || f.text.contains("Personal Vault"), "{}", f.text);
+    }
 
     #[test]
     fn names_onedrive_refuses() {

@@ -311,7 +311,8 @@ pub fn quota_bar(s: &State, loc: &Location) -> Option<(String, Option<f64>, Stri
 pub fn load(s: &mut State, p: usize, request: u64, fresh: bool) -> bool {
     match Account::at(&s.panes[p].loc) {
         Some(Account::B2) => b2::load(s, p, request, fresh),
-        Some(Account::Mega | Account::Dropbox | Account::OneDrive) | None => return false,
+        Some(Account::OneDrive) => return onedrive::load(s, p, request),
+        Some(Account::Mega | Account::Dropbox) | None => return false,
     }
     true
 }

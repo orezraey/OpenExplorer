@@ -117,6 +117,61 @@ fn panes_on(s: &State, id: &str) -> Vec<Location> {
     s.panes.iter().map(|p| p.loc.clone()).filter(|l| matches!(l, Location::Server { server, .. } if server.id == id)).collect()
 }
 
+fn entry_of(i: od::Item) -> Entry {
+    let modified = i.modified.filter(|t| *t > 0).map(|t| std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(t as u64));
+    crate::servers::entry(openexplorer_remote::Item { name: i.name, is_dir: i.is_dir, size: i.size, modified, link: false })
+}
+
+/// Lists pane `p`'s folder in Meus arquivos on a thread: what the kept tree holds shows at once,
+/// then the folder as the delta feed brings it (no request while the change watcher keeps the
+/// tree current), and then the folders inside it are read ahead, so opening one is immediate.
+/// `false` where the servers' listing does it (searches, the Lixeira, the account's top).
+pub fn load(s: &mut State, p: usize, request: u64) -> bool {
+    let Location::Server { server, path, find: None } = s.panes[p].loc.clone() else { return false };
+    if path.first().and_then(|f| od::Area::of(f)) != Some(od::Area::Files) {
+        return false;
+    }
+    let show_hidden = s.settings.show_hidden;
+    let pane = &mut s.panes[p];
+    pane.loading = true;
+    pane.error = None;
+    pane.free = None;
+    background(s, move |emit| {
+        let listed = |part, result| Msg::Listed { pane: p, request, part, result, at: None };
+        let shown = |items: Vec<od::Item>| items.into_iter().filter(|i| show_hidden || !i.name.starts_with('.')).map(entry_of).collect::<Vec<_>>();
+        let dir = server.path(&path);
+        let account = match catch_panic(t("abrir o OneDrive", "open OneDrive"), || od::reach(&server.user)) {
+            Ok(a) => a,
+            Err(e) => return emit(listed(crate::Part::WHOLE, Err(e))),
+        };
+        let kept = account.kept_list(&dir);
+        if let Some(items) = &kept {
+            emit(listed(crate::Part::Cached, Ok(shown(items.clone()))));
+        }
+        match catch_panic(t("listar", "list"), || account.list(&dir)) {
+            Ok(items) => emit(listed(crate::Part::WHOLE, Ok(shown(items)))),
+            // The kept listing stays on screen; the error is said.
+            Err(e) if kept.is_some() => emit(listed(crate::Part::Page { first: false, more: false }, Err(e))),
+            Err(e) => return emit(listed(crate::Part::WHOLE, Err(e))),
+        }
+        let _ = catch_panic(t("ler as pastas adiante", "read folders ahead"), || {
+            account.prefetch(&dir);
+            Ok(())
+        });
+    });
+    true
+}
+
+/// Atualizar: the folder pane `p` shows is read whole at its next opening, and the delta feed
+/// asked, whatever the tree holds.
+pub fn forget_shown(s: &State, p: usize) {
+    if let Some((server, path)) = at(&s.panes[p].loc)
+        && let Some(a) = od::cached(&server.user)
+    {
+        a.forget(&server.path(path));
+    }
+}
+
 /// Runs `work` with the account on a thread, then `done` with the result.
 fn task<T: Send + 'static>(s: &State, server: &Server, doing: &'static str, work: impl FnOnce(&Account) -> Result<T, String> + Send + 'static, done: impl FnOnce(Result<T, String>) -> Msg + Send + 'static) {
     let id = server.user.clone();
