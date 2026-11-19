@@ -60,7 +60,7 @@ pub struct Deleted {
 
 /// What `list_revisions` says of a deleted path.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Found {
+pub(crate) enum Found {
     File { rev: String, size: u64, when: i64 },
     /// A folder (`not_file`).
     Folder,
@@ -91,7 +91,7 @@ fn each<T: Sync, R: Send>(items: &[T], at_once: usize, work: impl Fn(&T) -> R + 
 
 impl Account {
     /// What `list_revisions` says of `path`.
-    fn found(&self, path: &str) -> Result<Found> {
+    pub(crate) fn found(&self, path: &str) -> Result<Found> {
         let v = match self.api.rpc("files/list_revisions", &json!({"path": api_path(path), "mode": "path", "limit": 1})) {
             Ok(v) => v,
             Err(f) if f.is("not_file") => return Ok(Found::Folder),

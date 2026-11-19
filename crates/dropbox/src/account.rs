@@ -37,6 +37,28 @@ const MAX_LOG_PAGES: usize = 5;
 const SAVE_EVERY: Duration = Duration::from_secs(60);
 /// Folders noted as changed for the watcher, past which it's told "everything".
 const MAX_PENDING: usize = 10_000;
+/// Tries of a write whose answer is lost, each after asking whether it was done.
+const WRITE_TRIES: u32 = 3;
+/// How long after a lost answer before asking how things stand: work Dropbox took in may still
+/// be under way.
+#[cfg(not(test))]
+pub(crate) const SETTLE: Duration = Duration::from_secs(2);
+#[cfg(test)]
+pub(crate) const SETTLE: Duration = Duration::from_millis(20);
+
+/// An item's metadata as the API writes it (what [`entry`] reads back).
+pub(crate) fn meta_value(e: &Entry) -> Value {
+    let mut v = json!({".tag": if e.dir { "folder" } else { "file" }, "name": e.name, "path_lower": e.lower});
+    if !e.dir {
+        v["rev"] = json!(e.rev);
+        v["size"] = json!(e.size);
+        v["content_hash"] = json!(e.hash);
+        if let Some(t) = e.modified {
+            v["client_modified"] = json!(crate::meta::timestamp(t));
+        }
+    }
+    v
+}
 
 /// The account's storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -285,18 +307,22 @@ impl Account {
 
     /// Every item of folder `path`, read whole (`list_folder` and its pages).
     fn read_folder(&self, path: &str) -> Result<Vec<Entry>> {
-        let first = self.api.rpc("files/list_folder", &json!({"path": api_path(path), "recursive": false, "include_deleted": false, "limit": 2000})).map_err(|f| {
+        self.read_whole(path).map_err(|f| {
             if f.is("not_found") { tr!("A pasta “{}” não está mais no Dropbox.", "The folder “{}” is no longer on Dropbox.", last(&api_path(path))) } else { about(path, f) }
-        })?;
+        })
+    }
+
+    /// [`Account::read_folder`], its failure as Dropbox gave it.
+    fn read_whole(&self, path: &str) -> std::result::Result<Vec<Entry>, Fail> {
+        let mut page = self.api.rpc("files/list_folder", &json!({"path": api_path(path), "recursive": false, "include_deleted": false, "limit": 2000}))?;
         let mut entries = Vec::new();
-        let mut page = first;
         loop {
             entries.extend(page.get("entries").and_then(Value::as_array).into_iter().flatten().filter_map(entry));
             if !page.get("has_more").and_then(Value::as_bool).unwrap_or(false) {
                 return Ok(entries);
             }
             let cursor = page.get("cursor").and_then(Value::as_str).unwrap_or("").to_string();
-            page = self.api.rpc("files/list_folder/continue", &json!({"cursor": cursor})).map_err(String::from)?;
+            page = self.api.rpc("files/list_folder/continue", &json!({"cursor": cursor}))?;
         }
     }
 
@@ -367,24 +393,154 @@ impl Account {
         entry(v.get("metadata").unwrap_or(v)).ok_or_else(|| t("O Dropbox respondeu sem os dados do item.", "Dropbox answered without the item's details.").into())
     }
 
+    // -----------------------------------------------------------------------------------------
+    // Writes whose answer was lost
+
+    /// Sends a write that mustn't go twice blindly (see [`crate::api::repeatable`]): `send`
+    /// once, and when its answer is lost, `settled` asks Dropbox how things stand: `Some`, the
+    /// answer the write would have given (it was done); `None`, it wasn't, and it goes again,
+    /// a few times at most.
+    pub(crate) fn write(&self, what: &str, send: impl Fn() -> std::result::Result<Value, Fail>, settled: impl Fn() -> std::result::Result<Option<Value>, Fail>) -> std::result::Result<Value, Fail> {
+        let mut tries = 0;
+        loop {
+            let lost = match send() {
+                Err(Fail::Lost(e)) => e,
+                r => return r,
+            };
+            tries += 1;
+            crate::api::log(&format!("Dropbox {what}: a resposta não veio ({lost}); conferindo"));
+            std::thread::sleep(SETTLE);
+            if let Some(v) = settled()? {
+                crate::api::log(&format!("Dropbox {what}: já estava feito"));
+                return Ok(v);
+            }
+            if tries >= WRITE_TRIES {
+                return Err(Fail::Lost(lost));
+            }
+        }
+    }
+
+    /// The metadata of the item at `path` as Dropbox has it now (never a kept listing), `None`
+    /// when there's nothing there.
+    pub(crate) fn metadata(&self, path: &str) -> std::result::Result<Option<Value>, Fail> {
+        match self.api.rpc("files/get_metadata", &json!({"path": api_path(path)})) {
+            Ok(v) => Ok(Some(v)),
+            Err(f) if f.is("not_found") => Ok(None),
+            Err(f) => Err(f),
+        }
+    }
+
+    /// The items at `paths` as Dropbox has them now, by lowercased path: their folders read
+    /// whole, each once (never a kept listing). A folder that isn't there holds nothing.
+    pub(crate) fn look(&self, paths: &[&str]) -> std::result::Result<HashMap<String, Entry>, Fail> {
+        let mut folders: Vec<String> = paths.iter().map(|p| parent(&key(p)).to_string()).collect();
+        folders.sort();
+        folders.dedup();
+        let mut out = HashMap::new();
+        for f in folders {
+            match self.read_whole(&f) {
+                Ok(entries) => out.extend(entries.into_iter().map(|e| (e.lower.clone(), e))),
+                Err(f) if f.is("not_found") => {}
+                Err(f) => return Err(f),
+            }
+        }
+        Ok(out)
+    }
+
+    /// How a move or copy from `from` to `to` whose answer was lost stands, from `look`'s
+    /// items: the new item when it was done. A move is done when the item left `from` and is at
+    /// `to` (or, a change of case alone, shows the new name); a copy, when `to` holds a folder
+    /// for a folder, a file with the same bytes for a file.
+    pub(crate) fn relocated(seen: &HashMap<String, Entry>, from: &str, to: &str, moving: bool) -> Option<Entry> {
+        let there = seen.get(&key(to))?;
+        let done = if moving {
+            if key(from) == key(to) { there.name == last(&api_path(to)) } else { !seen.contains_key(&key(from)) }
+        } else {
+            seen.get(&key(from)).is_some_and(|src| src.dir == there.dir && (src.dir || src.hash == there.hash && src.size == there.size))
+        };
+        done.then(|| there.clone())
+    }
+
+    /// The metadata a deletion of `path` would have answered, once it's gone: its last
+    /// revision, which Desfazer restores (`list_revisions`); a folder's has none.
+    fn deleted_metadata(&self, path: &str) -> std::result::Result<Value, Fail> {
+        let (lower, name) = (key(path), last(&api_path(path)).to_string());
+        Ok(match self.found(path).map_err(Fail::Other)? {
+            crate::deleted::Found::Folder => json!({".tag": "folder", "name": name, "path_lower": lower}),
+            crate::deleted::Found::File { rev, size, .. } => json!({".tag": "file", "name": name, "path_lower": lower, "rev": rev, "size": size}),
+            _ => json!({".tag": "file", "name": name, "path_lower": lower, "rev": ""}),
+        })
+    }
+
+    /// After a batch of deletions whose answer was lost: the item at `path` deleted, if it's
+    /// still there (gone meanwhile counts as deleted), else as the batch left it.
+    fn delete_rest(&self, path: &str) -> Result<Value> {
+        match self.metadata(path) {
+            Ok(None) => {}
+            Ok(Some(_)) => match self.delete_v2(path) {
+                Ok(v) => return Ok(v.get("metadata").cloned().unwrap_or(v)),
+                Err(f) if f.is("not_found") => {}
+                Err(f) => return Err(about(path, f)),
+            },
+            Err(f) => return Err(about(path, f)),
+        }
+        self.deleted_metadata(path).map_err(|f| about(path, f))
+    }
+
+    /// [`Account::delete`]'s request, and whether the item is gone when its answer was lost.
+    fn delete_v2(&self, path: &str) -> std::result::Result<Value, Fail> {
+        self.write(
+            "delete_v2",
+            || self.api.rpc("files/delete_v2", &json!({"path": api_path(path)})),
+            || match self.metadata(path)? {
+                Some(_) => Ok(None),
+                None => Ok(Some(json!({"metadata": self.deleted_metadata(path)?}))),
+            },
+        )
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Changes the panes make
+
     pub fn mkdir(&self, path: &str) -> Result<Entry> {
-        let v = self.api.rpc("files/create_folder_v2", &json!({"path": api_path(path), "autorename": false})).map_err(|f| about(path, f))?;
+        let v = self
+            .write(
+                "create_folder_v2",
+                || self.api.rpc("files/create_folder_v2", &json!({"path": api_path(path), "autorename": false})),
+                || Ok(self.metadata(path)?.filter(|m| m.get(".tag").and_then(Value::as_str) == Some("folder")).map(|m| json!({"metadata": m}))),
+            )
+            .map_err(|f| about(path, f))?;
         let e = Account::metadata_of(&v)?;
         self.note(&[Change::Is(e.clone())]);
         Ok(e)
     }
 
+    /// One `move_v2` or `copy_v2`, checked when its answer is lost.
+    fn relocate(&self, from: &str, to: &str, moving: bool) -> std::result::Result<Value, Fail> {
+        let (route, mut arg) = if moving { ("files/move_v2", json!({"allow_ownership_transfer": false})) } else { ("files/copy_v2", json!({})) };
+        arg["from_path"] = json!(api_path(from));
+        arg["to_path"] = json!(api_path(to));
+        arg["autorename"] = json!(false);
+        self.write(
+            route,
+            || self.api.rpc(route, &arg),
+            || {
+                let seen = self.look(&[from, to])?;
+                Ok(Account::relocated(&seen, from, to, moving).map(|e| json!({"metadata": meta_value(&e)})))
+            },
+        )
+    }
+
     /// Renames or moves `from` to `to`. Fails if something is at `to` (but a change of case
     /// alone goes through).
     pub fn rename(&self, from: &str, to: &str) -> Result<Entry> {
-        let arg = |a: &str, b: &str| json!({"from_path": api_path(a), "to_path": api_path(b), "autorename": false, "allow_ownership_transfer": false});
-        let v = match self.api.rpc("files/move_v2", &arg(from, to)) {
+        let v = match self.relocate(from, to, true) {
             Ok(v) => v,
             // Only the case changes: by a name of its own on the way.
             Err(f) if f.is("conflict") && key(from) == key(to) => {
                 let aside = format!("{}.oe-{}", api_path(from), now());
-                self.api.rpc("files/move_v2", &arg(from, &aside)).map_err(|f| about(from, f))?;
-                self.api.rpc("files/move_v2", &arg(&aside, to)).map_err(|f| about(to, f))?
+                self.relocate(from, &aside, true).map_err(|f| about(from, f))?;
+                self.relocate(&aside, to, true).map_err(|f| about(to, f))?
             }
             Err(f) => return Err(about(from, f)),
         };
@@ -395,7 +551,7 @@ impl Account {
 
     /// Copies a file or a folder and all it holds, on Dropbox's side.
     pub fn copy(&self, from: &str, to: &str) -> Result<Entry> {
-        let v = self.api.rpc("files/copy_v2", &json!({"from_path": api_path(from), "to_path": api_path(to), "autorename": false})).map_err(|f| about(from, f))?;
+        let v = self.relocate(from, to, false).map_err(|f| about(from, f))?;
         let e = Account::metadata_of(&v)?;
         self.note(&[Change::Is(e.clone())]);
         Ok(e)
@@ -404,7 +560,7 @@ impl Account {
     /// Deletes a file or a folder and all it holds. Dropbox keeps what's deleted for a while
     /// (see [`Account::restore`]). The item as it was, with its revision.
     pub fn delete(&self, path: &str) -> Result<Entry> {
-        let v = self.api.rpc("files/delete_v2", &json!({"path": api_path(path)})).map_err(|f| about(path, f))?;
+        let v = self.delete_v2(path).map_err(|f| about(path, f))?;
         let e = Account::metadata_of(&v)?;
         self.note(&[Change::Gone(e.lower.clone())]);
         Ok(e)
@@ -431,24 +587,35 @@ impl Account {
         // Up to 1,000 entries a job.
         for chunk in paths.chunks(1000) {
             let entries: Vec<Value> = chunk.iter().map(|p| json!({"path": api_path(p)})).collect();
-            let v = {
+            let answer = {
                 let _gate = self.batch_gate.lock().unwrap_or_else(|e| e.into_inner());
-                let v = self.api.rpc("files/delete_batch", &json!({"entries": entries})).map_err(String::from)?;
-                self.wait_job("files/delete_batch/check", v)?
+                self.api.rpc("files/delete_batch", &json!({"entries": entries})).and_then(|v| self.wait_job("files/delete_batch/check", v))
             };
-            let answered: Vec<Value> = v.get("entries").and_then(Value::as_array).cloned().unwrap_or_default();
-            let done: Vec<Result<Entry>> = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, p)| match answered.get(i).map(|r| (r.get(".tag").and_then(Value::as_str), r)) {
-                    Some((Some("success"), r)) => Account::metadata_of(r),
-                    Some((_, r)) => {
-                        let summary = r.get("failure").map(failure_summary).unwrap_or_default();
-                        Err(format!("“{}”: {}", last(&api_path(p)), crate::api::route_text(&summary)))
-                    }
-                    None => Err(tr!("“{}”: o Dropbox não disse se excluiu.", "“{}”: Dropbox didn't say whether it was deleted.", last(&api_path(p)))),
-                })
-                .collect();
+            let done: Vec<Result<Entry>> = match answer {
+                Ok(v) => {
+                    let answered: Vec<Value> = v.get("entries").and_then(Value::as_array).cloned().unwrap_or_default();
+                    chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| match answered.get(i).map(|r| (r.get(".tag").and_then(Value::as_str), r)) {
+                            Some((Some("success"), r)) => Account::metadata_of(r),
+                            Some((_, r)) => {
+                                let summary = r.get("failure").map(failure_summary).unwrap_or_default();
+                                Err(format!("“{}”: {}", last(&api_path(p)), crate::api::route_text(&summary)))
+                            }
+                            None => Err(tr!("“{}”: o Dropbox não disse se excluiu.", "“{}”: Dropbox didn't say whether it was deleted.", last(&api_path(p)))),
+                        })
+                        .collect()
+                }
+                // Whether the job ran is unknown: what's gone is taken as deleted by it, what's
+                // still there is deleted one by one.
+                Err(Fail::Lost(e)) => {
+                    crate::api::log(&format!("Dropbox delete_batch: a resposta não veio ({e}); conferindo item a item"));
+                    std::thread::sleep(SETTLE);
+                    chunk.iter().map(|p| self.delete_rest(p).and_then(|v| Account::metadata_of(&v))).collect()
+                }
+                Err(f) => return Err(f.text()),
+            };
             let gone: Vec<Change> = done.iter().filter_map(|r| r.as_ref().ok()).map(|e| Change::Gone(e.lower.clone())).collect();
             self.note(&gone);
             results.extend(done);
@@ -458,7 +625,9 @@ impl Account {
 
     /// Waits for a batch job that answered `first`: `complete` at once, or an `async_job_id`
     /// asked about at `check` until it ends.
-    pub(crate) fn wait_job(&self, check: &str, first: Value) -> Result<Value> {
+    /// A check whose answer was lost even after its own tries is [`Fail::Lost`]: the job may
+    /// have ended, the caller looks.
+    pub(crate) fn wait_job(&self, check: &str, first: Value) -> std::result::Result<Value, Fail> {
         let mut v = first;
         let mut pause = Duration::from_millis(100);
         let started = Instant::now();
@@ -467,18 +636,18 @@ impl Account {
             match v.get(".tag").and_then(Value::as_str) {
                 Some("complete") => return Ok(v),
                 Some("async_job_id") | Some("in_progress") => {}
-                Some("failed") => return Err(crate::api::route_text(&v.get("failed").map(failure_summary).unwrap_or_default())),
-                _ => return Err(t("O Dropbox respondeu ao lote de um jeito inesperado.", "Dropbox answered the batch in an unexpected way.").into()),
+                Some("failed") => return Err(Fail::Other(crate::api::route_text(&v.get("failed").map(failure_summary).unwrap_or_default()))),
+                _ => return Err(Fail::Other(t("O Dropbox respondeu ao lote de um jeito inesperado.", "Dropbox answered the batch in an unexpected way.").into())),
             }
             if let Some(job) = v.get("async_job_id").and_then(Value::as_str) {
                 id = job.to_string();
             }
             if started.elapsed() > Duration::from_secs(600) {
-                return Err(t("O lote no Dropbox não terminou em 10 minutos.", "The batch on Dropbox didn't end within 10 minutes.").into());
+                return Err(Fail::Other(t("O lote no Dropbox não terminou em 10 minutos.", "The batch on Dropbox didn't end within 10 minutes.").into()));
             }
             std::thread::sleep(pause);
             pause = (pause * 2).min(Duration::from_secs(2));
-            v = self.api.rpc(check, &json!({"async_job_id": id})).map_err(String::from)?;
+            v = self.api.rpc(check, &json!({"async_job_id": id}))?;
         }
     }
 
@@ -873,6 +1042,66 @@ mod tests {
         fake.put_file("/Docs/z.txt", b"z");
         assert!(third.join().unwrap().touches("/Docs"));
         assert_eq!(fake.count_since(&0, "files/list_folder/longpoll"), 2);
+    }
+
+    #[test]
+    fn a_write_whose_answer_was_lost_is_checked_and_not_sent_again() {
+        let fake = Fake::start();
+        fake.put_file("/A/f.txt", b"f");
+        fake.put_file("/A/g.txt", b"g");
+        let a = fake.account();
+        // Done by Dropbox, the answer lost on the way back: asked about, not sent again (which
+        // would fail, not_found or conflict, where the first succeeded).
+        fake.lose_answer("files/create_folder_v2");
+        let before = fake.calls();
+        assert!(a.mkdir("/Nova").unwrap().dir);
+        assert_eq!(fake.calls_since(&before), ["files/create_folder_v2", "files/get_metadata"]);
+        fake.lose_answer("files/move_v2");
+        let before = fake.calls();
+        assert_eq!(a.rename("/A/f.txt", "/B/f.txt").unwrap().name, "f.txt");
+        assert_eq!(fake.count_since(&before, "files/move_v2"), 1);
+        assert!(fake.has("/B/f.txt") && !fake.has("/A/f.txt"));
+        fake.lose_answer("files/copy_v2");
+        let before = fake.calls();
+        a.copy("/A/g.txt", "/C/g.txt").unwrap();
+        assert_eq!(fake.count_since(&before, "files/copy_v2"), 1);
+        assert_eq!(fake.content("/C/g.txt"), b"g");
+        // A deletion gives the revision Desfazer restores, as its answer would have.
+        let rev = a.metadata("/A/g.txt").unwrap().unwrap()["rev"].as_str().unwrap().to_string();
+        fake.lose_answer("files/delete_v2");
+        let before = fake.calls();
+        let e = a.delete("/A/g.txt").unwrap();
+        assert_eq!((e.dir, e.rev.as_str()), (false, rev.as_str()));
+        assert_eq!(fake.count_since(&before, "files/delete_v2"), 1);
+        a.restore("/A/g.txt", &e.rev).unwrap();
+        assert_eq!(fake.content("/A/g.txt"), b"g");
+        // Every one of them shows in the kept listings at once.
+        let names: Vec<String> = a.list("/").unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.contains(&"Nova".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn a_write_that_never_got_there_goes_again_and_reads_go_again_by_themselves() {
+        let fake = Fake::start();
+        fake.put_file("/A/f.txt", b"f");
+        let a = fake.account();
+        fake.drop_before("files/create_folder_v2");
+        let before = fake.calls();
+        a.mkdir("/Nova").unwrap();
+        assert_eq!(fake.calls_since(&before), ["files/create_folder_v2", "files/get_metadata", "files/create_folder_v2"]);
+        fake.drop_before("files/move_v2");
+        let before = fake.calls();
+        a.rename("/A/f.txt", "/Nova/f.txt").unwrap();
+        assert_eq!(fake.count_since(&before, "files/move_v2"), 2);
+        assert!(fake.has("/Nova/f.txt"));
+        fake.drop_before("files/delete_v2");
+        let e = a.delete("/Nova/f.txt").unwrap();
+        assert!(!e.dir && !fake.has("/Nova/f.txt"));
+        // A read is sent again without asking anything.
+        fake.drop_before("files/get_metadata");
+        let before = fake.calls();
+        assert!(a.metadata("/Nova").unwrap().is_some());
+        assert_eq!(fake.calls_since(&before), ["files/get_metadata", "files/get_metadata"]);
     }
 
     #[test]

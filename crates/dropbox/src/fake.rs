@@ -69,6 +69,10 @@ struct State {
     cut_download: Option<u64>,
     ranges: Vec<(String, u64)>,
     tokens: u64,
+    /// The next call to this route is done, but its answer never leaves (the connection drops).
+    lose_answer: Option<String>,
+    /// The next call to this route drops its connection before anything is done.
+    drop_before: Option<String>,
     /// Longpolls waiting now, and the most that ever waited at once.
     polling: usize,
     most_polling: usize,
@@ -404,6 +408,17 @@ impl Fake {
         self.st().batches.iter().filter(|(r, _)| r == route).map(|(_, n)| *n).collect()
     }
 
+    /// The next call to `route` does its work, then drops the connection without answering:
+    /// a request that reached Dropbox whose answer was lost.
+    pub fn lose_answer(&self, route: &str) {
+        self.st().lose_answer = Some(route.into());
+    }
+
+    /// The next call to `route` drops the connection before doing anything.
+    pub fn drop_before(&self, route: &str) {
+        self.st().drop_before = Some(route.into());
+    }
+
     /// The most longpolls that ever waited at once.
     pub fn most_longpolls(&self) -> usize {
         self.st().most_polling
@@ -495,6 +510,12 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
             return respond(&mut conn, 401, &[], json!({"error_summary": "invalid_access_token/..", "error": {".tag": "invalid_access_token"}}).to_string().as_bytes());
         }
         st.last_root = req.headers.get("dropbox-api-path-root").cloned();
+    }
+    if st.drop_before.as_deref() == Some(route.as_str()) {
+        st.drop_before = None;
+        drop(st);
+        let _ = conn.shutdown(std::net::Shutdown::Both);
+        return;
     }
     let s = |k: &str| arg.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let lower = |p: String| p.to_lowercase();
@@ -806,11 +827,16 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
         }
         "files/upload_session/finish" => {
             let id = arg.pointer("/cursor/session_id").and_then(Value::as_str).unwrap_or("").to_string();
-            let (mut data, _) = st.sessions.remove(&id).unwrap_or_default();
-            data.extend_from_slice(&req.body);
-            let path = arg.pointer("/commit/path").and_then(Value::as_str).unwrap_or("").to_string();
-            let m = st.put(&path, data);
-            ok(untagged(m))
+            match st.sessions.remove(&id) {
+                // Committed already (or never opened): its id is no more.
+                None => route_error("lookup_failed/not_found/", json!({".tag": "lookup_failed", "lookup_failed": {".tag": "not_found"}})),
+                Some((mut data, _)) => {
+                    data.extend_from_slice(&req.body);
+                    let path = arg.pointer("/commit/path").and_then(Value::as_str).unwrap_or("").to_string();
+                    let m = st.put(&path, data);
+                    ok(untagged(m))
+                }
+            }
         }
         "files/upload_session/finish_batch_v2" => {
             let entries = arg["entries"].as_array().cloned().unwrap_or_default();
@@ -869,8 +895,16 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
         other => (400, vec![], format!("Error in call to API function \"{other}\": unknown route").into_bytes()),
     };
     let delay = st.delay;
+    let lose = st.lose_answer.as_deref() == Some(route.as_str());
+    if lose {
+        st.lose_answer = None;
+    }
     drop(st);
     state.1.notify_all();
+    if lose {
+        let _ = conn.shutdown(std::net::Shutdown::Both);
+        return;
+    }
     if !delay.is_zero() {
         std::thread::sleep(delay);
     }

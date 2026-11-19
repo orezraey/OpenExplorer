@@ -5,8 +5,16 @@
 //! What every call shares lives here: the access token, renewed from the refresh token when it
 //! is about to expire or Dropbox says it did (`expired_access_token`, HTTP 401); waiting as long
 //! as Dropbox asks on HTTP 429 and 503 (`Retry-After`, or `retry_after` in the body, which
-//! `too_many_write_operations` leaves out); a few tries again on a dropped connection or a 5xx;
-//! and the `Dropbox-API-Path-Root` header of a team account (see [`crate::account`]).
+//! `too_many_write_operations` leaves out); and the `Dropbox-API-Path-Root` header of a team
+//! account (see [`crate::account`]).
+//!
+//! A request whose answer never came (a connection dropped once it was sent, a timeout, a 5xx)
+//! may or may not have done its work. Only routes that are safe to send twice go again by
+//! themselves (see [`repeatable`]): reads, the longpoll, the upload sessions' blocks (their
+//! offset says what Dropbox holds), a whole-file upload that overwrites. Any other route (a move,
+//! a copy, a deletion, a commit) fails with [`Fail::Lost`], and its caller asks Dropbox how
+//! things stand before sending it again or saying it failed (see `Account::write`). A request
+//! that never left (no address, no connection) goes again whatever its route.
 
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,6 +52,9 @@ pub enum Fail {
     Route { summary: String, error: Value },
     /// The access ended: revoked, or the refresh token no longer works.
     Auth(String),
+    /// The request may have reached Dropbox but its answer didn't come back (the connection
+    /// dropped, a timeout, a 5xx): whether it did its work is unknown. In the user's words.
+    Lost(String),
     /// Anything else, already in the user's words.
     Other(String),
 }
@@ -57,9 +68,52 @@ impl Fail {
     pub fn text(&self) -> String {
         match self {
             Fail::Route { summary, .. } => route_text(summary),
-            Fail::Auth(e) | Fail::Other(e) => e.clone(),
+            Fail::Auth(e) | Fail::Lost(e) | Fail::Other(e) => e.clone(),
         }
     }
+}
+
+/// Whether route `route` may go again by itself after a try whose answer was lost: sending it
+/// twice ends as sending it once. Reads and job checks; the longpoll; an upload session's start
+/// (a second one only leaves an unused session) and its blocks, each sent at an offset Dropbox
+/// checks (`incorrect_offset` says what it holds); a whole-file upload, which overwrites with the
+/// same bytes; a revision restored, which puts the same bytes at the path again (`RestoreError`
+/// has no conflict); a shared link made or taken away, whose second try's
+/// `shared_link_already_exists` / `shared_link_not_found` are taken as done. Anything else (a
+/// new folder, a move, a copy, a deletion, a commit of upload sessions, a batch job) would fail
+/// the second time where the first succeeded, or do the work twice.
+pub fn repeatable(route: &str) -> bool {
+    route.ends_with("/check")
+        || route.ends_with("/check_v2")
+        || matches!(
+            route,
+            "users/get_current_account"
+                | "users/get_space_usage"
+                | "auth/token/revoke"
+                | "files/list_folder"
+                | "files/list_folder/continue"
+                | "files/list_folder/get_latest_cursor"
+                | "files/list_folder/longpoll"
+                | "files/get_metadata"
+                | "files/list_revisions"
+                | "files/download"
+                | "files/upload"
+                | "files/upload_session/start"
+                | "files/upload_session/start_batch"
+                | "files/upload_session/append_v2"
+                | "files/upload_session/append_batch"
+                | "files/restore"
+                | "sharing/list_shared_links"
+                | "sharing/create_shared_link_with_settings"
+                | "sharing/revoke_shared_link"
+        )
+}
+
+/// How long a commit of `entries` upload sessions in one `finish_batch_v2` may take to answer:
+/// it answers only once every file is committed, and Dropbox gives no figure, so the RPC's 90 s
+/// and two seconds more per file (250 files: about 10 minutes).
+pub fn commit_timeout(entries: usize) -> Duration {
+    Duration::from_secs(90 + 2 * entries as u64)
 }
 
 impl From<Fail> for String {
@@ -268,19 +322,25 @@ impl Api {
         }
     }
 
-    /// Sends one call, trying again as the module docs say. `auth` adds the token (and the
-    /// path root); the longpoll goes without.
-    pub(crate) fn exec(&self, agent: Agent, url: &str, arg: Option<&Value>, range: Option<u64>, body: &mut Body, auth: bool) -> Result<ureq::http::Response<ureq::Body>, Fail> {
-        let agent = match agent {
-            Agent::Rpc => &self.rpc,
-            Agent::Transfer => &self.transfer,
-            Agent::Poll => &self.poll,
+    /// Sends one call, trying again as the module docs say: `repeat` when a try whose answer
+    /// was lost may go again (see [`repeatable`]). `auth` adds the token (and the path root);
+    /// the longpoll goes without.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn exec(&self, agent: Agent, url: &str, arg: Option<&Value>, range: Option<u64>, body: &mut Body, auth: bool, repeat: bool) -> Result<ureq::http::Response<ureq::Body>, Fail> {
+        let (agent, limit) = match agent {
+            Agent::Rpc => (&self.rpc, None),
+            Agent::Waiting(d) => (&self.rpc, Some(d)),
+            Agent::Transfer => (&self.transfer, None),
+            Agent::Poll => (&self.poll, None),
         };
         let arg = arg.map(|a| header_json(&a.to_string()));
         let mut refreshed: Option<String> = None;
         let (mut waits, mut tries) = (0u32, 0u32);
         loop {
             let mut req = agent.post(url);
+            if let Some(d) = limit {
+                req = req.config().timeout_global(Some(d)).timeout_recv_response(Some(d)).build();
+            }
             let mut token = None;
             if auth {
                 let tk = self.token(refreshed.as_deref())?;
@@ -314,8 +374,9 @@ impl Api {
                 Err(_) if stopped => return Err(Fail::Other(crate::CANCELLED.into())),
                 Err(e) => {
                     tries += 1;
-                    if tries >= TRIES {
-                        return Err(Fail::Other(net_text(&e)));
+                    if tries >= TRIES || !(repeat || never_sent(&e)) {
+                        log(&format!("Dropbox {url}: {e}, sem resposta"));
+                        return Err(Fail::Lost(net_text(&e)));
                     }
                     log(&format!("Dropbox {url}: {e}, tentando de novo"));
                     std::thread::sleep(Duration::from_millis(500 << tries));
@@ -350,9 +411,15 @@ impl Api {
                 }
                 429 => return Err(Fail::Other(t("O Dropbox pediu para esperar: muitas operações ao mesmo tempo. Tente de novo em instantes.", "Dropbox asked to wait: too many operations at once. Try again in a moment.").into())),
                 409 => return Err(Fail::Route { summary, error: json.get("error").cloned().unwrap_or(Value::Null) }),
-                500..=599 if tries + 1 < TRIES => {
+                500..=599 if repeat && tries + 1 < TRIES => {
                     tries += 1;
                     std::thread::sleep(Duration::from_millis(500 << tries));
+                }
+                // Dropbox's own failure midway (`internal_error`): whether the work was done is
+                // for the caller to find out.
+                s @ 500..=599 => {
+                    log(&format!("Dropbox {url}: HTTP {s} ({summary})"));
+                    return Err(Fail::Lost(tr!("O Dropbox respondeu com o erro HTTP {s}.", "Dropbox answered with HTTP error {s}.")));
                 }
                 400 => return Err(Fail::Other(tr!("O Dropbox recusou o pedido: {}", "Dropbox turned the request down: {}", text.chars().take(300).collect::<String>()))),
                 403 => return Err(Fail::Other(tr!("O Dropbox negou o acesso: {}", "Dropbox denied access: {}", if summary.is_empty() { text.chars().take(300).collect::<String>() } else { summary }))),
@@ -375,7 +442,14 @@ impl Api {
     /// An RPC route on the api host: `route` like "files/list_folder".
     pub fn rpc(&self, route: &str, arg: &Value) -> Result<Value, Fail> {
         let url = format!("{}/2/{route}", self.hosts.api);
-        let resp = self.exec(Agent::Rpc, &url, None, None, &mut Body::Json(arg.to_string()), true)?;
+        let resp = self.exec(Agent::Rpc, &url, None, None, &mut Body::Json(arg.to_string()), true, repeatable(route))?;
+        self.read_json(resp)
+    }
+
+    /// [`Api::rpc`] of a route that answers only once its work is done, given `limit` to.
+    pub fn rpc_waiting(&self, route: &str, arg: &Value, limit: Duration) -> Result<Value, Fail> {
+        let url = format!("{}/2/{route}", self.hosts.api);
+        let resp = self.exec(Agent::Waiting(limit), &url, None, None, &mut Body::Json(arg.to_string()), true, repeatable(route))?;
         self.read_json(resp)
     }
 
@@ -383,14 +457,14 @@ impl Api {
     pub fn longpoll(&self, cursor: &str, timeout: u64) -> Result<Value, Fail> {
         let url = format!("{}/2/files/list_folder/longpoll", self.hosts.notify);
         let arg = serde_json::json!({"cursor": cursor, "timeout": timeout});
-        let resp = self.exec(Agent::Poll, &url, None, None, &mut Body::Json(arg.to_string()), false)?;
+        let resp = self.exec(Agent::Poll, &url, None, None, &mut Body::Json(arg.to_string()), false, true)?;
         self.read_json(resp)
     }
 
     /// A content-download route: what `Dropbox-API-Result` says, and the body to read.
     pub fn download(&self, route: &str, arg: &Value, from: u64) -> Result<(Value, ureq::http::Response<ureq::Body>), Fail> {
         let url = format!("{}/2/{route}", self.hosts.content);
-        let resp = self.exec(Agent::Transfer, &url, Some(arg), (from > 0).then_some(from), &mut Body::Empty, true)?;
+        let resp = self.exec(Agent::Transfer, &url, Some(arg), (from > 0).then_some(from), &mut Body::Empty, true, true)?;
         let result = resp.headers().get("Dropbox-API-Result").and_then(|v| v.to_str().ok()).and_then(|v| serde_json::from_str(v).ok()).unwrap_or(Value::Null);
         Ok((result, resp))
     }
@@ -398,12 +472,13 @@ impl Api {
     /// A content-upload route.
     pub(crate) fn upload(&self, route: &str, arg: &Value, body: &mut Body) -> Result<Value, Fail> {
         let url = format!("{}/2/{route}", self.hosts.content);
-        let resp = self.exec(Agent::Transfer, &url, Some(arg), None, body, true)?;
+        let resp = self.exec(Agent::Transfer, &url, Some(arg), None, body, true, repeatable(route))?;
         self.read_json(resp)
     }
 
     fn read_json(&self, mut resp: ureq::http::Response<ureq::Body>) -> Result<Value, Fail> {
-        let text = resp.body_mut().with_config().limit(64 << 20).read_to_string().map_err(|e| Fail::Other(net_text(&e)))?;
+        // The work is done, but the answer saying how was cut short.
+        let text = resp.body_mut().with_config().limit(64 << 20).read_to_string().map_err(|e| Fail::Lost(net_text(&e)))?;
         self.received.fetch_add(text.len() as u64, Ordering::Relaxed);
         if text.trim().is_empty() {
             return Ok(Value::Null);
@@ -416,8 +491,16 @@ impl Api {
 #[derive(Clone, Copy)]
 pub(crate) enum Agent {
     Rpc,
+    /// An RPC given this long to answer instead.
+    Waiting(Duration),
     Transfer,
     Poll,
+}
+
+/// Whether a failed try never reached Dropbox: no address for it, no connection made.
+fn never_sent(e: &ureq::Error) -> bool {
+    matches!(e, ureq::Error::HostNotFound | ureq::Error::ConnectionFailed | ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect))
+        || matches!(e, ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
 /// A network failure in the user's words.

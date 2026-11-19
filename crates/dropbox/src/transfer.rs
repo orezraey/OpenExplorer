@@ -59,6 +59,11 @@ pub(crate) fn correct_offset(error: &Value) -> Option<u64> {
     error.get("correct_offset").or_else(|| error.pointer("/incorrect_offset/correct_offset")).and_then(Value::as_u64)
 }
 
+/// Whether metadata `m` is of a file of `len` bytes whose content hash is `hash`.
+pub(crate) fn holds(m: &Value, len: u64, hash: &str) -> bool {
+    entry(m).is_some_and(|e| !e.dir && e.size == len && e.hash == hash)
+}
+
 impl Account {
     /// Writes the file at `path` into `out`.
     pub fn download(&self, path: &str, out: &mut dyn Write, progress: Progress) -> Result<()> {
@@ -75,7 +80,7 @@ impl Account {
             let (meta, resp) = match self.api.download("files/download", &json!({"path": target}), done) {
                 Ok(r) => r,
                 Err(f) => {
-                    let retry = matches!(f, Fail::Other(_)) && tries + 1 < TRIES && done > 0;
+                    let retry = matches!(f, Fail::Other(_) | Fail::Lost(_)) && tries + 1 < TRIES && done > 0;
                     if !retry {
                         return Err(match f {
                             Fail::Route { .. } => format!("“{}”: {}", last(&api_path(path)), f.text()),
@@ -210,7 +215,7 @@ impl Account {
                             break;
                         }
                     }
-                    Err(Fail::Other(e)) if tries + 1 < TRIES => {
+                    Err(Fail::Lost(e) | Fail::Other(e)) if tries + 1 < TRIES => {
                         tries += 1;
                         crate::api::log(&format!("Dropbox envio: bloco em {offset} falhou ({e}), de novo"));
                         std::thread::sleep(Duration::from_millis(500 << tries));
@@ -227,7 +232,20 @@ impl Account {
             return Err(tr!("O arquivo mudou de tamanho durante o envio ({offset} de {len} bytes).", "The file changed size while being sent ({offset} of {len} bytes)."));
         }
         let id = session.unwrap_or_default();
-        self.api.upload("files/upload_session/finish", &json!({"cursor": {"session_id": id, "offset": offset}, "commit": commit}), &mut Body::Bytes(&[], None)).map_err(String::from)
+        self.finish(&id, offset, commit, &hash.clone().finish()).map_err(String::from)
+    }
+
+    /// Commits upload session `id`, `len` bytes long, as `commit` says. Its answer lost, the
+    /// commit is done when the file at the commit's path has these bytes (`len` and `hash`, the
+    /// content hash); else the session, not taken yet, is committed again.
+    pub(crate) fn finish(&self, id: &str, len: u64, commit: &Value, hash: &str) -> std::result::Result<Value, Fail> {
+        let path = commit.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        let arg = json!({"cursor": {"session_id": id, "offset": len}, "commit": commit});
+        self.write(
+            "upload_session/finish",
+            || self.api.upload("files/upload_session/finish", &arg, &mut Body::Bytes(&[], None)),
+            || Ok(self.metadata(&path)?.filter(|m| holds(m, len, hash))),
+        )
     }
 
     /// Whether the file at `path` on Dropbox has the same bytes as `local` (same size, same
@@ -332,6 +350,27 @@ mod tests {
         assert!(!a.same_content("/x.bin", &local, &|| false).unwrap());
         assert!(fake.calls_since(&before).is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_commit_whose_answer_was_lost_is_checked_by_its_bytes() {
+        let fake = Fake::start();
+        let a = fake.account();
+        let data = bytes(super::BLOCK + 10);
+        // Committed, the answer lost: the file there has these bytes, so it's done.
+        fake.lose_answer("files/upload_session/finish");
+        let before = fake.calls();
+        let e = a.upload("/um.bin", &mut &data[..], data.len() as u64, &mut |_| true).unwrap();
+        assert_eq!(e.size, data.len() as u64);
+        assert_eq!(fake.count_since(&before, "files/upload_session/finish"), 1);
+        assert_eq!(fake.content("/um.bin"), data);
+        // Over a file that was there: the old bytes don't count as committed.
+        fake.put_file("/dois.bin", b"antigo");
+        fake.drop_before("files/upload_session/finish");
+        let before = fake.calls();
+        a.upload("/dois.bin", &mut &data[..], data.len() as u64, &mut |_| true).unwrap();
+        assert_eq!(fake.count_since(&before, "files/upload_session/finish"), 2);
+        assert_eq!(fake.content("/dois.bin"), data);
     }
 
     #[test]
