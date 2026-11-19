@@ -11,6 +11,7 @@
 mod actions;
 mod address;
 mod autoscroll;
+mod b2;
 mod cache;
 mod caches;
 mod downloads;
@@ -99,6 +100,8 @@ enum Msg {
     Undo(undo::Answer),
     /// Something background work on a MEGA account brought back.
     Mega(mega::Answer),
+    /// Something background work on a B2 key brought back.
+    B2(b2::Answer),
     /// What the caches take, measured or cleared for Opções › Cache.
     Caches(caches::Answer),
     /// Installing the search service ended: search again in the panes `reload` shows.
@@ -541,6 +544,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
             Msg::Undo(answer) => undo::arrived(s, answer),
             Msg::Mega(answer) => mega::arrived(s, answer, tx, now),
+            Msg::B2(answer) => b2::arrived(s, answer),
             Msg::Caches(answer) => caches::arrived(s, answer),
             Msg::Changes { email, result } => watch::arrived(s, email, result, now),
             Msg::Quota { email, result } => {
@@ -894,6 +898,9 @@ fn list(s: &mut State, p: usize, fresh: bool) {
             emit(Msg::Listed { pane: p, request, part: Part::WHOLE, result, at: None });
         });
         return;
+    }
+    if matches!(&s.panes[p].loc, Location::Server { server, .. } if server.is_b2()) {
+        return b2::load(s, p, request, fresh);
     }
     if let Location::Server { server, .. } = &s.panes[p].loc {
         // A MEGA account's storage, the first time one of its folders opens.
@@ -1619,7 +1626,7 @@ fn clash_scene(s: &mut State, all: bool) {
 /// Opções open on Cache, its sizes fixed, then `then` applied to the page.
 fn cache_scene(s: &mut State, then: fn(&mut caches::Page)) {
     let mut v = settings::OptionsView::open(settings::OptionsTab::Cache);
-    v.cache.usage = Some(caches::Usage { drive: 3_565_158, mega: 48_211_968 });
+    v.cache.usage = Some(caches::Usage { drive: 3_565_158, mega: 48_211_968, b2: 1_204_224 });
     then(&mut v.cache);
     s.dialog = Some(actions::Dialog::Options(Box::new(v)));
 }
@@ -1684,6 +1691,9 @@ fn main() {
     openexplorer_mega::set_log(openexplorer_gdrive::log);
     // Each MEGA account's tree, sealed, so a start reads only what changed since.
     openexplorer_mega::set_cache_dir(Some(openexplorer_gdrive::local_dir().join("mega")));
+    openexplorer_b2::set_log(openexplorer_gdrive::log);
+    // Each B2 key's folder listings, sealed, so a recent folder reopens without asking B2.
+    openexplorer_b2::set_cache_dir(Some(b2::cache_dir()));
     rune::App::new(AppSpec::<State> {
         min_size: Some((900.0, 420.0)),
         families: initial.font.families(),
@@ -1789,7 +1799,7 @@ fn main() {
             ("options-cache-confirm", |s| cache_scene(s, |p| p.confirming = true)),
             ("options-cache-error", |s| {
                 cache_scene(s, |p| {
-                    p.usage = Some(caches::Usage { drive: 0, mega: 48_211_968 });
+                    p.usage = Some(caches::Usage { drive: 0, mega: 48_211_968, b2: 0 });
                     p.error = Some(tr!(
                         "Não foi possível apagar {}: O arquivo já está sendo usado por outro processo. (os error 32). Feche o que estiver usando o arquivo e tente de novo.",
                         "Couldn't delete {}: The process cannot access the file because it is being used by another process. (os error 32). Close whatever is using the file and try again.",
@@ -1933,6 +1943,22 @@ fn main() {
                 f.error = Some(openexplorer_mega::Refused::NeedsCode.text());
                 s.dialog = Some(actions::Dialog::Server(Box::new(f)));
             }),
+            // A B2 key's bucket, without a network.
+            ("b2", |s| {
+                let sv = openexplorer_remote::Server::b2("0051a2b3c4d5e6f0000000001", "B2 · fotos-familia");
+                s.servers.list.push(sv.clone());
+                s.panes[1].go(servers::folder(&sv, vec!["fotos-familia".into()]));
+                s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
+                s.active = 1;
+            }),
+            // Adding a B2 key, turned down.
+            ("b2-add", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::B2);
+                f.user = rune::TextEdit::new("0051a2b3c4d5e6f0000000001");
+                f.password = rune::TextEdit::new("K005abcdefghijklmnopqrstuvwxyz0").secure();
+                f.error = Some(openexplorer_i18n::t("O ID da chave ou a chave de aplicação estão errados (ou a chave foi apagada).", "The key ID or the application key is wrong (or the key was deleted).").into());
+                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+            }),
             // Compartilhar on a file shared with a few people and the link, without a network.
             ("share", |s| {
                 s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
@@ -1980,7 +2006,10 @@ fn main() {
     .args(rune_args(std::env::args().skip(1)))
     // The app ends without returning from `run`: what MEGA changed since its trees were last
     // kept is kept here, so the next start has less to catch up on.
-    .on_quit(|_, _| openexplorer_mega::save_caches())
+    .on_quit(|_, _| {
+        openexplorer_mega::save_caches();
+        openexplorer_b2::save_caches();
+    })
     .run();
 }
 

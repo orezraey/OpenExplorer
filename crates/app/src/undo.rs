@@ -57,6 +57,10 @@ pub enum Step {
     MegaTrash { server: Server, node: String, name: String },
     /// MEGA node `node`, named `name`, comes back from the Rubbish Bin to the folder it was in.
     MegaRestore { server: Server, node: String, name: String },
+    /// On B2 key `server`, the file (or every file of the folder) at `path` is hidden.
+    B2Hide { server: Server, path: String, is_dir: bool },
+    /// What was hidden at `path` at `since` (milliseconds, B2's clock) or later comes back.
+    B2Unhide { server: Server, path: String, is_dir: bool, since: i64 },
 }
 
 /// What undoes one action, or redoes one undone.
@@ -181,7 +185,7 @@ pub fn arrived(s: &mut State, answer: Answer) {
 // ---------------------------------------------------------------------------------------------
 // Jobs that record
 
-fn did(rec: &Rec, what: impl FnOnce(usize) -> String, reload: Vec<Location>, result: Result<String, String>) -> Msg {
+pub(crate) fn did(rec: &Rec, what: impl FnOnce(usize) -> String, reload: Vec<Location>, result: Result<String, String>) -> Msg {
     Msg::Undo(Answer::Did { record: rec.record(what, reload.clone()), reload, result })
 }
 
@@ -645,6 +649,7 @@ impl Step {
                 Some(st) if !st.in_bin => Err(tr!("“{name}” não está mais na Lixeira do MEGA.", "“{name}” is no longer in the MEGA Rubbish Bin.")),
                 Some(_) => Ok(()),
             },
+            Step::B2Hide { .. } | Step::B2Unhide { .. } => crate::b2::check(self),
             Step::ServerRemoveDir { server, path } => reach.server(server, &mut |c| match c.stat(path)? {
                 None => Err(tr!("“{}” não está mais no servidor.", "“{}” is no longer on the server.", server_name(path))),
                 Some(it) if !it.is_dir || it.link => Err(tr!("“{}” não é mais uma pasta.", "“{}” is no longer a folder.", server_name(path))),
@@ -731,6 +736,7 @@ impl Step {
                 reach.mega(server)?.restore(node)?;
                 Step::MegaTrash { server: server.clone(), node: node.clone(), name: name.clone() }
             }
+            Step::B2Hide { .. } | Step::B2Unhide { .. } => crate::b2::run(self)?,
         })
     }
 }
