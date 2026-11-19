@@ -57,7 +57,7 @@ mod flows;
 #[cfg(test)]
 pub(crate) mod mock;
 
-pub use account::{Account, Bucket, Fresh, Item, Rule, cached, connect, disconnect, reach, save_caches};
+pub use account::{Account, Bucket, Fresh, HideStopped, Item, Rule, cached, connect, disconnect, reach, save_caches};
 pub use watch::Polled;
 pub use api::{Allowed, set_log};
 pub use cache::set_dir as set_cache_dir;

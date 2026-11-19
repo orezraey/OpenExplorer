@@ -47,6 +47,8 @@ pub struct Large {
     pub info: Map<String, Value>,
     pub parts: BTreeMap<u64, (Arc<Vec<u8>>, String)>,
     pub ts: i64,
+    /// When each part arrived (a part not in it: at `ts`).
+    pub part_ts: BTreeMap<u64, i64>,
 }
 
 #[derive(Default)]
@@ -74,9 +76,12 @@ pub struct State {
 }
 
 impl State {
-    fn tick(&mut self) -> i64 {
-        self.clock += 1;
-        1_700_000_000_000 + self.clock
+    /// Now, milliseconds since 1970, as B2's clock gives it: always later than the last time
+    /// given, so versions made in a row keep their order.
+    pub fn tick(&mut self) -> i64 {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+        self.clock = (self.clock + 1).max(now);
+        self.clock
     }
 
     /// Unique across every stand-in of the run, as B2's ids are (the uploads this app is sending
@@ -148,6 +153,9 @@ pub struct Faults {
     pub latency_ms: AtomicU64,
     /// Bytes a second one connection's upload body is read at (0: as fast as it comes).
     pub upload_speed: AtomicU64,
+    /// File names whose hide, copy (to the name) and version delete are refused (403), every
+    /// time: a batch that fails midway, at a known item.
+    pub refused: Mutex<Vec<String>>,
 }
 
 pub struct Mock {
@@ -415,6 +423,10 @@ fn serve(conn: TcpStream, state: &Mutex<State>, faults: &Faults, url: &str) -> s
         return json_reply(&mut conn, s, &v);
     }
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
+    if matches!(call.as_str(), "b2_hide_file" | "b2_copy_file" | "b2_delete_file_version") && faults.refused.lock().unwrap().iter().any(|n| n == s(&body, "fileName")) {
+        let (s, v) = error(403, "access_denied", "refused for the test");
+        return json_reply(&mut conn, s, &v);
+    }
     let (s, v) = api(&call, &body, state, url);
     json_reply(&mut conn, s, &v)
 }
@@ -439,9 +451,11 @@ fn upload(req: &Request, state: &Mutex<State>) -> (u16, Value) {
     }
     let file_id = req.path.trim_start_matches("/upload_part/").to_string();
     let n: u64 = req.headers.get("x-bz-part-number").and_then(|n| n.parse().ok()).unwrap_or(0);
+    let ts = st.tick();
     let Some(large) = st.large.get_mut(&file_id) else { return error(400, "bad_request", "no such file") };
     large.parts.insert(n, (Arc::new(req.body.clone()), sha1.clone()));
-    (200, json!({"fileId": file_id, "partNumber": n, "contentLength": req.body.len(), "contentSha1": sha1, "uploadTimestamp": 1}))
+    large.part_ts.insert(n, ts);
+    (200, json!({"fileId": file_id, "partNumber": n, "contentLength": req.body.len(), "contentSha1": sha1, "uploadTimestamp": ts}))
 }
 
 fn download(conn: &mut TcpStream, req: &Request, state: &Mutex<State>, faults: &Faults) -> std::io::Result<()> {
@@ -602,7 +616,7 @@ fn api(call: &str, b: &Value, state: &Mutex<State>, url: &str) -> (u16, Value) {
             let id = st.id();
             let ts = st.tick();
             let info = b.get("fileInfo").and_then(Value::as_object).cloned().unwrap_or_default();
-            st.large.insert(id.clone(), Large { bucket: s(b, "bucketId").into(), name: s(b, "fileName").into(), info: info.clone(), parts: BTreeMap::new(), ts });
+            st.large.insert(id.clone(), Large { bucket: s(b, "bucketId").into(), name: s(b, "fileName").into(), info: info.clone(), parts: BTreeMap::new(), ts, part_ts: BTreeMap::new() });
             (200, json!({"fileId": id, "fileName": s(b, "fileName"), "bucketId": s(b, "bucketId"), "action": "start", "fileInfo": info, "uploadTimestamp": ts, "contentLength": 0, "contentSha1": "none"}))
         }
         // Oldest first, at most 100 a page, from `startFileId` (as B2 documents).
@@ -627,7 +641,7 @@ fn api(call: &str, b: &Value, state: &Mutex<State>, url: &str) -> (u16, Value) {
                 let most = b.get("maxPartCount").and_then(Value::as_u64).unwrap_or(1000).min(1000) as usize;
                 let all: Vec<_> = l.parts.range(from..).collect();
                 let next = all.get(most).map(|(n, _)| **n);
-                let parts: Vec<Value> = all.iter().take(most).map(|(n, (d, sha1))| json!({"fileId": s(b, "fileId"), "partNumber": n, "contentLength": d.len(), "contentSha1": sha1, "uploadTimestamp": 1})).collect();
+                let parts: Vec<Value> = all.iter().take(most).map(|(n, (d, sha1))| json!({"fileId": s(b, "fileId"), "partNumber": n, "contentLength": d.len(), "contentSha1": sha1, "uploadTimestamp": l.part_ts.get(n).copied().unwrap_or(l.ts)})).collect();
                 (200, json!({"parts": parts, "nextPartNumber": next}))
             }
             None => error(400, "bad_request", "no such file"),
@@ -643,9 +657,11 @@ fn api(call: &str, b: &Value, state: &Mutex<State>, url: &str) -> (u16, Value) {
             let data = src.data[from..=to].to_vec();
             let sha1 = sha1_hex(&data);
             let n = b.get("partNumber").and_then(Value::as_u64).unwrap_or(0);
+            let ts = st.tick();
             let Some(l) = st.large.get_mut(s(b, "largeFileId")) else { return error(400, "bad_request", "no such file") };
             l.parts.insert(n, (Arc::new(data.clone()), sha1.clone()));
-            (200, json!({"fileId": s(b, "largeFileId"), "partNumber": n, "contentLength": data.len(), "contentSha1": sha1, "uploadTimestamp": 1}))
+            l.part_ts.insert(n, ts);
+            (200, json!({"fileId": s(b, "largeFileId"), "partNumber": n, "contentLength": data.len(), "contentSha1": sha1, "uploadTimestamp": ts}))
         }
         "b2_finish_large_file" => {
             let id = s(b, "fileId").to_string();

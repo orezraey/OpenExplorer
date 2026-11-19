@@ -66,7 +66,7 @@ impl Conn for B2 {
 
     /// Hidden, not deleted: its versions stay as the bucket's rules say.
     fn remove_file(&mut self, path: &str) -> Result<()> {
-        self.account.hide(path, false).map(|_| ())
+        self.account.hide(path, false).map(|_| ()).map_err(String::from)
     }
 
     fn remove_dir(&mut self, path: &str) -> Result<()> {
@@ -75,7 +75,7 @@ impl Conn for B2 {
 
     /// A whole folder in one pass over its files, not folder by folder.
     fn remove(&mut self, path: &str, is_dir: bool) -> Result<()> {
-        self.account.hide(path, is_dir).map(|_| ())
+        self.account.hide(path, is_dir).map(|_| ()).map_err(String::from)
     }
 
     fn download(&mut self, path: &str, out: &mut dyn Write, progress: Progress) -> Result<()> {
