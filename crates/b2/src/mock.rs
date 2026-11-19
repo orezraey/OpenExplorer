@@ -613,7 +613,7 @@ fn api(call: &str, b: &Value, state: &Mutex<State>, url: &str) -> (u16, Value) {
             Some(l) => {
                 let from = b.get("startPartNumber").and_then(Value::as_u64).unwrap_or(1);
                 let most = b.get("maxPartCount").and_then(Value::as_u64).unwrap_or(1000).min(1000) as usize;
-                let all: Vec<(&u64, &(Arc<Vec<u8>>, String))> = l.parts.range(from..).collect();
+                let all: Vec<_> = l.parts.range(from..).collect();
                 let next = all.get(most).map(|(n, _)| **n);
                 let parts: Vec<Value> = all.iter().take(most).map(|(n, (d, sha1))| json!({"fileId": s(b, "fileId"), "partNumber": n, "contentLength": d.len(), "contentSha1": sha1, "uploadTimestamp": 1})).collect();
                 (200, json!({"parts": parts, "nextPartNumber": next}))
