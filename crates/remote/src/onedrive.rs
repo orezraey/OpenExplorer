@@ -53,8 +53,9 @@ impl Conn for OneDrive {
         self.account.remove(path)
     }
 
+    /// Only while it's empty, as OneDrive says now: undoing Nova pasta never takes what arrived.
     fn remove_dir(&mut self, path: &str) -> Result<()> {
-        self.account.remove(path)
+        self.account.remove_empty_dir(path)
     }
 
     /// A whole folder goes to the recycle bin in one step.

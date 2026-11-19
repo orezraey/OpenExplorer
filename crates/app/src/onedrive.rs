@@ -30,6 +30,8 @@ const PORTAL: &str = "https://entra.microsoft.com/#view/Microsoft_AAD_Registered
 /// The OneDrive accounts' state beside the servers'.
 pub struct Side {
     pub store: od::Store,
+    /// The list as the store keeps it, read once: dialogs ask it every frame.
+    pub accounts: Vec<StoredAccount>,
     /// Each account's storage, by server id: `None` while the answer is on its way.
     pub quotas: HashMap<String, Option<Quota>>,
     /// When each account a pane shows is next asked what changed.
@@ -40,12 +42,13 @@ pub struct Side {
 
 impl Side {
     pub fn load() -> Side {
-        Side { store: od::Store::at(openexplorer_gdrive::config_dir().join("onedrive-accounts.json")), quotas: HashMap::new(), watch: HashMap::new(), login: None }
+        let store = od::Store::at(openexplorer_gdrive::config_dir().join("onedrive-accounts.json"));
+        Side { accounts: store.accounts(), store, quotas: HashMap::new(), watch: HashMap::new(), login: None }
     }
 
     /// The servers the connected accounts show as.
     pub fn servers(&self) -> Vec<Server> {
-        self.store.accounts().iter().map(server_of).collect()
+        self.accounts.iter().map(server_of).collect()
     }
 }
 
@@ -215,6 +218,7 @@ fn connected(s: &mut State, attempt: u64, result: Result<StoredAccount, String>)
         od::disconnect(&account.id);
         return crate::fail(s, e);
     }
+    s.servers.onedrive.accounts = s.servers.onedrive.store.accounts();
     openexplorer_gdrive::log(&format!("conta OneDrive conectada: {} ({})", account.email, if account.business { "corporativa" } else { "pessoal" }));
     let server = server_of(&account);
     match s.servers.list.iter_mut().find(|sv| sv.id == server.id) {
@@ -238,6 +242,7 @@ pub fn remove(s: &mut State, server: &Server) -> bool {
         return false;
     }
     od::disconnect(&server.user);
+    s.servers.onedrive.accounts.retain(|a| a.id != server.user);
     s.servers.onedrive.quotas.remove(&server.id);
     s.servers.onedrive.watch.remove(&server.id);
     true
@@ -254,7 +259,7 @@ pub fn configure(s: &State, k: &Kit, f: &Form, layer: &mut Vec<El>) {
         )
         .into(),
     ));
-    let connected: Vec<String> = s.servers.onedrive.store.accounts().into_iter().map(|a| a.email).collect();
+    let connected: Vec<&str> = s.servers.onedrive.accounts.iter().map(|a| a.email.as_str()).collect();
     if !connected.is_empty() {
         inner = inner.child(muted(tr!("Já conectadas: {}", "Already connected: {}", connected.join(", "))));
     }
@@ -311,7 +316,7 @@ pub fn configure(s: &State, k: &Kit, f: &Form, layer: &mut Vec<El>) {
 // The recycle bin
 
 fn is_business(s: &State, server: &Server) -> bool {
-    s.servers.onedrive.store.find(&server.user).is_some_and(|a| a.business)
+    s.servers.onedrive.accounts.iter().any(|a| a.id == server.user && a.business)
 }
 
 /// Excluir: the items go to OneDrive's recycle bin; on a personal account Desfazer brings
