@@ -714,6 +714,12 @@ fn pane_key(p: usize) -> String {
     format!("pane-{p}")
 }
 
+/// Whether the focused element (its key, as [`rune::Tx::focused`] names it) is the name field
+/// of a rename in place (see `ui::rename_field`).
+fn rename_focused(focused: &str) -> bool {
+    focused == "rename-input" || focused.ends_with("/rename-input")
+}
+
 fn row_key(id: &str) -> String {
     format!("r:{id}")
 }
@@ -1174,6 +1180,14 @@ fn go_up(s: &mut State, p: usize) {
 // Selection and keys
 
 fn click(s: &mut State, p: usize, id: &str, mods: Mods) {
+    // A click on another row ends a rename in place, as leaving the field does in Explorer: the
+    // name typed is kept (a name that can't be taken keeps the field open, and the click waits).
+    if s.renaming.is_some() {
+        actions::commit_rename(s);
+        if s.renaming.is_some() {
+            return;
+        }
+    }
     s.active = p;
     let pane = &mut s.panes[p];
     if mods.cmd {
@@ -1196,9 +1210,17 @@ fn click(s: &mut State, p: usize, id: &str, mods: Mods) {
 }
 
 fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
-    // Keys belong to the name field while renaming.
+    // Keys belong to the name field while renaming. Once the focus left it (a click in a row,
+    // in the other pane), the rename ends as leaving the field does, and the key goes on: else
+    // both panes' keys would stay with a field no one is typing in.
     if s.renaming.is_some() {
-        return false;
+        if tx.focused().is_some_and(rename_focused) {
+            return false;
+        }
+        actions::commit_rename(s);
+        if s.renaming.is_some() {
+            return false;
+        }
     }
     let n = s.panes[p].entries.len();
     let at = s.panes[p].cursor.as_deref().and_then(|c| s.panes[p].index_of(c));
@@ -2106,6 +2128,32 @@ fn rune_args(given: impl Iterator<Item = String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F2, then a click on another row: the rename ends (the name kept as it was) and the click
+    /// selects, so the keys aren't left with a field no one is typing in. Before, the rename
+    /// stayed open and both panes' arrows went to it.
+    #[test]
+    fn a_click_on_another_row_ends_a_rename() {
+        let mut s = init();
+        s.panes[0].go(Location::Mock(Vec::new()));
+        s.panes[0].set_entries(Ok(MockDrive::new().list(&[])));
+        let ids: Vec<String> = s.panes[0].entries.iter().map(|e| e.id.clone()).collect();
+        let (a, b) = (&ids[0], &ids[1]);
+        let item = s.panes[0].entry(a).cloned().unwrap();
+        s.name_edit = actions::name_field(&item);
+        s.renaming = Some((0, item));
+        click(&mut s, 0, b, Mods::default());
+        assert!(s.renaming.is_none());
+        assert_eq!(s.panes[0].selected.iter().collect::<Vec<_>>(), [b]);
+        // A name that can't be taken keeps the field, and the click waits.
+        let item = s.panes[0].entry(a).cloned().unwrap();
+        s.name_edit = rune::TextEdit::new("");
+        s.renaming = Some((0, item));
+        click(&mut s, 0, a, Mods::default());
+        assert!(s.renaming.is_some());
+        assert_eq!(s.panes[0].selected.iter().collect::<Vec<_>>(), [b]);
+        assert!(rename_focused("rename-input") && !rename_focused("pane-0"));
+    }
 
     /// Rune gets the command line as given (so --snap and --script still work), and on Windows
     /// always-shown scroll bars unless the command line picks its own.
