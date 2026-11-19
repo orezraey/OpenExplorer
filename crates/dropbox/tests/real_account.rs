@@ -121,9 +121,56 @@ fn works_in_a_folder_of_its_own() {
     let gone = a.delete(&format!("{dir}/grande.bin")).unwrap();
     assert!(a.stat(&format!("{dir}/grande.bin")).unwrap().is_none());
     a.restore(&format!("{dir}/grande.bin"), &gone.rev).unwrap();
-    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - 600;
+    // A folder deleted and brought back: its file and its empty subfolder, within the window
+    // of Dropbox's own clock around the delete.
+    a.mkdir(&format!("{dir}/Sub/Vazia")).unwrap();
+    let from = a.api.server_now() - 2;
     let results = a.delete_many(&[format!("{dir}/Sub")]).unwrap();
+    let to = a.api.server_now() + 1;
     assert!(results[0].is_ok());
-    assert_eq!(a.restore_folder(&format!("{dir}/Sub"), since).unwrap(), 1);
+    assert_eq!(a.restore_folder(&format!("{dir}/Sub"), Some((from, to))).unwrap(), 1);
     assert!(a.stat(&format!("{dir}/Sub/Cópia.bin")).unwrap().is_some());
+    assert!(a.stat(&format!("{dir}/Sub/Vazia")).unwrap().is_some_and(|e| e.dir));
+
+    // Batches: small files together, then moved and copied in one job each.
+    let local = std::env::temp_dir().join(format!("oe-dropbox-real-{n}"));
+    std::fs::create_dir_all(&local).unwrap();
+    let files: Vec<(String, std::path::PathBuf)> = (0..20)
+        .map(|i| {
+            let f = local.join(format!("f{i}.txt"));
+            std::fs::write(&f, format!("arquivo {i}").repeat(i + 1)).unwrap();
+            (format!("{dir}/Lote/f{i}.txt"), f)
+        })
+        .collect();
+    let before = a.api.requests.load(std::sync::atomic::Ordering::Relaxed);
+    let sent = a.upload_many(&files, &mut |_, _| true);
+    eprintln!("upload_many of 20: {} requests", a.api.requests.load(std::sync::atomic::Ordering::Relaxed) - before);
+    assert!(sent.iter().all(Result::is_ok), "{sent:?}");
+    // Sent again: the same bytes are there, nothing goes.
+    let again = a.upload_many(&files, &mut |_, _| true);
+    assert!(again.iter().all(Result::is_ok), "{again:?}");
+    let moves: Vec<(String, String)> = (0..20).map(|i| (format!("{dir}/Lote/f{i}.txt"), format!("{dir}/Movidos/f{i}.txt"))).chain([(format!("{dir}/Lote/nada.txt"), format!("{dir}/Movidos/nada.txt"))]).collect();
+    let moved = a.move_many(&moves);
+    assert!(moved[..20].iter().all(Result::is_ok), "{moved:?}");
+    assert!(moved[20].is_err(), "a missing item fails alone");
+    let copies: Vec<(String, String)> = (0..5).map(|i| (format!("{dir}/Movidos/f{i}.txt"), format!("{dir}/Movidos/f{}.txt", i + 1))).collect();
+    let copied = a.copy_many(&copies);
+    assert!(copied.iter().all(Result::is_err), "names taken fail, one by one: {copied:?}");
+    let mut out = Vec::new();
+    a.download(&format!("{dir}/Movidos/f7.txt"), &mut out, &mut |_| true).unwrap();
+    assert_eq!(out, std::fs::read(&files[7].1).unwrap());
+
+    // The deleted items of a folder, and whether one deletion stamps its files alike.
+    a.delete(&format!("{dir}/Movidos")).unwrap();
+    let gone = a.deleted_in(&dir).unwrap();
+    eprintln!("deleted in {dir}: {gone:?}");
+    let folder = gone.iter().find(|d| d.name == "Movidos").expect("the folder among the deleted");
+    assert_eq!(folder.dir, Some(true));
+    assert_eq!(a.restore_deleted(folder).unwrap(), 20);
+    a.delete(&format!("{dir}/Movidos")).unwrap();
+    a.mkdir(&format!("{dir}/Movidos")).unwrap();
+    let inside = a.deleted_in(&format!("{dir}/Movidos")).unwrap();
+    let whens: std::collections::BTreeSet<Option<i64>> = inside.iter().map(|d| d.when).collect();
+    eprintln!("server_deleted of one folder's 20 files: {whens:?}");
+    let _ = std::fs::remove_dir_all(local);
 }

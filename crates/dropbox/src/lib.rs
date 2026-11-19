@@ -1,8 +1,9 @@
 //! Dropbox for Open Explorer: the OAuth login of a desktop app (PKCE, no secret, a refresh
 //! token), the accounts and their tokens, and the API v2 calls the panes need: listing, new
-//! folders, renaming, moving, copying on Dropbox's side, deleting and restoring what was
-//! deleted, downloads that resume, uploads (one request up to 150 MiB, an upload session in
-//! blocks above), the storage quota, shared links and the changes made elsewhere.
+//! folders, renaming, moving, copying on Dropbox's side, all three for many items in batch jobs,
+//! deleting and restoring what was deleted (a folder too, and the items deleted from a folder),
+//! downloads that resume, uploads (one request up to 8 MiB, an upload session in blocks above,
+//! many small files together), the storage quota, shared links and the changes made elsewhere.
 //!
 //! Everything here blocks; the app runs it on background threads.
 //!
@@ -30,8 +31,10 @@
 
 pub mod account;
 pub mod api;
+pub mod batch;
 pub mod cache;
 pub mod content;
+pub mod deleted;
 pub mod meta;
 pub mod oauth;
 pub mod store;
@@ -49,6 +52,7 @@ use serde::{Deserialize, Serialize};
 
 pub use account::{Account, Changes, Quota, cached, connect, disconnect, forget_kept, reach, save_caches};
 pub use api::set_log;
+pub use deleted::Deleted;
 pub use meta::Entry;
 
 /// Errors are shown to the user as they are, so they're plain sentences in the interface's

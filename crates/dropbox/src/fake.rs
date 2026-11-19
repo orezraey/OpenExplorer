@@ -2,7 +2,14 @@
 //! in memory, answering the routes the crate calls the way the API reference says they answer
 //! (metadata, 409 route errors with `error_summary`, cursors and their change log, `reset`,
 //! longpoll, upload sessions and their offsets, Range downloads, revisions, shared links, 429
-//! with `Retry-After`). It also drops connections on purpose, to test resuming.
+//! with `Retry-After`, the batch routes and their jobs, deleted files and folders). It also drops
+//! connections on purpose, to test resuming, and can answer each request after a delay, for the
+//! benchmarks to weigh a round trip.
+//!
+//! The answers' shapes follow Stone's JSON rules (the API's spec, `dropbox-api-spec`): a route
+//! whose result is declared `FileMetadata` or `FolderMetadata` (upload, restore, finish, a new
+//! folder) carries no `.tag`, one declared `Metadata` does; a batch entry's `Metadata` is nested
+//! under `success`, a `FileMetadata` inlined beside `".tag": "success"`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -38,14 +45,24 @@ struct State {
     next: u64,
     /// Listing pages still to give: cursor → entries.
     pages: HashMap<String, (Vec<Value>, String)>,
-    sessions: HashMap<String, Vec<u8>>,
-    jobs: HashMap<String, Value>,
+    /// Upload sessions: their bytes, and whether they're closed.
+    sessions: HashMap<String, (Vec<u8>, bool)>,
+    /// Folders deleted: lower → display path, which `include_deleted` lists.
+    deleted_dirs: HashMap<String, String>,
+    /// The next batch entries to fail with `too_many_write_operations`.
+    busy_entries: usize,
+    /// How long each answer waits, as a round trip to Dropbox would.
+    delay: Duration,
+    /// Batch jobs: their answer, and whether they were asked about once.
+    jobs: HashMap<String, (Value, bool)>,
     links: HashMap<String, String>,
     team: Option<(String, String)>,
     last_root: Option<String>,
     calls: Vec<String>,
     throttle: usize,
     throttled: usize,
+    /// The next call to this route is answered 429.
+    throttle_route: Option<String>,
     drop_append: bool,
     cut_download: Option<u64>,
     ranges: Vec<(String, u64)>,
@@ -69,6 +86,25 @@ fn meta(lower: &str, n: &Node) -> Value {
         let t = timestamp(1_700_000_000);
         json!({".tag": "file", "name": last(&n.display), "path_lower": lower, "path_display": n.display, "id": format!("id:{lower}"), "client_modified": t, "server_modified": t, "rev": n.rev, "size": n.data.len(), "content_hash": crate::content::of_reader(&mut &n.data[..], &|| false).unwrap()})
     }
+}
+
+/// A metadata object as a route declared `FileMetadata` or `FolderMetadata` answers it: no
+/// `.tag`.
+fn untagged(mut m: Value) -> Value {
+    if let Some(o) = m.as_object_mut() {
+        o.remove(".tag");
+    }
+    m
+}
+
+/// An HTTP date (`Thu, 19 Nov 2026 17:50:38 GMT`) of seconds since 1970.
+pub fn http_date(secs: i64) -> String {
+    let t = timestamp(secs);
+    let (y, mo, d, hms) = (&t[0..4], t[5..7].parse::<usize>().unwrap(), &t[8..10], &t[11..19]);
+    // 1970-01-01 was a Thursday.
+    let day = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][secs.div_euclid(86_400).rem_euclid(7) as usize];
+    let month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][mo - 1];
+    format!("{day}, {d} {month} {y} {hms} GMT")
 }
 
 /// Whether `lower` is in what a cursor on `path` (recursive or not) follows.
@@ -101,6 +137,7 @@ impl State {
             if !self.nodes.contains_key(&lower) {
                 self.nodes.insert(lower.clone(), Node { display: at.clone(), dir: true, data: Arc::default(), rev: String::new() });
                 self.deleted.remove(&lower);
+                self.deleted_dirs.remove(&lower);
                 self.logged(&lower);
             }
         }
@@ -114,6 +151,7 @@ impl State {
         self.revs.insert(rev.clone(), (display.to_string(), data.clone()));
         self.nodes.insert(lower.clone(), Node { display: display.to_string(), dir: false, data, rev });
         self.deleted.remove(&lower);
+        self.deleted_dirs.remove(&lower);
         self.logged(&lower);
         meta(&lower, &self.nodes[&lower])
     }
@@ -127,12 +165,69 @@ impl State {
         let before = meta(lower, self.nodes.get(lower)?);
         for k in self.subtree(lower) {
             let n = self.nodes.remove(&k).unwrap();
-            if !n.dir {
+            if n.dir {
+                self.deleted_dirs.insert(k.clone(), n.display.clone());
+            } else {
                 self.deleted.insert(k.clone(), (n.rev, now()));
             }
             self.logged(&k);
         }
         Some(before)
+    }
+
+    /// Moves or copies `from` to `to` (display): the new item's metadata, or the route's
+    /// error (`error_summary`, `error`).
+    fn relocate(&mut self, from: &str, to: &str, moving: bool) -> Result<Value, (String, Value)> {
+        let (from, to_l) = (from.to_lowercase(), to.to_lowercase());
+        if !self.nodes.contains_key(&from) {
+            return Err(("from_lookup/not_found/..".into(), json!({".tag": "from_lookup", "from_lookup": {".tag": "not_found"}})));
+        }
+        if self.nodes.contains_key(&to_l) {
+            return Err(("to/conflict/file/..".into(), json!({".tag": "to", "to": {".tag": "conflict", "conflict": {".tag": "file"}}})));
+        }
+        if to_l.starts_with(&format!("{from}/")) {
+            return Err(("cant_move_folder_into_itself/".into(), json!({".tag": "cant_move_folder_into_itself"})));
+        }
+        self.parents(to);
+        for k in self.subtree(&from) {
+            let mut n = self.nodes[&k].clone();
+            let new_display = format!("{to}{}", &n.display[from.len()..]);
+            n.display = new_display.clone();
+            let new_l = new_display.to_lowercase();
+            if !n.dir {
+                n.rev = self.rev();
+                self.revs.insert(n.rev.clone(), (new_display, n.data.clone()));
+            }
+            self.deleted.remove(&new_l);
+            self.deleted_dirs.remove(&new_l);
+            self.nodes.insert(new_l.clone(), n);
+            self.logged(&new_l);
+            if moving {
+                self.nodes.remove(&k);
+                self.logged(&k);
+            }
+        }
+        Ok(meta(&to_l, &self.nodes[&to_l]))
+    }
+
+    /// A batch entry's failure when Dropbox is too busy for it, if it's to be one.
+    fn busy(&mut self) -> Option<Value> {
+        (self.busy_entries > 0).then(|| {
+            self.busy_entries -= 1;
+            json!({".tag": "failure", "failure": {".tag": "too_many_write_operations"}})
+        })
+    }
+
+    /// A batch job's answer: at once for a single entry, else a job asked about until done
+    /// (the first ask finds it still running).
+    fn job(&mut self, entries: usize, done: Value) -> Value {
+        if entries == 1 {
+            return done;
+        }
+        self.next += 1;
+        let id = format!("job-{}", self.next);
+        self.jobs.insert(id.clone(), (done, false));
+        json!({".tag": "async_job_id", "async_job_id": id})
     }
 
     fn cursor(&self, path: &str, recursive: bool) -> String {
@@ -238,6 +333,11 @@ impl Fake {
         self.st().throttle = n;
     }
 
+    /// The next call to `route` is answered 429.
+    pub fn throttle_route(&self, route: &str) {
+        self.st().throttle_route = Some(route.into());
+    }
+
     pub fn throttled(&self) -> usize {
         self.st().throttled
     }
@@ -260,6 +360,36 @@ impl Fake {
 
     pub fn ranges(&self) -> Vec<(String, u64)> {
         self.st().ranges.clone()
+    }
+
+    /// Each answer waits `ms` milliseconds, as a round trip to Dropbox would.
+    pub fn delay(&self, ms: u64) {
+        self.st().delay = Duration::from_millis(ms);
+    }
+
+    /// The next `n` batch entries fail with `too_many_write_operations`.
+    pub fn busy_entries(&self, n: usize) {
+        self.st().busy_entries = n;
+    }
+
+    /// The file deleted from `display` was deleted `secs` earlier than it was.
+    pub fn backdate(&self, display: &str, secs: i64) {
+        if let Some(d) = self.st().deleted.get_mut(&display.to_lowercase()) {
+            d.1 -= secs;
+        }
+    }
+
+    /// An empty folder (and those on its way).
+    pub fn make_dir(&self, display: &str) {
+        let mut st = self.st();
+        st.parents(&format!("{display}/x"));
+        drop(st);
+        self.changed();
+    }
+
+    /// Calls made since `before` to `route`.
+    pub fn count_since(&self, before: &usize, route: &str) -> usize {
+        self.calls_since(before).iter().filter(|c| c.as_str() == route).count()
     }
 }
 
@@ -307,7 +437,7 @@ fn read_request(conn: &TcpStream) -> Option<Request> {
 }
 
 fn respond(conn: &mut TcpStream, status: u16, headers: &[(String, String)], body: &[u8]) {
-    let mut head = format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n", body.len());
+    let mut head = format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\nDate: {}\r\n", body.len(), http_date(now()));
     for (k, v) in headers {
         head.push_str(&format!("{k}: {v}\r\n"));
     }
@@ -326,6 +456,10 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
     let mut st = state.0.lock().unwrap();
     st.calls.push(route.clone());
     if route != "oauth2/token" && route != "files/list_folder/longpoll" {
+        if st.throttle_route.as_deref() == Some(route.as_str()) {
+            st.throttle_route = None;
+            st.throttle += 1;
+        }
         if st.throttle > 0 {
             st.throttle -= 1;
             st.throttled += 1;
@@ -370,7 +504,11 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
             } else {
                 let mut entries: Vec<Value> = st.nodes.iter().filter(|(k, _)| under(k, &path, recursive)).map(|(k, n)| meta(k, n)).collect();
                 if deleted {
-                    entries.extend(st.deleted.keys().filter(|k| under(k, &path, recursive) && !st.nodes.contains_key(*k)).map(|k| json!({".tag": "deleted", "name": last(k), "path_lower": k, "path_display": st.revs.values().find(|(d, _)| d.to_lowercase() == **k).map(|(d, _)| d.clone()).unwrap_or(k.clone())})));
+                    entries.extend(st.deleted.keys().filter(|k| under(k, &path, recursive) && !st.nodes.contains_key(*k)).map(|k| {
+                        let display = st.revs.values().find(|(d, _)| d.to_lowercase() == **k).map(|(d, _)| d.clone()).unwrap_or(k.clone());
+                        json!({".tag": "deleted", "name": last(&display), "path_lower": k, "path_display": display})
+                    }));
+                    entries.extend(st.deleted_dirs.iter().filter(|(k, _)| under(k, &path, recursive) && !st.nodes.contains_key(*k)).map(|(k, d)| json!({".tag": "deleted", "name": last(d), "path_lower": k, "path_display": d})));
                 }
                 let end = st.cursor(&path, recursive);
                 let limit = arg["limit"].as_u64().unwrap_or(2000) as usize;
@@ -444,39 +582,15 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
             } else {
                 st.parents(&display);
                 st.nodes.insert(l.clone(), Node { display, dir: true, data: Arc::default(), rev: String::new() });
+                st.deleted_dirs.remove(&l);
                 st.logged(&l);
-                ok(json!({"metadata": meta(&l, &st.nodes[&l])}))
+                ok(json!({"metadata": untagged(meta(&l, &st.nodes[&l]))}))
             }
         }
-        "files/move_v2" | "files/copy_v2" => {
-            let (from, to) = (lower(s("from_path")), s("to_path"));
-            let to_l = to.to_lowercase();
-            if !st.nodes.contains_key(&from) {
-                not_found("from_lookup")
-            } else if st.nodes.contains_key(&to_l) {
-                route_error("to/conflict/file/..", json!({".tag": "to", "to": {".tag": "conflict"}}))
-            } else {
-                let moving = route == "files/move_v2";
-                st.parents(&to);
-                for k in st.subtree(&from) {
-                    let mut n = st.nodes[&k].clone();
-                    let new_display = format!("{to}{}", &n.display[from.len()..]);
-                    n.display = new_display.clone();
-                    let new_l = new_display.to_lowercase();
-                    if !n.dir {
-                        n.rev = st.rev();
-                        st.revs.insert(n.rev.clone(), (new_display, n.data.clone()));
-                    }
-                    st.nodes.insert(new_l.clone(), n);
-                    st.logged(&new_l);
-                    if moving {
-                        st.nodes.remove(&k);
-                        st.logged(&k);
-                    }
-                }
-                ok(json!({"metadata": meta(&to_l, &st.nodes[&to_l])}))
-            }
-        }
+        "files/move_v2" | "files/copy_v2" => match st.relocate(&s("from_path"), &s("to_path"), route == "files/move_v2") {
+            Ok(m) => ok(json!({"metadata": m})),
+            Err((summary, error)) => route_error(&summary, error),
+        },
         "files/delete_v2" => match st.delete(&lower(s("path"))) {
             Some(m) => ok(json!({"metadata": m})),
             None => not_found("path_lookup"),
@@ -491,15 +605,40 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
                     None => json!({".tag": "failure", "failure": {".tag": "path_lookup", "path_lookup": {".tag": "not_found"}}}),
                 })
                 .collect();
-            st.next += 1;
-            let id = format!("job-{}", st.next);
-            st.jobs.insert(id.clone(), json!({".tag": "complete", "entries": results}));
-            ok(json!({".tag": "async_job_id", "async_job_id": id}))
+            let n = results.len();
+            let v = st.job(n, json!({".tag": "complete", "entries": results}));
+            ok(v)
         }
-        "files/delete_batch/check" => match st.jobs.get(&s("async_job_id")) {
-            Some(v) => ok(v.clone()),
+        "files/delete_batch/check" | "files/copy_batch/check_v2" | "files/move_batch/check_v2" => match st.jobs.get_mut(&s("async_job_id")) {
+            Some((v, asked)) if *asked => ok(v.clone()),
+            Some((_, asked)) => {
+                *asked = true;
+                ok(json!({".tag": "in_progress"}))
+            }
             None => route_error("invalid_async_job_id/", json!({".tag": "invalid_async_job_id"})),
         },
+        "files/copy_batch_v2" | "files/move_batch_v2" => {
+            let moving = route == "files/move_batch_v2";
+            let entries = arg["entries"].as_array().cloned().unwrap_or_default();
+            if entries.is_empty() || entries.len() > 1000 {
+                (400, vec![], b"Error in call to API function: entries: between 1 and 1000".to_vec())
+            } else {
+                let mut results = Vec::new();
+                for e in &entries {
+                    if let Some(busy) = st.busy() {
+                        results.push(busy);
+                        continue;
+                    }
+                    let (from, to) = (e["from_path"].as_str().unwrap_or(""), e["to_path"].as_str().unwrap_or(""));
+                    results.push(match st.relocate(from, to, moving) {
+                        Ok(m) => json!({".tag": "success", "success": m}),
+                        Err((_, error)) => json!({".tag": "failure", "failure": {".tag": "relocation_error", "relocation_error": error}}),
+                    });
+                }
+                let v = st.job(entries.len(), json!({".tag": "complete", "entries": results}));
+                ok(v)
+            }
+        }
         "files/list_revisions" => {
             let l = lower(s("path"));
             match (st.nodes.get(&l), st.deleted.get(&l)) {
@@ -510,6 +649,7 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
                     let m = meta(&l, &Node { display, dir: false, data, rev: rev.clone() });
                     ok(json!({"is_deleted": true, "server_deleted": timestamp(*when), "entries": [m]}))
                 }
+                (None, None) if st.deleted_dirs.contains_key(&l) => route_error("path/not_file/..", json!({".tag": "path", "path": {".tag": "not_file"}})),
                 (None, None) if st.revs.values().any(|(d, _)| d.to_lowercase().starts_with(&format!("{l}/"))) => route_error("path/not_file/..", json!({".tag": "path", "path": {".tag": "not_file"}})),
                 (None, None) => not_found("path"),
             }
@@ -517,7 +657,7 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
         "files/restore" => match st.revs.get(&s("rev")).cloned() {
             Some((_, data)) => {
                 let m = st.put(&s("path"), data.to_vec());
-                ok(m)
+                ok(untagged(m))
             }
             None => route_error("invalid_revision/", json!({".tag": "invalid_revision"})),
         },
@@ -550,37 +690,129 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
         }
         "files/upload" => {
             let m = st.put(&s("path"), req.body.clone());
-            ok(m)
+            ok(untagged(m))
         }
         "files/upload_session/start" => {
             st.next += 1;
             let id = format!("sess-{}", st.next);
-            st.sessions.insert(id.clone(), req.body.clone());
+            let close = arg["close"].as_bool().unwrap_or(false);
+            st.sessions.insert(id.clone(), (req.body.clone(), close));
             ok(json!({"session_id": id}))
+        }
+        "files/upload_session/start_batch" => {
+            let n = arg["num_sessions"].as_u64().unwrap_or(0);
+            if !(1..=1000).contains(&n) {
+                (400, vec![], b"Error in call to API function: num_sessions: between 1 and 1000".to_vec())
+            } else {
+                let ids: Vec<String> = (0..n)
+                    .map(|_| {
+                        st.next += 1;
+                        let id = format!("sess-{}", st.next);
+                        st.sessions.insert(id.clone(), (Vec::new(), false));
+                        id
+                    })
+                    .collect();
+                ok(json!({"session_ids": ids}))
+            }
         }
         "files/upload_session/append_v2" => {
             let id = arg.pointer("/cursor/session_id").and_then(Value::as_str).unwrap_or("").to_string();
             let offset = arg.pointer("/cursor/offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let held = st.sessions.get(&id).map(|d| d.len()).unwrap_or(0);
-            if offset != held {
-                route_error("incorrect_offset/..", json!({".tag": "incorrect_offset", "incorrect_offset": {"correct_offset": held}}))
+            match st.sessions.get(&id).map(|(d, closed)| (d.len(), *closed)) {
+                None => route_error("not_found/", json!({".tag": "not_found"})),
+                Some((_, true)) => route_error("closed/", json!({".tag": "closed"})),
+                // A struct member of a union is inlined beside its tag.
+                Some((held, _)) if offset != held => route_error("incorrect_offset/", json!({".tag": "incorrect_offset", "correct_offset": held})),
+                Some(_) => {
+                    let close = arg["close"].as_bool().unwrap_or(false);
+                    let held = st.sessions.get_mut(&id).unwrap();
+                    held.0.extend_from_slice(&req.body);
+                    held.1 = close;
+                    if std::mem::take(&mut st.drop_append) {
+                        // Taken in, but the answer never arrives.
+                        drop(st);
+                        let _ = conn.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                    ok(Value::Null)
+                }
+            }
+        }
+        "files/upload_session/append_batch" => {
+            let entries = arg["entries"].as_array().cloned().unwrap_or_default();
+            let total: u64 = entries.iter().map(|e| e["length"].as_u64().unwrap_or(0)).sum();
+            if entries.is_empty() || entries.len() > 500 {
+                (400, vec![], b"Error in call to API function: entries: between 1 and 500".to_vec())
+            } else if total != req.body.len() as u64 {
+                route_error("length_mismatch/", json!({".tag": "length_mismatch"}))
             } else {
-                st.sessions.get_mut(&id).unwrap().extend_from_slice(&req.body);
+                let mut at = 0usize;
+                let mut results = Vec::new();
+                for e in &entries {
+                    let id = e.pointer("/cursor/session_id").and_then(Value::as_str).unwrap_or("").to_string();
+                    let offset = e.pointer("/cursor/offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let len = e["length"].as_u64().unwrap_or(0) as usize;
+                    let piece = &req.body[at..at + len];
+                    at += len;
+                    let close = e["close"].as_bool().unwrap_or(false);
+                    results.push(match st.sessions.get_mut(&id) {
+                        None => json!({".tag": "failure", "failure": {".tag": "not_found"}}),
+                        Some((_, true)) => json!({".tag": "failure", "failure": {".tag": "closed"}}),
+                        Some((d, _)) if d.len() != offset => json!({".tag": "failure", "failure": {".tag": "incorrect_offset", "correct_offset": d.len()}}),
+                        Some((d, closed)) => {
+                            d.extend_from_slice(piece);
+                            *closed = close;
+                            json!({".tag": "success"})
+                        }
+                    });
+                }
                 if std::mem::take(&mut st.drop_append) {
-                    // Taken in, but the answer never arrives.
                     drop(st);
                     let _ = conn.shutdown(std::net::Shutdown::Both);
                     return;
                 }
-                ok(Value::Null)
+                ok(json!({"entries": results}))
             }
         }
         "files/upload_session/finish" => {
             let id = arg.pointer("/cursor/session_id").and_then(Value::as_str).unwrap_or("").to_string();
-            let data = st.sessions.remove(&id).unwrap_or_default();
+            let (mut data, _) = st.sessions.remove(&id).unwrap_or_default();
+            data.extend_from_slice(&req.body);
             let path = arg.pointer("/commit/path").and_then(Value::as_str).unwrap_or("").to_string();
             let m = st.put(&path, data);
-            ok(m)
+            ok(untagged(m))
+        }
+        "files/upload_session/finish_batch_v2" => {
+            let entries = arg["entries"].as_array().cloned().unwrap_or_default();
+            if entries.is_empty() || entries.len() > 1000 {
+                (400, vec![], b"Error in call to API function: entries: between 1 and 1000".to_vec())
+            } else {
+                let mut results = Vec::new();
+                for e in &entries {
+                    if let Some(busy) = st.busy() {
+                        results.push(busy);
+                        continue;
+                    }
+                    let id = e.pointer("/cursor/session_id").and_then(Value::as_str).unwrap_or("").to_string();
+                    let offset = e.pointer("/cursor/offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let path = e.pointer("/commit/path").and_then(Value::as_str).unwrap_or("").to_string();
+                    let lookup = |f: Value| json!({".tag": "failure", "failure": {".tag": "lookup_failed", "lookup_failed": f}});
+                    let held = st.sessions.get(&id).map(|(d, c)| (d.len(), *c));
+                    results.push(match held {
+                        None => lookup(json!({".tag": "not_found"})),
+                        Some((_, false)) => lookup(json!({".tag": "not_closed"})),
+                        Some((held, _)) if held != offset => lookup(json!({".tag": "incorrect_offset", "correct_offset": held})),
+                        Some(_) => {
+                            let (data, _) = st.sessions.remove(&id).unwrap();
+                            let mut m = untagged(st.put(&path, data));
+                            // A FileMetadata member is inlined beside the entry's tag.
+                            m[".tag"] = json!("success");
+                            m
+                        }
+                    });
+                }
+                ok(json!({"entries": results}))
+            }
         }
         "sharing/list_shared_links" => {
             let links: Vec<Value> = st.links.get(&lower(s("path"))).map(|u| json!({".tag": "file", "url": u})).into_iter().collect();
@@ -606,7 +838,11 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
         }
         other => (400, vec![], format!("Error in call to API function \"{other}\": unknown route").into_bytes()),
     };
+    let delay = st.delay;
     drop(st);
     state.1.notify_all();
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
     respond(&mut conn, status, &headers, &body);
 }

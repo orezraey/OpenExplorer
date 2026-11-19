@@ -133,8 +133,6 @@ pub(crate) enum Body<'a> {
     /// callback hears how many went in this try, and stops the call with [`crate::CANCELLED`]
     /// by answering `false`.
     Bytes(&'a [u8], Option<&'a mut dyn FnMut(usize) -> bool>),
-    /// `len` bytes read as they go: sent once, never again on a failure (they're gone).
-    Reader(&'a mut dyn Read, u64),
 }
 
 /// Reads a [`Body::Bytes`] out for one try, telling its callback how far it got.
@@ -170,6 +168,9 @@ pub struct Api {
     poll: ureq::Agent,
     /// `Dropbox-API-Path-Root`'s value, for an account whose root isn't its home.
     root: RwLock<Option<String>>,
+    /// Dropbox's clock as its last answer gave it (`Date`, seconds since 1970), and when that
+    /// answer came: see [`Api::server_now`].
+    clock: Mutex<Option<(i64, Instant)>>,
     /// Requests sent and bytes of JSON received, for the benchmarks.
     pub requests: AtomicU64,
     pub received: AtomicU64,
@@ -220,6 +221,7 @@ impl Api {
             // The longest longpoll is 480 s, and Dropbox adds up to 90 s of jitter.
             poll: agent(Some(Duration::from_secs(480 + 120)), None),
             root: RwLock::new(None),
+            clock: Mutex::new(None),
             requests: AtomicU64::new(0),
             received: AtomicU64::new(0),
             max_wait: Duration::from_secs(60),
@@ -295,26 +297,24 @@ impl Api {
                 req = req.header("Range", &format!("bytes={from}-"));
             }
             self.requests.fetch_add(1, Ordering::Relaxed);
-            let once = matches!(body, Body::Reader(..));
             let mut stopped = false;
             let sent = match body {
                 Body::Empty => req.send_empty(),
                 Body::Json(text) => req.header("Content-Type", "application/json").send(text.as_bytes()),
-                Body::Bytes(data, _) if data.is_empty() => req.header("Content-Type", "application/octet-stream").send(&[][..]),
+                Body::Bytes([], _) => req.header("Content-Type", "application/octet-stream").send(&[][..]),
                 Body::Bytes(data, told) => {
                     let mut sending = Sending { data, at: 0, told: told.as_deref_mut(), stopped: false };
                     let sent = req.header("Content-Type", "application/octet-stream").header("Content-Length", &data.len().to_string()).send(ureq::SendBody::from_reader(&mut sending));
                     stopped = sending.stopped;
                     sent
                 }
-                Body::Reader(r, len) => req.header("Content-Type", "application/octet-stream").header("Content-Length", &len.to_string()).send(ureq::SendBody::from_reader(*r)),
             };
             let mut resp = match sent {
                 Ok(r) => r,
                 Err(_) if stopped => return Err(Fail::Other(crate::CANCELLED.into())),
                 Err(e) => {
                     tries += 1;
-                    if once || tries >= TRIES {
+                    if tries >= TRIES {
                         return Err(Fail::Other(net_text(&e)));
                     }
                     log(&format!("Dropbox {url}: {e}, tentando de novo"));
@@ -322,6 +322,9 @@ impl Api {
                     continue;
                 }
             };
+            if let Some(date) = resp.headers().get("Date").and_then(|v| v.to_str().ok()).and_then(http_date) {
+                *self.clock.lock().unwrap_or_else(|e| e.into_inner()) = Some((date, Instant::now()));
+            }
             let status = resp.status().as_u16();
             if (200..300).contains(&status) {
                 return Ok(resp);
@@ -331,14 +334,14 @@ impl Api {
             let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
             let summary = json.get("error_summary").and_then(Value::as_str).unwrap_or("").to_string();
             match status {
-                401 if summary.starts_with("expired_access_token") && refreshed.is_none() && !once && matches!(self.auth, Auth::Refresh { .. }) => {
+                401 if summary.starts_with("expired_access_token") && refreshed.is_none() && matches!(self.auth, Auth::Refresh { .. }) => {
                     refreshed = token;
                 }
                 401 => {
                     log(&format!("Dropbox 401: {summary}"));
                     return Err(Fail::Auth(t("O acesso a esta conta do Dropbox foi revogado ou expirou. Remova a conta e conecte de novo.", "Access to this Dropbox account was revoked or expired. Remove the account and connect it again.").into()));
                 }
-                429 | 503 if waits + 1 < WAITS && !once => {
+                429 | 503 if waits + 1 < WAITS => {
                     waits += 1;
                     let asked = header_wait.or_else(|| json.pointer("/error/retry_after").and_then(Value::as_u64)).unwrap_or(1 << waits.min(5));
                     let wait = Duration::from_secs(asked.max(1)).min(self.max_wait);
@@ -347,7 +350,7 @@ impl Api {
                 }
                 429 => return Err(Fail::Other(t("O Dropbox pediu para esperar: muitas operações ao mesmo tempo. Tente de novo em instantes.", "Dropbox asked to wait: too many operations at once. Try again in a moment.").into())),
                 409 => return Err(Fail::Route { summary, error: json.get("error").cloned().unwrap_or(Value::Null) }),
-                500..=599 if tries + 1 < TRIES && !once => {
+                500..=599 if tries + 1 < TRIES => {
                     tries += 1;
                     std::thread::sleep(Duration::from_millis(500 << tries));
                 }
@@ -355,6 +358,17 @@ impl Api {
                 403 => return Err(Fail::Other(tr!("O Dropbox negou o acesso: {}", "Dropbox denied access: {}", if summary.is_empty() { text.chars().take(300).collect::<String>() } else { summary }))),
                 s => return Err(Fail::Other(tr!("O Dropbox respondeu com o erro HTTP {s}.", "Dropbox answered with HTTP error {s}."))),
             }
+        }
+    }
+
+    /// Dropbox's clock now, in seconds since 1970: the `Date` of its latest answer plus the time
+    /// since, else this computer's (before any answer). Whole seconds both, so up to a second
+    /// behind: times Dropbox writes (`server_deleted`) compare with it without trusting this
+    /// computer's clock.
+    pub fn server_now(&self) -> i64 {
+        match *self.clock.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some((date, at)) => date + at.elapsed().as_secs() as i64,
+            None => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
         }
     }
 
@@ -415,6 +429,17 @@ pub(crate) fn net_text(e: &ureq::Error) -> String {
     }
 }
 
+/// Seconds since 1970 of an HTTP date, `Thu, 19 Nov 2026 17:50:38 GMT` (the only form HTTP/1.1
+/// servers send).
+pub fn http_date(text: &str) -> Option<i64> {
+    let mut parts = text.split_whitespace().skip(1);
+    let (day, month, year, time) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let m = MONTHS.iter().position(|x| *x == month)? + 1;
+    let day: u32 = day.parse().ok()?;
+    crate::meta::seconds(&format!("{year}-{m:02}-{day:02}T{time}Z"))
+}
+
 /// JSON text fit for an HTTP header: everything outside printable ASCII as a `\uXXXX` escape,
 /// a character past U+FFFF as its two UTF-16 halves (what JSON calls for).
 pub fn header_json(json: &str) -> String {
@@ -447,6 +472,13 @@ mod tests {
         // Read back as JSON, it's the same text.
         let back: Value = serde_json::from_str(&h).unwrap();
         assert_eq!(back["path"], "/ação/😀.txt");
+    }
+
+    #[test]
+    fn http_dates_read_as_seconds() {
+        assert_eq!(http_date("Thu, 12 May 2015 15:50:38 GMT"), Some(1_431_445_838));
+        assert_eq!(http_date(&crate::fake::http_date(1_431_445_838)), Some(1_431_445_838));
+        assert_eq!(http_date("nada"), None);
     }
 
     #[test]
