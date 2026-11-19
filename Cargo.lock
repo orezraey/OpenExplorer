@@ -3038,10 +3038,13 @@ version = "0.2.0"
 dependencies = [
  "chrono",
  "md-5",
+ "openexplorer-b2",
+ "openexplorer-dropbox",
  "openexplorer-gdrive",
  "openexplorer-i18n",
  "openexplorer-index",
  "openexplorer-mega",
+ "openexplorer-onedrive",
  "openexplorer-remote",
  "rune",
  "rune-kit",
@@ -3051,6 +3054,46 @@ dependencies = [
  "windows",
  "windows-core",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "openexplorer-b2"
+version = "0.2.0"
+dependencies = [
+ "base64 0.22.1",
+ "keyring",
+ "openexplorer-cloud",
+ "openexplorer-i18n",
+ "serde",
+ "serde_json",
+ "sha1",
+ "ureq",
+]
+
+[[package]]
+name = "openexplorer-cloud"
+version = "0.2.0"
+dependencies = [
+ "aes-gcm",
+ "getrandom 0.3.4",
+ "hkdf",
+ "sha2 0.11.1",
+]
+
+[[package]]
+name = "openexplorer-dropbox"
+version = "0.2.0"
+dependencies = [
+ "base64 0.22.1",
+ "getrandom 0.3.4",
+ "keyring",
+ "openexplorer-cloud",
+ "openexplorer-i18n",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "ureq",
+ "url",
 ]
 
 [[package]]
@@ -3103,6 +3146,7 @@ dependencies = [
  "hkdf",
  "keyring",
  "num-bigint",
+ "openexplorer-cloud",
  "openexplorer-i18n",
  "pbkdf2",
  "serde",
@@ -3112,14 +3156,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "openexplorer-onedrive"
+version = "0.2.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "getrandom 0.3.4",
+ "keyring",
+ "openexplorer-cloud",
+ "openexplorer-i18n",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "ureq",
+ "url",
+]
+
+[[package]]
 name = "openexplorer-remote"
 version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
  "keyring",
+ "openexplorer-b2",
+ "openexplorer-dropbox",
  "openexplorer-i18n",
  "openexplorer-mega",
+ "openexplorer-onedrive",
  "percent-encoding",
  "quick-xml 0.38.4",
  "russh",

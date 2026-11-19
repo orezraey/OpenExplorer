@@ -120,8 +120,7 @@ fn stream(a: &mut dyn Conn, from: &str, b: &mut dyn Conn, to: &str, len: u64, p:
         let mut out = PipeOut { rx, chunk: Vec::new(), at: 0 };
         let mut last = 0;
         let sent = b.upload(to, &mut out, len, &mut |n| {
-            p.add_bytes(n - last);
-            last = n;
+            p.reached(&mut last, n);
             !p.cancelled()
         });
         // The upload stopping closes the pipe, which stops the download.
@@ -143,8 +142,7 @@ fn relay(c: &mut dyn Conn, from: &str, to: &str, len: u64, p: &Progress) -> Resu
     // The bar counts both ways (its size is twice the file's): down, then up.
     let mut last = 0;
     c.download(from, &mut file, &mut |n| {
-        p.add_bytes(n - last);
-        last = n;
+        p.reached(&mut last, n);
         !p.cancelled()
     })
     .map_err(|e| if p.cancelled() { CANCELLED.into() } else { e })?;
@@ -152,8 +150,7 @@ fn relay(c: &mut dyn Conn, from: &str, to: &str, len: u64, p: &Progress) -> Resu
     let mut file = std::fs::File::open(&tmp.0).map_err(|e| tr!("Não consegui ler o arquivo temporário: {e}", "Couldn't read the temporary file: {e}"))?;
     let mut last = 0;
     c.upload(to, &mut file, len, &mut |n| {
-        p.add_bytes(n - last);
-        last = n;
+        p.reached(&mut last, n);
         !p.cancelled()
     })
     .map_err(|e| if p.cancelled() { CANCELLED.into() } else { e })
@@ -192,24 +189,31 @@ pub fn between_servers(s: &mut State, from: &Location, items: Vec<Entry>, to: &L
             // A server allowing a single connection relays each file through the disk, which
             // the bar counts twice: down, then up.
             let one = same && a.limit() < 2;
-            // Each item as it is now, whatever Recortar does to the others meanwhile.
-            let pinned = with(&pool, &a, |c| {
+            // Each item as it is now, whatever Recortar does to the others meanwhile; and how
+            // many copies within the server go in one batch (Dropbox's), else one at a time.
+            let (pinned, most) = with(&pool, &a, |c| {
                 for ((p, e), path) in batch.rows().iter().zip(&items).zip(&paths) {
                     let size = if e.is_dir { measure(c, path, &|| p.cancelled()) } else { e.size.unwrap_or(0) };
                     p.size(if one { size * 2 } else { size });
                 }
-                Ok(pin_all(c, &paths))
+                Ok((pin_all(c, &paths), c.batches().0))
             })?;
+            let most = if same && !cut && !one { most.max(1) } else { 1 };
             let mut taken: HashSet<String> = with(&pool, &b, |c| c.list(&dir))?.into_iter().map(|i| i.name.to_lowercase()).collect();
             let (secret_a, secret_b) = (|| store::secret(&a.id), || store::secret(&b.id));
-            batch.run(|i, p| {
-                let (e, path, at) = (&items[i], &paths[i], &pinned[i]);
+            // Where the copy lands, its name free in `dir`; or why it can't be.
+            let mut place = |i: usize| -> Result<String, String> {
+                let (e, path) = (&items[i], &paths[i]);
                 if e.is_dir && same && (dir == *path || dir.starts_with(&format!("{path}/"))) {
                     return Err(tr!("Não dá para copiar a pasta \"{}\" para dentro dela mesma.", "Can't copy the folder \"{}\" into itself.", e.name));
                 }
                 let name = free_name(&e.name, e.is_dir, &taken);
                 taken.insert(name.to_lowercase());
-                let to = child(&dir, &name);
+                Ok(child(&dir, &name))
+            };
+            // One item: on the server's side, or down and up again.
+            let each = |i: usize, p: &Progress, to: String| -> Result<(), String> {
+                let (e, at) = (&items[i], &pinned[i]);
                 let size = if e.is_dir { 0 } else { e.size.unwrap_or(0) };
                 if one {
                     let mut lease = pool.take(&a, secret_a)?;
@@ -242,7 +246,52 @@ pub fn between_servers(s: &mut State, from: &Location, items: Vec<Entry>, to: &L
                     lb.done();
                     done
                 }
-            })
+            };
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let mut more = true;
+            while more {
+                let mut rows = Vec::new();
+                while rows.len() < most {
+                    let Some((i, p)) = batch.next(&next) else {
+                        more = false;
+                        break;
+                    };
+                    match place(i) {
+                        Ok(to) => rows.push((i, p, to)),
+                        Err(e) => p.end(Err(e)),
+                    }
+                }
+                match rows.len() {
+                    0 => {}
+                    1 => {
+                        let (i, p, to) = rows.pop().expect("one row");
+                        p.end(each(i, p, to));
+                    }
+                    // Copies within one server that has a batch for them, together.
+                    _ => {
+                        let copies: Vec<(String, String)> = rows.iter().map(|(i, _, to)| (pinned[*i].clone(), to.clone())).collect();
+                        let copied = match pool.take(&a, secret_a) {
+                            Ok(mut lease) => {
+                                let r = lease.copy_many(&copies);
+                                lease.done();
+                                r
+                            }
+                            Err(e) => vec![Err(e); copies.len()],
+                        };
+                        for ((i, p, to), r) in rows.into_iter().zip(copied) {
+                            p.end(match r {
+                                Ok(true) => {
+                                    p.add_bytes(p.total.load(std::sync::atomic::Ordering::Relaxed));
+                                    Ok(())
+                                }
+                                Ok(false) => each(i, p, to),
+                                Err(e) => Err(e),
+                            });
+                        }
+                    }
+                }
+            }
+            batch.summary()
         });
         emit(Msg::Done { reload, result });
     });
@@ -343,16 +392,14 @@ fn up(c: &mut dyn Conn, d: &Drive, path: &str, is_dir: bool, parent: &str, name:
     let mut file = std::fs::File::create(&tmp.0).map_err(|e| tr!("Não consegui criar o arquivo temporário: {e}", "Couldn't create the temporary file: {e}"))?;
     let mut last = 0;
     c.download(path, &mut file, &mut |n| {
-        p.add_bytes(n - last);
-        last = n;
+        p.reached(&mut last, n);
         !p.cancelled()
     })
     .map_err(|e| if p.cancelled() { CANCELLED.into() } else { e })?;
     drop(file);
     let mut last = 0;
     d.upload(&tmp.0, parent, name, &mut |n| {
-        p.add_bytes(n.saturating_sub(last));
-        last = n;
+        p.reached(&mut last, n);
         !p.cancelled()
     })
     .map(|_| ())
@@ -443,16 +490,14 @@ fn down(c: &mut dyn Conn, d: &Drive, f: &DriveFile, target: &str, shared: Option
     let mut last = 0;
     let len = d
         .download(f, &tmp.0, false, &mut |n| {
-            p.add_bytes(n.saturating_sub(last));
-            last = n;
+            p.reached(&mut last, n);
             !p.cancelled()
         })
         .map_err(|e| if p.cancelled() { CANCELLED.into() } else { e })?;
     let mut file = std::fs::File::open(&tmp.0).map_err(|e| tr!("Não consegui ler o arquivo temporário: {e}", "Couldn't read the temporary file: {e}"))?;
     let mut last = 0;
     c.upload(target, &mut file, len, &mut |n| {
-        p.add_bytes(n - last);
-        last = n;
+        p.reached(&mut last, n);
         !p.cancelled()
     })
     .map(|_| 0)
@@ -549,4 +594,25 @@ fn described(
         described(c, &child(path, &it.name), &it.name, it.is_dir, it.size, it.modified, &at, &mut inner, out, stop, depth + 1)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+    use crate::servers::tests::Resends;
+
+    /// Between two servers, or down and up again within one, a count that goes back (a part
+    /// sent again) neither wraps the row's bytes around nor counts the part twice.
+    #[test]
+    fn a_count_that_goes_back_neither_wraps_nor_counts_twice() {
+        let p = Progress::new(None);
+        stream(&mut Resends(vec![10, 20, 5, 30]), "/a", &mut Resends(vec![10, 20, 5, 30]), "/b", 30, &p).unwrap();
+        assert_eq!(p.bytes.load(Ordering::Relaxed), 30);
+        // Down, then up: the bar counts both ways.
+        let p = Progress::new(None);
+        relay(&mut Resends(vec![10, 20, 5, 30]), "/a", "/b", 30, &p).unwrap();
+        assert_eq!(p.bytes.load(Ordering::Relaxed), 60);
+    }
 }

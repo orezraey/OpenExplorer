@@ -15,6 +15,7 @@ use openexplorer_remote::{self as remote, Brand, Conn, Item, Pool, Protocol, Ref
 use openexplorer_i18n::{t, tr};
 use rune::{Icon, TextEdit, Tx};
 
+use crate::accounts::Account;
 use crate::actions::{Dialog, Then};
 use crate::model::{Entry, Location};
 use crate::ops::{self, CANCELLED, Progress};
@@ -33,6 +34,16 @@ pub struct Servers {
     pub mega_quotas: std::collections::HashMap<String, Option<openexplorer_mega::Quota>>,
     /// When each MEGA account a pane shows is next asked what changed.
     pub mega_watch: std::collections::HashMap<String, crate::mega::Watch>,
+    /// The Dropbox accounts' own list, their storage and their longpolls (see `dropbox.rs`).
+    pub dropbox: openexplorer_dropbox::store::Store,
+    pub dropbox_quotas: std::collections::HashMap<String, Option<openexplorer_dropbox::Quota>>,
+    pub dropbox_watch: std::collections::HashMap<String, crate::dropbox::Watch>,
+    /// The B2 keys' own list (see `b2.rs`).
+    pub b2: openexplorer_b2::Store,
+    /// The panes' B2 folders read again on the app's own (see `b2.rs`).
+    pub b2_watch: crate::b2::Watch,
+    /// The OneDrive accounts (see `onedrive.rs`).
+    pub onedrive: crate::onedrive::Side,
     /// Counts the add dialog's connection checks, to drop a stale answer.
     pub attempts: u64,
 }
@@ -43,7 +54,13 @@ impl Servers {
         let mega = crate::mega::store();
         let mut list = store.servers();
         list.extend(crate::mega::servers(&mega));
-        Servers { list, pool: Arc::default(), store, mega, mega_quotas: Default::default(), mega_watch: Default::default(), attempts: 0 }
+        let dropbox = crate::dropbox::store();
+        list.extend(crate::dropbox::servers(&dropbox));
+        let b2 = crate::b2::store();
+        list.extend(crate::b2::servers(&b2));
+        let onedrive = crate::onedrive::Side::load();
+        list.extend(onedrive.servers());
+        Servers { list, pool: Arc::default(), store, mega, mega_quotas: Default::default(), mega_watch: Default::default(), dropbox, dropbox_quotas: Default::default(), dropbox_watch: Default::default(), b2, b2_watch: Default::default(), onedrive, attempts: 0 }
     }
 }
 
@@ -251,7 +268,9 @@ pub(crate) fn measure(c: &mut dyn Conn, path: &str, stop: &dyn Fn() -> bool) -> 
 
 /// Runs `batch`'s rows on `server`, up to `at_once` at a time, each worker with a connection of
 /// its own, one connection left over for the panes' listings; then reloads `reload` and says how
-/// it went. `prepare` runs first, on one connection, and gives what the rows share.
+/// it went. `prepare` runs first, on one connection, and gives what the rows share. A worker
+/// takes a run of rows that `joins` (up to the connection's [`Conn::batches`]) for one `step`,
+/// which gives each its result; the others one at a time.
 #[allow(clippy::too_many_arguments)]
 fn transfer<P: Send + Sync + 'static>(
     s: &State,
@@ -260,7 +279,8 @@ fn transfer<P: Send + Sync + 'static>(
     at_once: usize,
     batch: transfers::Batch,
     prepare: impl FnOnce(&mut dyn Conn, &transfers::Batch) -> Result<P, String> + Send + 'static,
-    step: impl Fn(&mut dyn Conn, &P, usize, &Progress) -> Result<(), String> + Send + Sync + 'static,
+    joins: impl Fn(&P, usize) -> bool + Send + Sync + 'static,
+    step: impl Fn(&mut dyn Conn, &P, &[(usize, &Progress)]) -> Vec<Result<(), String>> + Send + Sync + 'static,
 ) {
     let workers = at_once.min(server.limit().saturating_sub(1)).min(batch.rows().len()).max(1);
     let (pool, server) = (s.servers.pool.clone(), server.clone());
@@ -273,8 +293,23 @@ fn transfer<P: Send + Sync + 'static>(
                 for _ in 0..workers {
                     scope.spawn(|| {
                         let ran = with(&pool, &server, |c| {
-                            while let Some((i, p)) = batch.next(&next) {
-                                p.end(step(c, &shared, i, p));
+                            let most = c.batches().0.max(1);
+                            // A row taken that doesn't join the run before it starts the next.
+                            let mut held = None;
+                            while let Some(first) = held.take().or_else(|| batch.next(&next)) {
+                                let mut rows = vec![first];
+                                while joins(&shared, first.0) && rows.len() < most {
+                                    match batch.next(&next) {
+                                        Some(r) if joins(&shared, r.0) => rows.push(r),
+                                        other => {
+                                            held = other;
+                                            break;
+                                        }
+                                    }
+                                }
+                                for ((_, p), r) in rows.iter().zip(step(c, &shared, &rows)) {
+                                    p.end(r);
+                                }
                             }
                             Ok(())
                         });
@@ -312,7 +347,7 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
         // The names the rows took in `dst`, before their files are made.
         Ok((std::sync::Mutex::new(HashSet::<PathBuf>::new()), paths))
     };
-    let step = move |c: &mut dyn Conn, (claimed, paths): &(std::sync::Mutex<HashSet<PathBuf>>, Vec<String>), i: usize, p: &Progress| {
+    let one = move |c: &mut dyn Conn, (claimed, paths): &(std::sync::Mutex<HashSet<PathBuf>>, Vec<String>), i: usize, p: &Progress| {
         let e = &items[i];
         let local = {
             let mut claimed = claimed.lock().unwrap_or_else(|e| e.into_inner());
@@ -333,7 +368,8 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
             Then::Open => ops::open(&local),
         }
     };
-    transfer(s, server, reload, at_once, batch, prepare, step);
+    let step = move |c: &mut dyn Conn, shared: &(std::sync::Mutex<HashSet<PathBuf>>, Vec<String>), rows: &[(usize, &Progress)]| rows.iter().map(|(i, p)| one(c, shared, *i, p)).collect();
+    transfer(s, server, reload, at_once, batch, prepare, |_, _| false, step);
 }
 
 /// A file or a folder and all it holds, from `path` on the server to `local`, `depth` folders
@@ -357,8 +393,7 @@ fn fetch(c: &mut dyn Conn, path: &str, is_dir: bool, modified: Option<SystemTime
     let mut file = std::fs::File::create_new(local).map_err(|e| tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", local.display()))?;
     let mut last = 0;
     let got = c.download(path, &mut file, &mut |n| {
-        p.add_bytes(n - last);
-        last = n;
+        p.reached(&mut last, n);
         !p.cancelled()
     });
     if let Err(e) = got {
@@ -388,37 +423,67 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
     let measured = sources.clone();
     let listed = dir.clone();
     let prepare = move |c: &mut dyn Conn, batch: &transfers::Batch| {
+        // Each row's size, and which are files small enough to go in one batch with others.
+        let largest = c.batches().1;
+        let mut small = Vec::new();
         for (p, src) in batch.rows().iter().zip(&measured) {
-            p.size(ops::measure(src, &|| p.cancelled()));
+            let size = ops::measure(src, &|| p.cancelled());
+            p.size(size);
+            small.push(!src.is_dir() && size <= largest);
         }
         // Lowercased: a server on Windows (or many NAS) takes "Nota.txt" and "nota.txt" for one
         // file, and an upload under the other spelling would replace it.
         let taken: HashSet<String> = c.list(&listed)?.into_iter().map(|i| i.name.to_lowercase()).collect();
-        Ok(std::sync::Mutex::new(taken))
+        Ok((std::sync::Mutex::new(taken), small))
     };
-    let step = move |c: &mut dyn Conn, taken: &std::sync::Mutex<HashSet<String>>, i: usize, p: &Progress| {
-        let src = &sources[i];
-        let is_dir = src.is_dir();
-        let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let name = {
-            let mut taken = taken.lock().unwrap_or_else(|e| e.into_inner());
-            let name = free_name(&name, is_dir, &taken);
-            taken.insert(name.to_lowercase());
-            name
-        };
-        let target = child(&dir, &name);
-        if let Err(e) = send(c, src, &target, p) {
-            if e == CANCELLED {
-                let _ = c.remove(&target, is_dir);
+    let step = move |c: &mut dyn Conn, (taken, _): &(std::sync::Mutex<HashSet<String>>, Vec<bool>), rows: &[(usize, &Progress)]| {
+        // Each row's name, taken before any is sent.
+        let targets: Vec<(String, bool)> = rows
+            .iter()
+            .map(|(i, _)| {
+                let src = &sources[*i];
+                let is_dir = src.is_dir();
+                let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let mut taken = taken.lock().unwrap_or_else(|e| e.into_inner());
+                let name = free_name(&name, is_dir, &taken);
+                taken.insert(name.to_lowercase());
+                (child(&dir, &name), is_dir)
+            })
+            .collect();
+        let sent: Vec<Result<(), String>> = match rows {
+            [(i, p)] => vec![send(c, &sources[*i], &targets[0].0, p)],
+            // Small files, together.
+            _ => {
+                let files: Vec<(String, PathBuf)> = rows.iter().zip(&targets).map(|((i, _), (to, _))| (to.clone(), sources[*i].clone())).collect();
+                let mut last = vec![0u64; rows.len()];
+                c.upload_files(&files, &mut |k, n| {
+                    let p = rows[k].1;
+                    p.reached(&mut last[k], n);
+                    !p.cancelled()
+                })
+                .into_iter()
+                .map(|r| r.map_err(cancelled))
+                .collect()
             }
-            return Err(e);
-        }
-        if remove {
-            trash::delete(src).map_err(|e| tr!("Enviado, mas não consegui mover o original para a Lixeira: {e}", "Uploaded, but couldn't move the original to the Recycle Bin: {e}"))?;
-        }
-        Ok(())
+        };
+        rows.iter()
+            .zip(&targets)
+            .zip(sent)
+            .map(|(((i, _), (target, is_dir)), r)| {
+                if let Err(e) = r {
+                    if e == CANCELLED {
+                        let _ = c.remove(target, *is_dir);
+                    }
+                    return Err(e);
+                }
+                if remove {
+                    trash::delete(&sources[*i]).map_err(|e| tr!("Enviado, mas não consegui mover o original para a Lixeira: {e}", "Uploaded, but couldn't move the original to the Recycle Bin: {e}"))?;
+                }
+                Ok(())
+            })
+            .collect()
     };
-    transfer(s, &server, reload, at_once, batch, prepare, step);
+    transfer(s, &server, reload, at_once, batch, prepare, |(_, small): &(_, Vec<bool>), i| small[i], step);
 }
 
 /// `name`, or the first "nome (2).ext" whose lowercase isn't in `taken` (lowercased names).
@@ -441,18 +506,35 @@ fn send(c: &mut dyn Conn, src: &Path, target: &str, p: &Progress) -> Result<(), 
     if src.is_dir() {
         c.mkdir(target)?;
         let items = std::fs::read_dir(src).map_err(|e| tr!("Não consegui ler {}: {e}", "Couldn't read {}: {e}", src.display()))?;
+        // Where the server takes files in batches, the folder's small files go together.
+        let (most, largest) = c.batches();
+        let mut small = Vec::new();
         for item in items {
             let item = item.map_err(|e| tr!("Não consegui ler {}: {e}", "Couldn't read {}: {e}", src.display()))?;
-            send(c, &item.path(), &child(target, &item.file_name().to_string_lossy()), p)?;
+            let (from, to) = (item.path(), child(target, &item.file_name().to_string_lossy()));
+            match item.metadata() {
+                Ok(m) if most > 1 && m.is_file() && m.len() <= largest => small.push((to, from)),
+                _ => send(c, &from, &to, p)?,
+            }
+        }
+        for files in small.chunks(most.max(1)) {
+            if p.cancelled() {
+                return Err(CANCELLED.into());
+            }
+            let mut last = vec![0u64; files.len()];
+            let sent = c.upload_files(files, &mut |k, n| {
+                p.reached(&mut last[k], n);
+                !p.cancelled()
+            });
+            if let Some(e) = sent.into_iter().find_map(Result::err) {
+                return Err(cancelled(e));
+            }
         }
         return Ok(());
     }
-    let mut file = std::fs::File::open(src).map_err(|e| tr!("Não consegui abrir {}: {e}", "Couldn't open {}: {e}", src.display()))?;
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut last = 0;
-    c.upload(target, &mut file, len, &mut |n| {
-        p.add_bytes(n - last);
-        last = n;
+    c.upload_file(target, src, &mut |n| {
+        p.reached(&mut last, n);
         !p.cancelled()
     })
     .map_err(cancelled)
@@ -466,19 +548,39 @@ pub fn move_within(s: &mut State, from: &Location, items: Vec<Entry>, to: &Locat
     let at = server.clone();
     undo::server_job(s, &server, reload, |n| tr!("mover {}", "move {}", undo::items(n)), move |c, rec| {
         let pinned = pin_all(c, &paths);
-        batch.run(|i, _| {
-            let (e, path) = (&items[i], &paths[i]);
-            let into = child(&dst, &e.name);
-            if *path == into {
-                return Ok(());
+        // As many at once as the server takes in a batch (Dropbox's), else one at a time.
+        let most = c.batches().0.max(1);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let mut more = true;
+        while more {
+            let mut rows = Vec::new();
+            while rows.len() < most {
+                let Some((i, p)) = batch.next(&next) else {
+                    more = false;
+                    break;
+                };
+                let (e, path) = (&items[i], &paths[i]);
+                let into = child(&dst, &e.name);
+                if *path == into {
+                    p.end(Ok(()));
+                } else if e.is_dir && (dst == *path || dst.starts_with(&format!("{path}/"))) {
+                    p.end(Err(tr!("Não dá para mover a pasta \"{}\" para dentro dela mesma.", "Can't move the folder \"{}\" into itself.", e.name)));
+                } else {
+                    rows.push((i, p, into));
+                }
             }
-            if e.is_dir && (dst == *path || dst.starts_with(&format!("{path}/"))) {
-                return Err(tr!("Não dá para mover a pasta \"{}\" para dentro dela mesma.", "Can't move the folder \"{}\" into itself.", e.name));
+            if rows.is_empty() {
+                continue;
             }
-            c.rename(&pinned[i], &into)?;
-            rec.add([undo::Step::ServerMove { server: at.clone(), from: into, to: path.clone() }]);
-            Ok(())
-        })
+            let moves: Vec<(String, String)> = rows.iter().map(|(i, _, into)| (pinned[*i].clone(), into.clone())).collect();
+            for ((i, p, into), moved) in rows.into_iter().zip(c.rename_many(&moves)) {
+                if moved.is_ok() {
+                    rec.add([undo::Step::ServerMove { server: at.clone(), from: into, to: paths[i].clone() }]);
+                }
+                p.end(moved);
+            }
+        }
+        batch.summary()
     });
 }
 
@@ -566,6 +668,9 @@ impl Category {
 pub enum Provider {
     GoogleDrive,
     Mega,
+    Dropbox,
+    B2,
+    OneDrive,
     Nextcloud,
     OwnCloud,
     Sftp,
@@ -574,9 +679,12 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub const ALL: [Provider; 7] = [
+    pub const ALL: [Provider; 10] = [
         Provider::GoogleDrive,
+        Provider::OneDrive,
+        Provider::Dropbox,
         Provider::Mega,
+        Provider::B2,
         Provider::Nextcloud,
         Provider::OwnCloud,
         Provider::Sftp,
@@ -588,6 +696,9 @@ impl Provider {
         match self {
             Provider::GoogleDrive => "Google Drive",
             Provider::Mega => "MEGA",
+            Provider::Dropbox => "Dropbox",
+            Provider::B2 => "Backblaze B2",
+            Provider::OneDrive => "OneDrive",
             Provider::Nextcloud => "Nextcloud",
             Provider::OwnCloud => "ownCloud",
             Provider::Sftp => "SFTP",
@@ -600,6 +711,9 @@ impl Provider {
         match self {
             Provider::GoogleDrive => t("OAuth no navegador", "OAuth in the browser"),
             Provider::Mega => t("E-mail e senha · criptografia de ponta a ponta", "E-mail and password · end-to-end encrypted"),
+            Provider::Dropbox => t("OAuth no navegador · contas pessoais e de times", "OAuth in the browser · personal and team accounts"),
+            Provider::B2 => t("Armazenamento de objetos · chave de aplicação", "Object storage · application key"),
+            Provider::OneDrive => t("Pessoal ou corporativo · OAuth no navegador", "Personal or work · OAuth in the browser"),
             Provider::Nextcloud => t("Nuvem via WebDAV", "Cloud via WebDAV"),
             Provider::OwnCloud => t("Nuvem via WebDAV", "Cloud via WebDAV"),
             Provider::Sftp => t("SSH seguro · porta 22", "Secure SSH · port 22"),
@@ -612,6 +726,9 @@ impl Provider {
         match self {
             Provider::GoogleDrive => &crate::icons::PROVIDER_GDRIVE,
             Provider::Mega => &crate::icons::PROVIDER_MEGA,
+            Provider::Dropbox => &crate::icons::PROVIDER_DROPBOX,
+            Provider::B2 => &crate::icons::PROVIDER_B2,
+            Provider::OneDrive => &crate::icons::PROVIDER_ONEDRIVE,
             Provider::Nextcloud => &crate::icons::PROVIDER_NEXTCLOUD,
             Provider::OwnCloud => &crate::icons::PROVIDER_OWNCLOUD,
             Provider::Sftp => &crate::icons::PROVIDER_SFTP,
@@ -623,7 +740,7 @@ impl Provider {
     pub fn in_category(self, category: Category) -> bool {
         match category {
             Category::All => true,
-            Category::Cloud => matches!(self, Provider::GoogleDrive | Provider::Mega | Provider::Nextcloud | Provider::OwnCloud),
+            Category::Cloud => matches!(self, Provider::GoogleDrive | Provider::OneDrive | Provider::Dropbox | Provider::Mega | Provider::B2 | Provider::Nextcloud | Provider::OwnCloud),
             Category::Nas => matches!(self, Provider::Nextcloud | Provider::OwnCloud | Provider::Sftp | Provider::Ftp | Provider::WebDav),
             Category::Protocols => matches!(self, Provider::Sftp | Provider::Ftp | Provider::WebDav),
         }
@@ -637,6 +754,9 @@ impl Provider {
         let keywords = match self {
             Provider::GoogleDrive => "google drive gdrive nuvem workspace oauth gmail cloud",
             Provider::Mega => "mega mega.nz nuvem cloud criptografia encrypted 2fa",
+            Provider::Dropbox => "dropbox nuvem cloud oauth time equipe team business",
+            Provider::B2 => "backblaze b2 bucket s3 nuvem cloud objetos object storage chave key",
+            Provider::OneDrive => "onedrive one drive microsoft office 365 sharepoint nuvem cloud oauth business empresa trabalho escola work school",
             Provider::Nextcloud => "nextcloud webdav dav https nas nuvem cloud",
             Provider::OwnCloud => "owncloud webdav dav https nas nuvem cloud",
             Provider::Sftp => "sftp ssh servidor linux nas chave 22 server key secure",
@@ -650,6 +770,9 @@ impl Provider {
         match self {
             Provider::GoogleDrive | Provider::Sftp => Protocol::Sftp,
             Provider::Mega => Protocol::Mega,
+            Provider::Dropbox => Protocol::Dropbox,
+            Provider::B2 => Protocol::B2,
+            Provider::OneDrive => Protocol::OneDrive,
             Provider::Ftp => Protocol::Ftp,
             Provider::Nextcloud | Provider::OwnCloud | Provider::WebDav => Protocol::Davs,
         }
@@ -671,6 +794,9 @@ impl Provider {
             (_, Protocol::Ftp | Protocol::Ftps) => Provider::Ftp,
             (_, Protocol::Dav | Protocol::Davs) => Provider::WebDav,
             (_, Protocol::Mega) => Provider::Mega,
+            (_, Protocol::Dropbox) => Provider::Dropbox,
+            (_, Protocol::B2) => Provider::B2,
+            (_, Protocol::OneDrive) => Provider::OneDrive,
         }
     }
 
@@ -680,6 +806,9 @@ impl Provider {
             Protocol::Ftp | Protocol::Ftps => Provider::Ftp,
             Protocol::Dav | Protocol::Davs => Provider::WebDav,
             Protocol::Mega => Provider::Mega,
+            Protocol::Dropbox => Provider::Dropbox,
+            Protocol::B2 => Provider::B2,
+            Protocol::OneDrive => Provider::OneDrive,
         }
     }
 }
@@ -789,12 +918,27 @@ impl Form {
             self.port = TextEdit::new("");
             self.folder = TextEdit::new("");
         }
+        if provider == Provider::B2 {
+            self.host = TextEdit::new("backblazeb2.com");
+            self.user.focused = true;
+            return;
+        }
         if provider == Provider::Mega {
             self.host = TextEdit::new("mega.nz");
             self.user.focused = true;
             self.needs_code = false;
             self.code = TextEdit::new("");
             return;
+        }
+        if provider == Provider::Dropbox {
+            self.host = TextEdit::new("dropbox.com");
+            self.client_id = TextEdit::new("");
+            self.custom_oauth = openexplorer_dropbox::AppConfig::load().is_err();
+            self.client_id.focused = self.custom_oauth;
+            return;
+        }
+        if provider == Provider::OneDrive {
+            return crate::onedrive::prepare(self);
         }
         if provider == Provider::GoogleDrive {
             let missing = openexplorer_gdrive::ClientConfig::load().is_err();
@@ -1087,8 +1231,16 @@ pub fn ask_add(s: &mut State) {
 }
 
 pub fn ask_edit(s: &mut State, id: &str) {
-    if id.starts_with("mega:") {
-        s.status = t("Contas MEGA não têm o que editar: para trocar de conta, remova e conecte de novo.", "MEGA accounts have nothing to edit: to switch accounts, remove it and connect again.").into();
+    if id.starts_with("b2:") {
+        s.status = t("Contas B2 não têm o que editar: para trocar a chave, remova e conecte de novo.", "B2 accounts have nothing to edit: to change the key, remove it and connect again.").into();
+        return;
+    }
+    if id.starts_with("mega:") || id.starts_with("onedrive:") {
+        s.status = t("Contas MEGA e OneDrive não têm o que editar: para trocar de conta, remova e conecte de novo.", "MEGA and OneDrive accounts have nothing to edit: to switch accounts, remove it and connect again.").into();
+        return;
+    }
+    if id.starts_with("dropbox:") {
+        s.status = t("Contas Dropbox não têm o que editar: para trocar de conta, remova e conecte de novo.", "Dropbox accounts have nothing to edit: to switch accounts, remove it and connect again.").into();
         return;
     }
     if let Some(server) = s.servers.list.iter().find(|sv| sv.id == id) {
@@ -1154,7 +1306,7 @@ pub fn toggle_tls(s: &mut State) {
             Protocol::Ftps => Protocol::Ftp,
             Protocol::Dav => Protocol::Davs,
             Protocol::Davs => Protocol::Dav,
-            p @ (Protocol::Sftp | Protocol::Mega) => p,
+            p @ (Protocol::Sftp | Protocol::Mega | Protocol::Dropbox | Protocol::B2 | Protocol::OneDrive) => p,
         };
         let trimmed = f.host.text.trim_start();
         if let Some((scheme, rest)) = trimmed.split_once("://") {
@@ -1360,19 +1512,25 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
     }
 }
 
-/// Forgets a server and its password (a MEGA account and its session); panes on it go home.
+/// Forgets a server and its password, or a cloud account and its secrets; panes on it go home.
 pub fn remove(s: &mut State, id: &str) {
-    let mega = s.servers.list.iter().find(|sv| sv.id == id && sv.is_mega()).cloned();
-    if let Some(sv) = &mega {
-        if !crate::mega::remove(s, sv) {
-            return;
+    let server = s.servers.list.iter().find(|sv| sv.id == id).cloned();
+    let account = server.as_ref().and_then(|sv| Some((Account::of(sv)?, sv)));
+    match account {
+        Some((account, sv)) => {
+            if !crate::accounts::remove(s, account, sv) {
+                return;
+            }
         }
-    } else if let Err(e) = s.servers.store.remove(id) {
-        crate::fail(s, e);
-        return;
+        None => {
+            if let Err(e) = s.servers.store.remove(id) {
+                crate::fail(s, e);
+                return;
+            }
+        }
     }
     s.servers.pool.forget(id);
-    let name = s.servers.list.iter().find(|sv| sv.id == id).map(|sv| sv.name.clone()).unwrap_or_default();
+    let name = server.as_ref().map(|sv| sv.name.as_str()).unwrap_or_default();
     s.servers.list.retain(|sv| sv.id != id);
     s.tree.server_changed(id);
     let on = |l: &Location| matches!(l, Location::Server { server, .. } if server.id == id);
@@ -1386,7 +1544,10 @@ pub fn remove(s: &mut State, id: &str) {
             crate::switch(s, p, Location::home());
         }
     }
-    s.status = if mega.is_some() { tr!("Conta MEGA removida: {name}", "MEGA account removed: {name}") } else { tr!("Servidor removido: {name}", "Server removed: {name}") };
+    s.status = match account {
+        Some((account, _)) => crate::accounts::removed(account, name),
+        None => tr!("Servidor removido: {name}", "Server removed: {name}"),
+    };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1425,16 +1586,32 @@ fn decode(s: &str) -> String {
 /// Reads `scheme://[user[:password]@]host[:port][/path]`; `None` for any other text.
 pub fn parse_address(text: &str) -> Option<Address> {
     let (scheme, rest) = text.trim().split_once("://")?;
-    // A MEGA account's own address (`mega://ana@exemplo.com/Drive na nuvem`), which only
-    // reaches an account already connected: the e-mail is the whole authority.
-    if scheme.eq_ignore_ascii_case("mega") {
+    // A B2 bucket's address (`b2://bucket/pasta`): bucket names are unique across B2.
+    if scheme.eq_ignore_ascii_case("b2") {
+        return Some(crate::b2::address(rest, decode));
+    }
+    // A MEGA or Dropbox account's own address (`mega://ana@exemplo.com/Drive na nuvem`,
+    // `dropbox://ana@exemplo.com/Fotos`), which only reaches an account already connected: the
+    // e-mail is the whole authority.
+    let account = if scheme.eq_ignore_ascii_case("mega") {
+        Some((Protocol::Mega, "mega.nz"))
+    } else if scheme.eq_ignore_ascii_case("dropbox") {
+        Some((Protocol::Dropbox, "dropbox.com"))
+    } else {
+        None
+    };
+    if let Some((protocol, host)) = account {
         let (email, path) = rest.split_once('/').map_or((rest, "/"), |(e, p)| (e, p));
         let email = decode(email).trim().to_lowercase();
         if !email.contains('@') {
             return None;
         }
         let path = format!("/{}", decode(path).trim_start_matches('/'));
-        return Some(Address { protocol: Protocol::Mega, user: email, password: None, host: "mega.nz".into(), port: None, path });
+        return Some(Address { protocol, user: email, password: None, host: host.into(), port: None, path });
+    }
+    if scheme.eq_ignore_ascii_case("onedrive") {
+        let (email, path) = crate::onedrive::address(&decode(rest))?;
+        return Some(Address { protocol: Protocol::OneDrive, user: email, password: None, host: "graph.microsoft.com".into(), port: None, path });
     }
     let protocol = Protocol::from_scheme(scheme)?;
     let (authority, path) = match rest.find('/') {
@@ -1475,14 +1652,22 @@ pub fn parse_address(text: &str) -> Option<Address> {
 /// The address bar's text for a server location: the server's address and the full path.
 pub fn address_text(loc: &Location) -> String {
     let Location::Server { server, path, .. } = loc else { return String::new() };
+    if server.is_b2() {
+        return crate::b2::address_text(path);
+    }
     format!("{}{}", server.address(), server.path(path))
 }
 
 /// The server location an address leads to, among the servers added: the same protocol, host
 /// and port (and user, when the address names one), and a path under the server's folder.
 pub fn reach(servers: &[Server], a: &Address) -> Result<Location, String> {
+    if a.protocol == Protocol::B2 {
+        return crate::b2::reach_address(servers, a);
+    }
     let port = a.port.unwrap_or(a.protocol.default_port());
-    let same = |sv: &&Server| sv.protocol == a.protocol && sv.host.eq_ignore_ascii_case(&a.host) && sv.port == port && (a.user.is_empty() || sv.user == a.user);
+    // A OneDrive account's address names its e-mail (the server's name), not its drive id.
+    let user = |sv: &Server| if sv.is_onedrive() { sv.name.to_lowercase() == a.user } else { sv.user == a.user };
+    let same = |sv: &&Server| sv.protocol == a.protocol && sv.host.eq_ignore_ascii_case(&a.host) && sv.port == port && (a.user.is_empty() || user(sv));
     let candidates: Vec<&Server> = servers.iter().filter(same).collect();
     if candidates.is_empty() {
         return Err(String::new());
@@ -1505,11 +1690,102 @@ pub fn reach(servers: &[Server], a: &Address) -> Result<Location, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A connection whose transfers report the counts given, in turn: a count that goes back
+    /// is what a service sending a part again reports (OneDrive's upload session past 4 MiB).
+    pub(crate) struct Resends(pub Vec<u64>);
+
+    impl Resends {
+        fn report(&self, progress: remote::Progress) -> remote::Result<()> {
+            for &n in &self.0 {
+                if !progress(n) {
+                    return Err(CANCELLED.into());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Conn for Resends {
+        fn list(&mut self, _: &str) -> remote::Result<Vec<Item>> {
+            Ok(Vec::new())
+        }
+        fn stat(&mut self, _: &str) -> remote::Result<Option<Item>> {
+            Ok(None)
+        }
+        fn mkdir(&mut self, _: &str) -> remote::Result<()> {
+            Ok(())
+        }
+        fn rename(&mut self, _: &str, _: &str) -> remote::Result<()> {
+            Ok(())
+        }
+        fn remove_file(&mut self, _: &str) -> remote::Result<()> {
+            Ok(())
+        }
+        fn remove_dir(&mut self, _: &str) -> remote::Result<()> {
+            Ok(())
+        }
+        fn download(&mut self, _: &str, _: &mut dyn std::io::Write, progress: remote::Progress) -> remote::Result<()> {
+            self.report(progress)
+        }
+        fn upload(&mut self, _: &str, _: &mut dyn std::io::Read, _: u64, progress: remote::Progress) -> remote::Result<()> {
+            self.report(progress)
+        }
+        fn home(&mut self) -> remote::Result<String> {
+            Ok("/".into())
+        }
+        fn is_link(&mut self, _: &str) -> remote::Result<bool> {
+            Ok(false)
+        }
+        fn alive(&mut self) -> bool {
+            true
+        }
+    }
+
+    /// A transfer whose count goes back (a part sent again) neither wraps the queue's bytes
+    /// around nor counts the part twice: the row ends at the file's size.
+    #[test]
+    fn a_count_that_goes_back_neither_wraps_nor_counts_twice() {
+        let dir = std::env::temp_dir().join(format!("oe-servers-resend-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = dir.join("x.bin");
+        std::fs::write(&local, [0u8; 30]).unwrap();
+        let p = Progress::new(None);
+        send(&mut Resends(vec![10, 20, 5, 30]), &local, "/x.bin", &p).unwrap();
+        assert_eq!(p.bytes.load(Ordering::Relaxed), 30);
+        let p = Progress::new(None);
+        fetch(&mut Resends(vec![10, 20, 5, 30]), "/x.bin", false, None, &dir.join("y.bin"), &p, 0).unwrap();
+        assert_eq!(p.bytes.load(Ordering::Relaxed), 30);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn server(protocol: Protocol, host: &str, root: &str) -> Server {
         Server { id: format!("{host}{root}"), name: host.into(), protocol, brand: None, host: host.into(), port: protocol.default_port(), user: "ana".into(), root: root.into(), key: None, host_key: None, cert: None, connections: 4, implicit: false }
+    }
+
+    /// Removing a server: it leaves its store and the list, and the panes, their history and
+    /// the clipboard on it go; a cloud account's own forgetting is its module's (`accounts`).
+    #[test]
+    fn a_removed_server_leaves_the_list_and_the_panes() {
+        let base = std::env::temp_dir().join(format!("oe-servers-remove-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sv = Server { id: format!("teste-remover-{}", std::process::id()), name: "Teste".into(), ..server(Protocol::Sftp, "nas", "/") };
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        s.servers.store = Store::at(base.join("servers.json"));
+        s.servers.store.save(sv.clone(), None).unwrap();
+        s.servers.list = vec![sv.clone()];
+        s.panes[0].loc = folder(&sv, vec!["x".into()]);
+        s.panes[1].back.push(folder(&sv, vec![]));
+        s.clip = Some(crate::actions::Clip { mode: crate::actions::ClipMode::Copy, from: folder(&sv, vec![]), items: Vec::new() });
+        remove(&mut s, &sv.id);
+        assert!(s.servers.store.servers().is_empty() && s.servers.list.is_empty());
+        assert!(!matches!(s.panes[0].loc, Location::Server { .. }) && s.panes[1].back.is_empty() && s.clip.is_none());
+        assert_eq!(s.status, "Servidor removido: Teste");
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
@@ -1569,9 +1845,9 @@ mod tests {
     fn unified_catalog_filters_and_configures_presets() {
         let mut f = Form::new();
         assert_eq!(f.step, Step::Pick);
-        assert_eq!(f.visible_providers().len(), 7);
+        assert_eq!(f.visible_providers().len(), 10);
         f.category = Category::Cloud;
-        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::Mega, Provider::Nextcloud, Provider::OwnCloud]);
+        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::OneDrive, Provider::Dropbox, Provider::Mega, Provider::B2, Provider::Nextcloud, Provider::OwnCloud]);
         f.category = Category::Protocols;
         assert_eq!(f.visible_providers(), [Provider::Sftp, Provider::Ftp, Provider::WebDav]);
         f.category = Category::All;

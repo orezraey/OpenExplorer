@@ -1,0 +1,23 @@
+[package]
+name = "openexplorer-dropbox"
+version.workspace = true
+edition.workspace = true
+
+# Our own blocking client of the Dropbox API v2 over ureq, not the `dropbox-sdk` crate: see the
+# crate docs in `src/lib.rs`. Every version here is one Cargo.lock already had.
+[features]
+# The stand-in for the API (`fake.rs`), for the app's tests of the panes' work on Dropbox.
+fake = []
+
+[dependencies]
+base64 = "0.22"
+getrandom = "0.3"
+# Refresh tokens live in the OS credential store: Credential Manager on Windows.
+keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
+openexplorer-cloud = { path = "../cloud" }
+openexplorer-i18n = { path = "../i18n" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+ureq = "3"
+url = "2"

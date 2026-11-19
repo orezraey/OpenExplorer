@@ -3,9 +3,12 @@
 //!
 //! Everything here blocks; the app runs it on background threads.
 
+mod b2;
 mod dav;
+mod dropbox;
 mod ftp;
 mod mega;
+mod onedrive;
 mod sftp;
 pub mod store;
 mod tls;
@@ -45,6 +48,12 @@ pub enum Protocol {
     /// A MEGA account (see `mega.rs`). Never written to `servers.json`: MEGA accounts are kept
     /// apart, so an older app reading that list doesn't meet a protocol it can't read.
     Mega,
+    /// A Dropbox account (see `dropbox.rs`), kept apart like MEGA's.
+    Dropbox,
+    /// A Backblaze B2 application key (see `b2.rs`); kept apart like MEGA.
+    B2,
+    /// A OneDrive account (see `onedrive.rs`), kept apart from `servers.json` as MEGA is.
+    OneDrive,
 }
 
 impl Protocol {
@@ -58,6 +67,9 @@ impl Protocol {
             Protocol::Dav => "WebDAV (http)",
             Protocol::Davs => "WebDAV (https)",
             Protocol::Mega => "MEGA",
+            Protocol::Dropbox => "Dropbox",
+            Protocol::B2 => "Backblaze B2",
+            Protocol::OneDrive => "OneDrive",
         }
     }
 
@@ -79,6 +91,9 @@ impl Protocol {
             Protocol::Dav => "http",
             Protocol::Davs => "https",
             Protocol::Mega => "mega",
+            Protocol::Dropbox => "dropbox",
+            Protocol::B2 => "b2",
+            Protocol::OneDrive => "onedrive",
         }
     }
 
@@ -98,7 +113,7 @@ impl Protocol {
             Protocol::Ftp | Protocol::Ftps => 21,
             Protocol::Sftp => 22,
             Protocol::Dav => 80,
-            Protocol::Davs | Protocol::Mega => 443,
+            Protocol::Davs | Protocol::Mega | Protocol::Dropbox | Protocol::B2 | Protocol::OneDrive => 443,
         }
     }
 
@@ -196,10 +211,64 @@ impl Server {
         self.protocol == Protocol::Mega
     }
 
+    /// The server a Dropbox account shows as in the panes: its e-mail is the user, its refresh
+    /// token in the Dropbox crate's own store.
+    pub fn dropbox(email: &str) -> Server {
+        Server { id: format!("dropbox:{email}"), protocol: Protocol::Dropbox, host: "dropbox.com".into(), ..Server::mega(email) }
+    }
+
+    pub fn is_dropbox(&self) -> bool {
+        self.protocol == Protocol::Dropbox
+    }
+
+    /// The server a Backblaze B2 key shows as in the panes: its key ID is the user, its
+    /// application key in the B2 crate's own store. `name` is what the tree shows.
+    pub fn b2(key_id: &str, name: &str) -> Server {
+        Server {
+            id: format!("b2:{key_id}"),
+            name: name.to_string(),
+            protocol: Protocol::B2,
+            brand: None,
+            host: "backblazeb2.com".into(),
+            port: 443,
+            user: key_id.to_string(),
+            root: "/".into(),
+            key: None,
+            host_key: None,
+            cert: None,
+            connections: 6,
+            implicit: false,
+        }
+    }
+
+    pub fn is_b2(&self) -> bool {
+        self.protocol == Protocol::B2
+    }
+
+    /// The server a OneDrive account shows as: the drive's id is the user (the account's key in
+    /// the OneDrive crate), its e-mail the name.
+    pub fn onedrive(drive: &str, email: &str) -> Server {
+        Server { id: format!("onedrive:{drive}"), name: email.to_string(), protocol: Protocol::OneDrive, host: "graph.microsoft.com".into(), user: drive.to_string(), connections: 6, ..Server::mega("") }
+    }
+
+    pub fn is_onedrive(&self) -> bool {
+        self.protocol == Protocol::OneDrive
+    }
+
     /// `sftp://ana@host:2222`, the port only when it isn't the usual one. Never the password.
     pub fn address(&self) -> String {
         if self.is_mega() {
             return format!("mega://{}", self.user);
+        }
+        if self.is_dropbox() {
+            return format!("dropbox://{}", self.user);
+        }
+        // Bucket names are unique across B2: an address names the bucket, not the key.
+        if self.is_b2() {
+            return "b2://".into();
+        }
+        if self.is_onedrive() {
+            return format!("onedrive://{}", self.name);
         }
         let user = if self.user.is_empty() { String::new() } else { format!("{}@", encode_user(&self.user)) };
         let host = if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() };
@@ -243,8 +312,34 @@ pub struct Item {
     pub link: bool,
 }
 
-/// Called with the bytes moved so far; `false` stops the transfer with [`CANCELLED`].
+/// Called with the bytes moved so far, never fewer than before (see [`onward`]); `false` stops
+/// the transfer with [`CANCELLED`].
 pub type Progress<'a> = &'a mut dyn FnMut(u64) -> bool;
+
+/// A transfer's progress that never goes back, as every [`Conn`] hands it on: a part or a file
+/// a cloud service is sent again (after a busy answer, or OneDrive's upload session past
+/// 4 MiB) starts its count over, and the queue's rows add what's new since the last count.
+/// SFTP, FTP and WebDAV count up by themselves (see [`pump`]); the cloud accounts' connections
+/// pass what their crates report through this.
+pub(crate) fn onward(progress: Progress<'_>) -> impl FnMut(u64) -> bool + '_ {
+    let mut top = 0;
+    move |n| {
+        top = top.max(n);
+        progress(top)
+    }
+}
+
+/// [`onward`] for each file of a batch ([`Conn::upload_files`]).
+pub(crate) fn onward_each(progress: &mut dyn FnMut(usize, u64) -> bool) -> impl FnMut(usize, u64) -> bool + '_ {
+    let mut top: Vec<u64> = Vec::new();
+    move |i, n| {
+        if top.len() <= i {
+            top.resize(i + 1, 0);
+        }
+        top[i] = top[i].max(n);
+        progress(i, top[i])
+    }
+}
 
 /// A logged-in connection. FTP serves one command at a time, so a connection is never shared:
 /// each job takes one from the [`Pool`] and gives it back.
@@ -266,6 +361,12 @@ pub trait Conn: Send {
     /// The folder the server puts the user in at login.
     fn home(&mut self) -> Result<String>;
 
+    /// Sends the file `local` on this computer to `path`, as [`Conn::upload`] does; a server
+    /// that can tell it already has the same bytes may skip sending them.
+    fn upload_file(&mut self, path: &str, local: &std::path::Path, progress: Progress) -> Result<()> {
+        send_file(self, path, local, progress)
+    }
+
     /// Whether `path` is a symbolic link itself.
     fn is_link(&mut self, path: &str) -> Result<bool>;
 
@@ -275,6 +376,33 @@ pub trait Conn: Send {
     fn copy(&mut self, from: &str, to: &str) -> Result<bool> {
         let _ = (from, to);
         Ok(false)
+    }
+
+    /// [`Conn::rename`] of each `(from, to)`: each one's result, in order, one failing leaving
+    /// the others to go on. A server with a batch command (Dropbox) does them in a few requests
+    /// (see [`Conn::batches`]).
+    fn rename_many(&mut self, moves: &[(String, String)]) -> Vec<Result<()>> {
+        moves.iter().map(|(from, to)| self.rename(from, to)).collect()
+    }
+
+    /// [`Conn::copy`] of each `(from, to)`: each one's result, in order, as `rename_many`.
+    fn copy_many(&mut self, copies: &[(String, String)]) -> Vec<Result<bool>> {
+        copies.iter().map(|(from, to)| self.copy(from, to)).collect()
+    }
+
+    /// [`Conn::upload_file`] of each `(path, local)`: each one's result, in order.
+    /// `progress(i, bytes)` hears file `i`'s bytes so far, never fewer than before; `false`
+    /// stops that file with [`CANCELLED`], and the others go on. A server that takes files in
+    /// batches sends them together (see [`Conn::batches`]).
+    fn upload_files(&mut self, files: &[(String, std::path::PathBuf)], progress: &mut dyn FnMut(usize, u64) -> bool) -> Vec<Result<()>> {
+        files.iter().enumerate().map(|(i, (path, local))| self.upload_file(path, local, &mut |n| progress(i, n))).collect()
+    }
+
+    /// How many items are worth giving [`Conn::rename_many`], [`Conn::copy_many`] and
+    /// [`Conn::upload_files`] at once, and the largest file worth putting in an upload batch:
+    /// `(1, 0)` where they go one by one anyway.
+    fn batches(&self) -> (usize, u64) {
+        (1, 0)
     }
 
     /// A file, or a folder and all it holds. A link, to a folder or not, goes alone: what it
@@ -303,6 +431,13 @@ pub trait Conn: Send {
     }
 }
 
+/// [`Conn::upload`] of the file `local`.
+pub(crate) fn send_file<C: Conn + ?Sized>(c: &mut C, path: &str, local: &std::path::Path, progress: Progress) -> Result<()> {
+    let mut file = std::fs::File::open(local).map_err(|e| tr!("Não consegui abrir {}: {e}", "Couldn't open {}: {e}", local.display()))?;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    c.upload(path, &mut file, len, progress)
+}
+
 /// Empties folder `path` and removes it, never going through a link.
 fn remove_tree<C: Conn + ?Sized>(c: &mut C, path: &str) -> Result<()> {
     for item in c.list(path)? {
@@ -324,6 +459,9 @@ fn open(server: &Server, secret: &str, trust: &tls::Trust) -> Result<Box<dyn Con
         Protocol::Sftp => Ok(Box::new(sftp::Sftp::connect(server, secret)?)),
         Protocol::Dav | Protocol::Davs => Ok(Box::new(dav::Dav::connect(server, secret, trust)?)),
         Protocol::Mega => Ok(Box::new(mega::Mega::connect(server)?)),
+        Protocol::Dropbox => Ok(Box::new(dropbox::Dropbox::connect(server)?)),
+        Protocol::B2 => Ok(Box::new(b2::B2::connect(server)?)),
+        Protocol::OneDrive => Ok(Box::new(onedrive::OneDrive::connect(server)?)),
     }
 }
 
@@ -600,6 +738,33 @@ mod tests {
 
     fn server(protocol: Protocol, port: u16) -> Server {
         Server { id: "x".into(), name: "x".into(), protocol, brand: None, host: "nas".into(), port, user: "ana@casa".into(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false }
+    }
+
+    #[test]
+    fn progress_handed_on_never_goes_back() {
+        let mut seen = Vec::new();
+        let mut report = |n| {
+            seen.push(n);
+            true
+        };
+        let mut onward = onward(&mut report);
+        for n in [10, 20, 0, 5, 30] {
+            onward(n);
+        }
+        drop(onward);
+        assert_eq!(seen, [10, 20, 20, 20, 30]);
+        // Each file of a batch on its own.
+        let mut seen = Vec::new();
+        let mut report = |i, n| {
+            seen.push((i, n));
+            true
+        };
+        let mut each = onward_each(&mut report);
+        for (i, n) in [(1, 10), (0, 4), (1, 3), (0, 8), (1, 12)] {
+            each(i, n);
+        }
+        drop(each);
+        assert_eq!(seen, [(1, 10), (0, 4), (1, 10), (0, 8), (1, 12)]);
     }
 
     #[test]

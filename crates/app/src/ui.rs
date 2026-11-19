@@ -9,7 +9,7 @@ use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, ScrollBar,
 
 use crate::model::{Kind, Location, SortCol, Space, crumbs, format_bytes, format_long, format_size, format_time, shown};
 use crate::actions::{self, ClipMode, Dialog};
-use crate::{State, click, disconnect, drag_item, dragged_ids, dropped, go_back, go_forward, go_up, key, load, navigate, open, pane_key, paths_for, row_key, set_sort};
+use crate::{State, click, disconnect, drag_item, dragged_ids, dropped, go_back, go_forward, go_up, key, load, navigate, open, pane_key, paths_for, refresh, row_key, set_sort};
 use crate::icons;
 use crate::ops::Stage;
 use openexplorer_i18n::{t, tr};
@@ -590,8 +590,8 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
             section_head(
                 "Cache",
                 t(
-                    "Cópias locais das pastas do Google Drive e das contas MEGA, para que abram sem esperar pela rede.",
-                    "Local copies of Google Drive folders and MEGA accounts, so they open without waiting for the network.",
+                    "Cópias locais das pastas do Google Drive e das contas MEGA, Dropbox, OneDrive e Backblaze B2, para que abram sem esperar pela rede.",
+                    "Local copies of Google Drive folders and MEGA, Dropbox, OneDrive and Backblaze B2 accounts, so they open without waiting for the network.",
                 ),
             ),
         ),
@@ -810,7 +810,7 @@ fn cache_page(k: &Kit, page: &crate::caches::Page, card: El, head: El) -> El {
     } else if page.waiting != 0 && usage.is_some() {
         t("Atualizando…", "Updating…")
     } else {
-        t("As duas pastas abaixo somadas.", "Both folders below added up.")
+        t("As pastas abaixo somadas.", "The folders below added up.")
     };
     let total = row()
         .key("cache-total")
@@ -852,6 +852,10 @@ fn cache_page(k: &Kit, page: &crate::caches::Page, card: El, head: El) -> El {
         .child(line("cache-drive", t("Listagens do Google Drive", "Google Drive listings"), crate::cache::root().display().to_string(), usage.map(|u| u.drive)))
         .child(divider())
         .child(line("cache-mega", t("Contas MEGA", "MEGA accounts"), openexplorer_mega::cache::dir().map_or_else(String::new, |d| d.display().to_string()), usage.map(|u| u.mega)))
+        .child(divider())
+        .child(line("cache-dropbox", t("Contas Dropbox", "Dropbox accounts"), openexplorer_dropbox::cache::dir().map_or_else(String::new, |d| d.display().to_string()), usage.map(|u| u.dropbox)))
+        .child(line("cache-b2", t("Listagens do Backblaze B2", "Backblaze B2 listings"), openexplorer_b2::cache::dir().map_or_else(String::new, |d| d.display().to_string()), usage.map(|u| u.b2)))
+        .child(line("cache-onedrive", t("Contas OneDrive", "OneDrive accounts"), openexplorer_onedrive::cache::dir().map_or_else(String::new, |d| d.display().to_string()), usage.map(|u| u.onedrive)))
         .child(divider())
         .child(actions);
 
@@ -1211,14 +1215,29 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             .item(item(t("Copiar link", "Copy link"), &icons::M_LINK, "", true, crate::sharing::copy_link))
             .item(item(t("Compartilhar…", "Share…"), &icons::M_SHARE, "", true, crate::sharing::ask_share));
     }
-    // Public links, for one MEGA item.
-    if n == 1 && changeable && crate::mega::at(&s.panes[p].loc).is_some() && !crate::mega::in_bin(&s.panes[p].loc) {
+    // Public or sharing links, for one item of a cloud account that makes them.
+    if n == 1
+        && changeable
+        && let Some((copy, remove)) = crate::accounts::links(&s.panes[p].loc)
+    {
         menu = menu
             .separator()
-            .item(item(t("Copiar link", "Copy link"), &icons::M_LINK, "", true, crate::mega::copy_link))
-            .item(item(t("Remover link", "Remove link"), &icons::M_LINK, "", true, crate::mega::remove_link));
+            .item(item(t("Copiar link", "Copy link"), &icons::M_LINK, "", true, copy))
+            .item(item(t("Remover link", "Remove link"), &icons::M_LINK, "", true, remove));
+    }
+    // Every version of a B2 item, for good.
+    if n > 0 && changeable && crate::b2::at(&s.panes[p].loc).is_some() {
+        menu = menu.min_width(250.0).item(item(t("Excluir todas as versões", "Delete every version"), &icons::M_DELETE, "", true, crate::b2::ask_purge).danger(true));
+    }
+    // A B2 bucket's large uploads that stopped midway.
+    if crate::b2::menu_bucket(s, p).is_some() {
+        menu = menu.separator().item(item(t("Envios inacabados…", "Unfinished uploads…"), &icons::M_PROPERTIES, "", true, crate::b2::ask_unfinished));
     }
     menu = menu.separator().item(item(t("Nova pasta", "New folder"), &icons::M_NEW_FOLDER, "Ctrl+Shift+N", editable, actions::ask_new_folder));
+    // What was deleted from a Dropbox folder, to bring back.
+    if crate::dropbox::shows_folder(s, p) {
+        menu = menu.item(item(t("Itens excluídos…", "Deleted items…"), &icons::M_RESTORE, "", true, crate::dropbox::show_deleted));
+    }
     if n > 0 {
         menu = menu.separator().item(item(t("Propriedades", "Properties"), &icons::M_PROPERTIES, "Alt+Enter", true, |s, p, _| actions::properties(s, p)));
     }
@@ -1254,19 +1273,20 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 [one] => tr!("Excluir \"{}\"?", "Delete \"{}\"?", shown(&one.name)),
                 many => tr!("Excluir {} itens?", "Delete {} items?", ui_count(many.len())),
             };
-            let where_to = if local {
-                t("Os itens vão para a Lixeira do Windows, de onde podem ser restaurados.", "The items go to the Windows Recycle Bin, where they can be restored.")
-            } else if crate::mega::at(&s.panes[*pane].loc).is_some() {
-                t("Os itens vão para a Lixeira do MEGA, de onde podem ser restaurados.", "The items go to the MEGA Rubbish Bin, where they can be restored.")
+            let where_to: Cow<str> = if local {
+                t("Os itens vão para a Lixeira do Windows, de onde podem ser restaurados.", "The items go to the Windows Recycle Bin, where they can be restored.").into()
+            } else if let Some(note) = crate::accounts::delete_note(s, &s.panes[*pane].loc) {
+                note
             } else {
                 t(
                     "Os itens vão para a lixeira do Google Drive, onde ficam 30 dias antes de serem apagados de vez.",
                     "The items go to the Google Drive trash, where they stay for 30 days before being deleted for good.",
                 )
+                .into()
             };
             // The explanation goes in the body, where it wraps; the dialog's own description
             // line doesn't, and would run under the close button.
-            let note = text(where_to).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
+            let note = text(where_to.into_owned()).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
             let body = col().w_full().gap(12.0).child(note).child(item_list(s, k, *pane, items)).child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Excluir", "Delete")).variant(ButtonVariant::Danger).on_press(actions::delete)));
             Modal::new("delete", title).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
         }
@@ -1284,10 +1304,8 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 .into()
             } else if s.panes[*pane].loc.is_local() {
                 t("Aqui não há Lixeira: os itens serão apagados para sempre. Isso não pode ser desfeito.", "There's no Recycle Bin here: the items will be deleted for good. This can't be undone.").into()
-            } else if crate::mega::at(&s.panes[*pane].loc).is_some() && !crate::mega::in_bin(&s.panes[*pane].loc) {
-                t("Itens de uma pasta compartilhada com você pertencem a quem compartilhou: serão apagados para sempre, sem passar pela Lixeira. Isso não pode ser desfeito.", "Items in a folder shared with you belong to whoever shared it: they'll be deleted for good, skipping the Rubbish Bin. This can't be undone.").into()
-            } else if crate::mega::in_bin(&s.panes[*pane].loc) {
-                t("Os itens serão apagados para sempre da Lixeira do MEGA. Isso não pode ser desfeito.", "The items will be deleted from the MEGA Rubbish Bin for good. This can't be undone.").into()
+            } else if let Some(note) = crate::accounts::purge_note(&s.panes[*pane].loc) {
+                note.into()
             } else if let Location::Server { server, .. } = &s.panes[*pane].loc {
                 tr!(
                     "Servidores não têm lixeira: os itens serão apagados para sempre de {}. Isso não pode ser desfeito.",
@@ -1318,6 +1336,19 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 .child(text(note).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
                 .child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Esvaziar lixeira", "Empty trash")).variant(ButtonVariant::Danger).on_press(actions::empty_trash)));
             Modal::new("empty-trash", t("Esvaziar a Lixeira do MEGA?", "Empty the MEGA Rubbish Bin?")).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
+        }
+        Dialog::EmptyTrash { email } if email.starts_with("onedrive:") => {
+            let who = s.servers.list.iter().find(|sv| sv.id == *email).map_or(email.as_str(), |sv| sv.name.as_str());
+            let note = tr!(
+                "Todos os itens que a lixeira do OneDrive de {who} mostra serão apagados para sempre. Isso não pode ser desfeito.",
+                "Everything the OneDrive recycle bin of {who} shows will be deleted for good. This can't be undone."
+            );
+            let body = col()
+                .w_full()
+                .gap(12.0)
+                .child(text(note).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
+                .child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Esvaziar lixeira", "Empty trash")).variant(ButtonVariant::Danger).on_press(actions::empty_trash)));
+            Modal::new("empty-trash", t("Esvaziar a lixeira do OneDrive?", "Empty the OneDrive recycle bin?")).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
         }
         Dialog::EmptyTrash { email } => {
             let note = tr!(
@@ -1370,6 +1401,10 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
         Dialog::Share(sh) => crate::sharing::share_dialog(s, k, sh, layer),
         Dialog::MakePublic(m) => crate::sharing::public_dialog(k, m, layer),
         Dialog::MegaLink(m) => crate::mega::link_dialog(k, m, layer),
+        Dialog::DropboxLink(m) => crate::dropbox::link_dialog(k, m, layer),
+        Dialog::DropboxDeleted(v) => crate::dropbox::deleted_dialog(k, v, layer),
+        Dialog::OneDriveLink(m) => crate::onedrive::link_dialog(k, m, layer),
+        Dialog::B2Unfinished(d) => crate::b2::unfinished_dialog(k, d, layer),
         Dialog::Server(f) => account_dialog(s, k, f, window_h, layer),
     }
 }
@@ -1607,10 +1642,16 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
     // -----------------------------------------------------------------------------------------
     // Step 2: Provider-specific configuration (Google Drive OAuth or server credentials)
 
+    if f.provider == Provider::OneDrive {
+        return crate::onedrive::configure(s, k, f, layer);
+    }
     let proto = f.effective_protocol();
     let (summary, badge_text) = match (f.provider, proto) {
         (Provider::GoogleDrive, _) => (t("Autorização segura OAuth 2.0 pelo navegador padrão", "Secure OAuth 2.0 sign-in through the default browser"), "OAuth 2.0"),
+        (Provider::OneDrive, _) => (t("Contas pessoais, corporativas ou de estudante pelo navegador", "Personal, work or school accounts through the browser"), "OAuth 2.0"),
         (Provider::Mega, _) => (t("Criptografia de ponta a ponta · os arquivos são decifrados neste computador", "End-to-end encryption · files are decrypted on this computer"), "E2EE"),
+        (Provider::Dropbox, _) => (t("Autorização segura OAuth 2.0 (PKCE) pelo navegador padrão", "Secure OAuth 2.0 (PKCE) sign-in through the default browser"), "OAuth 2.0"),
+        (Provider::B2, _) => crate::b2::summary(),
         (Provider::Nextcloud, Protocol::Davs) => (t("Servidor Nextcloud · conexão criptografada", "Nextcloud server · encrypted connection"), "HTTPS"),
         (Provider::Nextcloud, _) => (t("Servidor Nextcloud · conexão sem criptografia", "Nextcloud server · unencrypted connection"), "HTTP"),
         (Provider::OwnCloud, Protocol::Davs) => (t("Servidor ownCloud · conexão criptografada", "ownCloud server · encrypted connection"), "HTTPS"),
@@ -1818,6 +1859,22 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         return;
     }
 
+    // Dropbox step: the app's key when none is set, then the browser (see `dropbox.rs`).
+    if f.provider == Provider::Dropbox {
+        crate::dropbox::account_step(s, k, f, banner, window_h, layer);
+        return;
+    }
+
+    // B2 step: the key ID and the application key.
+    if f.provider == Provider::B2 {
+        let eye = eye_toggle("pass-eye", f.reveal_password, |s| {
+            if let Some(Dialog::Server(f)) = &mut s.dialog {
+                f.reveal_password = !f.reveal_password;
+            }
+        });
+        return crate::b2::form(k, f, banner, eye, |inner| account_scroll(k, "b2-scroll", window_h, inner), close, layer);
+    }
+
     // MEGA step: e-mail and password, then the two-factor code once the account asks for it.
     if f.provider == Provider::Mega {
         let labeled = |key: &'static str, label: &'static str, input: El| col().key(key).w_full().gap(4.0).child(text(label).font(k.ty.text_small_medium).color(k.c.text_base)).child(input);
@@ -1943,13 +2000,13 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         Provider::OwnCloud => t("owncloud.exemplo.com ou https://owncloud.exemplo.com", "owncloud.example.com or https://owncloud.example.com"),
         Provider::Sftp => t("nas.local, 192.168.0.10 ou sftp://usuario@host", "nas.local, 192.168.0.10 or sftp://user@host"),
         Provider::Ftp => t("ftp.exemplo.com, 192.168.0.10 ou ftp://usuario@host", "ftp.example.com, 192.168.0.10 or ftp://user@host"),
-        Provider::WebDav | Provider::GoogleDrive | Provider::Mega => t("dav.exemplo.com, 192.168.0.10 ou https://host/dav", "dav.example.com, 192.168.0.10 or https://host/dav"),
+        Provider::WebDav | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive => t("dav.exemplo.com, 192.168.0.10 ou https://host/dav", "dav.example.com, 192.168.0.10 or https://host/dav"),
     };
     let folder_hint = match f.provider {
         Provider::Nextcloud | Provider::OwnCloud => t("/remote.php/webdav (automático, se vazio)", "/remote.php/webdav (automatic if empty)"),
         Provider::WebDav => t("/dav ou /remote.php/dav/files/usuario (raiz /, se vazio)", "/dav or /remote.php/dav/files/user (root / if empty)"),
         Provider::Sftp => t("a pasta pessoal, se vazio", "the home folder if empty"),
-        Provider::Ftp | Provider::GoogleDrive | Provider::Mega => t("a pasta do login, se vazio", "the login folder if empty"),
+        Provider::Ftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive => t("a pasta do login, se vazio", "the login folder if empty"),
     };
     let name_hint = match f.provider {
         Provider::Nextcloud => t("Nextcloud (servidor), se vazio", "Nextcloud (server) if empty"),
@@ -1995,7 +2052,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
                     .key("tls-toggle"),
             );
         }
-        Provider::Sftp | Provider::GoogleDrive | Provider::Mega => {}
+        Provider::Sftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive => {}
     }
 
     inner = inner.child(field("folder", t("Pasta inicial", "Start folder"), &f.folder, folder_hint, |f| &mut f.folder));
@@ -2663,6 +2720,10 @@ fn toolbar(s: &State, k: &Kit) -> El {
             tool(k, "remove-server", &icons::SIGN_OUT, t("Remover conta", "Remove account"), true, move |s: &mut State, _| crate::servers::remove(s, &id))
                 .help(tr!("Tira {name} da lista e encerra a sessão do MEGA", "Removes {name} from the list and ends the MEGA session")),
         ),
+        (None, Some((id, name))) if id.starts_with("dropbox:") => bar.child(
+            tool(k, "remove-server", &icons::SIGN_OUT, t("Remover conta", "Remove account"), true, move |s: &mut State, _| crate::servers::remove(s, &id))
+                .help(tr!("Tira {name} da lista e revoga o acesso do Open Explorer ao Dropbox", "Removes {name} from the list and revokes Open Explorer's access to Dropbox")),
+        ),
         (None, Some((id, name))) => {
             let edit = id.clone();
             bar.child(
@@ -2677,7 +2738,7 @@ fn toolbar(s: &State, k: &Kit) -> El {
         (None, None) => bar,
     };
     bar.child(sep())
-        .child(tool(k, "reload-all", &icons::REFRESH, t("Atualizar", "Refresh"), true, |s: &mut State, _| load(s, s.active)))
+        .child(tool(k, "reload-all", &icons::REFRESH, t("Atualizar", "Refresh"), true, |s: &mut State, _| refresh(s, s.active)))
         .child(el().grow(1.0))
         .child(tool(k, "options", &icons::SETTINGS, t("Opções", "Options"), true, |s: &mut State, _| {
             s.dialog = Some(Dialog::Options(Box::new(crate::settings::OptionsView::open(crate::settings::OptionsTab::General))));
@@ -2959,7 +3020,7 @@ fn navbar(s: &State, k: &Kit, p: usize) -> El {
         .child(nav_button(k, "up", &icons::UP, t("Acima (Backspace)", "Up (Backspace)"), can_go_up(&pane.loc), move |s: &mut State| go_up(s, p)))
         .child(path_bar(s, k, p).mx(4.0))
         .child(search_box(s, k, p))
-        .child(nav_button(k, "reload", &icons::REFRESH, t("Atualizar (Ctrl+R)", "Refresh (Ctrl+R)"), true, move |s: &mut State| load(s, p)))
+        .child(nav_button(k, "reload", &icons::REFRESH, t("Atualizar (Ctrl+R)", "Refresh (Ctrl+R)"), true, move |s: &mut State| refresh(s, p)))
 }
 
 /// The search field of a Drive pane: Enter searches where the pane is (see
@@ -3350,8 +3411,8 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
         .child(head(0, "h-name", t("Nome", "Name"), SortCol::Name, false))
         .child(head(1, "h-size", t("Tamanho", "Size"), SortCol::Size, true))
-        .child(head(2, "h-mod", t("Data", "Date modified"), SortCol::Modified, false))
-        .child(head(3, "h-kind", if pane.loc.finds() { t("Pasta", "Folder") } else { t("Tipo", "Type") }, SortCol::Kind, false))
+        .child(head(2, "h-mod", crate::onedrive::bin_columns(&pane.loc).map_or(t("Data", "Date modified"), |c| c.0), SortCol::Modified, false))
+        .child(head(3, "h-kind", if let Some(c) = crate::onedrive::bin_columns(&pane.loc) { c.1 } else if pane.loc.finds() { t("Pasta", "Folder") } else { t("Tipo", "Type") }, SortCol::Kind, false))
         .children(grips);
 
     let selected = k.alpha(k.c.text_accent, if k.dark { 0.26 } else { 0.18 });
@@ -3399,7 +3460,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .child(cell(1).justify_end().child(muted(e.size.map(format_size).unwrap_or_default()).align(Align::End)))
         .child(cell(2).child(muted(e.modified.map(format_time).unwrap_or_default())))
         // A search's results show the folder each is in where the type goes.
-        .child(cell(3).child(muted(if found { crate::finder::folder_of(e) } else { e.kind_label() })))
+        .child(cell(3).child(muted(if found { crate::finder::folder_of(e) } else { crate::onedrive::origin_of(&pane.loc, e).unwrap_or_else(|| e.kind_label()) })))
         .on_press_tx(move |s: &mut State, tx: &mut Tx| {
             click(s, p, &id_press, tx.mods());
             tx.focus(pane_key(p), false);
@@ -3455,7 +3516,9 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .virtual_rows(n, ROW_H, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
         .virtual_rows_version((pane.version, w.map(f32::to_bits), s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))));
     let notice = |msg: String, color| col().key("notice").w_full().grow(1.0).padding(16.0).child(text(msg).font(k.ty.text_small).color(color).wrap());
-    let body = if let Some(err) = &pane.error {
+    let body = if let Some(consent) = crate::onedrive::bin_notice(s, k, p) {
+        consent
+    } else if let Some(err) = &pane.error {
         notice(err.clone(), k.c.danger.fg)
     } else if pane.loading && n == 0 {
         let searching = actions::shows_results(&pane.loc);
@@ -3552,8 +3615,8 @@ fn statusbar(s: &State, k: &Kit, p: usize) -> El {
     // against its organisation, not the account).
     let quota = match &pane.loc {
         Location::Drive { email, space: Space::MyDrive, .. } => s.quotas.get(email).copied().flatten().map(|q| (quota_label(&q), q.limit.filter(|l| *l > 0).map(|l| q.usage as f64 / l as f64), quota_help(q))),
-        // A MEGA account's storage, anywhere in it.
-        loc => crate::mega::quota_of(s, loc).map(|q| (crate::mega::quota_label(&q), (q.total > 0).then(|| q.used as f64 / q.total as f64), crate::mega::quota_help(q))),
+        // A cloud account's storage, anywhere in it.
+        loc => crate::accounts::quota_bar(s, loc),
     };
     let (right, used, help) = match quota {
         Some((label, used, help)) => (label, used, help),

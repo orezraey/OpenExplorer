@@ -15,6 +15,7 @@ hkdf = "0.13"
 # Sessions live in the OS credential store: Credential Manager on Windows. Never the password.
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
 num-bigint = "0.5"
+openexplorer-cloud = { path = "../cloud" }
 openexplorer-i18n = { path = "../i18n" }
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 serde = { version = "1", features = ["derive"] }

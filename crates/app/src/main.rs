@@ -8,12 +8,15 @@
 // keeps the console, for what it prints.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod accounts;
 mod actions;
 mod address;
 mod autoscroll;
+mod b2;
 mod cache;
 mod caches;
 mod downloads;
+mod dropbox;
 #[cfg(windows)]
 mod dragout;
 mod finder;
@@ -25,6 +28,7 @@ mod layout;
 mod mega;
 mod model;
 mod network;
+mod onedrive;
 mod ops;
 mod settings;
 mod sharing;
@@ -99,6 +103,11 @@ enum Msg {
     Undo(undo::Answer),
     /// Something background work on a MEGA account brought back.
     Mega(mega::Answer),
+    Dropbox(dropbox::Answer),
+    /// Something background work on a B2 key brought back.
+    B2(b2::Answer),
+    /// Something background work on a OneDrive account brought back.
+    OneDrive(onedrive::Answer),
     /// What the caches take, measured or cleared for Opções › Cache.
     Caches(caches::Answer),
     /// Installing the search service ended: search again in the panes `reload` shows.
@@ -532,15 +541,24 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                 for email in touched {
                     ask_quota(s, email);
                 }
-                let mut megas: Vec<openexplorer_remote::Server> = reload.iter().filter_map(|l| mega::at(l).map(|(sv, _)| sv.clone())).collect();
+                // So does one in a cloud account: each asked once.
                 let mut seen = std::collections::HashSet::new();
-                megas.retain(|sv| seen.insert(sv.id.clone()));
-                for sv in megas {
-                    mega::ask_quota(s, &sv);
+                let clouds: Vec<openexplorer_remote::Server> = reload
+                    .iter()
+                    .filter_map(|l| match l {
+                        Location::Server { server, .. } if accounts::Account::of(server).is_some() && seen.insert(server.id.clone()) => Some((**server).clone()),
+                        _ => None,
+                    })
+                    .collect();
+                for sv in clouds {
+                    accounts::ask_quota(s, &sv);
                 }
             }
             Msg::Undo(answer) => undo::arrived(s, answer),
             Msg::Mega(answer) => mega::arrived(s, answer, tx, now),
+            Msg::Dropbox(answer) => dropbox::arrived(s, answer, tx, now),
+            Msg::B2(answer) => b2::arrived(s, answer),
+            Msg::OneDrive(answer) => onedrive::arrived(s, answer, tx, now),
             Msg::Caches(answer) => caches::arrived(s, answer),
             Msg::Changes { email, result } => watch::arrived(s, email, result, now),
             Msg::Quota { email, result } => {
@@ -631,8 +649,8 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     // Accounts on screen are asked what changed elsewhere, every few seconds; after the
     // messages, so a listing that just ended is read again here if changes came during it.
     changed |= watch::tick(s, now);
-    mega::tick(s, now);
-    if let Some(at) = mega::next_ask(s) {
+    accounts::tick(s, now);
+    if let Some(at) = accounts::next_ask(s) {
         tx.wake_at(at);
     }
     for p in 0..2 {
@@ -821,6 +839,12 @@ fn load(s: &mut State, p: usize) {
     list(s, p, true);
 }
 
+/// Atualizar: [`load`], with a Dropbox folder read whole rather than from its kept listing.
+fn refresh(s: &mut State, p: usize) {
+    dropbox::forget_shown(s, p);
+    load(s, p);
+}
+
 /// The app changed the folders at `reload` itself, and Drive's change log may not show it yet:
 /// their cached listings aren't trusted on the log's word until read again.
 fn changed_here(s: &mut State, reload: &[Location]) {
@@ -895,12 +919,17 @@ fn list(s: &mut State, p: usize, fresh: bool) {
         });
         return;
     }
-    if let Location::Server { server, .. } = &s.panes[p].loc {
-        // A MEGA account's storage, the first time one of its folders opens.
-        if server.is_mega() && !s.servers.mega_quotas.contains_key(&server.id) {
-            let sv = (**server).clone();
-            mega::ask_quota(s, &sv);
-        }
+    // A cloud account's storage, the first time one of its folders opens.
+    if let Location::Server { server, .. } = &s.panes[p].loc
+        && accounts::quota_unasked(s, server)
+    {
+        let sv = (**server).clone();
+        accounts::ask_quota(s, &sv);
+    }
+    if accounts::load(s, p, request, fresh) {
+        return;
+    }
+    if let Location::Server { .. } = &s.panes[p].loc {
         return servers::load(s, p, request);
     }
     let Location::Drive { email, space, path } = s.panes[p].loc.clone() else {
@@ -1313,7 +1342,7 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             return true;
         }
         _ if ev.is_command('r') => {
-            load(s, p);
+            refresh(s, p);
             return true;
         }
         _ => return false,
@@ -1619,7 +1648,7 @@ fn clash_scene(s: &mut State, all: bool) {
 /// Opções open on Cache, its sizes fixed, then `then` applied to the page.
 fn cache_scene(s: &mut State, then: fn(&mut caches::Page)) {
     let mut v = settings::OptionsView::open(settings::OptionsTab::Cache);
-    v.cache.usage = Some(caches::Usage { drive: 3_565_158, mega: 48_211_968 });
+    v.cache.usage = Some(caches::Usage { drive: 3_565_158, mega: 48_211_968, dropbox: 1_204_224, b2: 1_204_224, onedrive: 1_310_720 });
     then(&mut v.cache);
     s.dialog = Some(actions::Dialog::Options(Box::new(v)));
 }
@@ -1681,9 +1710,7 @@ fn main() {
         std::process::exit(openexplorer_index::cli::run(&args[1..]));
     }
     let initial = settings::Settings::load();
-    openexplorer_mega::set_log(openexplorer_gdrive::log);
-    // Each MEGA account's tree, sealed, so a start reads only what changed since.
-    openexplorer_mega::set_cache_dir(Some(openexplorer_gdrive::local_dir().join("mega")));
+    accounts::start();
     rune::App::new(AppSpec::<State> {
         min_size: Some((900.0, 420.0)),
         families: initial.font.families(),
@@ -1789,7 +1816,7 @@ fn main() {
             ("options-cache-confirm", |s| cache_scene(s, |p| p.confirming = true)),
             ("options-cache-error", |s| {
                 cache_scene(s, |p| {
-                    p.usage = Some(caches::Usage { drive: 0, mega: 48_211_968 });
+                    p.usage = Some(caches::Usage { drive: 0, mega: 48_211_968, dropbox: 0, b2: 0, onedrive: 0 });
                     p.error = Some(tr!(
                         "Não foi possível apagar {}: O arquivo já está sendo usado por outro processo. (os error 32). Feche o que estiver usando o arquivo e tente de novo.",
                         "Couldn't delete {}: The process cannot access the file because it is being used by another process. (os error 32). Close whatever is using the file and try again.",
@@ -1925,6 +1952,38 @@ fn main() {
                 s.active = 1;
             }),
             // Adding a MEGA account that asks for its two-factor code.
+            // A Dropbox account's top with its storage, without a network.
+            ("dropbox", |s| {
+                let sv = openexplorer_remote::Server::dropbox("voce@exemplo.com");
+                s.servers.list.push(sv.clone());
+                s.servers.dropbox_quotas.insert(sv.id.clone(), Some(openexplorer_dropbox::Quota { used: 1_288_490_189, total: 2_199_023_255_552, team: false }));
+                s.panes[1].go(dropbox::top(&sv));
+                s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
+                s.active = 1;
+            }),
+            // A Dropbox folder's deleted items, two ticked.
+            ("dropbox-deleted", |s| {
+                let sv = openexplorer_remote::Server::dropbox("voce@exemplo.com");
+                s.servers.list.push(sv.clone());
+                s.panes[1].go(servers::folder(&sv, vec!["Documentos".into()]));
+                s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
+                s.active = 1;
+                let d = |name: &str, dir, size, when| openexplorer_dropbox::Deleted { name: name.into(), path: format!("/Documentos/{name}"), dir, rev: None, size, when };
+                let items = vec![
+                    d("Relatório final.docx", Some(false), Some(48_213), Some(1_763_560_800)),
+                    d("orçamento 2026.xlsx", Some(false), Some(12_904), Some(1_763_474_400)),
+                    d("Fotos da viagem", Some(true), None, None),
+                    d("rascunho.txt", None, None, None),
+                ];
+                s.dialog = Some(actions::Dialog::DropboxDeleted(Box::new(dropbox::DeletedView { server: sv, path: "/Documentos".into(), place: "Documentos".into(), picked: vec![true, false, true, false], items: Some(Ok(items)) })));
+            }),
+            // Adding a Dropbox account before its app is set up.
+            ("dropbox-add", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::Dropbox);
+                f.custom_oauth = true;
+                f.error = Some("App do Dropbox não configurado.".into());
+                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+            }),
             ("mega-add", |s| {
                 let mut f = servers::Form::for_provider(servers::Provider::Mega);
                 f.user = rune::TextEdit::new("voce@exemplo.com");
@@ -1932,6 +1991,51 @@ fn main() {
                 f.needs_code = true;
                 f.error = Some(openexplorer_mega::Refused::NeedsCode.text());
                 s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+            }),
+            // A B2 key's bucket, without a network.
+            ("b2", |s| {
+                let sv = openexplorer_remote::Server::b2("0051a2b3c4d5e6f0000000001", "B2 · fotos-familia");
+                s.servers.list.push(sv.clone());
+                s.panes[1].go(servers::folder(&sv, vec!["fotos-familia".into()]));
+                s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
+                s.active = 1;
+            }),
+            // Adding a B2 key, turned down.
+            ("b2-add", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::B2);
+                f.user = rune::TextEdit::new("0051a2b3c4d5e6f0000000001");
+                f.password = rune::TextEdit::new("K005abcdefghijklmnopqrstuvwxyz0").secure();
+                f.error = Some(openexplorer_i18n::t("O ID da chave ou a chave de aplicação estão errados (ou a chave foi apagada).", "The key ID or the application key is wrong (or the key was deleted).").into());
+                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+            }),
+            // A B2 bucket's unfinished uploads, without a network.
+            ("b2-unfinished", b2::unfinished_scene),
+            // A OneDrive account's files with its storage, without a network.
+            ("onedrive", |s| {
+                let sv = openexplorer_remote::Server::onedrive("b!exemplo", "voce@exemplo.com");
+                s.servers.list.push(sv.clone());
+                s.servers.onedrive.quotas.insert(sv.id.clone(), Some(openexplorer_onedrive::Quota { total: 1_099_511_627_776, used: 214_748_364_800, remaining: 884_763_262_976, deleted: 1_073_741_824, state: "normal".into() }));
+                s.panes[1].go(onedrive::files(&sv));
+                s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
+                s.active = 1;
+            }),
+            // A work OneDrive account's Lixeira, with where each item came from, without a network.
+            ("onedrive-bin", |s| onedrive::scene_bin(s, true)),
+            // The same Lixeira before SharePoint's permission is granted.
+            ("onedrive-bin-consent", |s| onedrive::scene_bin(s, false)),
+            // Adding a OneDrive account before an app registration is set up.
+            ("onedrive-add", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::OneDrive);
+                f.custom_oauth = true;
+                f.error = Some(t("Cliente OAuth do OneDrive não configurado.", "OneDrive OAuth client not set up.").into());
+                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+            }),
+            // The question Copiar link asks on a OneDrive file with no link.
+            ("onedrive-link", |s| {
+                let sv = openexplorer_remote::Server::onedrive("b!exemplo", "voce@exemplo.com");
+                if let Some(item) = MockDrive::new().list(&["Documentos".into()]).into_iter().find(|e| !e.is_dir) {
+                    s.dialog = Some(actions::Dialog::OneDriveLink(Box::new(onedrive::MakeLink { server: sv, path: "/Meus arquivos/x".into(), item })));
+                }
             }),
             // Compartilhar on a file shared with a few people and the link, without a network.
             ("share", |s| {
@@ -1978,9 +2082,11 @@ fn main() {
     })
     .font_smoothing(initial.text_render.smoothing())
     .args(rune_args(std::env::args().skip(1)))
-    // The app ends without returning from `run`: what MEGA changed since its trees were last
-    // kept is kept here, so the next start has less to catch up on.
-    .on_quit(|_, _| openexplorer_mega::save_caches())
+    // B2 folders on screen are read again only while the window is in front.
+    .on_focus(b2::window_focus)
+    // The app ends without returning from `run`: what the cloud accounts changed since their
+    // trees and listings were last kept is kept here, so the next start has less to catch up on.
+    .on_quit(|_, _| accounts::save_caches())
     .run();
 }
 

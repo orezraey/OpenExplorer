@@ -1,0 +1,13 @@
+[package]
+name = "openexplorer-cloud"
+version.workspace = true
+edition.workspace = true
+
+# What the cloud account crates (MEGA, Dropbox, B2, OneDrive) share: their sealed caches on disk,
+# running work on several items at once, reading a part of a file to send. Every version here is
+# one Cargo.lock already had.
+[dependencies]
+aes-gcm = "0.11"
+getrandom = "0.3"
+hkdf = "0.13"
+sha2 = "0.11"

@@ -28,47 +28,30 @@
 //! decrypting it.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
-use aes_gcm::KeyInit;
-use aes_gcm::aead::AeadInOut;
+use openexplorer_cloud::sealed::{self, OnClear, Store};
+use openexplorer_cloud::varint::{Reader, put_bytes, put_len, put_signed};
 use serde_json::Value;
-use sha2::Digest;
+
+pub use openexplorer_cloud::sealed::Refusal;
 
 use crate::nodes::{Handle, Kind, Node, NodeKey, Tree, UserHandle};
 
-const MAGIC: &[u8; 8] = b"OEMTREE\0";
 /// Bumped when the body's shape changes: a file of another format is thrown away.
 pub const FORMAT: u32 = 1;
-const HEADER: usize = 8 + 4 + 16 + 12;
-const TAG: usize = 16;
+const HEADER: usize = sealed::HEADER;
+const TAG: usize = sealed::TAG;
 
-/// Why a kept tree wasn't used.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Refusal {
-    /// No file.
-    Missing,
-    /// It couldn't be read.
-    Io(String),
-    /// Not one of these files, or of another format.
-    Format,
-    /// Sealed by another session (or another account).
-    OtherSession,
-    /// Changed since it was written: the authentication failed.
-    Tampered,
-    /// Opened, but its contents don't read as a tree.
-    Malformed,
-}
+/// The files, `<hash of the e-mail>.tree`. A clear leaves the trees the open accounts hold:
+/// each is the account's live state, which the `sc` channel keeps current, not a copy of its
+/// file; those accounts just never keep it on disk again this run.
+static STORE: Store = Store::new(b"OEMTREE\0", FORMAT, "tree", OnClear::Keep);
 
 /// What seals and opens one session's file.
 #[derive(Clone)]
-pub struct Secret {
-    key: [u8; 32],
-    id: [u8; 16],
-}
+pub struct Secret(sealed::Secret);
 
 impl Secret {
     /// The secret of the session with master key `master` and session key `sek`, of user `user`.
@@ -76,37 +59,25 @@ impl Secret {
         let mut ikm = [0u8; 32];
         ikm[..16].copy_from_slice(master);
         ikm[16..].copy_from_slice(sek);
-        let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(user.as_bytes()), &ikm);
-        let mut key = [0u8; 32];
-        let mut id = [0u8; 16];
-        hk.expand(b"OpenExplorer MEGA tree cache: key", &mut key).expect("32 bytes is a valid length");
-        hk.expand(b"OpenExplorer MEGA tree cache: key id", &mut id).expect("16 bytes is a valid length");
-        Secret { key, id }
+        Secret(sealed::Secret::derive("OpenExplorer MEGA tree cache", user.as_bytes(), &ikm))
     }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Where
 
-static DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
-/// One file is written at a time, so an older snapshot never lands over a newer one, and a
-/// forget waits for a write in flight (then the file it renamed is deleted too).
-static WRITING: Mutex<()> = Mutex::new(());
-
 /// The folder the trees are kept in; `None` keeps none (the default, and tests').
 pub fn set_dir(dir: Option<PathBuf>) {
-    *DIR.lock().unwrap_or_else(|e| e.into_inner()) = dir;
+    STORE.set_dir(dir);
 }
 
 pub fn dir() -> Option<PathBuf> {
-    DIR.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    STORE.dir()
 }
 
 /// The file of account `email` in `dir`: named by a hash, so the folder doesn't list e-mails.
 pub fn file_in(dir: &Path, email: &str) -> PathBuf {
-    let digest = sha2::Sha256::digest(crate::session::normal_email(email).as_bytes());
-    let name: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
-    dir.join(format!("{name}.tree"))
+    STORE.file_in(dir, &crate::session::normal_email(email))
 }
 
 /// The file of account `email` in the folder set, if one is.
@@ -114,19 +85,15 @@ pub fn file_of(email: &str) -> Option<PathBuf> {
     dir().map(|d| file_in(&d, email))
 }
 
-/// How many clears ran, and the folder of each: an account notes the count as it starts (see
-/// [`mark`]), and no tree it holds is written into a folder cleared since.
-static CLEARS: Mutex<(u64, Vec<(u64, PathBuf)>)> = Mutex::new((0, Vec::new()));
-
 /// What an account notes as it starts, before reading its kept tree: [`cleared_since`] tells
 /// whether its file's folder was cleared after.
 pub fn mark() -> u64 {
-    CLEARS.lock().unwrap_or_else(|e| e.into_inner()).0
+    STORE.mark()
 }
 
 /// Whether the folder `file` is in was cleared after [`mark`] gave `mark`.
 pub fn cleared_since(mark: u64, file: &Path) -> bool {
-    CLEARS.lock().unwrap_or_else(|e| e.into_inner()).1.iter().any(|(n, dir)| *n > mark && file.starts_with(dir))
+    STORE.cleared_since(mark, file)
 }
 
 /// Runs `clear` on the folder set (see [`set_dir`]), with every write held off: a tree an
@@ -134,22 +101,12 @@ pub fn cleared_since(mark: u64, file: &Path) -> bool {
 /// stays clear; accounts opened later read the whole tree and keep it as usual. `None` with no
 /// folder set.
 pub fn clear_with<R>(clear: impl FnOnce(&Path) -> R) -> Option<R> {
-    let dir = dir()?;
-    Some(clear_in(&dir, clear))
+    STORE.clear_with(clear)
 }
 
 /// [`clear_with`] on folder `dir`.
 pub fn clear_in<R>(dir: &Path, clear: impl FnOnce(&Path) -> R) -> R {
-    // Noted before waiting for a write in flight: a write that comes after sees it (it checks
-    // under the same lock), and one before lands first and is deleted with the rest.
-    {
-        let mut clears = CLEARS.lock().unwrap_or_else(|e| e.into_inner());
-        clears.0 += 1;
-        let n = clears.0;
-        clears.1.push((n, dir.to_path_buf()));
-    }
-    let _held = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-    clear(dir)
+    STORE.clear_in(dir, clear)
 }
 
 /// Deletes account `email`'s file, after any write in flight.
@@ -161,41 +118,11 @@ pub fn forget(email: &str) {
 
 /// Deletes `file`, and any temporary file a write cut short (a crash) left beside it.
 pub fn forget_file(file: &Path) {
-    let _held = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = std::fs::remove_file(file);
-    let (Some(dir), Some(stem)) = (file.parent(), file.file_stem().and_then(|s| s.to_str())) else { return };
-    let prefix = format!("{stem}.tmp");
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        if entry.file_name().to_str().is_some_and(|n| n.starts_with(&prefix)) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
+    STORE.forget_file(file);
 }
 
 // ---------------------------------------------------------------------------------------------
 // Body
-
-fn put_len(out: &mut Vec<u8>, mut n: u64) {
-    loop {
-        let b = (n & 0x7f) as u8;
-        n >>= 7;
-        if n == 0 {
-            out.push(b);
-            return;
-        }
-        out.push(b | 0x80);
-    }
-}
-
-fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
-    put_len(out, b.len() as u64);
-    out.extend_from_slice(b);
-}
-
-/// Signed numbers zigzagged, so small negative ones stay short.
-fn put_signed(out: &mut Vec<u8>, n: i64) {
-    put_len(out, ((n << 1) ^ (n >> 63)) as u64);
-}
 
 const HAS_MODIFIED: u8 = 1;
 const HAS_OTHERS: u8 = 2;
@@ -249,72 +176,16 @@ pub fn encode(tree: &Tree, shares: &HashMap<String, [u8; 16]>) -> Vec<u8> {
     out
 }
 
-struct Reader<'a> {
-    data: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Refusal> {
-        let end = self.at.checked_add(n).filter(|&e| e <= self.data.len()).ok_or(Refusal::Malformed)?;
-        let out = &self.data[self.at..end];
-        self.at = end;
-        Ok(out)
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], Refusal> {
-        Ok(self.take(N)?.try_into().expect("N bytes"))
-    }
-
-    fn byte(&mut self) -> Result<u8, Refusal> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn len(&mut self) -> Result<u64, Refusal> {
-        let mut n = 0u64;
-        for shift in (0..64).step_by(7) {
-            let b = self.byte()?;
-            n |= u64::from(b & 0x7f) << shift;
-            if b & 0x80 == 0 {
-                return Ok(n);
-            }
-        }
-        Err(Refusal::Malformed)
-    }
-
-    fn signed(&mut self) -> Result<i64, Refusal> {
-        let n = self.len()?;
-        Ok(((n >> 1) as i64) ^ -((n & 1) as i64))
-    }
-
-    /// A count of things at least `min` bytes each, checked against what's left.
-    fn count(&mut self, min: usize) -> Result<usize, Refusal> {
-        let n = usize::try_from(self.len()?).map_err(|_| Refusal::Malformed)?;
-        if n.saturating_mul(min) > self.data.len() - self.at {
-            return Err(Refusal::Malformed);
-        }
-        Ok(n)
-    }
-
-    fn bytes(&mut self) -> Result<&'a [u8], Refusal> {
-        let n = usize::try_from(self.len()?).map_err(|_| Refusal::Malformed)?;
-        self.take(n)
-    }
-
-    fn text(&mut self) -> Result<&'a str, Refusal> {
-        std::str::from_utf8(self.bytes()?).map_err(|_| Refusal::Malformed)
-    }
-
-    fn id<const N: usize>(&mut self) -> Result<crate::nodes::Id<N>, Refusal> {
-        let raw = self.array::<N>()?;
-        let len = raw.iter().position(|&b| b == 0).unwrap_or(N);
-        crate::nodes::Id::new(std::str::from_utf8(&raw[..len]).map_err(|_| Refusal::Malformed)?).filter(|id| id.0 == raw).ok_or(Refusal::Malformed)
-    }
+/// A MEGA id of `N` bytes, padded with zeros.
+fn id<const N: usize>(r: &mut Reader) -> Result<crate::nodes::Id<N>, Refusal> {
+    let raw = r.array::<N>()?;
+    let len = raw.iter().position(|&b| b == 0).unwrap_or(N);
+    crate::nodes::Id::new(std::str::from_utf8(&raw[..len]).map_err(|_| Refusal::Malformed)?).filter(|id| id.0 == raw).ok_or(Refusal::Malformed)
 }
 
 /// The tree and the share keys [`encode`] wrote (`body` without the header).
 pub fn decode(body: &[u8]) -> Result<(Tree, HashMap<String, [u8; 16]>), Refusal> {
-    let mut r = Reader { data: body, at: 0 };
+    let mut r = Reader::new(body);
     let sn = r.text()?.to_string();
     let count = r.count(1 + 16)?;
     let mut shares = HashMap::with_capacity(count);
@@ -330,15 +201,15 @@ pub fn decode(body: &[u8]) -> Result<(Tree, HashMap<String, [u8; 16]>), Refusal>
     let count = r.count(8 + 8 + 2 + 3 + 1 + 11)?;
     let mut tree = Tree::with_capacity(count);
     for _ in 0..count {
-        let handle: Handle = r.id()?;
-        let parent: Handle = r.id()?;
+        let handle: Handle = id(&mut r)?;
+        let parent: Handle = id(&mut r)?;
         let kind = Kind::of(i64::from(r.byte()?)).ok_or(Refusal::Malformed)?;
         let flags = r.byte()?;
         if handle.is_empty() || flags & !(HAS_MODIFIED | HAS_OTHERS | HAS_INSHARE | HAS_LINK) != 0 {
             return Err(Refusal::Malformed);
         }
         let name = r.text()?.to_string();
-        let size = r.len()?;
+        let size = r.unsigned()?;
         let created = r.signed()?;
         let modified = if flags & HAS_MODIFIED != 0 { Some(r.signed()?) } else { None };
         let key = r.bytes()?;
@@ -346,15 +217,15 @@ pub fn decode(body: &[u8]) -> Result<(Tree, HashMap<String, [u8; 16]>), Refusal>
             return Err(Refusal::Malformed);
         }
         let others = if flags & HAS_OTHERS != 0 { Some(r.text()?.into()) } else { None };
-        let owner: UserHandle = r.id()?;
-        let inshare = if flags & HAS_INSHARE != 0 { Some((r.id::<11>()?, r.byte()?.min(2))) } else { None };
-        let link = if flags & HAS_LINK != 0 { Some(r.id::<8>()?) } else { None };
+        let owner: UserHandle = id(&mut r)?;
+        let inshare = if flags & HAS_INSHARE != 0 { Some((id::<11>(&mut r)?, r.byte()?.min(2))) } else { None };
+        let link = if flags & HAS_LINK != 0 { Some(id::<8>(&mut r)?) } else { None };
         if tree.get(&handle).is_some() {
             return Err(Refusal::Malformed);
         }
         tree.put(Node { handle, parent, kind, name, size, created, modified, key: NodeKey::new(key), others, owner, inshare, link });
     }
-    if r.at != body.len() {
+    if !r.done() {
         return Err(Refusal::Malformed);
     }
     tree.sn = sn;
@@ -367,42 +238,13 @@ pub fn decode(body: &[u8]) -> Result<(Tree, HashMap<String, [u8; 16]>), Refusal>
 
 /// Seals a body [`encode`] made (its first bytes are room for the header) in place: the file's
 /// whole contents.
-pub fn seal(secret: &Secret, mut file: Vec<u8>) -> Vec<u8> {
-    let nonce = crate::crypto::random::<12>();
-    file[..8].copy_from_slice(MAGIC);
-    file[8..12].copy_from_slice(&FORMAT.to_le_bytes());
-    file[12..28].copy_from_slice(&secret.id);
-    file[28..HEADER].copy_from_slice(&nonce);
-    let gcm = aes_gcm::Aes256Gcm::new_from_slice(&secret.key).expect("a 32-byte key");
-    let (head, body) = file.split_at_mut(HEADER);
-    let tag = gcm.encrypt_inout_detached((&nonce[..]).try_into().expect("12 bytes"), &head[..28], body.into()).expect("a body GCM takes");
-    file.extend_from_slice(&tag);
-    file
-}
-
-/// Whether a file's first bytes are of this format and this session's.
-fn check_header(secret: &Secret, head: &[u8]) -> Result<(), Refusal> {
-    if head.len() < HEADER || &head[..8] != MAGIC || head[8..12] != FORMAT.to_le_bytes() {
-        return Err(Refusal::Format);
-    }
-    if head[12..28] != secret.id {
-        return Err(Refusal::OtherSession);
-    }
-    Ok(())
+pub fn seal(secret: &Secret, file: Vec<u8>) -> Vec<u8> {
+    STORE.seal(&secret.0, file)
 }
 
 /// Opens a file [`seal`] made, in place: the body, after the header.
 pub fn open(secret: &Secret, file: &mut [u8]) -> Result<std::ops::Range<usize>, Refusal> {
-    if file.len() < HEADER + TAG {
-        return Err(Refusal::Format);
-    }
-    check_header(secret, &file[..HEADER])?;
-    let end = file.len() - TAG;
-    let tag: [u8; TAG] = file[end..].try_into().expect("16 bytes");
-    let (head, rest) = file.split_at_mut(HEADER);
-    let gcm = aes_gcm::Aes256Gcm::new_from_slice(&secret.key).expect("a 32-byte key");
-    gcm.decrypt_inout_detached((&head[28..]).try_into().expect("12 bytes"), &head[..28], (&mut rest[..end - HEADER]).into(), (&tag[..]).try_into().expect("16 bytes")).map_err(|_| Refusal::Tampered)?;
-    Ok(HEADER..end)
+    STORE.open(&secret.0, file)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -419,47 +261,13 @@ pub fn write(file: &Path, secret: &Secret, body: Vec<u8>) -> std::io::Result<()>
 /// wrote.
 pub fn write_unless(file: &Path, secret: &Secret, body: Vec<u8>, forgotten: &AtomicBool, mark: u64) -> std::io::Result<bool> {
     let sealed = seal(secret, body);
-    let _held = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-    if forgotten.load(Ordering::SeqCst) || cleared_since(mark, file) {
-        return Ok(false);
-    }
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = file.with_extension(format!("tmp{}", u32::from_le_bytes(crate::crypto::random::<4>())));
-    let result = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&sealed)?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, file)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result.map(|()| true)
+    STORE.write_unless(file, &sealed, forgotten, mark)
 }
 
-/// The tree and the share keys kept in `file`.
+/// The tree and the share keys kept in `file`. A file of another session or format is refused
+/// from its header, without reading the rest (over 100 MB on a big account).
 pub fn read(file: &Path, secret: &Secret) -> Result<(Tree, HashMap<String, [u8; 16]>), Refusal> {
-    let io = |e: std::io::Error| Refusal::Io(e.to_string());
-    let mut f = match std::fs::File::open(file) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Refusal::Missing),
-        Err(e) => return Err(io(e)),
-    };
-    // The header first: a file of another session or format is refused without reading the
-    // rest (over 100 MB on a big account).
-    let mut data = vec![0; HEADER];
-    match f.read_exact(&mut data) {
-        Ok(()) => check_header(secret, &data)?,
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err(Refusal::Format),
-        Err(e) => return Err(io(e)),
-    }
-    let len = f.metadata().map_err(io)?.len();
-    data.reserve(usize::try_from(len).unwrap_or(0).saturating_sub(HEADER));
-    f.read_to_end(&mut data).map_err(io)?;
-    let body = open(secret, &mut data)?;
+    let (data, body) = STORE.read(file, &secret.0)?;
     decode(&data[body])
 }
 
@@ -544,6 +352,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A file sealed before the shared crate (`openexplorer-cloud`) took over the sealing, and
+    /// its name: both must still be what they were.
+    #[test]
+    fn a_file_kept_before_still_opens() {
+        let hex = "4f454d5452454500010000006a3c5f089e0f15662618c2eccf5f5a0192c78e184b36a63f918beb9a17c9226c4cb485ceb6f6f30422153a8c99a8c3ac25cdec8c390f68b28b80b40fd9eb63284667eec064cafb34";
+        let mut old: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+        let body = open(&secret(), &mut old).unwrap();
+        assert_eq!(&old[body], b"kept before the shared crate");
+        assert_eq!(file_in(Path::new("d"), " Ana@Exemplo.com"), Path::new("d").join("840d9902bc6853e59cd9585cd0ecb3ee.tree"));
+    }
+
     #[test]
     fn a_changed_byte_anywhere_is_refused() {
         let (tree, shares) = sample();
@@ -556,7 +375,7 @@ mod tests {
             let got = open(&secret(), &mut bad).err();
             let want = match i {
                 0..12 => Refusal::Format,
-                12..28 => Refusal::OtherSession,
+                12..28 => Refusal::OtherKey,
                 _ => Refusal::Tampered,
             };
             assert_eq!(got, Some(want), "byte {i}");
@@ -577,8 +396,8 @@ mod tests {
         let sealed = seal(&secret(), encode(&tree, &shares));
         let others = [Secret::of("USER0000000", &[7; 16], &[10; 16]), Secret::of("USER0000000", &[8; 16], &[9; 16]), Secret::of("USER0000001", &[7; 16], &[9; 16])];
         for other in &others {
-            assert_eq!(open(other, &mut sealed.clone()).err(), Some(Refusal::OtherSession));
-            let forged = Secret { key: other.key, id: secret().id };
+            assert_eq!(open(other, &mut sealed.clone()).err(), Some(Refusal::OtherKey));
+            let forged = Secret(sealed::Secret { key: other.0.key, id: secret().0.id });
             assert_eq!(open(&forged, &mut sealed.clone()).err(), Some(Refusal::Tampered));
         }
     }
@@ -627,10 +446,10 @@ mod tests {
             put_signed(&mut out, n);
         }
         put_len(&mut out, u64::MAX);
-        let mut r = Reader { data: &out, at: 0 };
+        let mut r = Reader::new(&out);
         for n in nums {
             assert_eq!(r.signed().unwrap(), n);
         }
-        assert_eq!(r.len().unwrap(), u64::MAX);
+        assert_eq!(r.unsigned().unwrap(), u64::MAX);
     }
 }
