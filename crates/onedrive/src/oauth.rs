@@ -148,7 +148,9 @@ impl PendingLogin {
             Err(if e == "access_denied" && !why.contains("AADSTS") {
                 Fail::new(t("Login cancelado no navegador.", "Login cancelled in the browser."))
             } else {
-                crate::graph::login_failure(400, &serde_json::json!({ "error": e, "error_description": why }).to_string())
+                // A grant for SharePoint refused reads as what to add, not as a failed sign-in.
+                let read = if self.resource { crate::graph::resource_failure } else { crate::graph::login_failure };
+                read(400, &serde_json::json!({ "error": e, "error_description": why }).to_string())
             })
         } else {
             Ok(code.unwrap_or_default())

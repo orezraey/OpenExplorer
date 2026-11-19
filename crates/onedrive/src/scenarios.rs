@@ -303,6 +303,77 @@ fn without_sharepoint_permission_the_account_keeps_working() {
     assert_eq!(a.bin_access(), crate::bin::Access::Ready);
 }
 
+/// Answers a sign-in's loopback as the browser would, with `query` after its state.
+fn browser_comes_back(login: &crate::PendingLogin, query: &str) -> std::thread::JoinHandle<()> {
+    use std::io::{Read, Write};
+    let url = url::Url::parse(&login.url).unwrap();
+    let q = |k: &str| url.query_pairs().find(|(n, _)| n == k).map(|(_, v)| v.into_owned()).unwrap();
+    let port = url::Url::parse(&q("redirect_uri")).unwrap().port().unwrap();
+    let target = format!("/?state={}&{query}", q("state"));
+    std::thread::spawn(move || {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(s, "GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+    })
+}
+
+#[test]
+fn authorizing_the_bin_keeps_the_new_refresh_token_and_graph_goes_on() {
+    let fake = Fake::start();
+    fake.with(|st| {
+        st.business = true;
+        let docs = st.add(ROOT, "Docs", true, &[]);
+        st.add(&docs, "a.txt", false, b"alfa");
+    });
+    let kept = Arc::new(Mutex::new(Vec::<String>::new()));
+    let k = kept.clone();
+    let cfg = crate::ClientConfig { client_id: "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0".into(), tenant: "common".into() };
+    let graph = Graph::new(cfg, fake.ends(), "r0".into(), Box::new(move |t| k.lock().unwrap().push(t.into())));
+    let a = Account::start(Meta { id: DRIVE.into(), email: "ana@exemplo.com".into(), name: "Ana".into(), kind: Kind::Business }, graph, None).unwrap();
+    assert!(a.list("/Lixeira").unwrap_err().contains("AllSites.Write"));
+    // Refused in the browser: what to add, not a failed sign-in.
+    let login = a.bin_grant().unwrap();
+    let b = browser_comes_back(&login, "error=invalid_client&error_description=AADSTS650057%3A+Invalid+resource");
+    let err = a.bin_granted(&login).unwrap_err();
+    b.join().unwrap();
+    assert!(err.contains("AllSites.Write") && !err.contains("administrador aprove"), "{err}");
+    // Granted on Microsoft's page: the code becomes SharePoint's token and a new refresh token.
+    fake.with(|st| st.sp_granted = true);
+    let login = a.bin_grant().unwrap();
+    let b = browser_comes_back(&login, "code=c1");
+    a.bin_granted(&login).unwrap();
+    b.join().unwrap();
+    let newest = kept.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(a.graph.refresh_token(), newest);
+    assert_eq!(a.bin_access(), crate::bin::Access::Ready);
+    // Graph's token is still Graph's: the files list.
+    assert_eq!(names(&a, "/Meus arquivos/Docs"), ["a.txt"]);
+    let (gone, _) = a.trash_many(&["/Meus arquivos/Docs/a.txt".into()]);
+    assert!(a.can_restore(&gone[0].0));
+}
+
+#[test]
+fn a_sharepoint_permission_that_isnt_enough_asks_for_the_right_one() {
+    let (fake, a, _) = setup_work();
+    // Both the site collection's bin and the site's answer 403.
+    fake.with(|st| {
+        st.sp_site_refused = true;
+        st.sp_web_refused = true;
+    });
+    let err = a.list("/Lixeira").unwrap_err();
+    assert!(err.contains("AllSites.Write"), "{err}");
+    assert!(matches!(a.bin_access(), crate::bin::Access::NeedsConsent(why) if why.contains("negou")));
+}
+
+#[test]
+fn a_filter_answered_with_any_error_reads_the_whole_bin() {
+    let (fake, a, _) = setup_work();
+    fake.with(|st| st.sp_filter_status = 500);
+    let (gone, _) = a.trash_many(&["/Meus arquivos/Docs/a.txt".into()]);
+    assert!(a.can_restore(&gone[0].0));
+}
+
 #[test]
 fn sharepoint_asking_for_a_digest_refusing_the_site_bin_paging_and_no_filter() {
     let (fake, a, docs) = setup_work();

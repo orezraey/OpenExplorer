@@ -170,15 +170,23 @@ impl Site {
         if f.is_empty() { self.library_name().to_string() } else { format!("{}/{f}", self.library_name()) }
     }
 
+    /// Where an item deleted from `folder` is, from the host on ("personal/ana/Documents/Fotos").
+    fn full(&self, folder: &str) -> String {
+        let f = folder.trim_matches('/');
+        let lib = self.library.trim_matches('/');
+        if f.is_empty() { lib.to_string() } else { format!("{lib}/{f}") }
+    }
+
     /// `dir` (a `DirName`) as the panes show it: below Meus arquivos when it's in the library.
     fn origin(&self, dir: &str) -> String {
         let d = dir.trim_matches('/');
         let lib = self.library.trim_matches('/');
         let files = Area::Files.label();
+        // By `get`: a byte count can fall inside a character of another folder's name.
         let rest = if d.eq_ignore_ascii_case(lib) {
             Some("")
-        } else if d.len() > lib.len() && d[..lib.len()].eq_ignore_ascii_case(lib) && d.as_bytes()[lib.len()] == b'/' {
-            Some(&d[lib.len() + 1..])
+        } else if d.get(..lib.len()).is_some_and(|head| head.eq_ignore_ascii_case(lib)) && d.as_bytes().get(lib.len()) == Some(&b'/') {
+            d.get(lib.len() + 1..)
         } else {
             None
         };
@@ -364,7 +372,12 @@ impl Account {
     fn sp(&self, method: &str, rel: &str, what: &str) -> Res<Value> {
         let site = self.site()?;
         let url = if rel.starts_with("http") { rel.to_string() } else { format!("{}/_api/{rel}", site.url) };
-        if !url.starts_with(&format!("{}/", site.url)) {
+        // SharePoint's own links (the next page) only on the site's host: the token goes nowhere else.
+        let same_host = match (url::Url::parse(&url), url::Url::parse(&site.url)) {
+            (Ok(a), Ok(b)) => a.origin() == b.origin(),
+            _ => false,
+        };
+        if !same_host {
             return Err(Fail::new(t("Resposta inesperada do SharePoint.", "Unexpected answer from SharePoint.")));
         }
         for asked_digest in [false, true] {
@@ -435,8 +448,15 @@ impl Account {
                     raw.clear();
                     url = format!("{}?{select}{filter}", self.collection());
                 }
-                // A filter it can't take: the whole bin, filtered here.
-                Err(f) if f.status == 400 && filtered => {
+                // Refused on both: the token holds a SharePoint permission that isn't enough
+                // (another than AllSites.Write): what to grant, with SharePoint's words.
+                Err(f) if matches!(f.status, 401 | 403) => {
+                    lock(&self.bin.shown).0 = Access::NeedsConsent(f.text.clone());
+                    return Err(Fail { text: consent_help(), ..f });
+                }
+                Err(f) if f.code == NEEDS_CONSENT => return Err(f),
+                // A filter it can't take (whatever it answers): the whole bin, filtered here.
+                Err(_) if filtered => {
                     filtered = false;
                     raw.clear();
                     url = format!("{}?{select}", self.collection());
@@ -612,8 +632,11 @@ impl Account {
         for (id, _, _) in items {
             let Some(g) = gone.get_mut(id) else { continue };
             let key = site.key(&g.folder);
-            // The newest that fits: a twin deleted earlier from the same folder is older.
-            let hit = found.iter().filter(|b| !taken.contains(&b.id) && b.leaf.eq_ignore_ascii_case(&g.leaf) && same_place(&b.dir, &key)).max_by_key(|b| b.deleted);
+            let full = site.full(&g.folder);
+            let named: Vec<&BinItem> = found.iter().filter(|b| !taken.contains(&b.id) && b.leaf.eq_ignore_ascii_case(&g.leaf)).collect();
+            // The newest that fits (a twin deleted earlier from the same folder is older): from
+            // the library's whole path first, from its name on only when none is.
+            let hit = named.iter().filter(|b| b.dir.trim_matches('/').to_lowercase() == full.to_lowercase()).max_by_key(|b| b.deleted).or_else(|| named.iter().filter(|b| same_place(&b.dir, &key)).max_by_key(|b| b.deleted));
             match hit {
                 Some(b) => {
                     taken.push(b.id.clone());
@@ -707,6 +730,9 @@ mod tests {
         assert_eq!(s.origin("personal/ana_contoso_com/Documents/Fotos"), "Meus arquivos/Fotos");
         assert_eq!(s.origin("/personal/ana_contoso_com/Documents"), "Meus arquivos");
         assert_eq!(s.origin("sites/outro/Lists/Tarefas"), "sites/outro/Lists/Tarefas");
+        // A character across the library's length doesn't split.
+        assert_eq!(s.origin("personal/ana_contoso_com/Documentosé/x"), "personal/ana_contoso_com/Documentosé/x");
+        assert_eq!(s.origin("personal/ana_contoso_com/Documenté/x"), "personal/ana_contoso_com/Documenté/x");
     }
 
     #[test]

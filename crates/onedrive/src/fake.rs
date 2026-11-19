@@ -65,6 +65,10 @@ pub struct State {
     pub sp_site_refused: bool,
     /// `$filter` refused (400).
     pub sp_no_filter: bool,
+    /// `$filter` answered with this status instead (a 500, say), when not 0.
+    pub sp_filter_status: u16,
+    /// The site's recycle bin refused too (403).
+    pub sp_web_refused: bool,
     /// Recycle bin items per page (`odata.nextLink`), all at once if 0.
     pub sp_page: usize,
     /// The recycle bin, oldest first.
@@ -697,13 +701,14 @@ fn sharepoint(req: &Req, st: &mut State, rest: &str, base: &str) -> Resp {
     } else {
         return sp_error(404, "-1, Microsoft.SharePoint.Client.InvalidClientQueryException", "The expression is not valid.");
     };
-    if coll == "site" && st.sp_site_refused {
+    if (coll == "site" && st.sp_site_refused) || (coll == "web" && st.sp_web_refused) {
         return sp_error(403, "-2147024891, System.UnauthorizedAccessException", "Access denied.");
     }
     let visible = |b: &FBin| coll == "site" || b.stage == 1;
     if after.is_empty() && req.method == "GET" {
         let since = match req.query.get("$filter") {
             Some(_) if st.sp_no_filter => return sp_error(400, "-1, Microsoft.SharePoint.Client.InvalidClientQueryException", "The query is not valid."),
+            Some(_) if st.sp_filter_status != 0 => return sp_error(st.sp_filter_status, "-1, System.NotSupportedException", "Not supported."),
             Some(f) => f.split("datetime'").nth(1).map(|s| s.trim_end_matches('\'').to_string()),
             None => None,
         };
