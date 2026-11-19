@@ -615,6 +615,33 @@ fn uploads_go_whole_or_in_session_parts_that_resume() {
 }
 
 #[test]
+fn a_small_upload_reports_progress_and_cancelling_it_makes_no_file() {
+    let (fake, a, _, _) = setup(Kind::Personal);
+    let body = data(1_000_000);
+    let len = body.len() as u64;
+    // Progress as the bytes go, never back, also when the request is sent again (throttled; the
+    // folder just listed, so the PUT is the request throttled).
+    names(&a, "/Meus arquivos/Docs");
+    fake.with(|st| st.throttle = 1);
+    let mut seen = Vec::new();
+    a.upload("/Meus arquivos/Docs/s.bin", &mut &body[..], len, &mut |n| {
+        seen.push(n);
+        true
+    })
+    .unwrap();
+    assert!(seen.len() > 1 && seen.is_sorted() && *seen.last().unwrap() == len, "{seen:?}");
+    assert!(seen.iter().filter(|n| **n == len).count() > 1, "the body went twice");
+    assert!(fake.with(|st| st.items.values().any(|i| i.name == "s.bin" && i.data == body)));
+    // Cancelled at the start, or at the very last bytes: the file is never made.
+    for (name, stop_at) in [("c1.bin", 100_000), ("c2.bin", len)] {
+        let err = a.upload(&format!("/Meus arquivos/Docs/{name}"), &mut &body[..], len, &mut |n| n < stop_at).unwrap_err();
+        assert_eq!(err, crate::CANCELLED);
+        assert!(fake.with(|st| !st.items.values().any(|i| i.name == name)), "{name}");
+        assert!(a.stat(&format!("/Meus arquivos/Docs/{name}")).unwrap().is_none());
+    }
+}
+
+#[test]
 fn throttling_waits_and_goes_on() {
     let (fake, a, _, _) = setup(Kind::Personal);
     fake.with(|st| st.throttle = 2);

@@ -365,6 +365,19 @@ impl Graph {
     /// [`Graph::send`] to the whole address `url` of another resource, with a token for `scope`
     /// (see [`Graph::token_for`]); `None` is Graph.
     pub fn send_as(&self, scope: Option<&str>, method: &str, url: &str, body: Body<'_>, headers: &[(&str, &str)]) -> Res<Reply> {
+        self.run(scope, method, url, body, headers, None)
+    }
+
+    /// [`Graph::send`] of `data`, telling `progress` how many bytes went as they go (the most so
+    /// far, when the request is sent again), and stopping when it answers `false`: then the
+    /// body is cut short, so the request is never done, and the error is [`crate::CANCELLED`].
+    /// Once all of the body went, the answer is waited for whatever `progress` says.
+    pub fn send_counted(&self, method: &str, path: &str, data: &[u8], kind: &str, progress: &mut dyn FnMut(u64) -> bool) -> Res<Reply> {
+        self.run(None, method, &self.url(path), Body::Raw(data, kind), &[], Some(progress))
+    }
+
+    fn run(&self, scope: Option<&str>, method: &str, url: &str, body: Body<'_>, headers: &[(&str, &str)], mut progress: Option<&mut dyn FnMut(u64) -> bool>) -> Res<Reply> {
+        let mut high = 0u64;
         let bytes: Option<(std::borrow::Cow<'_, [u8]>, &str)> = match body {
             Body::None => None,
             Body::Json(v) => Some((serde_json::to_vec(v).expect("JSON values serialize").into(), "application/json")),
@@ -383,11 +396,26 @@ impl Graph {
             for (k, v) in headers {
                 req = req.header(*k, *v);
             }
-            let resp = match &bytes {
-                Some((b, kind)) => self.agent.run(req.header("Content-Type", *kind).body(&b[..]).map_err(|e| Fail::new(e.to_string()))?),
-                None if method == "GET" || method == "DELETE" => self.agent.run(req.body(()).map_err(|e| Fail::new(e.to_string()))?),
-                None => self.agent.run(req.body(Vec::new()).map_err(|e| Fail::new(e.to_string()))?),
+            let mut stopped = false;
+            let resp = match (&bytes, progress.as_mut()) {
+                (Some((b, kind)), Some(p)) => {
+                    let mut report = |n: u64| {
+                        high = high.max(n);
+                        p(high)
+                    };
+                    let mut counted = Counted { data: b, at: 0, base: 0, progress: &mut report, stopped: false };
+                    let req = req.header("Content-Type", *kind).header("Content-Length", b.len().to_string()).body(ureq::SendBody::from_reader(&mut counted)).map_err(|e| Fail::new(e.to_string()))?;
+                    let r = self.agent.run(req);
+                    stopped = counted.stopped;
+                    r
+                }
+                (Some((b, kind)), None) => self.agent.run(req.header("Content-Type", *kind).body(&b[..]).map_err(|e| Fail::new(e.to_string()))?),
+                (None, _) if method == "GET" || method == "DELETE" => self.agent.run(req.body(()).map_err(|e| Fail::new(e.to_string()))?),
+                (None, _) => self.agent.run(req.body(Vec::new()).map_err(|e| Fail::new(e.to_string()))?),
             };
+            if stopped {
+                return Err(Fail::new(crate::CANCELLED));
+            }
             let mut resp = match resp {
                 Ok(r) => r,
                 Err(e) if method == "GET" && attempt + 1 < TRIES => {
@@ -493,6 +521,29 @@ impl Graph {
             todo = again;
         }
         out.into_iter().map(|o| o.unwrap_or_else(|| Err(Fail::new(tr!("{what}: o OneDrive não respondeu a este pedido.", "{what}: OneDrive didn't answer this request."))))).collect()
+    }
+}
+
+/// Bytes as a request body that reports how far it got (from `base` on) and stops when told:
+/// the bytes of the read that was told to stop never go.
+pub(crate) struct Counted<'a> {
+    pub data: &'a [u8],
+    pub at: usize,
+    pub base: u64,
+    pub progress: &'a mut dyn FnMut(u64) -> bool,
+    pub stopped: bool,
+}
+
+impl std::io::Read for Counted<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(self.data.len() - self.at).min(64 * 1024);
+        buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+        self.at += n;
+        if n > 0 && !(self.progress)(self.base + self.at as u64) {
+            self.stopped = true;
+            return Err(std::io::Error::other(crate::CANCELLED));
+        }
+        Ok(n)
     }
 }
 

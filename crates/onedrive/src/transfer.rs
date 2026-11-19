@@ -5,7 +5,8 @@
 //! expire). An upload of up to 4 MiB goes in one request; a bigger one in an upload session, in
 //! parts of 10 MiB (a multiple of 320 KiB, as Graph asks), each part held in memory so it can be
 //! sent again from the byte the session says it's missing. Both check the QuickXorHash Graph
-//! gives against the bytes that went through.
+//! gives against the bytes that went through. Both report progress as the bytes go, and
+//! Cancelar cuts the body short, so what wasn't all sent is never made; what was is kept.
 
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -14,7 +15,7 @@ use openexplorer_i18n::{t, tr};
 use serde_json::{Value, json};
 
 use crate::account::{Account, Item};
-use crate::graph::{Body, transfer_agent};
+use crate::graph::{Counted, transfer_agent};
 use crate::quickxor::QuickXor;
 use crate::tree::Seen;
 use crate::{CANCELLED, Result, log};
@@ -50,28 +51,6 @@ fn fill(src: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<usize> {
         }
     }
     Ok(n)
-}
-
-/// A part's bytes as a request body that reports how far it got and stops when told.
-struct Counted<'a> {
-    data: &'a [u8],
-    at: usize,
-    base: u64,
-    progress: &'a mut dyn FnMut(u64) -> bool,
-    stopped: bool,
-}
-
-impl Read for Counted<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = buf.len().min(self.data.len() - self.at).min(64 * 1024);
-        buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
-        self.at += n;
-        if n > 0 && !(self.progress)(self.base + self.at as u64) {
-            self.stopped = true;
-            return Err(std::io::Error::other(CANCELLED));
-        }
-        Ok(n)
-    }
 }
 
 impl Account {
@@ -176,11 +155,9 @@ impl Account {
                 return Err(tr!("\"{name}\" mudou de tamanho durante o envio.", "\"{name}\" changed size while being sent."));
             }
             hash.update(&data);
-            let v = self.graph.send("PUT", &format!("{url}/content"), Body::Raw(&data, "application/octet-stream"), &[])?.json(t("Enviar", "Upload"))?;
-            if !progress(len) {
-                return Err(CANCELLED.into());
-            }
-            v
+            // Cancelar cuts the body short, so the file is never made; once all of it went, the
+            // upload is done, and isn't undone by a Cancelar that came while Graph answered.
+            self.graph.send_counted("PUT", &format!("{url}/content"), &data, "application/octet-stream", progress)?.json(t("Enviar", "Upload"))?
         } else {
             self.upload_session(&url, &name, src, len, &mut hash, progress)?
         };
