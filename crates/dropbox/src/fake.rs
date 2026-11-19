@@ -63,6 +63,8 @@ struct State {
     throttled: usize,
     /// The next call to this route is answered 429.
     throttle_route: Option<String>,
+    /// Each batch call's route and how many entries it carried.
+    batches: Vec<(String, usize)>,
     drop_append: bool,
     cut_download: Option<u64>,
     ranges: Vec<(String, u64)>,
@@ -394,6 +396,11 @@ impl Fake {
         self.changed();
     }
 
+    /// How many entries each call to batch route `route` carried, in order.
+    pub fn batch_sizes(&self, route: &str) -> Vec<usize> {
+        self.st().batches.iter().filter(|(r, _)| r == route).map(|(_, n)| *n).collect()
+    }
+
     /// Calls made since `before` to `route`.
     pub fn count_since(&self, before: &usize, route: &str) -> usize {
         self.calls_since(before).iter().filter(|c| c.as_str() == route).count()
@@ -483,6 +490,9 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
     }
     let s = |k: &str| arg.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let lower = |p: String| p.to_lowercase();
+    if let Some(entries) = arg.get("entries").and_then(Value::as_array) {
+        st.batches.push((route.clone(), entries.len()));
+    }
     let (status, headers, body): (u16, Vec<(String, String)>, Vec<u8>) = match route.as_str() {
         "oauth2/token" => {
             st.tokens += 1;

@@ -661,6 +661,12 @@ pub fn reach(email: &str) -> Result<Arc<Account>> {
     Ok(account)
 }
 
+/// Makes `account` the one open for `email` (the app's tests, on the stand-in).
+#[cfg(any(test, feature = "fake"))]
+pub fn adopt(email: &str, account: Arc<Account>) {
+    OPEN.lock().unwrap_or_else(|e| e.into_inner()).insert(normal_email(email), account);
+}
+
 /// Opens the account a login just got `tokens` for and keeps its refresh token in the
 /// credential store.
 pub fn connect(cfg: &AppConfig, tokens: &crate::oauth::Tokens) -> Result<Arc<Account>> {

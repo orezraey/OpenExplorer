@@ -42,8 +42,9 @@ pub mod transfer;
 
 #[cfg(test)]
 mod bench;
-#[cfg(test)]
-pub(crate) mod fake;
+/// A stand-in for the API on this machine: the crate's tests, and the app's with `fake`.
+#[cfg(any(test, feature = "fake"))]
+pub mod fake;
 
 use std::path::PathBuf;
 

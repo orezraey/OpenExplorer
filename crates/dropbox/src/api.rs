@@ -228,7 +228,7 @@ impl Api {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fake"))]
     pub(crate) fn short_waits(mut self) -> Api {
         self.max_wait = Duration::from_millis(50);
         self
