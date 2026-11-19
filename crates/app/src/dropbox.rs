@@ -818,3 +818,209 @@ mod tests {
         assert!(!c.touches(&sv.path(&["Fotos".into()])));
     }
 }
+
+/// The panes' work on a Dropbox account in batches, as the panes do it (Colar, Recortar, an
+/// upload), against the Dropbox crate's stand-in for the API: the account is the connection,
+/// with its batch methods and `batches()` of (250, 8 MiB).
+#[cfg(test)]
+mod batches {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use openexplorer_dropbox::fake::Fake;
+
+    use super::*;
+    use crate::actions::{self, Clip, ClipMode};
+    use crate::ops::Stage;
+
+    /// Lets background jobs finish: polls until the status says how the last one went.
+    fn settle(s: &mut State) {
+        let start = Instant::now();
+        loop {
+            crate::poll(s, 0.0, &mut rune::Tx::default());
+            let busy = s.panes.iter().any(|p| p.loading) || s.status.is_empty() || s.status.ends_with('…');
+            if !busy {
+                return;
+            }
+            assert!(start.elapsed() < Duration::from_secs(60), "stuck: {}", s.status);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A state whose only server is an account on a new stand-in, open as `tag`'s e-mail.
+    fn on_fake(tag: &str) -> (Fake, Server, State) {
+        let fake = Fake::start();
+        let email = format!("{tag}@lotes.teste");
+        dropbox::account::adopt(&email, Arc::new(fake.account()));
+        let server = Server::dropbox(&email);
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        s.servers.list = vec![server.clone()];
+        // Rows done stay in the queue, to be looked at.
+        s.settings.clear_completed = false;
+        (fake, server, s)
+    }
+
+    fn open(s: &mut State, p: usize, loc: Location) {
+        crate::switch(s, p, loc);
+        s.status = "listado".into();
+        settle(s);
+    }
+
+    /// Picks `names` (all when empty) in pane 0's folder and pastes them into pane 1's, without
+    /// waiting for the job.
+    fn paste_now(s: &mut State, names: &[&str], mode: ClipMode) {
+        let items: Vec<Entry> = s.panes[0].entries.iter().filter(|e| names.is_empty() || names.contains(&e.name.as_str())).cloned().collect();
+        s.status.clear();
+        s.clip = Some(Clip { mode, from: s.panes[0].loc.clone(), items });
+        actions::paste(s, 1);
+    }
+
+    /// The stages of the last `n` rows of the queue, in order.
+    fn stages(s: &State, n: usize) -> Vec<Stage> {
+        s.transfers[s.transfers.len() - n..].iter().map(|t| t.progress.stage()).collect()
+    }
+
+    fn count(stages: &[Stage], stage: Stage) -> usize {
+        stages.iter().filter(|s| **s == stage).count()
+    }
+
+    #[test]
+    fn moves_go_in_batches_of_what_the_account_takes_and_undo_one_by_one() {
+        let (fake, sv, mut s) = on_fake("mover");
+        for i in 0..300 {
+            fake.put_file(&format!("/A/f{i:03}.txt"), b"a");
+        }
+        // Taken where f007 goes: that one fails alone.
+        fake.put_file("/B/f007.txt", b"ja estava");
+        open(&mut s, 0, folder(&sv, vec!["A".into()]));
+        open(&mut s, 1, folder(&sv, vec!["B".into()]));
+        paste_now(&mut s, &[], ClipMode::Cut);
+        settle(&mut s);
+        // 250 a batch, the rest in the next; each row with its own result.
+        assert_eq!(fake.batch_sizes("files/move_batch_v2"), [250, 50]);
+        let st = stages(&s, 300);
+        assert_eq!((count(&st, Stage::Done), count(&st, Stage::Failed)), (299, 1), "{}", s.status);
+        assert_eq!(st[7], Stage::Failed);
+        assert!(s.transfers[s.transfers.len() - 300 + 7].progress.error().contains("Já existe"));
+        assert!(s.status.contains("299") && s.status.contains("com erro: 1"), "{}", s.status);
+        assert!(fake.has("/B/f000.txt") && fake.has("/B/f299.txt") && fake.has("/A/f007.txt"));
+        assert_eq!(fake.content("/B/f007.txt"), b"ja estava");
+
+        // Desfazer: a step per item moved, each back where it was; the one that failed stays.
+        crate::undo::undo(&mut s, false);
+        settle(&mut s);
+        assert!(s.status.starts_with("Desfeito"), "{}", s.status);
+        assert!((0..300).all(|i| fake.has(&format!("/A/f{i:03}.txt"))));
+        assert!((0..300).filter(|i| *i != 7).all(|i| !fake.has(&format!("/B/f{i:03}.txt"))));
+        assert_eq!(fake.content("/B/f007.txt"), b"ja estava");
+    }
+
+    #[test]
+    fn copies_in_one_folder_take_free_names_and_rows_cancelled_meanwhile_stay_out() {
+        let (fake, sv, mut s) = on_fake("copiar");
+        for i in 0..300 {
+            fake.put_file(&format!("/C/f{i:03}.txt"), format!("{i}").as_bytes());
+        }
+        open(&mut s, 0, folder(&sv, vec!["C".into()]));
+        open(&mut s, 1, folder(&sv, vec!["C".into()]));
+        // Each answer late, so the first batch is still out when Cancelar comes.
+        fake.delay(150);
+        paste_now(&mut s, &[], ClipMode::Copy);
+        std::thread::sleep(Duration::from_millis(300));
+        let rows = s.transfers.len() - 300;
+        for t in &s.transfers[rows + 280..rows + 290] {
+            t.progress.cancel();
+        }
+        settle(&mut s);
+        fake.delay(0);
+        assert_eq!(fake.batch_sizes("files/copy_batch_v2"), [250, 40]);
+        let st = stages(&s, 300);
+        assert_eq!((count(&st, Stage::Done), count(&st, Stage::Cancelled)), (290, 10), "{}", s.status);
+        // The names the one-by-one path gives: "nome (2).ext".
+        assert_eq!(fake.content("/C/f000 (2).txt"), b"0");
+        assert_eq!(fake.content("/C/f299 (2).txt"), b"299");
+        assert!(!fake.has("/C/f285 (2).txt"));
+    }
+
+    fn local_tree(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("oe-app-dropbox-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(path: &Path, n: usize, seed: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, (0..n).map(|k| ((k + seed) % 251) as u8).collect::<Vec<u8>>()).unwrap();
+    }
+
+    #[test]
+    fn uploads_go_together_up_to_what_the_account_takes_with_free_names() {
+        let (fake, sv, mut s) = on_fake("enviar");
+        let local = local_tree("enviar");
+        for i in 0..300 {
+            write(&local.join(format!("f{i:03}.bin")), 1000 + i, i);
+        }
+        // Too big for a batch: alone, in its own session.
+        write(&local.join("grande.bin"), (8 << 20) + 10, 1);
+        for i in 0..5 {
+            write(&local.join(format!("Pasta/p{i}.bin")), 500, i);
+        }
+        // Taken on Dropbox already: the upload gets "f000 (2).bin", as one by one.
+        fake.put_file("/U/f000.bin", b"outro");
+        open(&mut s, 0, Location::Local(local.clone()));
+        open(&mut s, 1, folder(&sv, vec!["U".into()]));
+        paste_now(&mut s, &[], ClipMode::Copy);
+        settle(&mut s);
+        let st = stages(&s, 302);
+        assert_eq!(count(&st, Stage::Done), 302, "{}", s.status);
+        let finished = fake.batch_sizes("files/upload_session/finish_batch_v2");
+        assert!(finished.iter().all(|n| *n <= 250), "{finished:?}");
+        // The 300 rows, and the folder's five in a batch of their own; a run a worker was left
+        // with a single row of goes in one request, as one by one.
+        let alone = fake.count_since(&0, "files/upload");
+        assert_eq!(finished.iter().sum::<usize>() + alone, 305, "{finished:?} + {alone}");
+        assert!(finished.len() < 20, "{finished:?}");
+        assert_eq!(fake.content("/U/f000 (2).bin"), std::fs::read(local.join("f000.bin")).unwrap());
+        assert_eq!(fake.content("/U/f000.bin"), b"outro");
+        assert_eq!(fake.content("/U/f299.bin"), std::fs::read(local.join("f299.bin")).unwrap());
+        assert_eq!(fake.content("/U/grande.bin"), std::fs::read(local.join("grande.bin")).unwrap());
+        assert_eq!(fake.content("/U/Pasta/p4.bin"), std::fs::read(local.join("Pasta/p4.bin")).unwrap());
+        // Each row's bar full.
+        for t in &s.transfers[s.transfers.len() - 302..] {
+            assert_eq!(t.progress.bytes.load(std::sync::atomic::Ordering::Relaxed), t.progress.total.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        let _ = std::fs::remove_dir_all(local);
+    }
+
+    #[test]
+    fn a_folder_cancelled_between_its_batches_goes_away_whole() {
+        let (fake, sv, mut s) = on_fake("cancelar");
+        let local = local_tree("cancelar");
+        for i in 0..300 {
+            write(&local.join(format!("Grande/g{i:03}.bin")), 200, i);
+        }
+        open(&mut s, 0, Location::Local(local.clone()));
+        open(&mut s, 1, folder(&sv, vec!["V".into()]));
+        fake.make_dir("/V");
+        fake.delay(150);
+        paste_now(&mut s, &["Grande"], ClipMode::Copy);
+        // The folder made, its first 250 files arrived at Dropbox: Cancelar.
+        let start = Instant::now();
+        while fake.batch_sizes("files/upload_session/append_batch").is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(20));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        s.transfers.last().unwrap().progress.cancel();
+        settle(&mut s);
+        fake.delay(0);
+        assert_eq!(stages(&s, 1), [Stage::Cancelled], "{}", s.status);
+        // The first batch committed, none after it, and what arrived taken away with the folder.
+        assert_eq!(fake.batch_sizes("files/upload_session/append_batch"), [250]);
+        assert_eq!(fake.batch_sizes("files/upload_session/finish_batch_v2"), [250]);
+        assert!(!fake.has("/V/Grande"));
+        let _ = std::fs::remove_dir_all(local);
+    }
+}

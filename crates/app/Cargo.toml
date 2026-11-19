@@ -21,6 +21,10 @@ serde_json = "1"
 trash = "5"
 md-5 = "0.10"
 
+[dev-dependencies]
+# The Dropbox crate's stand-in for the API, for the tests of the panes' batches.
+openexplorer-dropbox = { path = "../dropbox", features = ["fake"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_UI_Controls", "Win32_System_Registry", "Win32_NetworkManagement_WNet", "Win32_NetworkManagement_NetManagement"] }
 # COM objects for dragging Drive files out as virtual files (`dragout.rs`); the version Rune uses.
