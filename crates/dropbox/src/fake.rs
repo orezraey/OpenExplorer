@@ -379,6 +379,13 @@ impl Fake {
         }
     }
 
+    /// The file deleted from `display` has no revision kept any more.
+    pub fn expire(&self, display: &str) {
+        if let Some(d) = self.st().deleted.get_mut(&display.to_lowercase()) {
+            d.0.clear();
+        }
+    }
+
     /// An empty folder (and those on its way).
     pub fn make_dir(&self, display: &str) {
         let mut st = self.st();
@@ -644,6 +651,7 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
             match (st.nodes.get(&l), st.deleted.get(&l)) {
                 (Some(n), _) if n.dir => route_error("path/not_file/..", json!({".tag": "path", "path": {".tag": "not_file"}})),
                 (Some(n), _) => ok(json!({"is_deleted": false, "entries": [meta(&l, n)]})),
+                (None, Some((rev, when))) if rev.is_empty() => ok(json!({"is_deleted": true, "server_deleted": timestamp(*when), "entries": [], "has_more": false})),
                 (None, Some((rev, when))) => {
                     let (display, data) = st.revs[rev].clone();
                     let m = meta(&l, &Node { display, dir: false, data, rev: rev.clone() });

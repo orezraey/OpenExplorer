@@ -5,7 +5,8 @@
 //! the API does give: `list_folder` with `include_deleted` lists the items deleted from a folder
 //! that exists (files and folders alike, with no date and nothing telling one from the other),
 //! and `list_revisions` of a deleted file says when it was deleted (`server_deleted`, Dropbox's
-//! clock) and its last revision; of a folder it answers `not_file`.
+//! clock) and its last revision; of a folder it answers `not_file`. A file whose revisions are
+//! gone (kept past the plan's days) can't come back, and isn't listed nor taken for a folder.
 //!
 //! So a folder comes back as the website brings it back: the folder made again, what was
 //! deleted in it listed (all the way down), each file deleted in that one deletion restored at
@@ -61,8 +62,10 @@ pub struct Deleted {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Found {
     File { rev: String, size: u64, when: i64 },
-    /// A folder (or nothing Dropbox will say more of).
+    /// A folder (`not_file`).
     Folder,
+    /// Nothing left to bring back: no revision kept, or Dropbox doesn't know the path.
+    Gone,
     /// A file that's there now.
     Live,
 }
@@ -91,7 +94,8 @@ impl Account {
     fn found(&self, path: &str) -> Result<Found> {
         let v = match self.api.rpc("files/list_revisions", &json!({"path": api_path(path), "mode": "path", "limit": 1})) {
             Ok(v) => v,
-            Err(f) if f.is("not_file") || f.is("not_found") => return Ok(Found::Folder),
+            Err(f) if f.is("not_file") => return Ok(Found::Folder),
+            Err(f) if f.is("not_found") => return Ok(Found::Gone),
             Err(f) => return Err(about(path, f)),
         };
         if !v.get("is_deleted").and_then(Value::as_bool).unwrap_or(false) {
@@ -100,7 +104,7 @@ impl Account {
         let when = v.get("server_deleted").and_then(Value::as_str).and_then(crate::meta::seconds).unwrap_or(0);
         let rev = v.pointer("/entries/0/rev").and_then(Value::as_str).unwrap_or("").to_string();
         let size = v.pointer("/entries/0/size").and_then(Value::as_u64).unwrap_or(0);
-        Ok(if rev.is_empty() { Found::Folder } else { Found::File { rev, size, when } })
+        Ok(if rev.is_empty() { Found::Gone } else { Found::File { rev, size, when } })
     }
 
     /// The paths (as Dropbox shows them) deleted from folder `path`, all the way down with
@@ -140,7 +144,7 @@ impl Account {
                 None => item(None, None, None, None),
                 Some(Ok(Found::File { rev, size, when })) => item(Some(false), Some(rev.clone()), Some(*size), Some(*when)),
                 Some(Ok(Found::Folder)) => item(Some(true), None, None, None),
-                Some(Ok(Found::Live)) => continue,
+                Some(Ok(Found::Live | Found::Gone)) => continue,
                 Some(Err(e)) => return Err(e.clone()),
             });
         }
@@ -167,6 +171,7 @@ impl Account {
             Found::File { rev, .. } => self.restore(&item.path, &rev).map(|_| 1),
             Found::Folder => self.restore_folder(&item.path, None),
             Found::Live => Err(tr!("“{}” já está de volta no Dropbox.", "“{}” is already back on Dropbox.", item.name)),
+            Found::Gone => Err(tr!("O Dropbox não guarda mais “{}”.", "Dropbox no longer keeps “{}”.", item.name)),
         }
     }
 
@@ -187,7 +192,7 @@ impl Account {
             match f? {
                 Found::File { rev, when, .. } => files.push((p.clone(), rev, when)),
                 Found::Folder => folders.push(p.clone()),
-                Found::Live => {}
+                Found::Live | Found::Gone => {}
             }
         }
         let (from, to) = match window {
@@ -207,6 +212,13 @@ impl Account {
         // Only the deepest: making one makes the folders on its way.
         let deepest: Vec<String> = remade.iter().filter(|f| !remade.iter().any(|o| parent(&key(o)) == key(f))).cloned().collect();
         let back: Vec<&(String, String, i64)> = files.iter().filter(|(.., when)| inside(*when)).collect();
+        // Files deleted there, none within the window: say how far the nearest was, as a window
+        // missed (two clocks not agreeing) would otherwise only show as an empty folder.
+        if back.is_empty()
+            && let Some((p, _, when)) = files.iter().min_by_key(|(.., w)| (w - from).abs().min((w - to).abs()))
+        {
+            crate::api::log(&format!("Dropbox restaurar {path}: nenhum dos {} arquivos excluídos foi excluído entre {from} e {to}; o mais perto, {p}, em {when}", files.len()));
+        }
         let failed = Mutex::new(Vec::new());
         each(&deepest, WRITES, |f| {
             if let Err(e) = self.mkdir(f)
@@ -284,6 +296,22 @@ mod tests {
         assert_eq!(fake.content("/Pasta/Sub/b.txt"), b"dois");
         assert!(fake.has("/Pasta/a.txt") && fake.has("/Pasta/Vazia/Dentro"));
         assert!(!fake.has("/Pasta/velho.txt") && !fake.has("/Pasta/Antiga"));
+    }
+
+    #[test]
+    fn a_file_whose_revisions_are_gone_is_neither_listed_nor_made_a_folder() {
+        let fake = Fake::start();
+        fake.put_file("/P/velho.txt", b"v");
+        fake.put_file("/P/novo.txt", b"n");
+        let a = fake.account();
+        a.delete("/P/velho.txt").unwrap();
+        fake.expire("/P/velho.txt");
+        a.delete("/P/novo.txt").unwrap();
+        let items = a.deleted_in("/P").unwrap();
+        assert_eq!(items.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["novo.txt"]);
+        a.delete("/P").unwrap();
+        assert_eq!(a.restore_folder("/P", None).unwrap(), 1);
+        assert!(fake.has("/P/novo.txt") && !fake.has("/P/velho.txt"));
     }
 
     #[test]
