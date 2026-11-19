@@ -15,6 +15,7 @@ use openexplorer_remote::{self as remote, Brand, Conn, Item, Pool, Protocol, Ref
 use openexplorer_i18n::{t, tr};
 use rune::{Icon, TextEdit, Tx};
 
+use crate::accounts::Account;
 use crate::actions::{Dialog, Then};
 use crate::model::{Entry, Location};
 use crate::ops::{self, CANCELLED, Progress};
@@ -1515,29 +1516,25 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
     }
 }
 
-/// Forgets a server and its password (a MEGA account and its session); panes on it go home.
+/// Forgets a server and its password, or a cloud account and its secrets; panes on it go home.
 pub fn remove(s: &mut State, id: &str) {
-    let mega = s.servers.list.iter().find(|sv| sv.id == id && (sv.is_mega() || sv.is_onedrive())).cloned();
-    let dropbox = s.servers.list.iter().find(|sv| sv.id == id && sv.is_dropbox()).cloned();
-    let b2 = s.servers.list.iter().find(|sv| sv.id == id && sv.is_b2()).cloned();
-    if let Some(sv) = &mega {
-        if !if sv.is_onedrive() { crate::onedrive::remove(s, sv) } else { crate::mega::remove(s, sv) } {
-            return;
+    let server = s.servers.list.iter().find(|sv| sv.id == id).cloned();
+    let account = server.as_ref().and_then(|sv| Some((Account::of(sv)?, sv)));
+    match account {
+        Some((account, sv)) => {
+            if !crate::accounts::remove(s, account, sv) {
+                return;
+            }
         }
-    } else if let Some(sv) = &dropbox {
-        if !crate::dropbox::remove(s, sv) {
-            return;
+        None => {
+            if let Err(e) = s.servers.store.remove(id) {
+                crate::fail(s, e);
+                return;
+            }
         }
-    } else if let Some(sv) = &b2 {
-        if !crate::b2::remove(s, sv) {
-            return;
-        }
-    } else if let Err(e) = s.servers.store.remove(id) {
-        crate::fail(s, e);
-        return;
     }
     s.servers.pool.forget(id);
-    let name = s.servers.list.iter().find(|sv| sv.id == id).map(|sv| sv.name.clone()).unwrap_or_default();
+    let name = server.as_ref().map(|sv| sv.name.as_str()).unwrap_or_default();
     s.servers.list.retain(|sv| sv.id != id);
     s.tree.server_changed(id);
     let on = |l: &Location| matches!(l, Location::Server { server, .. } if server.id == id);
@@ -1551,11 +1548,8 @@ pub fn remove(s: &mut State, id: &str) {
             crate::switch(s, p, Location::home());
         }
     }
-    s.status = match &mega {
-        Some(sv) if sv.is_onedrive() => tr!("Conta OneDrive removida: {name}", "OneDrive account removed: {name}"),
-        Some(_) => tr!("Conta MEGA removida: {name}", "MEGA account removed: {name}"),
-        None if dropbox.is_some() => tr!("Conta Dropbox removida: {name}", "Dropbox account removed: {name}"),
-        None if b2.is_some() => tr!("Conta B2 removida: {name}", "B2 account removed: {name}"),
+    s.status = match account {
+        Some((account, _)) => crate::accounts::removed(account, name),
         None => tr!("Servidor removido: {name}", "Server removed: {name}"),
     };
 }
@@ -1705,6 +1699,28 @@ mod tests {
 
     fn server(protocol: Protocol, host: &str, root: &str) -> Server {
         Server { id: format!("{host}{root}"), name: host.into(), protocol, brand: None, host: host.into(), port: protocol.default_port(), user: "ana".into(), root: root.into(), key: None, host_key: None, cert: None, connections: 4, implicit: false }
+    }
+
+    /// Removing a server: it leaves its store and the list, and the panes, their history and
+    /// the clipboard on it go; a cloud account's own forgetting is its module's (`accounts`).
+    #[test]
+    fn a_removed_server_leaves_the_list_and_the_panes() {
+        let base = std::env::temp_dir().join(format!("oe-servers-remove-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sv = Server { id: format!("teste-remover-{}", std::process::id()), name: "Teste".into(), ..server(Protocol::Sftp, "nas", "/") };
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        s.servers.store = Store::at(base.join("servers.json"));
+        s.servers.store.save(sv.clone(), None).unwrap();
+        s.servers.list = vec![sv.clone()];
+        s.panes[0].loc = folder(&sv, vec!["x".into()]);
+        s.panes[1].back.push(folder(&sv, vec![]));
+        s.clip = Some(crate::actions::Clip { mode: crate::actions::ClipMode::Copy, from: folder(&sv, vec![]), items: Vec::new() });
+        remove(&mut s, &sv.id);
+        assert!(s.servers.store.servers().is_empty() && s.servers.list.is_empty());
+        assert!(!matches!(s.panes[0].loc, Location::Server { .. }) && s.panes[1].back.is_empty() && s.clip.is_none());
+        assert_eq!(s.status, "Servidor removido: Teste");
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

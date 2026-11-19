@@ -8,6 +8,7 @@
 
 use std::borrow::Cow;
 
+use openexplorer_i18n::tr;
 use openexplorer_remote::{Protocol, Server};
 use rune::Tx;
 
@@ -241,6 +242,31 @@ pub fn links(loc: &Location) -> Option<(MenuAction, MenuAction)> {
         Account::Dropbox => Some((dropbox::copy_link, dropbox::remove_link)),
         Account::OneDrive if !onedrive::in_bin(loc) => Some((onedrive::copy_link, onedrive::remove_link)),
         Account::Mega | Account::OneDrive | Account::B2 => None,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Removing
+
+/// Forgets account `server`, of kind `account`: it leaves the account's own store, its secrets
+/// the credential store, its kept tree or listings the disk. `false` if it couldn't (the failure
+/// shown already).
+pub fn remove(s: &mut State, account: Account, server: &Server) -> bool {
+    match account {
+        Account::Mega => mega::remove(s, server),
+        Account::Dropbox => dropbox::remove(s, server),
+        Account::B2 => b2::remove(s, server),
+        Account::OneDrive => onedrive::remove(s, server),
+    }
+}
+
+/// The status bar's words once account `name`, of kind `account`, is removed.
+pub fn removed(account: Account, name: &str) -> String {
+    match account {
+        Account::Mega => tr!("Conta MEGA removida: {name}", "MEGA account removed: {name}"),
+        Account::Dropbox => tr!("Conta Dropbox removida: {name}", "Dropbox account removed: {name}"),
+        Account::B2 => tr!("Conta B2 removida: {name}", "B2 account removed: {name}"),
+        Account::OneDrive => tr!("Conta OneDrive removida: {name}", "OneDrive account removed: {name}"),
     }
 }
 
