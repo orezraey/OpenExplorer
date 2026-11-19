@@ -728,3 +728,24 @@ fn a_new_upload_cancels_only_unfinished_ones_that_surely_stopped() {
     crate::notes::set_file(None);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn the_folders_inside_one_shown_are_read_ahead_and_kept() {
+    let m = mock();
+    let a = m.account();
+    a.list("/fotos").unwrap();
+    assert!(a.cached("/fotos/2024").is_none() && a.cached("/fotos/vazia").is_none());
+    let before = m.calls("b2_list_file_names");
+    a.prefetch("/fotos");
+    // One request per folder not kept, and nothing again once they are.
+    assert_eq!(m.calls("b2_list_file_names"), before + 2);
+    let kept: Vec<String> = a.cached("/fotos/2024").unwrap().items.iter().map(|i| i.name.clone()).collect();
+    assert!(kept.contains(&"ferias".to_string()) && kept.contains(&"praia.jpg".to_string()), "{kept:?}");
+    assert!(a.cached("/fotos/vazia").unwrap().items.is_empty());
+    a.prefetch("/fotos");
+    assert_eq!(m.calls("b2_list_file_names"), before + 2);
+    // The buckets at the top read ahead too.
+    a.list("/").unwrap();
+    a.prefetch("/");
+    assert!(a.cached("/docs").is_some());
+}

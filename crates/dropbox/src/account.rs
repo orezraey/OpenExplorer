@@ -246,6 +246,12 @@ impl Account {
         }
     }
 
+    /// Folder `path`'s kept listing, with no request and however current: what the tree shows
+    /// at once while the folder is listed behind it. `None` when it isn't kept.
+    pub fn kept(&self, path: &str) -> Option<Vec<Entry>> {
+        self.lists().get(&key(path), now()).map(|f| f.entries.clone())
+    }
+
     /// Forgets folder `path`'s kept listing: the next opening reads it whole (Atualizar).
     pub fn forget(&self, path: &str) {
         let mut lists = self.lists();

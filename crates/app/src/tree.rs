@@ -369,10 +369,25 @@ fn load(s: &mut State, node: &Node) {
         }
         (NodeId::Server(_, path), Some(Location::Server { server, .. })) => {
             let (pool, server, path, show_hidden) = (s.servers.pool.clone(), server.clone(), path.clone(), s.settings.show_hidden);
+            let nodes = |server: &openexplorer_remote::Server, path: &[String], names: Vec<String>| sorted(names.into_iter().map(|n| remote_node(server, extend_segs(path, &n))).collect());
+            // A cloud account's kept listing shows at once; the folder is listed behind it, and
+            // replaces it only when that works.
+            let kept = crate::accounts::kept_folders(&server, &path, show_hidden);
+            let shown = kept.is_some();
+            if let Some(names) = kept {
+                s.tree.kids.insert(id.clone(), Kids::Ready(nodes(&server, &path, names)));
+                s.tree.version += 1;
+            }
             background(s, move |emit| {
                 let result = crate::catch_panic(t("ler as pastas do servidor", "read the server's folders"), || crate::servers::folders(&pool, &server, &path, show_hidden));
-                emit(done(result.map(|names| sorted(names.into_iter().map(|n| remote_node(&server, extend_segs(&path, &n))).collect()))));
+                if shown && result.is_err() {
+                    return;
+                }
+                emit(done(result.map(|names| nodes(&server, &path, names))));
             });
+            if shown {
+                return;
+            }
         }
         _ => return,
     }

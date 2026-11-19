@@ -29,6 +29,8 @@ pub const PAGE: u32 = 10_000;
 pub const COPY_WHOLE_BELOW: u64 = 5_000_000_000;
 /// How many calls a batch over many files (deleting a folder, copying one) has out at once.
 pub const AT_ONCE: usize = 8;
+/// Folders read ahead at most after one shows (see [`Account::prefetch`]).
+pub const AHEAD: usize = 24;
 
 /// An item of a listing.
 #[derive(Clone, Debug, PartialEq)]
@@ -394,6 +396,18 @@ impl Account {
             None => self.lists.get("", ""),
             Some(s) => self.lists.get(&s.bucket, &s.prefix()),
         }
+    }
+
+    /// Reads ahead the folders inside folder `path` that have no kept listing (up to
+    /// [`AHEAD`], [`AT_ONCE`] at a time), so expanding one in the tree or opening it shows at
+    /// once. Listing is free on B2; what fails is left for the opening to read.
+    pub fn prefetch(&self, path: &str) {
+        let Some(kept) = self.cached(path) else { return };
+        let base = path.trim_end_matches('/');
+        let dirs: Vec<String> = kept.items.iter().filter(|i| i.is_dir).map(|i| format!("{base}/{}", i.name)).filter(|d| self.cached(d).is_none()).take(AHEAD).collect();
+        openexplorer_cloud::each(&dirs, AT_ONCE, |d| {
+            let _ = self.read(d, false);
+        });
     }
 
     /// The folder at `path`, read from B2 now (a copy's or an upload's check of the names taken

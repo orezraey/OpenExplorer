@@ -306,6 +306,23 @@ pub fn quota_bar(s: &State, loc: &Location) -> Option<(String, Option<f64>, Stri
 // ---------------------------------------------------------------------------------------------
 // Listing and watching
 
+/// The folders inside folder `path` of `server` as its account keeps them, with no request:
+/// what the tree shows at once while it lists the folder behind it. `None` where nothing is kept
+/// (or the account lists from memory anyway, as MEGA does).
+pub fn kept_folders(server: &Server, path: &[String], show_hidden: bool) -> Option<Vec<String>> {
+    let dir = server.path(path);
+    let shown = |name: &str| show_hidden || !name.starts_with('.');
+    match Account::of(server)? {
+        Account::Mega => None,
+        Account::B2 => {
+            let kept = openexplorer_b2::cached(&server.user)?.cached(&dir)?;
+            Some(kept.items.iter().filter(|i| i.is_dir && shown(&i.name)).map(|i| i.name.clone()).collect())
+        }
+        Account::OneDrive => Some(openexplorer_onedrive::cached(&server.user)?.kept_list(&dir)?.into_iter().filter(|i| i.is_dir && shown(&i.name)).map(|i| i.name).collect()),
+        Account::Dropbox => Some(openexplorer_dropbox::cached(&server.user)?.kept(&dir)?.into_iter().filter(|e| e.dir && shown(&e.name)).map(|e| e.name).collect()),
+    }
+}
+
 /// Lists pane `p`'s folder where the account lists its own way (B2, from its kept listings);
 /// `false` where the servers' listing does it.
 pub fn load(s: &mut State, p: usize, request: u64, fresh: bool) -> bool {

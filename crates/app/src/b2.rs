@@ -113,9 +113,22 @@ pub fn load(s: &mut State, p: usize, request: u64, _fresh: bool) {
             Ok(a) => a,
             Err(e) => return emit(listed(Part::WHOLE, Err(e))),
         };
+        // Once the folder shows, the folders inside it are read ahead: expanding one in the tree
+        // or opening it is then immediate.
+        let ahead = || {
+            let _ = catch_panic(t("ler as pastas adiante", "read folders ahead"), || {
+                account.prefetch(&dir);
+                Ok(())
+            });
+        };
         let Some(kept) = account.cached(&dir) else {
             let result = catch_panic(t("listar", "list"), || account.list_fresh(&dir).map(|items| entries(items, show_hidden)));
-            return emit(listed(Part::WHOLE, result));
+            let ok = result.is_ok();
+            emit(listed(Part::WHOLE, result));
+            if ok {
+                ahead();
+            }
+            return;
         };
         emit(listed(Part::Cached, Ok(entries(kept.items.clone(), show_hidden))));
         drop(kept);
@@ -125,6 +138,7 @@ pub fn load(s: &mut State, p: usize, request: u64, _fresh: bool) {
             // The kept listing stays on screen; the error is said.
             Err(e) => emit(listed(Part::Page { first: false, more: false }, Err(e))),
         }
+        ahead();
     });
 }
 
