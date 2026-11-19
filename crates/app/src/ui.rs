@@ -1215,19 +1215,15 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             .item(item(t("Copiar link", "Copy link"), &icons::M_LINK, "", true, crate::sharing::copy_link))
             .item(item(t("Compartilhar…", "Share…"), &icons::M_SHARE, "", true, crate::sharing::ask_share));
     }
-    // Public links, for one MEGA item.
-    if n == 1 && changeable && crate::mega::at(&s.panes[p].loc).is_some() && !crate::mega::in_bin(&s.panes[p].loc) {
+    // Public or sharing links, for one item of a cloud account that makes them.
+    if n == 1
+        && changeable
+        && let Some((copy, remove)) = crate::accounts::links(&s.panes[p].loc)
+    {
         menu = menu
             .separator()
-            .item(item(t("Copiar link", "Copy link"), &icons::M_LINK, "", true, crate::mega::copy_link))
-            .item(item(t("Remover link", "Remove link"), &icons::M_LINK, "", true, crate::mega::remove_link));
-    }
-    // Shared links, for one Dropbox item.
-    if n == 1 && changeable && crate::dropbox::at(&s.panes[p].loc).is_some() {
-        menu = menu
-            .separator()
-            .item(item(t("Copiar link", "Copy link"), &icons::M_LINK, "", true, crate::dropbox::copy_link))
-            .item(item(t("Remover link", "Remove link"), &icons::M_LINK, "", true, crate::dropbox::remove_link));
+            .item(item(t("Copiar link", "Copy link"), &icons::M_LINK, "", true, copy))
+            .item(item(t("Remover link", "Remove link"), &icons::M_LINK, "", true, remove));
     }
     // Every version of a B2 item, for good.
     if n > 0 && changeable && crate::b2::at(&s.panes[p].loc).is_some() {
@@ -1236,13 +1232,6 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     // A B2 bucket's large uploads that stopped midway.
     if crate::b2::menu_bucket(s, p).is_some() {
         menu = menu.separator().item(item(t("Envios inacabados…", "Unfinished uploads…"), &icons::M_PROPERTIES, "", true, crate::b2::ask_unfinished));
-    }
-    // Sharing links, for one OneDrive item.
-    if n == 1 && changeable && crate::onedrive::at(&s.panes[p].loc).is_some() && !crate::onedrive::in_bin(&s.panes[p].loc) {
-        menu = menu
-            .separator()
-            .item(item(t("Copiar link", "Copy link"), &icons::M_LINK, "", true, crate::onedrive::copy_link))
-            .item(item(t("Remover link", "Remove link"), &icons::M_LINK, "", true, crate::onedrive::remove_link));
     }
     menu = menu.separator().item(item(t("Nova pasta", "New folder"), &icons::M_NEW_FOLDER, "Ctrl+Shift+N", editable, actions::ask_new_folder));
     // What was deleted from a Dropbox folder, to bring back.
@@ -1280,31 +1269,24 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
     match d {
         Dialog::Delete { pane, items } => {
             let local = s.panes[*pane].loc.is_local();
-            let b2_note: String;
             let title = match items.as_slice() {
                 [one] => tr!("Excluir \"{}\"?", "Delete \"{}\"?", shown(&one.name)),
                 many => tr!("Excluir {} itens?", "Delete {} items?", ui_count(many.len())),
             };
-            let where_to = if local {
-                t("Os itens vão para a Lixeira do Windows, de onde podem ser restaurados.", "The items go to the Windows Recycle Bin, where they can be restored.")
-            } else if crate::mega::at(&s.panes[*pane].loc).is_some() {
-                t("Os itens vão para a Lixeira do MEGA, de onde podem ser restaurados.", "The items go to the MEGA Rubbish Bin, where they can be restored.")
-            } else if crate::dropbox::at(&s.panes[*pane].loc).is_some() {
-                crate::dropbox::delete_note()
-            } else if crate::b2::at(&s.panes[*pane].loc).is_some() {
-                b2_note = crate::b2::delete_note(&s.panes[*pane].loc);
-                b2_note.as_str()
-            } else if let Some(note) = crate::onedrive::delete_note(s, &s.panes[*pane].loc) {
+            let where_to: Cow<str> = if local {
+                t("Os itens vão para a Lixeira do Windows, de onde podem ser restaurados.", "The items go to the Windows Recycle Bin, where they can be restored.").into()
+            } else if let Some(note) = crate::accounts::delete_note(s, &s.panes[*pane].loc) {
                 note
             } else {
                 t(
                     "Os itens vão para a lixeira do Google Drive, onde ficam 30 dias antes de serem apagados de vez.",
                     "The items go to the Google Drive trash, where they stay for 30 days before being deleted for good.",
                 )
+                .into()
             };
             // The explanation goes in the body, where it wraps; the dialog's own description
             // line doesn't, and would run under the close button.
-            let note = text(where_to).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
+            let note = text(where_to.into_owned()).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
             let body = col().w_full().gap(12.0).child(note).child(item_list(s, k, *pane, items)).child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Excluir", "Delete")).variant(ButtonVariant::Danger).on_press(actions::delete)));
             Modal::new("delete", title).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
         }
@@ -1322,14 +1304,8 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 .into()
             } else if s.panes[*pane].loc.is_local() {
                 t("Aqui não há Lixeira: os itens serão apagados para sempre. Isso não pode ser desfeito.", "There's no Recycle Bin here: the items will be deleted for good. This can't be undone.").into()
-            } else if crate::mega::at(&s.panes[*pane].loc).is_some() && !crate::mega::in_bin(&s.panes[*pane].loc) {
-                t("Itens de uma pasta compartilhada com você pertencem a quem compartilhou: serão apagados para sempre, sem passar pela Lixeira. Isso não pode ser desfeito.", "Items in a folder shared with you belong to whoever shared it: they'll be deleted for good, skipping the Rubbish Bin. This can't be undone.").into()
-            } else if crate::b2::at(&s.panes[*pane].loc).is_some() {
-                crate::b2::purge_note().into()
-            } else if crate::mega::in_bin(&s.panes[*pane].loc) {
-                t("Os itens serão apagados para sempre da Lixeira do MEGA. Isso não pode ser desfeito.", "The items will be deleted from the MEGA Rubbish Bin for good. This can't be undone.").into()
-            } else if crate::onedrive::in_bin(&s.panes[*pane].loc) {
-                t("Os itens serão apagados para sempre da lixeira do OneDrive. Isso não pode ser desfeito.", "The items will be deleted from the OneDrive recycle bin for good. This can't be undone.").into()
+            } else if let Some(note) = crate::accounts::purge_note(&s.panes[*pane].loc) {
+                note.into()
             } else if let Location::Server { server, .. } = &s.panes[*pane].loc {
                 tr!(
                     "Servidores não têm lixeira: os itens serão apagados para sempre de {}. Isso não pode ser desfeito.",
@@ -3639,8 +3615,8 @@ fn statusbar(s: &State, k: &Kit, p: usize) -> El {
     // against its organisation, not the account).
     let quota = match &pane.loc {
         Location::Drive { email, space: Space::MyDrive, .. } => s.quotas.get(email).copied().flatten().map(|q| (quota_label(&q), q.limit.filter(|l| *l > 0).map(|l| q.usage as f64 / l as f64), quota_help(q))),
-        // A MEGA account's storage, anywhere in it.
-        loc => crate::mega::quota_of(s, loc).map(|q| (crate::mega::quota_label(&q), (q.total > 0).then(|| q.used as f64 / q.total as f64), crate::mega::quota_help(q))).or_else(|| crate::dropbox::quota_status(s, loc)).or_else(|| crate::onedrive::quota_bar(s, loc)),
+        // A cloud account's storage, anywhere in it.
+        loc => crate::accounts::quota_bar(s, loc),
     };
     let (right, used, help) = match quota {
         Some((label, used, help)) => (label, used, help),

@@ -97,6 +97,12 @@ pub fn bin_node(server: &Server, path: &[String]) -> bool {
     server.is_onedrive() && path.len() == 1 && is_bin(path)
 }
 
+/// What the Excluir permanentemente question says in the Lixeira; `None` elsewhere (the
+/// servers' words apply).
+pub fn purge_note(loc: &Location) -> Option<&'static str> {
+    in_bin(loc).then(|| t("Os itens serão apagados para sempre da lixeira do OneDrive. Isso não pode ser desfeito.", "The items will be deleted from the OneDrive recycle bin for good. This can't be undone."))
+}
+
 /// Whether the items `loc` lists can be renamed, cut or deleted: not Meus arquivos itself.
 pub fn items_fixed(loc: &Location) -> bool {
     at(loc).is_some_and(|(_, path)| path.is_empty())

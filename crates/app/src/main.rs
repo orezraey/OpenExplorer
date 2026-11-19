@@ -8,6 +8,7 @@
 // keeps the console, for what it prints.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod accounts;
 mod actions;
 mod address;
 mod autoscroll;
@@ -540,21 +541,17 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                 for email in touched {
                     ask_quota(s, email);
                 }
-                let mut megas: Vec<openexplorer_remote::Server> = reload.iter().filter_map(|l| mega::at(l).map(|(sv, _)| sv.clone())).collect();
+                // So does one in a cloud account: each asked once.
                 let mut seen = std::collections::HashSet::new();
-                megas.retain(|sv| seen.insert(sv.id.clone()));
-                for sv in megas {
-                    mega::ask_quota(s, &sv);
-                }
-                let mut boxes: Vec<openexplorer_remote::Server> = reload.iter().filter_map(|l| dropbox::at(l).map(|(sv, _)| sv.clone())).collect();
-                boxes.dedup_by(|a, b| a.id == b.id);
-                for sv in boxes {
-                    dropbox::ask_quota(s, &sv);
-                }
-                let mut ones: Vec<openexplorer_remote::Server> = reload.iter().filter_map(|l| onedrive::at(l).map(|(sv, _)| sv.clone())).collect();
-                ones.dedup_by(|a, b| a.id == b.id);
-                for sv in ones {
-                    onedrive::ask_quota(s, &sv);
+                let clouds: Vec<openexplorer_remote::Server> = reload
+                    .iter()
+                    .filter_map(|l| match l {
+                        Location::Server { server, .. } if accounts::Account::of(server).is_some() && seen.insert(server.id.clone()) => Some((**server).clone()),
+                        _ => None,
+                    })
+                    .collect();
+                for sv in clouds {
+                    accounts::ask_quota(s, &sv);
                 }
             }
             Msg::Undo(answer) => undo::arrived(s, answer),
@@ -652,17 +649,8 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     // Accounts on screen are asked what changed elsewhere, every few seconds; after the
     // messages, so a listing that just ended is read again here if changes came during it.
     changed |= watch::tick(s, now);
-    mega::tick(s, now);
-    dropbox::tick(s, now);
-    if let Some(at) = dropbox::next_ask(s) {
-        tx.wake_at(at);
-    }
-    onedrive::tick(s, now);
-    b2::tick(s, now);
-    if let Some(at) = b2::next_ask(s) {
-        tx.wake_at(at);
-    }
-    if let Some(at) = mega::next_ask(s).into_iter().chain(onedrive::next_ask(s)).reduce(f64::min) {
+    accounts::tick(s, now);
+    if let Some(at) = accounts::next_ask(s) {
         tx.wake_at(at);
     }
     for p in 0..2 {
@@ -931,25 +919,17 @@ fn list(s: &mut State, p: usize, fresh: bool) {
         });
         return;
     }
-    // A Dropbox account's storage, the first time one of its folders opens.
-    if let Some((server, _)) = dropbox::at(&s.panes[p].loc)
-        && !s.servers.dropbox_quotas.contains_key(&server.id)
+    // A cloud account's storage, the first time one of its folders opens.
+    if let Location::Server { server, .. } = &s.panes[p].loc
+        && accounts::quota_unasked(s, server)
     {
-        let sv = server.clone();
-        dropbox::ask_quota(s, &sv);
+        let sv = (**server).clone();
+        accounts::ask_quota(s, &sv);
     }
-    if matches!(&s.panes[p].loc, Location::Server { server, .. } if server.is_b2()) {
-        return b2::load(s, p, request, fresh);
+    if accounts::load(s, p, request, fresh) {
+        return;
     }
-    if let Location::Server { server, .. } = &s.panes[p].loc {
-        // A MEGA account's storage, the first time one of its folders opens.
-        if server.is_mega() && !s.servers.mega_quotas.contains_key(&server.id) {
-            let sv = (**server).clone();
-            mega::ask_quota(s, &sv);
-        } else if server.is_onedrive() && !s.servers.onedrive.quotas.contains_key(&server.id) {
-            let sv = (**server).clone();
-            onedrive::ask_quota(s, &sv);
-        }
+    if let Location::Server { .. } = &s.panes[p].loc {
         return servers::load(s, p, request);
     }
     let Location::Drive { email, space, path } = s.panes[p].loc.clone() else {
@@ -1730,20 +1710,7 @@ fn main() {
         std::process::exit(openexplorer_index::cli::run(&args[1..]));
     }
     let initial = settings::Settings::load();
-    openexplorer_mega::set_log(openexplorer_gdrive::log);
-    // Each MEGA account's tree, sealed, so a start reads only what changed since.
-    openexplorer_mega::set_cache_dir(Some(openexplorer_gdrive::local_dir().join("mega")));
-    openexplorer_dropbox::set_log(openexplorer_gdrive::log);
-    // Each Dropbox account's listings, sealed, so a folder opened before isn't read again.
-    openexplorer_dropbox::cache::set_dir(Some(openexplorer_gdrive::local_dir().join("dropbox")));
-    openexplorer_b2::set_log(openexplorer_gdrive::log);
-    // Each B2 key's folder listings, sealed, so a folder seen before shows at once.
-    openexplorer_b2::set_cache_dir(Some(b2::cache_dir()));
-    // Which file each large B2 upload sends, to take one that stopped up again.
-    openexplorer_b2::set_notes_file(Some(b2::notes_file()));
-    // Each OneDrive account's listings and delta position, sealed, so a start reads one page.
-    openexplorer_onedrive::set_log(openexplorer_gdrive::log);
-    openexplorer_onedrive::set_cache_dir(Some(openexplorer_gdrive::local_dir().join("onedrive")));
+    accounts::start();
     rune::App::new(AppSpec::<State> {
         min_size: Some((900.0, 420.0)),
         families: initial.font.families(),
@@ -2117,14 +2084,9 @@ fn main() {
     .args(rune_args(std::env::args().skip(1)))
     // B2 folders on screen are read again only while the window is in front.
     .on_focus(b2::window_focus)
-    // The app ends without returning from `run`: what MEGA changed since its trees were last
-    // kept is kept here, so the next start has less to catch up on.
-    .on_quit(|_, _| {
-        openexplorer_mega::save_caches();
-        openexplorer_dropbox::save_caches();
-        openexplorer_b2::save_caches();
-        openexplorer_onedrive::save_caches();
-    })
+    // The app ends without returning from `run`: what the cloud accounts changed since their
+    // trees and listings were last kept is kept here, so the next start has less to catch up on.
+    .on_quit(|_, _| accounts::save_caches())
     .run();
 }
 

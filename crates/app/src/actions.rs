@@ -11,6 +11,7 @@ use openexplorer_gdrive::{Details, Drive, DriveFile, Revision, Sharing};
 use openexplorer_i18n::{t, tr};
 use rune::{TextEdit, Tx};
 
+use crate::accounts;
 use crate::address::{self, Reached, Target};
 use crate::model::{Entry, Location, Space, shown, typed};
 use crate::transfers::{self, End, Op};
@@ -97,7 +98,7 @@ pub fn editable(loc: &Location) -> bool {
         Location::Local(dir) => !crate::network::is_server(dir),
         Location::Mock(_) | Location::Found(_) => false,
         Location::Drive { .. } => drive_folder(loc).is_some(),
-        Location::Server { find, .. } => find.is_none() && crate::mega::why_not(loc).is_none() && crate::b2::why_not(loc).is_none() && crate::onedrive::why_not(loc).is_none(),
+        Location::Server { find, .. } => find.is_none() && accounts::why_not(loc).is_none(),
     }
 }
 
@@ -107,7 +108,7 @@ pub fn editable(loc: &Location) -> bool {
 pub fn items_editable(loc: &Location) -> bool {
     match loc {
         Location::Drive { space: Space::SharedDrives | Space::Trash, .. } => false,
-        Location::Server { .. } if crate::mega::items_fixed(loc) || crate::b2::items_fixed(loc) || crate::onedrive::items_fixed(loc) => false,
+        Location::Server { .. } if accounts::items_fixed(loc) => false,
         Location::Drive { .. } | Location::Found(_) | Location::Server { .. } => true,
         _ => editable(loc),
     }
@@ -116,12 +117,12 @@ pub fn items_editable(loc: &Location) -> bool {
 /// Lixeira itself, where Restaurar and Excluir permanentemente apply (not a trashed folder's
 /// contents, which come back with it).
 pub fn in_trash(loc: &Location) -> bool {
-    matches!(loc, Location::Drive { space: Space::Trash, path, .. } if path.is_empty()) || crate::mega::bin_top(loc) || crate::onedrive::bin_top(loc)
+    matches!(loc, Location::Drive { space: Space::Trash, path, .. } if path.is_empty()) || accounts::bin_top(loc)
 }
 
 /// Why `loc` doesn't take what was asked (pasting, a new folder, cutting).
 fn why_not(loc: &Location) -> String {
-    if let Some(why) = crate::mega::why_not(loc).or_else(|| crate::b2::why_not(loc)).or_else(|| crate::onedrive::why_not(loc)) {
+    if let Some(why) = accounts::why_not(loc) {
         return why;
     }
     match loc {
@@ -1033,11 +1034,11 @@ pub fn ask_delete(s: &mut State, p: usize) {
     // The network and WSL have no Lixeira: Del deletes for good there, after asking (as
     // Explorer does). By the items' own paths, so a search's results there count too.
     let loc = &s.panes[p].loc;
-    // A MEGA account has its own Rubbish Bin; deleting inside it is for good.
-    // So do Dropbox, with its deleted files, and OneDrive; B2 hides what's deleted, and Desfazer
-    // brings it back.
-    let mega_bin = (crate::mega::at(loc).is_some() && !crate::mega::deletes_for_good(loc)) || crate::dropbox::at(loc).is_some() || crate::b2::at(loc).is_some() || crate::onedrive::at(loc).is_some();
-    if (loc.is_local() && s.settings.skip_recycle_bin) || (matches!(loc, Location::Server { .. }) && !mega_bin) || items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_remote(&path)) {
+    // A cloud account keeps what's deleted (MEGA's Rubbish Bin, deleting inside it being for
+    // good; Dropbox's deleted files; B2's hidden versions; OneDrive's recycle bin); a server
+    // doesn't.
+    let kept = accounts::keeps_deleted(loc);
+    if (loc.is_local() && s.settings.skip_recycle_bin) || (matches!(loc, Location::Server { .. }) && !kept) || items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_remote(&path)) {
         s.dialog = Some(Dialog::Purge { pane: p, items });
         return;
     }
@@ -1073,11 +1074,11 @@ pub fn delete(s: &mut State) {
                 Ok(tr!("Movido para a lixeira do Google Drive: {}.", "Moved to the Google Drive trash: {}.", count(n)))
             });
         }
-        Location::Server { server, .. } if server.is_mega() => crate::mega::trash(s, &loc, items),
-        Location::Server { server, .. } if server.is_dropbox() => crate::dropbox::delete(s, &loc, items),
-        Location::Server { server, .. } if server.is_b2() => crate::b2::hide(s, &loc, items),
-        Location::Server { server, .. } if server.is_onedrive() => crate::onedrive::trash(s, &loc, items),
-        Location::Server { .. } => crate::servers::delete(s, &loc, items, vec![loc.clone()]),
+        Location::Server { .. } => {
+            if let Err(items) = accounts::delete(s, &loc, items) {
+                crate::servers::delete(s, &loc, items, vec![loc.clone()]);
+            }
+        }
         Location::Mock(_) => return not_here(s, pane),
     }
     s.status = tr!("Excluindo {}…", "Deleting {}…", count(n));
@@ -1098,11 +1099,8 @@ fn to_the_drive_trash(n: usize) -> String {
 
 /// Restaurar: the selected items in Lixeira go back where they were.
 pub fn restore(s: &mut State, p: usize) {
-    if crate::mega::bin_top(&s.panes[p].loc) {
-        return crate::mega::restore(s, p);
-    }
-    if crate::onedrive::bin_top(&s.panes[p].loc) {
-        return crate::onedrive::restore(s, p);
+    if accounts::restore(s, p) {
+        return;
     }
     let items = selected(s, p);
     let loc = s.panes[p].loc.clone();
@@ -1136,23 +1134,11 @@ pub fn purge(s: &mut State) {
         s.status = tr!("Excluindo permanentemente {}…", "Deleting forever {}…", count(n));
         return;
     }
-    if crate::b2::at(&loc).is_some() {
-        crate::b2::purge(s, &loc, items);
-        s.status = tr!("Excluindo permanentemente {}…", "Deleting forever {}…", count(n));
-        return;
-    }
-    if crate::mega::at(&loc).is_some() {
-        crate::mega::purge(s, &loc, items);
-        s.status = tr!("Excluindo permanentemente {}…", "Deleting forever {}…", count(n));
-        return;
-    }
-    if crate::onedrive::in_bin(&loc) {
-        crate::onedrive::purge(s, &loc, items);
-        s.status = tr!("Excluindo permanentemente {}…", "Deleting forever {}…", count(n));
-        return;
-    }
     if let Location::Server { .. } = &loc {
-        crate::servers::delete(s, &loc, items, vec![loc.clone()]);
+        // A cloud account may delete for good its own way; if not, the servers' deleting does.
+        if let Err(items) = accounts::purge(s, &loc, items) {
+            crate::servers::delete(s, &loc, items, vec![loc.clone()]);
+        }
         s.status = tr!("Excluindo permanentemente {}…", "Deleting forever {}…", count(n));
         return;
     }
@@ -1170,16 +1156,8 @@ pub fn purge(s: &mut State) {
 /// Esvaziar lixeira: asks first, as it can't be undone.
 pub fn ask_empty_trash(s: &mut State, p: usize) {
     let loc = &s.panes[p].loc;
-    if crate::mega::bin_top(loc)
-        && let Some((server, _)) = crate::mega::at(loc)
-    {
-        s.dialog = Some(Dialog::EmptyTrash { email: server.id.clone() });
-        return;
-    }
-    if crate::onedrive::bin_top(loc)
-        && let Some((server, _)) = crate::onedrive::at(loc)
-    {
-        s.dialog = Some(Dialog::EmptyTrash { email: server.id.clone() });
+    if let Some(id) = accounts::bin_of(loc) {
+        s.dialog = Some(Dialog::EmptyTrash { email: id });
         return;
     }
     if let (true, Some(email)) = (in_trash(loc), account(loc)) {
@@ -1191,11 +1169,8 @@ pub fn ask_empty_trash(s: &mut State, p: usize) {
 /// trash.
 pub fn empty_trash(s: &mut State) {
     let Some(Dialog::EmptyTrash { email }) = s.dialog.take() else { return };
-    if email.starts_with("mega:") {
-        return crate::mega::empty_bin(s, &email);
-    }
-    if email.starts_with("onedrive:") {
-        return crate::onedrive::empty_bin(s, &email);
+    if accounts::empty_bin(s, &email) {
+        return;
     }
     drive_job(s, &email, account_panes(s, &email), |d| d.empty_trash().map(|_| t("Lixeira esvaziada.", "Trash emptied.").into()));
     s.status = t("Esvaziando a lixeira…", "Emptying the trash…").into();
@@ -1601,6 +1576,79 @@ mod tests {
 
     fn drive(space: Space, path: &[&str]) -> Location {
         Location::Drive { email: "a@b".into(), space, path: path.iter().map(|id| (id.to_string(), id.to_string())).collect() }
+    }
+
+    /// What each account's places allow, written down before the questions went through
+    /// `crate::accounts`: the top, an area, a folder in it, the bins, a search; and a plain
+    /// server beside them.
+    #[test]
+    fn each_accounts_places_allow_what_they_did() {
+        const WAS: &str = r#"mega [] find=false: editable=0 items=0 trash=0 why="O topo da conta MEGA só tem Drive na nuv"
+mega [] find=true: editable=0 items=0 trash=0 why="O topo da conta MEGA só tem Drive na nuv"
+mega ["Drive na nuvem"] find=false: editable=1 items=1 trash=0 why="Não dá para fazer isso aqui."
+mega ["Drive na nuvem"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa não são uma pa"
+mega ["Drive na nuvem", "x"] find=false: editable=1 items=1 trash=0 why="Não dá para fazer isso aqui."
+mega ["Drive na nuvem", "x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa não são uma pa"
+mega ["Lixeira"] find=false: editable=0 items=1 trash=1 why="A Lixeira do MEGA não recebe itens: excl"
+mega ["Lixeira"] find=true: editable=0 items=1 trash=0 why="A Lixeira do MEGA não recebe itens: excl"
+mega ["Lixeira", "x"] find=false: editable=0 items=1 trash=0 why="A Lixeira do MEGA não recebe itens: excl"
+mega ["Lixeira", "x"] find=true: editable=0 items=1 trash=0 why="A Lixeira do MEGA não recebe itens: excl"
+mega ["Compartilhados comigo"] find=false: editable=0 items=0 trash=0 why="Compartilhados comigo lista as pastas qu"
+mega ["Compartilhados comigo"] find=true: editable=0 items=0 trash=0 why="Compartilhados comigo lista as pastas qu"
+mega ["Compartilhados comigo", "x"] find=false: editable=1 items=1 trash=0 why="Não dá para fazer isso aqui."
+mega ["Compartilhados comigo", "x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa não são uma pa"
+mega ["Compartilhados comigo", "x", "y"] find=false: editable=1 items=1 trash=0 why="Não dá para fazer isso aqui."
+mega ["Compartilhados comigo", "x", "y"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa não são uma pa"
+dropbox [] find=false: editable=1 items=1 trash=0 why="Não dá para fazer isso aqui."
+dropbox [] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa não são uma pa"
+dropbox ["x"] find=false: editable=1 items=1 trash=0 why="Não dá para fazer isso aqui."
+dropbox ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa não são uma pa"
+dropbox ["x", "y"] find=false: editable=1 items=1 trash=0 why="Não dá para fazer isso aqui."
+dropbox ["x", "y"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa não são uma pa"
+b2 [] find=false: editable=0 items=0 trash=0 why="O topo da conta B2 só lista os buckets: "
+b2 [] find=true: editable=0 items=0 trash=0 why="O topo da conta B2 só lista os buckets: "
+b2 ["bucket"] find=false: editable=1 items=1 trash=0 why="Não dá para fazer isso aqui."
+b2 ["bucket"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa não são uma pa"
+b2 ["bucket", "x"] find=false: editable=1 items=1 trash=0 why="Não dá para fazer isso aqui."
+b2 ["bucket", "x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa não são uma pa"
+onedrive [] find=false: editable=0 items=0 trash=0 why="O topo da conta OneDrive só tem as pasta"
+onedrive [] find=true: editable=0 items=0 trash=0 why="O topo da conta OneDrive só tem as pasta"
+onedrive ["Meus arquivos"] find=false: editable=1 items=1 trash=0 why="Não dá para fazer isso aqui."
+onedrive ["Meus arquivos"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa não são uma pa"
+onedrive ["Meus arquivos", "x"] find=false: editable=1 items=1 trash=0 why="Não dá para fazer isso aqui."
+onedrive ["Meus arquivos", "x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa não são uma pa"
+onedrive ["Lixeira"] find=false: editable=0 items=1 trash=1 why="A Lixeira do OneDrive não recebe itens n"
+onedrive ["Lixeira"] find=true: editable=0 items=1 trash=0 why="A Lixeira do OneDrive não recebe itens n"
+onedrive ["Lixeira", "x"] find=false: editable=0 items=1 trash=0 why="A Lixeira do OneDrive não recebe itens n"
+onedrive ["Lixeira", "x"] find=true: editable=0 items=1 trash=0 why="A Lixeira do OneDrive não recebe itens n"
+sftp [] find=false: editable=1 items=1 trash=0 why="Não dá para fazer isso aqui."
+sftp [] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa não são uma pa"
+sftp ["x"] find=false: editable=1 items=1 trash=0 why="Não dá para fazer isso aqui."
+sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa não são uma pa"
+"#;
+        use openexplorer_remote::Server;
+        let servers = [
+            ("mega", Server::mega("ana@exemplo.com"), vec![vec![], vec!["Drive na nuvem"], vec!["Drive na nuvem", "x"], vec!["Lixeira"], vec!["Lixeira", "x"], vec!["Compartilhados comigo"], vec!["Compartilhados comigo", "x"], vec!["Compartilhados comigo", "x", "y"]]),
+            ("dropbox", Server::dropbox("ana@exemplo.com"), vec![vec![], vec!["x"], vec!["x", "y"]]),
+            ("b2", Server::b2("000ab12cd", "chave"), vec![vec![], vec!["bucket"], vec!["bucket", "x"]]),
+            ("onedrive", Server::onedrive("d1", "ana@exemplo.com"), vec![vec![], vec!["Meus arquivos"], vec!["Meus arquivos", "x"], vec!["Lixeira"], vec!["Lixeira", "x"]]),
+            ("sftp", Server { id: "s1".into(), protocol: openexplorer_remote::Protocol::Sftp, host: "nas".into(), port: 22, ..Server::mega("x") }, vec![vec![], vec!["x"]]),
+        ];
+        let mut table = String::new();
+        for (name, server, paths) in servers {
+            for path in paths {
+                for find in [false, true] {
+                    let path: Vec<String> = path.iter().map(|p| p.to_string()).collect();
+                    let mut loc = crate::servers::folder(&server, path.clone());
+                    if find && let Location::Server { find: f, .. } = &mut loc {
+                        *f = Some("x".into());
+                    }
+                    let why: String = why_not(&loc).chars().take(40).collect();
+                    table.push_str(&format!("{name} {path:?} find={find}: editable={} items={} trash={} why={why:?}\n", editable(&loc) as u8, items_editable(&loc) as u8, in_trash(&loc) as u8));
+                }
+            }
+        }
+        assert_eq!(table, WAS);
     }
 
     /// A search looks where the pane is: under a folder (in its shared drive when it sits in

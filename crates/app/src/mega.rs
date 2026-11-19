@@ -81,6 +81,24 @@ pub fn why_not(loc: &Location) -> Option<String> {
     }
 }
 
+/// What the Excluir question says of where the items go.
+pub fn delete_note() -> &'static str {
+    t("Os itens vão para a Lixeira do MEGA, de onde podem ser restaurados.", "The items go to the MEGA Rubbish Bin, where they can be restored.")
+}
+
+/// What the Excluir permanentemente question says in `loc`: in the Rubbish Bin, or in a folder
+/// shared with the account (deleting there is for good too).
+pub fn purge_note(loc: &Location) -> &'static str {
+    if in_bin(loc) {
+        t("Os itens serão apagados para sempre da Lixeira do MEGA. Isso não pode ser desfeito.", "The items will be deleted from the MEGA Rubbish Bin for good. This can't be undone.")
+    } else {
+        t(
+            "Itens de uma pasta compartilhada com você pertencem a quem compartilhou: serão apagados para sempre, sem passar pela Lixeira. Isso não pode ser desfeito.",
+            "Items in a folder shared with you belong to whoever shared it: they'll be deleted for good, skipping the Rubbish Bin. This can't be undone.",
+        )
+    }
+}
+
 /// Whether the items `loc` lists can be renamed, cut or deleted: not the three areas, nor the
 /// shared folders themselves.
 pub fn items_fixed(loc: &Location) -> bool {
