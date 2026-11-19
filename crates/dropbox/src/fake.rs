@@ -69,6 +69,9 @@ struct State {
     cut_download: Option<u64>,
     ranges: Vec<(String, u64)>,
     tokens: u64,
+    /// Longpolls waiting now, and the most that ever waited at once.
+    polling: usize,
+    most_polling: usize,
 }
 
 /// The stand-in, serving until dropped.
@@ -401,6 +404,11 @@ impl Fake {
         self.st().batches.iter().filter(|(r, _)| r == route).map(|(_, n)| *n).collect()
     }
 
+    /// The most longpolls that ever waited at once.
+    pub fn most_longpolls(&self) -> usize {
+        self.st().most_polling
+    }
+
     /// Calls made since `before` to `route`.
     pub fn count_since(&self, before: &usize, route: &str) -> usize {
         self.calls_since(before).iter().filter(|c| c.as_str() == route).count()
@@ -577,7 +585,9 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
             let c: Value = serde_json::from_str(&s("cursor")).unwrap_or(Value::Null);
             let (at, path, recursive) = (c[1].as_u64().unwrap_or(0) as usize, c[2].as_str().unwrap_or("").to_string(), c[3].as_bool().unwrap_or(false));
             let until = Instant::now() + Duration::from_secs(arg["timeout"].as_u64().unwrap_or(30));
-            loop {
+            st.polling += 1;
+            st.most_polling = st.most_polling.max(st.polling);
+            let answer = loop {
                 if st.log[at.min(st.log.len())..].iter().any(|(k, _)| under(k, &path, recursive)) {
                     break ok(json!({"changes": true}));
                 }
@@ -586,7 +596,9 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
                     break ok(json!({"changes": false}));
                 }
                 st = state.1.wait_timeout(st, left).unwrap().0;
-            }
+            };
+            st.polling -= 1;
+            answer
         }
         "files/get_metadata" => match st.nodes.get(&lower(s("path"))) {
             Some(n) => ok(meta(&lower(s("path")), n)),

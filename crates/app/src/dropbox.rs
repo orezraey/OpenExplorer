@@ -75,8 +75,9 @@ pub enum Answer {
     /// A login in the browser ended: the account it opened.
     Connected { result: Result<StoredAccount, String> },
     Quota { id: String, result: Result<Quota, String> },
-    /// What changed in account `id` while its longpoll waited.
-    Changes { id: String, result: Result<Changes, String> },
+    /// What changed in account `id` while its longpoll waited; `wait` is the [`Watch`]'s that
+    /// sent it.
+    Changes { id: String, wait: u64, result: Result<Changes, String> },
     /// What Copiar link found: the item's link, or `None` when it has none yet.
     Link { server: Box<Server>, path: String, item: Entry, result: Result<Option<String>, String> },
     /// A link made (`Some`) or taken away (`None`) for the item named `name`.
@@ -94,7 +95,7 @@ pub fn arrived(s: &mut State, a: Answer, tx: &mut Tx, now: f64) {
             }
             Err(e) => openexplorer_gdrive::log(&format!("cota do Dropbox {id}: {e}")),
         },
-        Answer::Changes { id, result } => changes_arrived(s, id, result, now),
+        Answer::Changes { id, wait, result } => changes_arrived(s, id, wait, result, now),
         Answer::Link { server, path, item, result } => match result {
             Ok(Some(link)) => {
                 tx.copy(link);
@@ -702,34 +703,41 @@ const WAIT: u64 = 60;
 /// After a failed wait, how long until the next one.
 const RETRY: f64 = 60.0;
 
-/// When each account shown waits for changes next, and whether a wait is out.
+/// Numbers each wait sent, so an answer is told from a newer wait's.
+static WAITS: AtomicU64 = AtomicU64::new(0);
+
+/// When each account shown waits for changes next, and whether a wait is out (`wait`, its
+/// number).
 #[derive(Default)]
 pub struct Watch {
     next: f64,
     busy: bool,
+    wait: u64,
 }
 
 /// Keeps one longpoll out for each Dropbox account a pane shows (on a thread of its own, it
-/// costs nothing while nothing changes).
+/// costs nothing while nothing changes). An account no pane shows any more keeps its entry
+/// while its wait is out: coming back to it meanwhile sends no second one.
 pub fn tick(s: &mut State, now: f64) {
     if s.servers.dropbox_watch.is_empty() && !s.panes.iter().any(|p| at(&p.loc).is_some()) {
         return;
     }
     let mut shown: Vec<Server> = s.panes.iter().filter_map(|p| at(&p.loc).map(|(sv, _)| sv.clone())).collect();
     shown.dedup_by(|a, b| a.id == b.id);
-    s.servers.dropbox_watch.retain(|id, _| shown.iter().any(|sv| sv.id == *id));
+    s.servers.dropbox_watch.retain(|id, w| w.busy || shown.iter().any(|sv| sv.id == *id));
     for server in shown {
         // Only an account already open: opening one is the listing's job.
         if dropbox::cached(&server.user).is_none() {
             continue;
         }
-        let w = s.servers.dropbox_watch.entry(server.id.clone()).or_insert(Watch { next: now, busy: false });
+        let w = s.servers.dropbox_watch.entry(server.id.clone()).or_insert(Watch { next: now, busy: false, wait: 0 });
         if w.busy || now < w.next {
             continue;
         }
         w.busy = true;
-        let id = server.id.clone();
-        task(s, &server, t("esperar mudanças no Dropbox", "wait for changes on Dropbox"), |a| a.watch(WAIT), move |result| Msg::Dropbox(Answer::Changes { id, result }));
+        w.wait = WAITS.fetch_add(1, Ordering::Relaxed) + 1;
+        let (id, wait) = (server.id.clone(), w.wait);
+        task(s, &server, t("esperar mudanças no Dropbox", "wait for changes on Dropbox"), |a| a.watch(WAIT), move |result| Msg::Dropbox(Answer::Changes { id, wait, result }));
     }
 }
 
@@ -738,8 +746,9 @@ pub fn next_ask(s: &State) -> Option<f64> {
     s.servers.dropbox_watch.values().filter(|w| !w.busy).map(|w| w.next).reduce(f64::min)
 }
 
-fn changes_arrived(s: &mut State, id: String, result: Result<Changes, String>, now: f64) {
-    let Some(w) = s.servers.dropbox_watch.get_mut(&id) else { return };
+fn changes_arrived(s: &mut State, id: String, wait: u64, result: Result<Changes, String>, now: f64) {
+    // A wait from before the account was removed and added again isn't this entry's.
+    let Some(w) = s.servers.dropbox_watch.get_mut(&id).filter(|w| w.wait == wait) else { return };
     w.busy = false;
     let changes = match result {
         Ok(c) => {
@@ -942,6 +951,52 @@ mod batches {
         assert_eq!(fake.content("/C/f000 (2).txt"), b"0");
         assert_eq!(fake.content("/C/f299 (2).txt"), b"299");
         assert!(!fake.has("/C/f285 (2).txt"));
+    }
+
+    /// Leaving an account while its longpoll waits and coming back sends no second one; the
+    /// wait's answer frees the entry, and one of an older wait changes nothing.
+    #[test]
+    fn one_longpoll_per_account_across_leaving_and_coming_back() {
+        let (fake, sv, mut s) = on_fake("vigiar");
+        fake.put_file("/W/a.txt", b"a");
+        let local = local_tree("vigiar");
+        open(&mut s, 1, folder(&sv, vec!["W".into()]));
+        tick(&mut s, 0.0);
+        let wait_for = |what: &dyn Fn() -> bool| {
+            let start = Instant::now();
+            while !what() {
+                assert!(start.elapsed() < Duration::from_secs(20));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        wait_for(&|| fake.count_since(&0, "files/list_folder/longpoll") == 1);
+        let first = s.servers.dropbox_watch[&sv.id].wait;
+        // Away, then back, while the wait is out.
+        open(&mut s, 1, Location::Local(local.clone()));
+        tick(&mut s, 1.0);
+        assert!(s.servers.dropbox_watch[&sv.id].busy, "kept while its wait is out");
+        open(&mut s, 1, folder(&sv, vec!["W".into()]));
+        tick(&mut s, 2.0);
+        assert_eq!(s.servers.dropbox_watch[&sv.id].wait, first, "no second wait sent");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!((fake.count_since(&0, "files/list_folder/longpoll"), fake.most_longpolls()), (1, 1));
+        // An answer of an older wait: ignored.
+        arrived(&mut s, Answer::Changes { id: sv.id.clone(), wait: first - 1, result: Ok(Changes::default()) }, &mut rune::Tx::default(), 3.0);
+        assert!(s.servers.dropbox_watch[&sv.id].busy);
+        // A change elsewhere ends the wait, and the next one (the frame loop ticks) goes out alone.
+        fake.put_file("/W/b.txt", b"b");
+        let start = Instant::now();
+        while s.servers.dropbox_watch[&sv.id].wait == first {
+            assert!(start.elapsed() < Duration::from_secs(20), "{:?}", fake.calls_since(&0));
+            crate::poll(&mut s, 4.0, &mut rune::Tx::default());
+            tick(&mut s, 4.0);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        wait_for(&|| fake.count_since(&0, "files/list_folder/longpoll") == 2);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(fake.count_since(&0, "files/list_folder/longpoll"), 2);
+        assert_eq!(fake.most_longpolls(), 1);
+        let _ = std::fs::remove_dir_all(local);
     }
 
     fn local_tree(tag: &str) -> PathBuf {

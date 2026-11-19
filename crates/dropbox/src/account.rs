@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -86,8 +86,13 @@ pub struct Account {
     /// When the log was last read to its end.
     caught_up: Mutex<Option<Instant>>,
     /// The cursor a longpoll is waiting on now, since when and for how long: while it's the
-    /// log's and the wait hasn't overrun, nothing changed since.
-    watching: Mutex<Option<(String, Instant, u64)>>,
+    /// log's and the wait hasn't overrun, nothing changed since. Tagged with the longpoll's
+    /// number, so only that one clears it.
+    watching: Mutex<Option<(u64, String, Instant, u64)>>,
+    /// One longpoll out at a time (see [`Account::watch`]).
+    poll_gate: Mutex<()>,
+    /// Longpolls ended so far.
+    polls: AtomicU64,
     /// Folders the log changed since the watcher last asked.
     pending: Mutex<(HashSet<String>, bool)>,
     /// Where the listings are kept between runs and what seals them; `None` keeps nothing.
@@ -165,6 +170,8 @@ impl Account {
             batch_gate: Mutex::new(()),
             caught_up: Mutex::new(None),
             watching: Mutex::new(None),
+            poll_gate: Mutex::new(()),
+            polls: AtomicU64::new(0),
             pending: Mutex::default(),
             kept,
             saved_at: Mutex::new(None),
@@ -212,7 +219,7 @@ impl Account {
         }
         let watching = self.watching.lock().unwrap_or_else(|e| e.into_inner()).clone();
         match watching {
-            Some((cursor, since, timeout)) => since.elapsed() < Duration::from_secs(timeout + 90) && Some(cursor) == self.lists().log,
+            Some((_, cursor, since, timeout)) => since.elapsed() < Duration::from_secs(timeout + 90) && Some(cursor) == self.lists().log,
             None => false,
         }
     }
@@ -541,13 +548,29 @@ impl Account {
     /// Waits up to `timeout` seconds (30 to 480) for something to change in the account, without
     /// spending any of its quota of calls (`list_folder/longpoll`), then reads the log: what
     /// changed since the last ask, by this wait or by a folder opening meanwhile.
+    ///
+    /// One longpoll per account at a time: a call made while another waits doesn't send its
+    /// own; it waits for that one to end and answers what changed by then.
     pub fn watch(&self, timeout: u64) -> Result<Changes> {
+        let ended = self.polls.load(Ordering::SeqCst);
+        let _gate = self.poll_gate.lock().unwrap_or_else(|e| e.into_inner());
+        if self.polls.load(Ordering::SeqCst) != ended {
+            let (folders, all) = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()));
+            return Ok(Changes { folders, all, backoff: None });
+        }
         self.ensure_log()?;
         let cursor = self.lists().log.clone().unwrap_or_default();
         let timeout = timeout.clamp(30, 480);
-        *self.watching.lock().unwrap_or_else(|e| e.into_inner()) = Some((cursor.clone(), Instant::now(), timeout));
+        let me = ended + 1;
+        *self.watching.lock().unwrap_or_else(|e| e.into_inner()) = Some((me, cursor.clone(), Instant::now(), timeout));
         let polled = self.api.longpoll(&cursor, timeout);
-        *self.watching.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        {
+            let mut watching = self.watching.lock().unwrap_or_else(|e| e.into_inner());
+            if watching.as_ref().is_some_and(|w| w.0 == me) {
+                *watching = None;
+            }
+        }
+        self.polls.store(me, Ordering::SeqCst);
         let polled = match polled {
             Ok(v) => v,
             Err(f) if f.is("reset") => {
@@ -819,6 +842,37 @@ mod tests {
         let changes = waiting.join().unwrap();
         assert!(changes.touches("/Docs") && !changes.touches("/Outra"), "{changes:?}");
         assert!(a.list("/Docs").unwrap().iter().any(|e| e.name == "y.txt"));
+    }
+
+    #[test]
+    fn two_watchers_at_once_share_one_longpoll_and_neither_clears_the_other() {
+        let fake = Fake::start();
+        fake.put_file("/Docs/x.txt", b"x");
+        let a = Arc::new(fake.account());
+        a.list("/Docs").unwrap();
+        let (w1, w2) = (a.clone(), a.clone());
+        let first = std::thread::spawn(move || w1.watch(30).unwrap());
+        std::thread::sleep(Duration::from_millis(200));
+        let second = std::thread::spawn(move || w2.watch(30).unwrap());
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(fake.most_longpolls(), 1);
+        // Still known current while the one longpoll waits.
+        std::thread::sleep(FRESH);
+        let before = fake.calls();
+        a.list("/Docs").unwrap();
+        assert!(fake.calls_since(&before).is_empty());
+        fake.put_file("/Docs/y.txt", b"y");
+        let (c1, c2) = (first.join().unwrap(), second.join().unwrap());
+        assert!(c1.touches("/Docs") && c2.is_empty(), "{c1:?} {c2:?}");
+        assert_eq!(fake.count_since(&0, "files/list_folder/longpoll"), 1);
+        // The next wait is a longpoll of its own again, and its state stays its own.
+        let w = a.clone();
+        let third = std::thread::spawn(move || w.watch(30).unwrap());
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(a.fresh());
+        fake.put_file("/Docs/z.txt", b"z");
+        assert!(third.join().unwrap().touches("/Docs"));
+        assert_eq!(fake.count_since(&0, "files/list_folder/longpoll"), 2);
     }
 
     #[test]
