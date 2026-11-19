@@ -605,26 +605,19 @@ impl Account {
             let a = self.api.run("b2_copy_part", &json!({"sourceFileId": v.id, "largeFileId": file_id, "partNumber": n, "range": format!("bytes={from}-{to}")}))?;
             Ok(a.get("contentSha1").and_then(Value::as_str).filter(|s| *s != "none").map(str::to_string))
         });
-        let copied = match copied {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = self.cancel_large(&file_id);
-                return Err(e);
-            }
+        // Each b2_copy_part answers with the part's contentSha1, and b2_finish_large_file joins
+        // the parts by those. One missing (B2 never leaves it out) gives the copy up rather than
+        // guessing; and a copy that fails anywhere is cancelled, as nothing can resume it (it
+        // starts over), so its parts don't stay billed.
+        let joined = match copied {
+            Ok(c) if c.iter().all(Option::is_some) => self.finish_large(&file_id, &c.into_iter().flatten().collect::<Vec<_>>()),
+            Ok(_) => Err(tr!("O B2 não deu o SHA-1 das partes copiadas de “{}”; copie baixando e enviando.", "B2 didn't give the SHA-1 of the copied parts of “{}”; copy it by downloading and uploading.", name)),
+            Err(e) => Err(e),
         };
-        // The part's checksums as B2 holds them, when the copies didn't say.
-        let sha1s: Vec<String> = if copied.iter().all(Option::is_some) {
-            copied.into_iter().flatten().collect()
-        } else {
-            let parts = self.parts(&file_id)?;
-            ranges.iter().map(|(n, ..)| parts.get(n).map(|p| p.1.clone()).filter(|s| s != "none").unwrap_or_default()).collect()
-        };
-        // Without every part's checksum B2 can't join them: the copy is given up, not guessed.
-        if sha1s.iter().any(String::is_empty) {
+        if joined.is_err() {
             let _ = self.cancel_large(&file_id);
-            return Err(tr!("O B2 não deu o SHA-1 das partes copiadas de “{}”; copie baixando e enviando.", "B2 didn't give the SHA-1 of the copied parts of “{}”; copy it by downloading and uploading.", name));
         }
-        self.finish_large(&file_id, &sha1s).map(|_| ())
+        joined.map(|_| ())
     }
 }
 

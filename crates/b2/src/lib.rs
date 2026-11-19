@@ -33,7 +33,8 @@
 //! `b2_list_file_names` gives). Deleting hides (`b2_hide_file`): the name leaves the listing and
 //! what it held stays as a hidden version until the bucket's lifecycle rules delete it (never,
 //! with B2's default "keep all versions"), so it can be brought back by deleting the hide marker
-//! (Desfazer). "Delete every version" deletes each version of the name for good. A rename
+//! (Desfazer): `b2_delete_file_version` on a name's latest version makes the most recent older
+//! one its current version again, as Backblaze's reference for that call says. "Delete every version" deletes each version of the name for good. A rename
 //! retires the old name by deleting the version just copied when it was the name's only one
 //! (nothing of its history is lost), and by hiding it otherwise.
 //!

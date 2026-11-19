@@ -104,6 +104,32 @@ fn a_kept_listing_shows_while_b2_is_asked_again_and_changes_elsewhere_come_throu
 }
 
 #[test]
+fn a_walk_reads_a_whole_tree_in_one_request() {
+    let m = mock();
+    let a = m.account();
+    a.buckets_fresh().unwrap();
+    m.reset_counts();
+    let mut got = Vec::new();
+    a.walk("/fotos", &mut |page| {
+        got.extend(page.into_iter().map(|(rel, item)| (rel, item.name, item.size)));
+        true
+    })
+    .unwrap();
+    got.sort();
+    let want = [("2024/ferias/a.jpg", "a.jpg", 3), ("2024/praia.jpg", "praia.jpg", 5), ("leia-me.txt", "leia-me.txt", 2), ("vazia/.bzEmpty", ".bzEmpty", 0)];
+    assert_eq!(got, want.map(|(r, n, s)| (r.to_string(), n.to_string(), Some(s))));
+    assert_eq!(m.lock().requests, 1);
+    let mut under = Vec::new();
+    a.walk("/fotos/2024", &mut |page| {
+        under.extend(page.into_iter().map(|(rel, _)| rel));
+        false
+    })
+    .unwrap();
+    under.sort();
+    assert_eq!(under, ["ferias/a.jpg", "praia.jpg"]);
+}
+
+#[test]
 fn a_name_between_a_file_and_its_folder_is_still_found_in_one_or_two_requests() {
     let m = mock();
     {
@@ -548,7 +574,12 @@ fn copies_stay_on_b2_and_big_ones_go_in_parts() {
     assert_eq!(v.id, id);
     a.copy_large(&v, &bucket, "enorme.iso").unwrap();
     assert_eq!(m.calls("b2_copy_part"), 3);
+    assert_eq!(m.calls("b2_list_parts"), 0, "the parts' SHA-1 come with b2_copy_part");
     assert_eq!(get(&a, "/docs/enorme.iso"), data);
+    // A copy that fails midway is cancelled: its parts don't stay unfinished, billed.
+    m.faults.copy_part_refused.store(1, Ordering::SeqCst);
+    assert!(a.copy_large(&v, &bucket, "outra.iso").is_err());
+    assert!(m.lock().large.is_empty());
 }
 
 #[test]

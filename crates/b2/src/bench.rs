@@ -218,6 +218,49 @@ fn bench_freshness() {
     println!("moving a file in the bucket                : {} requests, {:>6.1} ms", m.lock().requests, t.elapsed().as_secs_f64() * 1000.0);
 }
 
+/// Searching a bucket of 200 folders of 20 files: folder by folder, as the servers' search reads
+/// any server (one listing a folder), against one walk of every name.
+#[test]
+#[ignore]
+fn bench_search() {
+    let m = Mock::start();
+    {
+        let mut st = m.lock();
+        for f in 0..200 {
+            for i in 0..20 {
+                st.add("bkt_fotos", &format!("album {f:03}/sub/IMG_{i:04}.jpg"), b"");
+            }
+        }
+    }
+    let a = m.account();
+    a.buckets_fresh().unwrap();
+    a.api.auth().unwrap();
+    m.faults.latency_ms.store(LATENCY_MS, Ordering::SeqCst);
+    println!("\nSearching a bucket of 200 folders (each with a subfolder) of 20 files; B2 answering after {LATENCY_MS} ms\n");
+    m.reset_counts();
+    let t = Instant::now();
+    let mut todo = std::collections::VecDeque::from([String::from("/fotos")]);
+    let mut names = 0;
+    while let Some(dir) = todo.pop_front() {
+        for it in a.list(&dir).unwrap() {
+            names += 1;
+            if it.is_dir {
+                todo.push_back(format!("{dir}/{}", it.name));
+            }
+        }
+    }
+    println!("folder by folder: {names} names, {} requests, {:.0} ms", m.lock().requests, t.elapsed().as_secs_f64() * 1000.0);
+    m.reset_counts();
+    let t = Instant::now();
+    let mut files = 0;
+    a.walk("/fotos", &mut |page| {
+        files += page.len();
+        true
+    })
+    .unwrap();
+    println!("one walk:         {files} files, {} requests, {:.0} ms", m.lock().requests, t.elapsed().as_secs_f64() * 1000.0);
+}
+
 /// While a pane stays on a folder: how soon a change made elsewhere shows, and what the
 /// readings cost an hour.
 #[test]

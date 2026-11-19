@@ -89,11 +89,16 @@ fn entries(items: Vec<b2::Item>, show_hidden: bool) -> Vec<Entry> {
 /// always asked again behind it (B2 can't say what changed, and listing is free; see
 /// `openexplorer_b2::watch`): the pane changes only if B2's answer differs, so nothing blinks
 /// and the selection and the scroll stay. `_fresh` (Atualizar) changes nothing here: every
-/// opening reads. A search goes the servers' way.
+/// opening reads. A search in a bucket reads its whole tree at once ([`search`]); at the key's
+/// top it goes the servers' way.
 pub fn load(s: &mut State, p: usize, request: u64, _fresh: bool) {
-    let Location::Server { server, path, find: None } = s.panes[p].loc.clone() else {
-        return crate::servers::load(s, p, request);
-    };
+    let Location::Server { server, path, find } = s.panes[p].loc.clone() else { return };
+    if let Some(text) = find {
+        if path.is_empty() {
+            return crate::servers::load(s, p, request);
+        }
+        return search(s, p, request, server.path(&path), server.user.clone(), text);
+    }
     // The pane's next reading on the app's own comes a full turn after this one.
     s.servers.b2_watch.panes[p] = None;
     let show_hidden = s.settings.show_hidden;
@@ -121,6 +126,81 @@ pub fn load(s: &mut State, p: usize, request: u64, _fresh: bool) {
             Err(e) => emit(listed(Part::Page { first: false, more: false }, Err(e))),
         }
     });
+}
+
+/// Searches the B2 folder `dir` of key `key_id` and every folder below it for names holding all
+/// of `text`'s words: one walk of every name under it (10,000 a request), not a listing a folder
+/// as on other servers. Folders are found by the names under them. Each result's id is its path
+/// from `dir`, as the servers' search gives it; results come in pages as they're found.
+fn search(s: &mut State, p: usize, request: u64, dir: String, key_id: String, text: String) {
+    let show_hidden = s.settings.show_hidden;
+    let live = s.live[p].clone();
+    let pane = &mut s.panes[p];
+    pane.loading = true;
+    pane.error = None;
+    pane.free = None;
+    background(s, move |emit| {
+        let alive = || live.load(Ordering::Relaxed) == request;
+        let mut first = true;
+        let mut page = |entries: Vec<Entry>, more: bool| {
+            emit(Msg::Listed { pane: p, request, part: Part::Page { first, more }, result: Ok(entries), at: None });
+            first = false;
+        };
+        let result = catch_panic(t("pesquisar", "search"), || {
+            let account = b2::reach(&key_id)?;
+            let words = crate::finder::words(&text);
+            let mut pager = crate::finder::Pager::new(&mut page);
+            let mut found = Found { words, show_hidden, folders: Default::default(), buf: Vec::new() };
+            account.walk(&dir, &mut |files| {
+                found.page(files, &mut |e| pager.push(e));
+                alive() && !pager.full()
+            })?;
+            pager.flush(false);
+            Ok(())
+        });
+        if let Err(e) = result {
+            emit(Msg::Listed { pane: p, request, part: Part::Page { first, more: false }, result: Err(e), at: None });
+        }
+    });
+}
+
+/// What a search found so far: the words, and the folders already given.
+struct Found {
+    words: Vec<Vec<u8>>,
+    show_hidden: bool,
+    folders: std::collections::HashSet<String>,
+    buf: Vec<u8>,
+}
+
+impl Found {
+    /// The results among a page of files (paths below the folder searched): the folders on
+    /// their way, once each, and the files.
+    fn page(&mut self, files: Vec<(String, b2::Item)>, out: &mut dyn FnMut(Entry)) {
+        for (rel, item) in files {
+            let parts: Vec<&str> = rel.split('/').collect();
+            // A name B2 holds but no folder can show ("a//b").
+            if parts.iter().any(|c| c.is_empty()) {
+                continue;
+            }
+            let (name, above) = parts.split_last().expect("one part at least");
+            // A hidden folder hides what's in it.
+            let mut hidden = false;
+            for (i, folder) in above.iter().enumerate() {
+                hidden |= !self.show_hidden && folder.starts_with('.');
+                if hidden {
+                    break;
+                }
+                let id = parts[..=i].join("/");
+                if self.folders.insert(id.clone()) && crate::finder::matches_in(&self.words, folder, &mut self.buf) {
+                    out(Entry { id, ..entry(b2::Item { name: folder.to_string(), is_dir: true, size: None, modified: None, id: None, info: None }) });
+                }
+            }
+            let shown = !hidden && *name != b2::account::EMPTY_MARKER && (self.show_hidden || !name.starts_with('.'));
+            if shown && crate::finder::matches_in(&self.words, name, &mut self.buf) {
+                out(Entry { id: rel.clone(), ..entry(item) });
+            }
+        }
+    }
 }
 
 /// B2 listed the folder just as the pane shows it: it only stops loading.
@@ -897,6 +977,29 @@ mod tests {
 
     fn shown(s: &State, p: usize) -> Vec<String> {
         s.panes[p].entries.iter().map(|e| e.name.clone()).collect()
+    }
+
+    /// A search finds files and the folders on their way (once each, by name), not the empty
+    /// folders' markers, nor what hidden folders hold unless hidden items show.
+    #[test]
+    fn a_search_finds_files_and_the_folders_on_their_way() {
+        let files = || {
+            ["fotos 2024/praia.jpg", "fotos 2024/praia (2).jpg", "fotos 2024/vazia/.bzEmpty", "outra/praia/x.txt", ".oculta/praia.jpg", "a//praia.jpg"].map(|r| (r.to_string(), item(r.rsplit('/').next().unwrap())))
+        };
+        let run = |text: &str, show_hidden: bool| {
+            let mut found = Found { words: crate::finder::words(text), show_hidden, folders: Default::default(), buf: Vec::new() };
+            let mut got = Vec::new();
+            // Two pages: a folder met again in the second isn't given twice.
+            found.page(files().to_vec(), &mut |e| got.push((e.id, e.is_dir)));
+            found.page(files()[..2].to_vec(), &mut |e| got.push((e.id, e.is_dir)));
+            got
+        };
+        let got = run("praia", false);
+        assert_eq!(got, [("fotos 2024/praia.jpg".to_string(), false), ("fotos 2024/praia (2).jpg".into(), false), ("outra/praia".into(), true), ("fotos 2024/praia.jpg".into(), false), ("fotos 2024/praia (2).jpg".into(), false)]);
+        assert_eq!(run("2024", false), [("fotos 2024".to_string(), true)]);
+        assert!(run("bzempty", true).is_empty());
+        assert!(run("praia", true).contains(&(".oculta/praia.jpg".to_string(), false)));
+        assert!(run("vazia", false).contains(&("fotos 2024/vazia".to_string(), true)));
     }
 
     /// A reading on the app's own that found a change replaces the list in place, the selection

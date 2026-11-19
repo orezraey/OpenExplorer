@@ -507,6 +507,51 @@ impl Account {
         }
     }
 
+    /// Every file under the folder at `path`, at any depth, page by page: 10,000 names a request,
+    /// folders not folded (a search reads a whole tree this way in a request or a few, where
+    /// folder by folder took one a folder). Each comes as its path below the folder and its
+    /// item; `page` returns `false` to stop.
+    pub fn walk(&self, path: &str, page: &mut dyn FnMut(Vec<(String, Item)>) -> bool) -> Result<()> {
+        let s = Spot::of(path).ok_or_else(|| t("Pesquise dentro de um bucket.", "Search inside a bucket.").to_string())?;
+        let bucket = self.bucket(&s.bucket)?;
+        let prefix = s.prefix();
+        let auth = self.api.auth()?;
+        // A key limited to a prefix lists within it, wherever above it the search starts.
+        let list_prefix = match (within(auth.allowed.name_prefix.as_deref(), &prefix), auth.allowed.name_prefix.as_deref()) {
+            (Within::Inside, _) => prefix.clone(),
+            (Within::Outside, _) => return Err(t("Esta chave de aplicação só alcança outra pasta deste bucket.", "This application key only reaches another folder of this bucket.").into()),
+            (_, np) => np.unwrap_or_default().to_string(),
+        };
+        let mut start: Option<String> = None;
+        loop {
+            let mut body = json!({"bucketId": bucket.id, "prefix": list_prefix, "maxFileCount": PAGE});
+            if let Some(s) = &start {
+                body["startFileName"] = s.clone().into();
+            }
+            let v = self.api.run("b2_list_file_names", &body)?;
+            let items = v
+                .get("files")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Version::of)
+                .filter(|v| v.action == "upload")
+                .filter_map(|v| {
+                    let rel = v.name.strip_prefix(&prefix).filter(|r| !r.is_empty())?.to_string();
+                    let item = v.item(rel.rsplit('/').next().unwrap_or(&rel));
+                    Some((rel, item))
+                })
+                .collect();
+            if !page(items) {
+                return Ok(());
+            }
+            match v.get("nextFileName").and_then(Value::as_str) {
+                Some(n) => start = Some(n.to_string()),
+                None => return Ok(()),
+            }
+        }
+    }
+
     /// Every current file under `prefix` (no folder levels), as versions.
     pub(crate) fn files_under(&self, bucket: &Bucket, prefix: &str) -> Result<Vec<Version>> {
         let mut out = Vec::new();

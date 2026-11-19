@@ -136,6 +136,8 @@ pub struct Faults {
     pub too_many: AtomicUsize,
     /// The next API calls answer 403 `transaction_cap_exceeded`.
     pub capped: AtomicUsize,
+    /// The next `b2_copy_part` calls answer 400.
+    pub copy_part_refused: AtomicUsize,
     /// The next uploads (files and parts) answer 503.
     pub upload_busy: AtomicUsize,
     /// The next download sends only this many bytes, then closes.
@@ -397,6 +399,10 @@ fn serve(conn: TcpStream, state: &Mutex<State>, faults: &Faults, url: &str) -> s
         let (s, v) = error(429, "too_many_requests", "");
         let wait = state.lock().unwrap().retry_after;
         return respond(&mut conn, s, &[("Content-Type", "application/json".into()), ("Retry-After", wait.to_string())], v.to_string().as_bytes());
+    }
+    if call == "b2_copy_part" && take(&faults.copy_part_refused) {
+        let (s, v) = error(400, "bad_request", "range out of the file");
+        return json_reply(&mut conn, s, &v);
     }
     if take(&faults.capped) {
         let (s, v) = error(403, "transaction_cap_exceeded", "Transaction cap exceeded");
