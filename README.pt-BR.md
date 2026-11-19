@@ -14,7 +14,8 @@ integrados. Escrito em Rust.
   pastas compartilhadas com você e links públicos de arquivos. Tudo cifrado e decifrado no seu
   computador; as pastas abertas se atualizam quando algo muda em outro lugar.
 * OneDrive: contas pessoais, corporativas ou de estudante, links de compartilhamento, lixeira com
-  desfazer (pessoais). As pastas abertas se atualizam quando algo muda em outro lugar.
+  desfazer (e, nas corporativas, a Lixeira pelo SharePoint). As pastas abertas se atualizam
+  quando algo muda em outro lugar.
 * SFTP, FTP/FTPS, WebDAV, Nextcloud e ownCloud.
 * Copiar e mover entre qualquer um deles, com fila de transferências.
 * Pesquisa instantânea por nome nos discos NTFS locais, parecida com o Everything. Também dá para
@@ -64,13 +65,20 @@ aplicativo seu (gratuito, sem segredo):
 2. Autenticação: adicione a plataforma "Aplicativos móveis e da área de trabalho" com o URI de
    redirecionamento `http://localhost`, e ligue "Permitir fluxos de clientes públicos".
 3. Permissões de API: Microsoft Graph, delegadas, `Files.ReadWrite.All`, `offline_access` e
-   `User.Read`.
+   `User.Read`. Para a lixeira de contas corporativas ou de estudante, também SharePoint,
+   delegada, `AllSites.Write` (veja abaixo).
 4. No Open Explorer, vá em Adicionar conta → OneDrive e cole o ID do aplicativo (cliente) (ele
    fica em `%APPDATA%\OpenExplorer\onedrive-client.json`; `OPENEXPLORER_ONEDRIVE_CLIENT_ID`
    também serve).
 
-A Microsoft não deixa aplicativos listarem nem restaurarem a lixeira do OneDrive em contas
-corporativas ou de estudante: nelas, itens excluídos são restaurados pelo site.
+O Microsoft Graph não lista a lixeira de uma conta corporativa ou de estudante nem restaura dela,
+então o Open Explorer a lê pela API REST do SharePoint, que precisa daquela permissão do
+SharePoint. Com ela no registro, abra a Lixeira da conta e clique em Autorizar no navegador (ou
+peça a um administrador que conceda o consentimento para a organização); daí em diante a Lixeira
+lista o que foi excluído, de onde e quando, com Restaurar, Excluir permanentemente e Esvaziar
+lixeira, e Desfazer traz de volta o que o Open Explorer excluiu. Sem ela a conta funciona como
+antes, sem a Lixeira. Contas pessoais não têm Lixeira (o Graph não lista a delas); Desfazer
+restaura o que foi excluído.
 
 ## Compilar
 

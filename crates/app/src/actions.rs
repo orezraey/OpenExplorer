@@ -113,7 +113,7 @@ pub fn items_editable(loc: &Location) -> bool {
 /// Lixeira itself, where Restaurar and Excluir permanentemente apply (not a trashed folder's
 /// contents, which come back with it).
 pub fn in_trash(loc: &Location) -> bool {
-    matches!(loc, Location::Drive { space: Space::Trash, path, .. } if path.is_empty()) || crate::mega::bin_top(loc)
+    matches!(loc, Location::Drive { space: Space::Trash, path, .. } if path.is_empty()) || crate::mega::bin_top(loc) || crate::onedrive::bin_top(loc)
 }
 
 /// Why `loc` doesn't take what was asked (pasting, a new folder, cutting).
@@ -1098,6 +1098,9 @@ pub fn restore(s: &mut State, p: usize) {
     if crate::mega::bin_top(&s.panes[p].loc) {
         return crate::mega::restore(s, p);
     }
+    if crate::onedrive::bin_top(&s.panes[p].loc) {
+        return crate::onedrive::restore(s, p);
+    }
     let items = selected(s, p);
     let loc = s.panes[p].loc.clone();
     let (false, true, Some(email)) = (items.is_empty(), in_trash(&loc), account(&loc)) else { return };
@@ -1140,6 +1143,11 @@ pub fn purge(s: &mut State) {
         s.status = tr!("Excluindo permanentemente {}…", "Deleting forever {}…", count(n));
         return;
     }
+    if crate::onedrive::in_bin(&loc) {
+        crate::onedrive::purge(s, &loc, items);
+        s.status = tr!("Excluindo permanentemente {}…", "Deleting forever {}…", count(n));
+        return;
+    }
     if let Location::Server { .. } = &loc {
         crate::servers::delete(s, &loc, items, vec![loc.clone()]);
         s.status = tr!("Excluindo permanentemente {}…", "Deleting forever {}…", count(n));
@@ -1165,6 +1173,12 @@ pub fn ask_empty_trash(s: &mut State, p: usize) {
         s.dialog = Some(Dialog::EmptyTrash { email: server.id.clone() });
         return;
     }
+    if crate::onedrive::bin_top(loc)
+        && let Some((server, _)) = crate::onedrive::at(loc)
+    {
+        s.dialog = Some(Dialog::EmptyTrash { email: server.id.clone() });
+        return;
+    }
     if let (true, Some(email)) = (in_trash(loc), account(loc)) {
         s.dialog = Some(Dialog::EmptyTrash { email: email.to_string() });
     }
@@ -1176,6 +1190,9 @@ pub fn empty_trash(s: &mut State) {
     let Some(Dialog::EmptyTrash { email }) = s.dialog.take() else { return };
     if email.starts_with("mega:") {
         return crate::mega::empty_bin(s, &email);
+    }
+    if email.starts_with("onedrive:") {
+        return crate::onedrive::empty_bin(s, &email);
     }
     drive_job(s, &email, account_panes(s, &email), |d| d.empty_trash().map(|_| t("Lixeira esvaziada.", "Trash emptied.").into()));
     s.status = t("Esvaziando a lixeira…", "Emptying the trash…").into();
@@ -1686,6 +1703,27 @@ mod tests {
         assert!(!editable(&at(&[])) && !editable(&at(&["Compartilhados comigo"])) && !editable(&at(&["Lixeira"])));
         assert!(!items_editable(&at(&[])) && items_editable(&at(&["Drive na nuvem"])));
         assert!(why_not(&at(&["Lixeira"])).contains("Lixeira do MEGA"));
+    }
+
+    /// A work OneDrive account's Lixeira: Del asks before deleting for good, Esvaziar goes to
+    /// the account, and nothing is put in it.
+    #[test]
+    fn a_onedrive_lixeira_is_a_trash() {
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        let sv = openexplorer_remote::Server::onedrive("b!x", "ana@contoso.com");
+        let at = |path: &[&str]| crate::servers::folder(&sv, path.iter().map(|p| p.to_string()).collect());
+        assert!(in_trash(&at(&["Lixeira"])) && !in_trash(&at(&["Lixeira", "Velha"])) && !in_trash(&at(&["Meus arquivos"])));
+        assert!(!editable(&at(&["Lixeira"])) && editable(&at(&["Meus arquivos"])));
+        s.panes[1].go(at(&["Lixeira"]));
+        let e = Entry { id: "a.txt".into(), name: "a.txt".into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        s.panes[1].set_entries(Ok(vec![e]));
+        s.panes[1].selected = ["a.txt".to_string()].into();
+        ask_delete(&mut s, 1);
+        assert!(matches!(&s.dialog, Some(Dialog::Purge { pane: 1, .. })));
+        s.dialog = None;
+        ask_empty_trash(&mut s, 1);
+        assert!(matches!(&s.dialog, Some(Dialog::EmptyTrash { email }) if email == "onedrive:b!x"));
     }
 
     #[test]

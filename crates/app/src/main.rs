@@ -2028,6 +2028,10 @@ fn main() {
                 s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
                 s.active = 1;
             }),
+            // A work OneDrive account's Lixeira, with where each item came from, without a network.
+            ("onedrive-bin", |s| onedrive::scene_bin(s, true)),
+            // The same Lixeira before SharePoint's permission is granted.
+            ("onedrive-bin-consent", |s| onedrive::scene_bin(s, false)),
             // Adding a OneDrive account before an app registration is set up.
             ("onedrive-add", |s| {
                 let mut f = servers::Form::for_provider(servers::Provider::OneDrive);
