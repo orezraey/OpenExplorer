@@ -81,3 +81,49 @@ fn bench() {
         }
     }
 }
+
+/// What one Excluir costs on a work account whose recycle bin holds `n` older items: Graph's
+/// delete, then the bin read for the new item's Desfazer. SharePoint here takes no `$filter`
+/// and pages its answers 500 items at a time.
+/// Run with `cargo test -p openexplorer-onedrive --lib bench_bin -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn bench_bin() {
+    println!("lixeira | pedidos ao SharePoint | pedidos | bytes | ms");
+    for n in [100, 1_000, 10_000] {
+        let fake = Fake::start();
+        fake.with(|st| {
+            st.business = true;
+            st.sp_granted = true;
+            st.sp_no_filter = true;
+            st.sp_page = 500;
+            let docs = st.add(ROOT, "Docs", true, &[]);
+            for i in 0..n {
+                let id = st.add(&docs, &format!("velho {i}.txt"), false, b"v");
+                st.touch(&id, |it| it.deleted = true);
+                st.put_in_bin(&id, "2024-05-06T07:08:09Z");
+            }
+            for i in 0..RUNS + 2 {
+                st.add(&docs, &format!("novo {i}.txt"), false, b"n");
+            }
+        });
+        let a = on(fake.ends(), Kind::Business, None).unwrap();
+        a.list("/Meus arquivos/Docs").unwrap();
+        let mut k = 0;
+        let delete = |k: usize| {
+            let (gone, err) = a.trash_many(&[format!("/Meus arquivos/Docs/novo {k}.txt")]);
+            assert!(err.is_none() && a.can_restore(&gone[0].0), "{err:?} {gone:?}");
+        };
+        // The first delete also asks for the site once.
+        delete(k);
+        k += 1;
+        let sp0 = fake.with(|st| st.sp_requests);
+        let (req, bytes, ms) = measure(&fake, || {
+            delete(k);
+            k += 1;
+        });
+        // `measure` warms up once more: RUNS + 1 deletes since sp0.
+        let sp = (fake.with(|st| st.sp_requests) - sp0) / (RUNS + 1);
+        println!("{n} | {sp} | {req} | {bytes} | {ms:.2}");
+    }
+}

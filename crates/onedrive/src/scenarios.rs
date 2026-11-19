@@ -171,6 +171,75 @@ fn personal_accounts_undo_and_redo_several_deletes() {
     assert_eq!(fake.with(|st| st.sp_requests), 0);
 }
 
+/// 25 files in Docs besides a.txt and b.txt, their paths, and Docs listed.
+fn many(fake: &Fake, a: &Account, docs: &str) -> Vec<String> {
+    let paths = fake.with(|st| {
+        (0..25)
+            .map(|i| {
+                st.add(docs, &format!("f{i:02}.txt"), false, b"f");
+                format!("/Meus arquivos/Docs/f{i:02}.txt")
+            })
+            .collect::<Vec<_>>()
+    });
+    a.catch_up().unwrap();
+    assert_eq!(names(a, "/Meus arquivos/Docs").len(), 27);
+    paths
+}
+
+/// What's left of f00…f24 in Docs, as the account has it and as Graph does.
+fn left(fake: &Fake, a: &Account) -> (Vec<String>, Vec<String>) {
+    let mut graph: Vec<String> = fake.with(|st| st.items.values().filter(|i| !i.deleted && i.name.starts_with('f')).map(|i| i.name.clone()).collect());
+    graph.sort();
+    (names(a, "/Meus arquivos/Docs").into_iter().filter(|n| n.starts_with('f')).collect(), graph)
+}
+
+#[test]
+fn a_batch_cut_midway_keeps_what_its_first_part_deleted() {
+    for kind in [Kind::Personal, Kind::Business] {
+        let (fake, a, docs, _) = setup(kind);
+        fake.with(|st| {
+            st.business = kind == Kind::Business;
+            st.sp_granted = true;
+        });
+        let paths = many(&fake, &a, &docs);
+        // The second $batch (items 21 to 25) gets no answer.
+        fake.with(|st| st.drop_batch = Some(1));
+        let (gone, err) = a.trash_many(&paths);
+        assert_eq!(gone.len(), 20, "{kind:?}");
+        assert!(err.unwrap().contains("Não consegui falar com o OneDrive"));
+        let rest: Vec<String> = (20..25).map(|i| format!("f{i:02}.txt")).collect();
+        // Out of the kept tree at once, without waiting for the delta feed.
+        assert_eq!(names(&a, "/Meus arquivos/Docs").into_iter().filter(|n| n.starts_with('f')).collect::<Vec<_>>(), rest);
+        assert_eq!(left(&fake, &a), (rest.clone(), rest.clone()));
+        // Each of the 20 can be undone.
+        let ids: Vec<String> = gone.iter().map(|(id, _)| id.clone()).collect();
+        assert!(ids.iter().all(|id| a.can_restore(id)), "{kind:?}");
+        // Undone. On a personal account the 20 restores go in one $batch and the reading of
+        // where they came back to, cut, in another: they're back all the same, and the delta
+        // feed brings them to the tree.
+        fake.with(|st| st.drop_batch = Some(1));
+        let (back, err) = a.restore_many(&ids);
+        assert_eq!((back.len(), err), (20, None), "{kind:?}");
+        a.catch_up().unwrap();
+        assert_eq!(left(&fake, &a).0.len(), 25);
+    }
+}
+
+#[test]
+fn restores_cut_midway_say_which_came_back() {
+    let (fake, a, docs, _) = setup(Kind::Personal);
+    let paths = many(&fake, &a, &docs);
+    let (gone, err) = a.trash_many(&paths);
+    assert_eq!((gone.len(), err), (25, None));
+    let ids: Vec<String> = gone.iter().map(|(id, _)| id.clone()).collect();
+    fake.with(|st| st.drop_batch = Some(1));
+    let (back, err) = a.restore_many(&ids);
+    assert_eq!(back, ids[..20]);
+    assert!(err.unwrap().contains("Não consegui falar com o OneDrive"));
+    let first: Vec<String> = (0..20).map(|i| format!("f{i:02}.txt")).collect();
+    assert_eq!(left(&fake, &a), (first.clone(), first));
+}
+
 /// A work account with SharePoint's permission granted, Docs (a.txt, b.txt) and Fotos.
 fn setup_work() -> (Fake, Account, String) {
     let fake = Fake::start();
@@ -367,7 +436,7 @@ fn a_sharepoint_permission_that_isnt_enough_asks_for_the_right_one() {
 }
 
 #[test]
-fn a_filter_answered_with_any_error_reads_the_whole_bin() {
+fn a_filter_answered_with_any_error_reads_the_newest_first() {
     let (fake, a, _) = setup_work();
     fake.with(|st| st.sp_filter_status = 500);
     let (gone, _) = a.trash_many(&["/Meus arquivos/Docs/a.txt".into()]);
@@ -400,6 +469,84 @@ fn sharepoint_asking_for_a_digest_refusing_the_site_bin_paging_and_no_filter() {
     let (back, err) = a.bin_restore(&["b.txt".into()]);
     assert_eq!((back.len(), err), (1, None));
     assert_eq!(names(&a, "/Meus arquivos/Docs"), ["a.txt", "b.txt"]);
+}
+
+/// `n` items deleted long ago in Docs' recycle bin, and files `novo 0.txt`… to delete.
+fn old_bin(fake: &Fake, docs: &str, n: usize, new: usize) {
+    fake.with(|st| {
+        for i in 0..n {
+            let id = st.add(docs, &format!("velho {i}.txt"), false, b"v");
+            st.touch(&id, |it| it.deleted = true);
+            st.put_in_bin(&id, "2024-05-06T07:08:09Z");
+        }
+        for i in 0..new {
+            st.add(docs, &format!("novo {i}.txt"), false, b"n");
+        }
+    });
+}
+
+/// Deletes `novo {k}.txt`: whether Desfazer can bring it back, and the SharePoint requests.
+fn delete_new(fake: &Fake, a: &Account, k: usize) -> (bool, usize) {
+    let before = fake.with(|st| st.sp_requests);
+    let (gone, err) = a.trash_many(&[format!("/Meus arquivos/Docs/novo {k}.txt")]);
+    assert_eq!((gone.len(), err), (1, None));
+    (a.can_restore(&gone[0].0), fake.with(|st| st.sp_requests) - before)
+}
+
+#[test]
+fn without_a_filter_a_delete_reads_only_the_newest_of_the_bin() {
+    let (fake, a, docs) = setup_work();
+    old_bin(&fake, &docs, 300, 3);
+    fake.with(|st| {
+        st.sp_no_filter = true;
+        st.sp_page = 50;
+    });
+    a.list("/Meus arquivos/Docs").unwrap();
+    // The first delete asks for the site and finds the filter refused, once.
+    assert!(delete_new(&fake, &a, 0).0);
+    // From then on one request, not the 300 items in 6 pages.
+    assert_eq!(delete_new(&fake, &a, 1), (true, 1));
+    // Twins: Desfazer takes the one it deleted.
+    fake.with(|st| st.add(&docs, "novo 1.txt", false, b"outro"));
+    a.catch_up().unwrap();
+    let (second, _) = a.trash_many(&["/Meus arquivos/Docs/novo 1.txt".into()]);
+    a.restore(&second[0].0).unwrap();
+    let mut out = Vec::new();
+    a.download("/Meus arquivos/Docs/novo 1.txt", &mut out, &mut |_| true).unwrap();
+    assert_eq!(out, b"outro");
+}
+
+#[test]
+fn a_bin_that_takes_no_order_is_read_whole_and_that_is_remembered() {
+    // Refused.
+    let (fake, a, docs) = setup_work();
+    old_bin(&fake, &docs, 30, 3);
+    fake.with(|st| {
+        st.sp_no_filter = true;
+        st.sp_no_orderby = true;
+        st.sp_page = 10;
+    });
+    assert!(delete_new(&fake, &a, 0).0);
+    assert_eq!(delete_new(&fake, &a, 1), (true, 4), "the whole bin, without asking what it refused again");
+    // Taken but not followed (oldest first), the bin smaller than `$top`: seen as not sorted.
+    let (fake, a, docs) = setup_work();
+    old_bin(&fake, &docs, 5, 3);
+    fake.with(|st| {
+        st.sp_no_filter = true;
+        st.sp_ignore_orderby = true;
+    });
+    assert!(delete_new(&fake, &a, 0).0);
+    assert_eq!(delete_new(&fake, &a, 1), (true, 1));
+    // Taken but not followed, the bin bigger than `$top`: the oldest look sorted and the new item
+    // isn't among them; the whole bin finds it, and is read from then on.
+    let (fake, a, docs) = setup_work();
+    old_bin(&fake, &docs, 100, 3);
+    fake.with(|st| {
+        st.sp_no_filter = true;
+        st.sp_ignore_orderby = true;
+    });
+    assert!(delete_new(&fake, &a, 0).0);
+    assert_eq!(delete_new(&fake, &a, 1), (true, 1));
 }
 
 #[test]
@@ -465,6 +612,33 @@ fn uploads_go_whole_or_in_session_parts_that_resume() {
     let err = a.upload("/Meus arquivos/Docs/c.bin", &mut &big[..], big.len() as u64, &mut |n| n < 1_000_000).unwrap_err();
     assert_eq!(err, crate::CANCELLED);
     assert!(fake.with(|st| !st.items.values().any(|i| i.name == "c.bin")));
+}
+
+#[test]
+fn a_small_upload_reports_progress_and_cancelling_it_makes_no_file() {
+    let (fake, a, _, _) = setup(Kind::Personal);
+    let body = data(1_000_000);
+    let len = body.len() as u64;
+    // Progress as the bytes go, never back, also when the request is sent again (throttled; the
+    // folder just listed, so the PUT is the request throttled).
+    names(&a, "/Meus arquivos/Docs");
+    fake.with(|st| st.throttle = 1);
+    let mut seen = Vec::new();
+    a.upload("/Meus arquivos/Docs/s.bin", &mut &body[..], len, &mut |n| {
+        seen.push(n);
+        true
+    })
+    .unwrap();
+    assert!(seen.len() > 1 && seen.is_sorted() && *seen.last().unwrap() == len, "{seen:?}");
+    assert!(seen.iter().filter(|n| **n == len).count() > 1, "the body went twice");
+    assert!(fake.with(|st| st.items.values().any(|i| i.name == "s.bin" && i.data == body)));
+    // Cancelled at the start, or at the very last bytes: the file is never made.
+    for (name, stop_at) in [("c1.bin", 100_000), ("c2.bin", len)] {
+        let err = a.upload(&format!("/Meus arquivos/Docs/{name}"), &mut &body[..], len, &mut |n| n < stop_at).unwrap_err();
+        assert_eq!(err, crate::CANCELLED);
+        assert!(fake.with(|st| !st.items.values().any(|i| i.name == name)), "{name}");
+        assert!(a.stat(&format!("/Meus arquivos/Docs/{name}")).unwrap().is_none());
+    }
 }
 
 #[test]

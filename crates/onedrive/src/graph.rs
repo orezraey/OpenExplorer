@@ -365,6 +365,19 @@ impl Graph {
     /// [`Graph::send`] to the whole address `url` of another resource, with a token for `scope`
     /// (see [`Graph::token_for`]); `None` is Graph.
     pub fn send_as(&self, scope: Option<&str>, method: &str, url: &str, body: Body<'_>, headers: &[(&str, &str)]) -> Res<Reply> {
+        self.run(scope, method, url, body, headers, None)
+    }
+
+    /// [`Graph::send`] of `data`, telling `progress` how many bytes went as they go (the most so
+    /// far, when the request is sent again), and stopping when it answers `false`: then the
+    /// body is cut short, so the request is never done, and the error is [`crate::CANCELLED`].
+    /// Once all of the body went, the answer is waited for whatever `progress` says.
+    pub fn send_counted(&self, method: &str, path: &str, data: &[u8], kind: &str, progress: &mut dyn FnMut(u64) -> bool) -> Res<Reply> {
+        self.run(None, method, &self.url(path), Body::Raw(data, kind), &[], Some(progress))
+    }
+
+    fn run(&self, scope: Option<&str>, method: &str, url: &str, body: Body<'_>, headers: &[(&str, &str)], mut progress: Option<&mut dyn FnMut(u64) -> bool>) -> Res<Reply> {
+        let mut high = 0u64;
         let bytes: Option<(std::borrow::Cow<'_, [u8]>, &str)> = match body {
             Body::None => None,
             Body::Json(v) => Some((serde_json::to_vec(v).expect("JSON values serialize").into(), "application/json")),
@@ -383,11 +396,26 @@ impl Graph {
             for (k, v) in headers {
                 req = req.header(*k, *v);
             }
-            let resp = match &bytes {
-                Some((b, kind)) => self.agent.run(req.header("Content-Type", *kind).body(&b[..]).map_err(|e| Fail::new(e.to_string()))?),
-                None if method == "GET" || method == "DELETE" => self.agent.run(req.body(()).map_err(|e| Fail::new(e.to_string()))?),
-                None => self.agent.run(req.body(Vec::new()).map_err(|e| Fail::new(e.to_string()))?),
+            let mut stopped = false;
+            let resp = match (&bytes, progress.as_mut()) {
+                (Some((b, kind)), Some(p)) => {
+                    let mut report = |n: u64| {
+                        high = high.max(n);
+                        p(high)
+                    };
+                    let mut counted = Counted { data: b, at: 0, base: 0, progress: &mut report, stopped: false };
+                    let req = req.header("Content-Type", *kind).header("Content-Length", b.len().to_string()).body(ureq::SendBody::from_reader(&mut counted)).map_err(|e| Fail::new(e.to_string()))?;
+                    let r = self.agent.run(req);
+                    stopped = counted.stopped;
+                    r
+                }
+                (Some((b, kind)), None) => self.agent.run(req.header("Content-Type", *kind).body(&b[..]).map_err(|e| Fail::new(e.to_string()))?),
+                (None, _) if method == "GET" || method == "DELETE" => self.agent.run(req.body(()).map_err(|e| Fail::new(e.to_string()))?),
+                (None, _) => self.agent.run(req.body(Vec::new()).map_err(|e| Fail::new(e.to_string()))?),
             };
+            if stopped {
+                return Err(Fail::new(crate::CANCELLED));
+            }
             let mut resp = match resp {
                 Ok(r) => r,
                 Err(e) if method == "GET" && attempt + 1 < TRIES => {
@@ -429,11 +457,13 @@ impl Graph {
         self.call("GET", path, None, what)
     }
 
-    /// Several small requests in one (`$batch`, 20 at most each): the answers in the order
-    /// asked, each `(status, body)`. Those throttled are asked again after the longest
-    /// `Retry-After` among them.
-    pub fn batch(&self, subs: &[Sub], what: &str) -> Res<Vec<(u16, Value)>> {
-        let mut out: Vec<Option<(u16, Value)>> = vec![None; subs.len()];
+    /// Several small requests in one (`$batch`, 20 at most each): each one's answer, in the
+    /// order asked, as `(status, body)`. Those throttled are asked again after the longest
+    /// `Retry-After` among them. A `$batch` that fails (no answer, say) fails its requests, and
+    /// those not sent yet, with its error, and nothing more is sent (a request that got no answer
+    /// may have been done, so it isn't sent again); what earlier ones answered stays.
+    pub fn batch(&self, subs: &[Sub], what: &str) -> Vec<Res<(u16, Value)>> {
+        let mut out: Vec<Option<Res<(u16, Value)>>> = vec![None; subs.len()];
         let mut todo: Vec<usize> = (0..subs.len()).collect();
         for round in 0..TRIES {
             if todo.is_empty() {
@@ -441,7 +471,9 @@ impl Graph {
             }
             let mut again = Vec::new();
             let mut wait = 0;
-            for chunk in todo.chunks(20) {
+            let mut chunks = todo.chunks(20);
+            let mut failed = None;
+            for chunk in chunks.by_ref() {
                 let requests: Vec<Value> = chunk
                     .iter()
                     .map(|&i| {
@@ -454,9 +486,18 @@ impl Graph {
                         r
                     })
                     .collect();
-                let answer = self.call("POST", "/$batch", Some(&json!({ "requests": requests })), what)?;
+                let answer = match self.call("POST", "/$batch", Some(&json!({ "requests": requests })), what) {
+                    Ok(a) => a,
+                    Err(f) => {
+                        for &i in chunk {
+                            out[i] = Some(Err(f.clone()));
+                        }
+                        failed = Some(f);
+                        break;
+                    }
+                };
                 for r in answer.get("responses").and_then(Value::as_array).into_iter().flatten() {
-                    let Some(i) = r.get("id").and_then(Value::as_str).and_then(|s| s.parse::<usize>().ok()).filter(|i| *i < subs.len()) else { continue };
+                    let Some(i) = r.get("id").and_then(Value::as_str).and_then(|s| s.parse::<usize>().ok()).filter(|i| chunk.contains(i)) else { continue };
                     let status = r.get("status").and_then(Value::as_u64).unwrap_or(0) as u16;
                     if matches!(status, 429 | 503) && round + 1 < TRIES {
                         let secs = r.pointer("/headers/Retry-After").or_else(|| r.pointer("/headers/retry-after")).and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or(v.as_u64())).unwrap_or(1 << round.min(5));
@@ -464,15 +505,45 @@ impl Graph {
                         again.push(i);
                         continue;
                     }
-                    out[i] = Some((status, r.get("body").cloned().unwrap_or(Value::Null)));
+                    out[i] = Some(Ok((status, r.get("body").cloned().unwrap_or(Value::Null))));
                 }
+            }
+            if let Some(f) = failed {
+                // Neither those not sent yet nor those waiting to be asked again go.
+                for i in chunks.flatten().chain(&again) {
+                    out[*i] = Some(Err(f.clone()));
+                }
+                break;
             }
             if wait > 0 {
                 self.throttled(wait);
             }
             todo = again;
         }
-        Ok(out.into_iter().map(|o| o.unwrap_or((0, Value::Null))).collect())
+        out.into_iter().map(|o| o.unwrap_or_else(|| Err(Fail::new(tr!("{what}: o OneDrive não respondeu a este pedido.", "{what}: OneDrive didn't answer this request."))))).collect()
+    }
+}
+
+/// Bytes as a request body that reports how far it got (from `base` on) and stops when told:
+/// the bytes of the read that was told to stop never go.
+pub(crate) struct Counted<'a> {
+    pub data: &'a [u8],
+    pub at: usize,
+    pub base: u64,
+    pub progress: &'a mut dyn FnMut(u64) -> bool,
+    pub stopped: bool,
+}
+
+impl std::io::Read for Counted<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(self.data.len() - self.at).min(64 * 1024);
+        buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+        self.at += n;
+        if n > 0 && !(self.progress)(self.base + self.at as u64) {
+            self.stopped = true;
+            return Err(std::io::Error::other(crate::CANCELLED));
+        }
+        Ok(n)
     }
 }
 

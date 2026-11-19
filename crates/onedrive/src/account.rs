@@ -686,23 +686,28 @@ impl Account {
         }
         let since = chrono::Utc::now().timestamp();
         let subs: Vec<Sub> = locs.iter().map(|l| Sub { method: "DELETE", url: l.addr.url(), body: None }).collect();
-        let answers = match self.graph.batch(&subs, t("Excluir", "Delete")) {
-            Ok(a) => a,
-            Err(e) => return (Vec::new(), Some(e.text)),
-        };
+        // Each one as it went: a `$batch` that failed midway leaves what earlier ones deleted
+        // deleted (out of the tree, and undoable).
+        let answers = self.graph.batch(&subs, t("Excluir", "Delete"));
         let mut done = Vec::new();
         let mut first = None;
         let mut noted = Vec::new();
-        for ((l, folder), (status, body)) in locs.iter().zip(&folders).zip(answers) {
-            if (200..300).contains(&status) || status == 404 {
-                self.gone(&l.addr.id);
-                done.push((l.addr.id.clone(), l.item.name.clone()));
-                // Only this drive's own items are in its recycle bin.
-                if status != 404 && l.own {
-                    noted.push((l.addr.id.clone(), l.item.name.clone(), folder.clone()));
+        for ((l, folder), answer) in locs.iter().zip(&folders).zip(answers) {
+            match answer {
+                Ok((status, _)) if (200..300).contains(&status) || status == 404 => {
+                    self.gone(&l.addr.id);
+                    done.push((l.addr.id.clone(), l.item.name.clone()));
+                    // Only this drive's own items are in its recycle bin.
+                    if status != 404 && l.own {
+                        noted.push((l.addr.id.clone(), l.item.name.clone(), folder.clone()));
+                    }
                 }
-            } else if first.is_none() {
-                first = Some(crate::graph::failure(status, &body.to_string(), &l.item.name).text);
+                Ok((status, body)) => {
+                    first.get_or_insert_with(|| crate::graph::failure(status, &body.to_string(), &l.item.name).text);
+                }
+                Err(f) => {
+                    first.get_or_insert(f.text);
+                }
             }
         }
         self.note_gone(&noted, since);
@@ -717,26 +722,25 @@ impl Account {
             return self.restore_business(ids);
         }
         let subs: Vec<Sub> = ids.iter().map(|id| Sub { method: "POST", url: format!("/drives/{}/items/{}/restore", segment(self.drive()), segment(id)), body: Some(json!({})) }).collect();
-        let answers = match self.graph.batch(&subs, t("Restaurar", "Restore")) {
-            Ok(a) => a,
-            Err(e) => return (Vec::new(), Some(e.text)),
-        };
+        let answers = self.graph.batch(&subs, t("Restaurar", "Restore"));
         let mut done = Vec::new();
         let mut first = None;
-        for (id, (status, body)) in ids.iter().zip(answers) {
-            if (200..300).contains(&status) {
-                done.push(id.clone());
-            } else if first.is_none() {
-                first = Some(crate::graph::failure(status, &body.to_string(), t("Restaurar", "Restore")).text);
+        for (id, answer) in ids.iter().zip(answers) {
+            match answer {
+                Ok((status, _)) if (200..300).contains(&status) => done.push(id.clone()),
+                Ok((status, body)) => {
+                    first.get_or_insert_with(|| crate::graph::failure(status, &body.to_string(), t("Restaurar", "Restore")).text);
+                }
+                Err(f) => {
+                    first.get_or_insert(f.text);
+                }
             }
         }
         // Where each came back to, asked as listings ask (the restore's answer may leave out
-        // the parent): into the tree at once.
+        // the parent): into the tree at once. What isn't read now, the delta feed brings.
         let subs: Vec<Sub> = done.iter().map(|id| Sub { method: "GET", url: format!("/drives/{}/items/{}?$select={SELECT}", segment(self.drive()), segment(id)), body: None }).collect();
-        if !subs.is_empty()
-            && let Ok(items) = self.graph.batch(&subs, t("Restaurar", "Restore"))
-        {
-            for (status, body) in items {
+        if !subs.is_empty() {
+            for (status, body) in self.graph.batch(&subs, t("Restaurar", "Restore")).into_iter().flatten() {
                 if (200..300).contains(&status) {
                     self.took(&body);
                 }
