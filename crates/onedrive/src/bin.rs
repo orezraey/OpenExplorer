@@ -245,6 +245,12 @@ fn same_place(dir: &str, key: &str) -> bool {
     d == k || d.ends_with(&format!("/{k}"))
 }
 
+/// Whether a failed bin read says nothing of the query it asked: SharePoint not granted, no
+/// answer, or busy. Another way to ask wouldn't fare better, and the way kept stays.
+fn not_the_query(f: &Fail) -> bool {
+    f.code == NEEDS_CONSENT || matches!(f.status, 0 | 401 | 403 | 429 | 502 | 503 | 504)
+}
+
 /// A recycle bin item's id, checked before it goes into an address.
 fn guid(id: &str) -> Res<&str> {
     if !id.is_empty() && id.len() <= 40 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
@@ -492,15 +498,15 @@ impl Account {
     /// cheaply as SharePoint lets: with `$filter` on `DeletedDate`; where that's refused, the
     /// newest first (`$orderby` and `$top`), stopping at the first one older than `since`;
     /// where that's refused or not followed (the answer isn't newest first), the whole bin.
-    /// What SharePoint refused is remembered, so a delete doesn't pay a failed request first.
-    /// Also how it was read.
+    /// What SharePoint refused is remembered, so a delete doesn't pay a failed request first;
+    /// no answer, or one that says SharePoint is busy, isn't a refusal, and fails this read
+    /// alone. Also how it was read.
     fn read_recent(&self, since: i64, want: usize) -> Res<(Vec<BinItem>, Recent)> {
-        let refused = |f: &Fail| f.code == NEEDS_CONSENT || matches!(f.status, 401 | 403);
         if *lock(&self.bin.recent) == Recent::Filter {
             let filter = chrono::DateTime::from_timestamp(since, 0).map(|d| format!("&$filter=DeletedDate%20ge%20datetime%27{}%27", d.format("%Y-%m-%dT%H:%M:%SZ"))).unwrap_or_default();
             match self.bin_pages(&format!("{SELECT}{filter}"), |_| true) {
                 Ok(raw) => return Ok((self.bin_of(&raw, Some(since))?, Recent::Filter)),
-                Err(f) if refused(&f) => return Err(f),
+                Err(f) if not_the_query(&f) => return Err(f),
                 // A filter it can't take (whatever it answers): not asked again.
                 Err(f) => {
                     log(&format!("OneDrive {}: a lixeira não aceita $filter ({}); lendo as mais novas primeiro", self.meta.id, f.status));
@@ -534,7 +540,7 @@ impl Account {
                         *lock(&self.bin.recent) = Recent::Whole;
                         break;
                     }
-                    Err(f) if refused(&f) => return Err(f),
+                    Err(f) if not_the_query(&f) => return Err(f),
                     Err(f) => {
                         log(&format!("OneDrive {}: a lixeira não aceita $orderby ({}); lendo-a inteira", self.meta.id, f.status));
                         *lock(&self.bin.recent) = Recent::Whole;
@@ -866,6 +872,9 @@ mod tests {
         assert_eq!(number(Some(&Value::String("1234".into()))), 1234);
         assert_eq!(time(Some(&Value::String("2024-05-06T07:08:09Z".into()))), 1714979289);
         assert!(guid("9a1b2c3d-0000-4e5f-8a9b-0123456789ab").is_ok() && guid("x')/deleteAll(").is_err());
+        // No answer or busy: not a refused query, so the way the bin is read isn't changed.
+        assert!(not_the_query(&Fail::new("Não consegui falar com o OneDrive")) && not_the_query(&sp_failure(503, "", "Ler")));
+        assert!(!not_the_query(&sp_failure(400, "", "Ler")) && !not_the_query(&sp_failure(500, "", "Ler")));
         assert_eq!(decode("a%20b%C3%A3%"), "a bã%");
     }
 }
