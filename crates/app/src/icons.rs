@@ -114,6 +114,11 @@ icon32!(
     r##"<circle cx="16" cy="16" r="14" fill="#D9272E"/><path d="M9.2 21.5V10.8L16 17.6L22.8 10.8V21.5" fill="none" stroke="#FFFFFF" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>"##
 );
 icon32!(
+    PROVIDER_ONEDRIVE,
+    "provider-onedrive",
+    r##"<path d="M13.2 10.2C15 8.4 17.4 7.6 19.8 8C22.6 8.5 24.8 10.6 25.4 13.4C27.9 13.7 29.8 15.8 29.8 18.3C29.8 21 27.6 23.2 24.9 23.2H12.6Z" fill="#0364B8"/><path d="M13.2 10.2C11.2 9.2 8.8 9.2 6.8 10.3C4.6 11.6 3.3 13.9 3.4 16.4C1.9 17.2 1 18.7 1.2 20.4C1.4 22.1 2.9 23.2 4.6 23.2H18.5L23.2 13.6C21.6 12.5 19.6 12.1 17.7 12.5C16.4 11.2 14.8 10.4 13.2 10.2Z" fill="#0078D4"/><path d="M6.8 15.6C9.4 14.4 12.6 14.7 15 16.4L24.9 23.2H4.6C2.9 23.2 1.4 22.1 1.2 20.4C1 18.4 2.4 16.5 4.4 16.1C5.1 15.9 5.9 15.7 6.8 15.6Z" fill="#1490DF"/><path d="M15 16.4C17.2 14.9 20.1 14.4 22.7 15.3C24.1 14.2 26 13.9 27.6 14.6C29 15.4 29.9 16.8 29.8 18.3C29.8 21 27.6 23.2 24.9 23.2Z" fill="#28A8EA"/>"##
+);
+icon32!(
     PROVIDER_NEXTCLOUD,
     "provider-nextcloud",
     r##"<rect x="2" y="2" width="28" height="28" rx="7" fill="#0082C9"/><circle cx="8.2" cy="16" r="2.9" fill="none" stroke="#FFFFFF" stroke-width="2.2"/><circle cx="23.8" cy="16" r="2.9" fill="none" stroke="#FFFFFF" stroke-width="2.2"/><circle cx="16" cy="16" r="4.5" fill="none" stroke="#FFFFFF" stroke-width="2.4"/>"##

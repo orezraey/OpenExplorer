@@ -1,8 +1,9 @@
 //! The app's caches on disk, for Opções › Cache: how much room they take, and clearing them.
 //!
-//! Two caches live under `%LOCALAPPDATA%\OpenExplorer`: `cache\`, the last listing of each
-//! Google Drive folder (see [`crate::cache`]), and `mega\`, each MEGA account's sealed tree
-//! (see `openexplorer_mega::cache`). Both only spare reading from the network: clearing them
+//! Three caches live under `%LOCALAPPDATA%\OpenExplorer`: `cache\`, the last listing of each
+//! Google Drive folder (see [`crate::cache`]), `mega\`, each MEGA account's sealed tree (see
+//! `openexplorer_mega::cache`), and `onedrive\`, each OneDrive account's sealed listings (see
+//! `openexplorer_onedrive::cache`). All only spare reading from the network: clearing them
 //! leaves accounts, sessions and settings as they are.
 
 use std::path::{Path, PathBuf};
@@ -18,16 +19,22 @@ use crate::{Msg, State};
 pub struct Usage {
     pub drive: u64,
     pub mega: u64,
+    /// `onedrive\`: each OneDrive account's sealed listings (see `openexplorer_onedrive::cache`).
+    pub onedrive: u64,
 }
 
 impl Usage {
     pub fn total(self) -> u64 {
-        self.drive + self.mega
+        self.drive + self.mega + self.onedrive
     }
 
     /// Measured now. Walks the folders, so it runs off the UI thread.
     fn now() -> Usage {
-        Usage { drive: dir_size(&crate::cache::root()), mega: openexplorer_mega::cache::dir().map_or(0, |d| dir_size(&d)) }
+        Usage {
+            drive: dir_size(&crate::cache::root()),
+            mega: openexplorer_mega::cache::dir().map_or(0, |d| dir_size(&d)),
+            onedrive: openexplorer_onedrive::cache::dir().map_or(0, |d| dir_size(&d)),
+        }
     }
 }
 
@@ -95,11 +102,9 @@ pub fn clear(s: &mut State) {
         // No answer only if the Drive cache's disk thread is gone: clear it from here.
         let drive = drive.recv().unwrap_or_else(|_| clear_dir(&crate::cache::root()));
         let mega = openexplorer_mega::cache::clear_with(clear_dir).unwrap_or(Ok(()));
-        let result = match (drive, mega) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
-            (Err(a), Err(b)) => Err(format!("{a}\n{b}")),
-        };
+        let onedrive = openexplorer_onedrive::cache::clear_with(clear_dir).unwrap_or(Ok(()));
+        let errors: Vec<String> = [drive, mega, onedrive].into_iter().filter_map(Result::err).collect();
+        let result = if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) };
         emit(Msg::Caches(Answer::Cleared { id, result, usage: Usage::now() }));
     });
 }
@@ -222,7 +227,7 @@ mod tests {
         assert_eq!(dir_size(&dir), 1240);
         assert_eq!(dir_size(&dir.join("conta")), 240);
         assert_eq!(dir_size(&dir.join("nada")), 0);
-        assert_eq!(Usage { drive: 1240, mega: 60 }.total(), 1300);
+        assert_eq!(Usage { drive: 1240, mega: 60, onedrive: 5 }.total(), 1305);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -57,6 +57,10 @@ pub enum Step {
     MegaTrash { server: Server, node: String, name: String },
     /// MEGA node `node`, named `name`, comes back from the Rubbish Bin to the folder it was in.
     MegaRestore { server: Server, node: String, name: String },
+    /// OneDrive item `id` of account `server`, named `name`, goes to the recycle bin.
+    OneDriveTrash { server: Server, id: String, name: String },
+    /// OneDrive item `id`, named `name`, comes back from the recycle bin (personal accounts).
+    OneDriveRestore { server: Server, id: String, name: String },
 }
 
 /// What undoes one action, or redoes one undone.
@@ -645,6 +649,8 @@ impl Step {
                 Some(st) if !st.in_bin => Err(tr!("“{name}” não está mais na Lixeira do MEGA.", "“{name}” is no longer in the MEGA Rubbish Bin.")),
                 Some(_) => Ok(()),
             },
+            // OneDrive says itself what's no longer there (or no longer in the bin).
+            Step::OneDriveTrash { .. } | Step::OneDriveRestore { .. } => Ok(()),
             Step::ServerRemoveDir { server, path } => reach.server(server, &mut |c| match c.stat(path)? {
                 None => Err(tr!("“{}” não está mais no servidor.", "“{}” is no longer on the server.", server_name(path))),
                 Some(it) if !it.is_dir || it.link => Err(tr!("“{}” não é mais uma pasta.", "“{}” is no longer a folder.", server_name(path))),
@@ -730,6 +736,14 @@ impl Step {
             Step::MegaRestore { server, node, name } => {
                 reach.mega(server)?.restore(node)?;
                 Step::MegaTrash { server: server.clone(), node: node.clone(), name: name.clone() }
+            }
+            Step::OneDriveTrash { server, id, name } => {
+                crate::onedrive::trash_id(server, id).map_err(|e| tr!("“{name}”: {e}", "“{name}”: {e}"))?;
+                Step::OneDriveRestore { server: server.clone(), id: id.clone(), name: name.clone() }
+            }
+            Step::OneDriveRestore { server, id, name } => {
+                crate::onedrive::restore_id(server, id).map_err(|e| tr!("“{name}”: {e}", "“{name}”: {e}"))?;
+                Step::OneDriveTrash { server: server.clone(), id: id.clone(), name: name.clone() }
             }
         })
     }

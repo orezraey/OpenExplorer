@@ -33,6 +33,8 @@ pub struct Servers {
     pub mega_quotas: std::collections::HashMap<String, Option<openexplorer_mega::Quota>>,
     /// When each MEGA account a pane shows is next asked what changed.
     pub mega_watch: std::collections::HashMap<String, crate::mega::Watch>,
+    /// The OneDrive accounts (see `onedrive.rs`).
+    pub onedrive: crate::onedrive::Side,
     /// Counts the add dialog's connection checks, to drop a stale answer.
     pub attempts: u64,
 }
@@ -43,7 +45,9 @@ impl Servers {
         let mega = crate::mega::store();
         let mut list = store.servers();
         list.extend(crate::mega::servers(&mega));
-        Servers { list, pool: Arc::default(), store, mega, mega_quotas: Default::default(), mega_watch: Default::default(), attempts: 0 }
+        let onedrive = crate::onedrive::Side::load();
+        list.extend(onedrive.servers());
+        Servers { list, pool: Arc::default(), store, mega, mega_quotas: Default::default(), mega_watch: Default::default(), onedrive, attempts: 0 }
     }
 }
 
@@ -566,6 +570,7 @@ impl Category {
 pub enum Provider {
     GoogleDrive,
     Mega,
+    OneDrive,
     Nextcloud,
     OwnCloud,
     Sftp,
@@ -574,9 +579,10 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub const ALL: [Provider; 7] = [
+    pub const ALL: [Provider; 8] = [
         Provider::GoogleDrive,
         Provider::Mega,
+        Provider::OneDrive,
         Provider::Nextcloud,
         Provider::OwnCloud,
         Provider::Sftp,
@@ -588,6 +594,7 @@ impl Provider {
         match self {
             Provider::GoogleDrive => "Google Drive",
             Provider::Mega => "MEGA",
+            Provider::OneDrive => "OneDrive",
             Provider::Nextcloud => "Nextcloud",
             Provider::OwnCloud => "ownCloud",
             Provider::Sftp => "SFTP",
@@ -600,6 +607,7 @@ impl Provider {
         match self {
             Provider::GoogleDrive => t("OAuth no navegador", "OAuth in the browser"),
             Provider::Mega => t("E-mail e senha · criptografia de ponta a ponta", "E-mail and password · end-to-end encrypted"),
+            Provider::OneDrive => t("Pessoal ou corporativo · OAuth no navegador", "Personal or work · OAuth in the browser"),
             Provider::Nextcloud => t("Nuvem via WebDAV", "Cloud via WebDAV"),
             Provider::OwnCloud => t("Nuvem via WebDAV", "Cloud via WebDAV"),
             Provider::Sftp => t("SSH seguro · porta 22", "Secure SSH · port 22"),
@@ -612,6 +620,7 @@ impl Provider {
         match self {
             Provider::GoogleDrive => &crate::icons::PROVIDER_GDRIVE,
             Provider::Mega => &crate::icons::PROVIDER_MEGA,
+            Provider::OneDrive => &crate::icons::PROVIDER_ONEDRIVE,
             Provider::Nextcloud => &crate::icons::PROVIDER_NEXTCLOUD,
             Provider::OwnCloud => &crate::icons::PROVIDER_OWNCLOUD,
             Provider::Sftp => &crate::icons::PROVIDER_SFTP,
@@ -623,7 +632,7 @@ impl Provider {
     pub fn in_category(self, category: Category) -> bool {
         match category {
             Category::All => true,
-            Category::Cloud => matches!(self, Provider::GoogleDrive | Provider::Mega | Provider::Nextcloud | Provider::OwnCloud),
+            Category::Cloud => matches!(self, Provider::GoogleDrive | Provider::Mega | Provider::OneDrive | Provider::Nextcloud | Provider::OwnCloud),
             Category::Nas => matches!(self, Provider::Nextcloud | Provider::OwnCloud | Provider::Sftp | Provider::Ftp | Provider::WebDav),
             Category::Protocols => matches!(self, Provider::Sftp | Provider::Ftp | Provider::WebDav),
         }
@@ -637,6 +646,7 @@ impl Provider {
         let keywords = match self {
             Provider::GoogleDrive => "google drive gdrive nuvem workspace oauth gmail cloud",
             Provider::Mega => "mega mega.nz nuvem cloud criptografia encrypted 2fa",
+            Provider::OneDrive => "onedrive one drive microsoft office 365 sharepoint nuvem cloud oauth business empresa trabalho escola work school",
             Provider::Nextcloud => "nextcloud webdav dav https nas nuvem cloud",
             Provider::OwnCloud => "owncloud webdav dav https nas nuvem cloud",
             Provider::Sftp => "sftp ssh servidor linux nas chave 22 server key secure",
@@ -650,6 +660,7 @@ impl Provider {
         match self {
             Provider::GoogleDrive | Provider::Sftp => Protocol::Sftp,
             Provider::Mega => Protocol::Mega,
+            Provider::OneDrive => Protocol::OneDrive,
             Provider::Ftp => Protocol::Ftp,
             Provider::Nextcloud | Provider::OwnCloud | Provider::WebDav => Protocol::Davs,
         }
@@ -671,6 +682,7 @@ impl Provider {
             (_, Protocol::Ftp | Protocol::Ftps) => Provider::Ftp,
             (_, Protocol::Dav | Protocol::Davs) => Provider::WebDav,
             (_, Protocol::Mega) => Provider::Mega,
+            (_, Protocol::OneDrive) => Provider::OneDrive,
         }
     }
 
@@ -680,6 +692,7 @@ impl Provider {
             Protocol::Ftp | Protocol::Ftps => Provider::Ftp,
             Protocol::Dav | Protocol::Davs => Provider::WebDav,
             Protocol::Mega => Provider::Mega,
+            Protocol::OneDrive => Provider::OneDrive,
         }
     }
 }
@@ -795,6 +808,9 @@ impl Form {
             self.needs_code = false;
             self.code = TextEdit::new("");
             return;
+        }
+        if provider == Provider::OneDrive {
+            return crate::onedrive::prepare(self);
         }
         if provider == Provider::GoogleDrive {
             let missing = openexplorer_gdrive::ClientConfig::load().is_err();
@@ -1087,8 +1103,8 @@ pub fn ask_add(s: &mut State) {
 }
 
 pub fn ask_edit(s: &mut State, id: &str) {
-    if id.starts_with("mega:") {
-        s.status = t("Contas MEGA não têm o que editar: para trocar de conta, remova e conecte de novo.", "MEGA accounts have nothing to edit: to switch accounts, remove it and connect again.").into();
+    if id.starts_with("mega:") || id.starts_with("onedrive:") {
+        s.status = t("Contas MEGA e OneDrive não têm o que editar: para trocar de conta, remova e conecte de novo.", "MEGA and OneDrive accounts have nothing to edit: to switch accounts, remove it and connect again.").into();
         return;
     }
     if let Some(server) = s.servers.list.iter().find(|sv| sv.id == id) {
@@ -1154,7 +1170,7 @@ pub fn toggle_tls(s: &mut State) {
             Protocol::Ftps => Protocol::Ftp,
             Protocol::Dav => Protocol::Davs,
             Protocol::Davs => Protocol::Dav,
-            p @ (Protocol::Sftp | Protocol::Mega) => p,
+            p @ (Protocol::Sftp | Protocol::Mega | Protocol::OneDrive) => p,
         };
         let trimmed = f.host.text.trim_start();
         if let Some((scheme, rest)) = trimmed.split_once("://") {
@@ -1362,9 +1378,9 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
 
 /// Forgets a server and its password (a MEGA account and its session); panes on it go home.
 pub fn remove(s: &mut State, id: &str) {
-    let mega = s.servers.list.iter().find(|sv| sv.id == id && sv.is_mega()).cloned();
+    let mega = s.servers.list.iter().find(|sv| sv.id == id && (sv.is_mega() || sv.is_onedrive())).cloned();
     if let Some(sv) = &mega {
-        if !crate::mega::remove(s, sv) {
+        if !if sv.is_onedrive() { crate::onedrive::remove(s, sv) } else { crate::mega::remove(s, sv) } {
             return;
         }
     } else if let Err(e) = s.servers.store.remove(id) {
@@ -1386,7 +1402,11 @@ pub fn remove(s: &mut State, id: &str) {
             crate::switch(s, p, Location::home());
         }
     }
-    s.status = if mega.is_some() { tr!("Conta MEGA removida: {name}", "MEGA account removed: {name}") } else { tr!("Servidor removido: {name}", "Server removed: {name}") };
+    s.status = match &mega {
+        Some(sv) if sv.is_onedrive() => tr!("Conta OneDrive removida: {name}", "OneDrive account removed: {name}"),
+        Some(_) => tr!("Conta MEGA removida: {name}", "MEGA account removed: {name}"),
+        None => tr!("Servidor removido: {name}", "Server removed: {name}"),
+    };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1436,6 +1456,10 @@ pub fn parse_address(text: &str) -> Option<Address> {
         let path = format!("/{}", decode(path).trim_start_matches('/'));
         return Some(Address { protocol: Protocol::Mega, user: email, password: None, host: "mega.nz".into(), port: None, path });
     }
+    if scheme.eq_ignore_ascii_case("onedrive") {
+        let (email, path) = crate::onedrive::address(&decode(rest))?;
+        return Some(Address { protocol: Protocol::OneDrive, user: email, password: None, host: "graph.microsoft.com".into(), port: None, path });
+    }
     let protocol = Protocol::from_scheme(scheme)?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -1482,7 +1506,9 @@ pub fn address_text(loc: &Location) -> String {
 /// and port (and user, when the address names one), and a path under the server's folder.
 pub fn reach(servers: &[Server], a: &Address) -> Result<Location, String> {
     let port = a.port.unwrap_or(a.protocol.default_port());
-    let same = |sv: &&Server| sv.protocol == a.protocol && sv.host.eq_ignore_ascii_case(&a.host) && sv.port == port && (a.user.is_empty() || sv.user == a.user);
+    // A OneDrive account's address names its e-mail (the server's name), not its drive id.
+    let user = |sv: &Server| if sv.is_onedrive() { sv.name.to_lowercase() == a.user } else { sv.user == a.user };
+    let same = |sv: &&Server| sv.protocol == a.protocol && sv.host.eq_ignore_ascii_case(&a.host) && sv.port == port && (a.user.is_empty() || user(sv));
     let candidates: Vec<&Server> = servers.iter().filter(same).collect();
     if candidates.is_empty() {
         return Err(String::new());
@@ -1569,9 +1595,9 @@ mod tests {
     fn unified_catalog_filters_and_configures_presets() {
         let mut f = Form::new();
         assert_eq!(f.step, Step::Pick);
-        assert_eq!(f.visible_providers().len(), 7);
+        assert_eq!(f.visible_providers().len(), 8);
         f.category = Category::Cloud;
-        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::Mega, Provider::Nextcloud, Provider::OwnCloud]);
+        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::Mega, Provider::OneDrive, Provider::Nextcloud, Provider::OwnCloud]);
         f.category = Category::Protocols;
         assert_eq!(f.visible_providers(), [Provider::Sftp, Provider::Ftp, Provider::WebDav]);
         f.category = Category::All;

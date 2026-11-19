@@ -590,8 +590,8 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
             section_head(
                 "Cache",
                 t(
-                    "Cópias locais das pastas do Google Drive e das contas MEGA, para que abram sem esperar pela rede.",
-                    "Local copies of Google Drive folders and MEGA accounts, so they open without waiting for the network.",
+                    "Cópias locais das pastas do Google Drive e das contas MEGA e OneDrive, para que abram sem esperar pela rede.",
+                    "Local copies of Google Drive folders and MEGA and OneDrive accounts, so they open without waiting for the network.",
                 ),
             ),
         ),
@@ -810,7 +810,7 @@ fn cache_page(k: &Kit, page: &crate::caches::Page, card: El, head: El) -> El {
     } else if page.waiting != 0 && usage.is_some() {
         t("Atualizando…", "Updating…")
     } else {
-        t("As duas pastas abaixo somadas.", "Both folders below added up.")
+        t("As pastas abaixo somadas.", "The folders below added up.")
     };
     let total = row()
         .key("cache-total")
@@ -852,6 +852,8 @@ fn cache_page(k: &Kit, page: &crate::caches::Page, card: El, head: El) -> El {
         .child(line("cache-drive", t("Listagens do Google Drive", "Google Drive listings"), crate::cache::root().display().to_string(), usage.map(|u| u.drive)))
         .child(divider())
         .child(line("cache-mega", t("Contas MEGA", "MEGA accounts"), openexplorer_mega::cache::dir().map_or_else(String::new, |d| d.display().to_string()), usage.map(|u| u.mega)))
+        .child(divider())
+        .child(line("cache-onedrive", t("Contas OneDrive", "OneDrive accounts"), openexplorer_onedrive::cache::dir().map_or_else(String::new, |d| d.display().to_string()), usage.map(|u| u.onedrive)))
         .child(divider())
         .child(actions);
 
@@ -1218,6 +1220,13 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             .item(item(t("Copiar link", "Copy link"), &icons::M_LINK, "", true, crate::mega::copy_link))
             .item(item(t("Remover link", "Remove link"), &icons::M_LINK, "", true, crate::mega::remove_link));
     }
+    // Sharing links, for one OneDrive item.
+    if n == 1 && changeable && crate::onedrive::at(&s.panes[p].loc).is_some() {
+        menu = menu
+            .separator()
+            .item(item(t("Copiar link", "Copy link"), &icons::M_LINK, "", true, crate::onedrive::copy_link))
+            .item(item(t("Remover link", "Remove link"), &icons::M_LINK, "", true, crate::onedrive::remove_link));
+    }
     menu = menu.separator().item(item(t("Nova pasta", "New folder"), &icons::M_NEW_FOLDER, "Ctrl+Shift+N", editable, actions::ask_new_folder));
     if n > 0 {
         menu = menu.separator().item(item(t("Propriedades", "Properties"), &icons::M_PROPERTIES, "Alt+Enter", true, |s, p, _| actions::properties(s, p)));
@@ -1258,6 +1267,8 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 t("Os itens vão para a Lixeira do Windows, de onde podem ser restaurados.", "The items go to the Windows Recycle Bin, where they can be restored.")
             } else if crate::mega::at(&s.panes[*pane].loc).is_some() {
                 t("Os itens vão para a Lixeira do MEGA, de onde podem ser restaurados.", "The items go to the MEGA Rubbish Bin, where they can be restored.")
+            } else if let Some(note) = crate::onedrive::delete_note(s, &s.panes[*pane].loc) {
+                note
             } else {
                 t(
                     "Os itens vão para a lixeira do Google Drive, onde ficam 30 dias antes de serem apagados de vez.",
@@ -1370,6 +1381,7 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
         Dialog::Share(sh) => crate::sharing::share_dialog(s, k, sh, layer),
         Dialog::MakePublic(m) => crate::sharing::public_dialog(k, m, layer),
         Dialog::MegaLink(m) => crate::mega::link_dialog(k, m, layer),
+        Dialog::OneDriveLink(m) => crate::onedrive::link_dialog(k, m, layer),
         Dialog::Server(f) => account_dialog(s, k, f, window_h, layer),
     }
 }
@@ -1607,9 +1619,13 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
     // -----------------------------------------------------------------------------------------
     // Step 2: Provider-specific configuration (Google Drive OAuth or server credentials)
 
+    if f.provider == Provider::OneDrive {
+        return crate::onedrive::configure(s, k, f, layer);
+    }
     let proto = f.effective_protocol();
     let (summary, badge_text) = match (f.provider, proto) {
         (Provider::GoogleDrive, _) => (t("Autorização segura OAuth 2.0 pelo navegador padrão", "Secure OAuth 2.0 sign-in through the default browser"), "OAuth 2.0"),
+        (Provider::OneDrive, _) => (t("Contas pessoais, corporativas ou de estudante pelo navegador", "Personal, work or school accounts through the browser"), "OAuth 2.0"),
         (Provider::Mega, _) => (t("Criptografia de ponta a ponta · os arquivos são decifrados neste computador", "End-to-end encryption · files are decrypted on this computer"), "E2EE"),
         (Provider::Nextcloud, Protocol::Davs) => (t("Servidor Nextcloud · conexão criptografada", "Nextcloud server · encrypted connection"), "HTTPS"),
         (Provider::Nextcloud, _) => (t("Servidor Nextcloud · conexão sem criptografia", "Nextcloud server · unencrypted connection"), "HTTP"),
@@ -1943,13 +1959,13 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         Provider::OwnCloud => t("owncloud.exemplo.com ou https://owncloud.exemplo.com", "owncloud.example.com or https://owncloud.example.com"),
         Provider::Sftp => t("nas.local, 192.168.0.10 ou sftp://usuario@host", "nas.local, 192.168.0.10 or sftp://user@host"),
         Provider::Ftp => t("ftp.exemplo.com, 192.168.0.10 ou ftp://usuario@host", "ftp.example.com, 192.168.0.10 or ftp://user@host"),
-        Provider::WebDav | Provider::GoogleDrive | Provider::Mega => t("dav.exemplo.com, 192.168.0.10 ou https://host/dav", "dav.example.com, 192.168.0.10 or https://host/dav"),
+        Provider::WebDav | Provider::GoogleDrive | Provider::Mega | Provider::OneDrive => t("dav.exemplo.com, 192.168.0.10 ou https://host/dav", "dav.example.com, 192.168.0.10 or https://host/dav"),
     };
     let folder_hint = match f.provider {
         Provider::Nextcloud | Provider::OwnCloud => t("/remote.php/webdav (automático, se vazio)", "/remote.php/webdav (automatic if empty)"),
         Provider::WebDav => t("/dav ou /remote.php/dav/files/usuario (raiz /, se vazio)", "/dav or /remote.php/dav/files/user (root / if empty)"),
         Provider::Sftp => t("a pasta pessoal, se vazio", "the home folder if empty"),
-        Provider::Ftp | Provider::GoogleDrive | Provider::Mega => t("a pasta do login, se vazio", "the login folder if empty"),
+        Provider::Ftp | Provider::GoogleDrive | Provider::Mega | Provider::OneDrive => t("a pasta do login, se vazio", "the login folder if empty"),
     };
     let name_hint = match f.provider {
         Provider::Nextcloud => t("Nextcloud (servidor), se vazio", "Nextcloud (server) if empty"),
@@ -1995,7 +2011,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
                     .key("tls-toggle"),
             );
         }
-        Provider::Sftp | Provider::GoogleDrive | Provider::Mega => {}
+        Provider::Sftp | Provider::GoogleDrive | Provider::Mega | Provider::OneDrive => {}
     }
 
     inner = inner.child(field("folder", t("Pasta inicial", "Start folder"), &f.folder, folder_hint, |f| &mut f.folder));
@@ -3553,7 +3569,7 @@ fn statusbar(s: &State, k: &Kit, p: usize) -> El {
     let quota = match &pane.loc {
         Location::Drive { email, space: Space::MyDrive, .. } => s.quotas.get(email).copied().flatten().map(|q| (quota_label(&q), q.limit.filter(|l| *l > 0).map(|l| q.usage as f64 / l as f64), quota_help(q))),
         // A MEGA account's storage, anywhere in it.
-        loc => crate::mega::quota_of(s, loc).map(|q| (crate::mega::quota_label(&q), (q.total > 0).then(|| q.used as f64 / q.total as f64), crate::mega::quota_help(q))),
+        loc => crate::mega::quota_of(s, loc).map(|q| (crate::mega::quota_label(&q), (q.total > 0).then(|| q.used as f64 / q.total as f64), crate::mega::quota_help(q))).or_else(|| crate::onedrive::quota_bar(s, loc)),
     };
     let (right, used, help) = match quota {
         Some((label, used, help)) => (label, used, help),

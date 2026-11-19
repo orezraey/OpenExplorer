@@ -7,6 +7,7 @@ edition.workspace = true
 base64 = "0.22"
 openexplorer-i18n = { path = "../i18n" }
 openexplorer-mega = { path = "../mega" }
+openexplorer-onedrive = { path = "../onedrive" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
 quick-xml = "0.38"

@@ -9,6 +9,7 @@ rune-kit = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 openexplorer-gdrive = { path = "../gdrive" }
 openexplorer-mega = { path = "../mega" }
+openexplorer-onedrive = { path = "../onedrive" }
 openexplorer-i18n = { path = "../i18n" }
 openexplorer-remote = { path = "../remote" }
 openexplorer-index = { path = "../index" }

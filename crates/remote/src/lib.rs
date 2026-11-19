@@ -6,6 +6,7 @@
 mod dav;
 mod ftp;
 mod mega;
+mod onedrive;
 mod sftp;
 pub mod store;
 mod tls;
@@ -45,6 +46,8 @@ pub enum Protocol {
     /// A MEGA account (see `mega.rs`). Never written to `servers.json`: MEGA accounts are kept
     /// apart, so an older app reading that list doesn't meet a protocol it can't read.
     Mega,
+    /// A OneDrive account (see `onedrive.rs`), kept apart from `servers.json` as MEGA is.
+    OneDrive,
 }
 
 impl Protocol {
@@ -58,6 +61,7 @@ impl Protocol {
             Protocol::Dav => "WebDAV (http)",
             Protocol::Davs => "WebDAV (https)",
             Protocol::Mega => "MEGA",
+            Protocol::OneDrive => "OneDrive",
         }
     }
 
@@ -79,6 +83,7 @@ impl Protocol {
             Protocol::Dav => "http",
             Protocol::Davs => "https",
             Protocol::Mega => "mega",
+            Protocol::OneDrive => "onedrive",
         }
     }
 
@@ -98,7 +103,7 @@ impl Protocol {
             Protocol::Ftp | Protocol::Ftps => 21,
             Protocol::Sftp => 22,
             Protocol::Dav => 80,
-            Protocol::Davs | Protocol::Mega => 443,
+            Protocol::Davs | Protocol::Mega | Protocol::OneDrive => 443,
         }
     }
 
@@ -196,10 +201,23 @@ impl Server {
         self.protocol == Protocol::Mega
     }
 
+    /// The server a OneDrive account shows as: the drive's id is the user (the account's key in
+    /// the OneDrive crate), its e-mail the name.
+    pub fn onedrive(drive: &str, email: &str) -> Server {
+        Server { id: format!("onedrive:{drive}"), name: email.to_string(), protocol: Protocol::OneDrive, host: "graph.microsoft.com".into(), user: drive.to_string(), connections: 6, ..Server::mega("") }
+    }
+
+    pub fn is_onedrive(&self) -> bool {
+        self.protocol == Protocol::OneDrive
+    }
+
     /// `sftp://ana@host:2222`, the port only when it isn't the usual one. Never the password.
     pub fn address(&self) -> String {
         if self.is_mega() {
             return format!("mega://{}", self.user);
+        }
+        if self.is_onedrive() {
+            return format!("onedrive://{}", self.name);
         }
         let user = if self.user.is_empty() { String::new() } else { format!("{}@", encode_user(&self.user)) };
         let host = if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() };
@@ -324,6 +342,7 @@ fn open(server: &Server, secret: &str, trust: &tls::Trust) -> Result<Box<dyn Con
         Protocol::Sftp => Ok(Box::new(sftp::Sftp::connect(server, secret)?)),
         Protocol::Dav | Protocol::Davs => Ok(Box::new(dav::Dav::connect(server, secret, trust)?)),
         Protocol::Mega => Ok(Box::new(mega::Mega::connect(server)?)),
+        Protocol::OneDrive => Ok(Box::new(onedrive::OneDrive::connect(server)?)),
     }
 }
 

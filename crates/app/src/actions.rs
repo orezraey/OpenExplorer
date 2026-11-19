@@ -51,6 +51,8 @@ pub enum Dialog {
     MakePublic(Box<crate::sharing::MakePublic>),
     /// Copiar link on a MEGA file with no link yet: make one?
     MegaLink(Box<crate::mega::MakeLink>),
+    /// Copiar link on a OneDrive item with no link yet: make one?
+    OneDriveLink(Box<crate::onedrive::MakeLink>),
     /// Adicionar servidor, or Editar servidor.
     Server(Box<crate::servers::Form>),
 }
@@ -91,7 +93,7 @@ pub fn editable(loc: &Location) -> bool {
         Location::Local(dir) => !crate::network::is_server(dir),
         Location::Mock(_) | Location::Found(_) => false,
         Location::Drive { .. } => drive_folder(loc).is_some(),
-        Location::Server { find, .. } => find.is_none() && crate::mega::why_not(loc).is_none(),
+        Location::Server { find, .. } => find.is_none() && crate::mega::why_not(loc).is_none() && crate::onedrive::why_not(loc).is_none(),
     }
 }
 
@@ -101,7 +103,7 @@ pub fn editable(loc: &Location) -> bool {
 pub fn items_editable(loc: &Location) -> bool {
     match loc {
         Location::Drive { space: Space::SharedDrives | Space::Trash, .. } => false,
-        Location::Server { .. } if crate::mega::items_fixed(loc) => false,
+        Location::Server { .. } if crate::mega::items_fixed(loc) || crate::onedrive::items_fixed(loc) => false,
         Location::Drive { .. } | Location::Found(_) | Location::Server { .. } => true,
         _ => editable(loc),
     }
@@ -115,7 +117,7 @@ pub fn in_trash(loc: &Location) -> bool {
 
 /// Why `loc` doesn't take what was asked (pasting, a new folder, cutting).
 fn why_not(loc: &Location) -> String {
-    if let Some(why) = crate::mega::why_not(loc) {
+    if let Some(why) = crate::mega::why_not(loc).or_else(|| crate::onedrive::why_not(loc)) {
         return why;
     }
     match loc {
@@ -1028,7 +1030,8 @@ pub fn ask_delete(s: &mut State, p: usize) {
     // Explorer does). By the items' own paths, so a search's results there count too.
     let loc = &s.panes[p].loc;
     // A MEGA account has its own Rubbish Bin; deleting inside it is for good.
-    let mega_bin = crate::mega::at(loc).is_some() && !crate::mega::deletes_for_good(loc);
+    // So does OneDrive.
+    let mega_bin = (crate::mega::at(loc).is_some() && !crate::mega::deletes_for_good(loc)) || crate::onedrive::at(loc).is_some();
     if (loc.is_local() && s.settings.skip_recycle_bin) || (matches!(loc, Location::Server { .. }) && !mega_bin) || items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_remote(&path)) {
         s.dialog = Some(Dialog::Purge { pane: p, items });
         return;
@@ -1066,6 +1069,7 @@ pub fn delete(s: &mut State) {
             });
         }
         Location::Server { server, .. } if server.is_mega() => crate::mega::trash(s, &loc, items),
+        Location::Server { server, .. } if server.is_onedrive() => crate::onedrive::trash(s, &loc, items),
         Location::Server { .. } => crate::servers::delete(s, &loc, items, vec![loc.clone()]),
         Location::Mock(_) => return not_here(s, pane),
     }
