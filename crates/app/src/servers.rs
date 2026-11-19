@@ -39,6 +39,8 @@ pub struct Servers {
     pub dropbox_watch: std::collections::HashMap<String, crate::dropbox::Watch>,
     /// The B2 keys' own list (see `b2.rs`).
     pub b2: openexplorer_b2::Store,
+    /// The panes' B2 folders read again on the app's own (see `b2.rs`).
+    pub b2_watch: crate::b2::Watch,
     /// The OneDrive accounts (see `onedrive.rs`).
     pub onedrive: crate::onedrive::Side,
     /// Counts the add dialog's connection checks, to drop a stale answer.
@@ -57,7 +59,7 @@ impl Servers {
         list.extend(crate::b2::servers(&b2));
         let onedrive = crate::onedrive::Side::load();
         list.extend(onedrive.servers());
-        Servers { list, pool: Arc::default(), store, mega, mega_quotas: Default::default(), mega_watch: Default::default(), dropbox, dropbox_quotas: Default::default(), dropbox_watch: Default::default(), b2, onedrive, attempts: 0 }
+        Servers { list, pool: Arc::default(), store, mega, mega_quotas: Default::default(), mega_watch: Default::default(), dropbox, dropbox_quotas: Default::default(), dropbox_watch: Default::default(), b2, b2_watch: Default::default(), onedrive, attempts: 0 }
     }
 }
 

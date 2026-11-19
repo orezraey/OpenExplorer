@@ -54,6 +54,8 @@ pub enum Dialog {
     DropboxLink(Box<crate::dropbox::MakeLink>),
     /// Copiar link on a OneDrive item with no link yet: make one?
     OneDriveLink(Box<crate::onedrive::MakeLink>),
+    /// Envios inacabados of a B2 bucket.
+    B2Unfinished(Box<crate::b2::Unfinished>),
     /// Adicionar servidor, or Editar servidor.
     Server(Box<crate::servers::Form>),
 }
