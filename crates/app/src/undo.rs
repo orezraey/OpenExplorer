@@ -63,6 +63,10 @@ pub enum Step {
     /// What was deleted from `path` comes back: the file at revision `rev`, or (no `rev`) the
     /// folder, with the files deleted from it at `since` (seconds since 1970) or later.
     DropboxRestore { server: Server, path: String, name: String, rev: Option<String>, since: i64 },
+    /// On B2 key `server`, the file (or every file of the folder) at `path` is hidden.
+    B2Hide { server: Server, path: String, is_dir: bool },
+    /// What was hidden at `path` at `since` (milliseconds, B2's clock) or later comes back.
+    B2Unhide { server: Server, path: String, is_dir: bool, since: i64 },
 }
 
 /// What undoes one action, or redoes one undone.
@@ -187,7 +191,7 @@ pub fn arrived(s: &mut State, answer: Answer) {
 // ---------------------------------------------------------------------------------------------
 // Jobs that record
 
-fn did(rec: &Rec, what: impl FnOnce(usize) -> String, reload: Vec<Location>, result: Result<String, String>) -> Msg {
+pub(crate) fn did(rec: &Rec, what: impl FnOnce(usize) -> String, reload: Vec<Location>, result: Result<String, String>) -> Msg {
     Msg::Undo(Answer::Did { record: rec.record(what, reload.clone()), reload, result })
 }
 
@@ -652,6 +656,7 @@ impl Step {
                 Some(_) => Ok(()),
             },
             Step::DropboxDelete { .. } | Step::DropboxRestore { .. } => crate::dropbox::check(self),
+            Step::B2Hide { .. } | Step::B2Unhide { .. } => crate::b2::check(self),
             Step::ServerRemoveDir { server, path } => reach.server(server, &mut |c| match c.stat(path)? {
                 None => Err(tr!("“{}” não está mais no servidor.", "“{}” is no longer on the server.", server_name(path))),
                 Some(it) if !it.is_dir || it.link => Err(tr!("“{}” não é mais uma pasta.", "“{}” is no longer a folder.", server_name(path))),
@@ -739,6 +744,7 @@ impl Step {
                 Step::MegaTrash { server: server.clone(), node: node.clone(), name: name.clone() }
             }
             Step::DropboxDelete { .. } | Step::DropboxRestore { .. } => crate::dropbox::run(self)?,
+            Step::B2Hide { .. } | Step::B2Unhide { .. } => crate::b2::run(self)?,
         })
     }
 }

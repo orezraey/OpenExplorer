@@ -590,8 +590,8 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
             section_head(
                 "Cache",
                 t(
-                    "Cópias locais das pastas do Google Drive e das contas MEGA, para que abram sem esperar pela rede.",
-                    "Local copies of Google Drive folders and MEGA accounts, so they open without waiting for the network.",
+                    "Cópias locais das pastas do Google Drive, das contas MEGA e do Backblaze B2, para que abram sem esperar pela rede.",
+                    "Local copies of Google Drive folders, MEGA accounts and Backblaze B2, so they open without waiting for the network.",
                 ),
             ),
         ),
@@ -810,7 +810,7 @@ fn cache_page(k: &Kit, page: &crate::caches::Page, card: El, head: El) -> El {
     } else if page.waiting != 0 && usage.is_some() {
         t("Atualizando…", "Updating…")
     } else {
-        t("As duas pastas abaixo somadas.", "Both folders below added up.")
+        t("As pastas abaixo somadas.", "The folders below added up.")
     };
     let total = row()
         .key("cache-total")
@@ -854,6 +854,7 @@ fn cache_page(k: &Kit, page: &crate::caches::Page, card: El, head: El) -> El {
         .child(line("cache-mega", t("Contas MEGA", "MEGA accounts"), openexplorer_mega::cache::dir().map_or_else(String::new, |d| d.display().to_string()), usage.map(|u| u.mega)))
         .child(divider())
         .child(line("cache-dropbox", t("Contas Dropbox", "Dropbox accounts"), openexplorer_dropbox::cache::dir().map_or_else(String::new, |d| d.display().to_string()), usage.map(|u| u.dropbox)))
+        .child(line("cache-b2", t("Listagens do Backblaze B2", "Backblaze B2 listings"), openexplorer_b2::cache::dir().map_or_else(String::new, |d| d.display().to_string()), usage.map(|u| u.b2)))
         .child(divider())
         .child(actions);
 
@@ -1227,6 +1228,10 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             .item(item(t("Copiar link", "Copy link"), &icons::M_LINK, "", true, crate::dropbox::copy_link))
             .item(item(t("Remover link", "Remove link"), &icons::M_LINK, "", true, crate::dropbox::remove_link));
     }
+    // Every version of a B2 item, for good.
+    if n > 0 && changeable && crate::b2::at(&s.panes[p].loc).is_some() {
+        menu = menu.min_width(250.0).item(item(t("Excluir todas as versões", "Delete every version"), &icons::M_DELETE, "", true, crate::b2::ask_purge).danger(true));
+    }
     menu = menu.separator().item(item(t("Nova pasta", "New folder"), &icons::M_NEW_FOLDER, "Ctrl+Shift+N", editable, actions::ask_new_folder));
     if n > 0 {
         menu = menu.separator().item(item(t("Propriedades", "Properties"), &icons::M_PROPERTIES, "Alt+Enter", true, |s, p, _| actions::properties(s, p)));
@@ -1259,6 +1264,7 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
     match d {
         Dialog::Delete { pane, items } => {
             let local = s.panes[*pane].loc.is_local();
+            let b2_note: String;
             let title = match items.as_slice() {
                 [one] => tr!("Excluir \"{}\"?", "Delete \"{}\"?", shown(&one.name)),
                 many => tr!("Excluir {} itens?", "Delete {} items?", ui_count(many.len())),
@@ -1269,6 +1275,9 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 t("Os itens vão para a Lixeira do MEGA, de onde podem ser restaurados.", "The items go to the MEGA Rubbish Bin, where they can be restored.")
             } else if crate::dropbox::at(&s.panes[*pane].loc).is_some() {
                 crate::dropbox::delete_note()
+            } else if crate::b2::at(&s.panes[*pane].loc).is_some() {
+                b2_note = crate::b2::delete_note(&s.panes[*pane].loc);
+                b2_note.as_str()
             } else {
                 t(
                     "Os itens vão para a lixeira do Google Drive, onde ficam 30 dias antes de serem apagados de vez.",
@@ -1297,6 +1306,8 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 t("Aqui não há Lixeira: os itens serão apagados para sempre. Isso não pode ser desfeito.", "There's no Recycle Bin here: the items will be deleted for good. This can't be undone.").into()
             } else if crate::mega::at(&s.panes[*pane].loc).is_some() && !crate::mega::in_bin(&s.panes[*pane].loc) {
                 t("Itens de uma pasta compartilhada com você pertencem a quem compartilhou: serão apagados para sempre, sem passar pela Lixeira. Isso não pode ser desfeito.", "Items in a folder shared with you belong to whoever shared it: they'll be deleted for good, skipping the Rubbish Bin. This can't be undone.").into()
+            } else if crate::b2::at(&s.panes[*pane].loc).is_some() {
+                crate::b2::purge_note().into()
             } else if crate::mega::in_bin(&s.panes[*pane].loc) {
                 t("Os itens serão apagados para sempre da Lixeira do MEGA. Isso não pode ser desfeito.", "The items will be deleted from the MEGA Rubbish Bin for good. This can't be undone.").into()
             } else if let Location::Server { server, .. } = &s.panes[*pane].loc {
@@ -1624,6 +1635,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         (Provider::GoogleDrive, _) => (t("Autorização segura OAuth 2.0 pelo navegador padrão", "Secure OAuth 2.0 sign-in through the default browser"), "OAuth 2.0"),
         (Provider::Mega, _) => (t("Criptografia de ponta a ponta · os arquivos são decifrados neste computador", "End-to-end encryption · files are decrypted on this computer"), "E2EE"),
         (Provider::Dropbox, _) => (t("Autorização segura OAuth 2.0 (PKCE) pelo navegador padrão", "Secure OAuth 2.0 (PKCE) sign-in through the default browser"), "OAuth 2.0"),
+        (Provider::B2, _) => crate::b2::summary(),
         (Provider::Nextcloud, Protocol::Davs) => (t("Servidor Nextcloud · conexão criptografada", "Nextcloud server · encrypted connection"), "HTTPS"),
         (Provider::Nextcloud, _) => (t("Servidor Nextcloud · conexão sem criptografia", "Nextcloud server · unencrypted connection"), "HTTP"),
         (Provider::OwnCloud, Protocol::Davs) => (t("Servidor ownCloud · conexão criptografada", "ownCloud server · encrypted connection"), "HTTPS"),
@@ -1837,6 +1849,16 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         return;
     }
 
+    // B2 step: the key ID and the application key.
+    if f.provider == Provider::B2 {
+        let eye = eye_toggle("pass-eye", f.reveal_password, |s| {
+            if let Some(Dialog::Server(f)) = &mut s.dialog {
+                f.reveal_password = !f.reveal_password;
+            }
+        });
+        return crate::b2::form(k, f, banner, eye, |inner| account_scroll(k, "b2-scroll", window_h, inner), close, layer);
+    }
+
     // MEGA step: e-mail and password, then the two-factor code once the account asks for it.
     if f.provider == Provider::Mega {
         let labeled = |key: &'static str, label: &'static str, input: El| col().key(key).w_full().gap(4.0).child(text(label).font(k.ty.text_small_medium).color(k.c.text_base)).child(input);
@@ -1962,13 +1984,13 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         Provider::OwnCloud => t("owncloud.exemplo.com ou https://owncloud.exemplo.com", "owncloud.example.com or https://owncloud.example.com"),
         Provider::Sftp => t("nas.local, 192.168.0.10 ou sftp://usuario@host", "nas.local, 192.168.0.10 or sftp://user@host"),
         Provider::Ftp => t("ftp.exemplo.com, 192.168.0.10 ou ftp://usuario@host", "ftp.example.com, 192.168.0.10 or ftp://user@host"),
-        Provider::WebDav | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox => t("dav.exemplo.com, 192.168.0.10 ou https://host/dav", "dav.example.com, 192.168.0.10 or https://host/dav"),
+        Provider::WebDav | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 => t("dav.exemplo.com, 192.168.0.10 ou https://host/dav", "dav.example.com, 192.168.0.10 or https://host/dav"),
     };
     let folder_hint = match f.provider {
         Provider::Nextcloud | Provider::OwnCloud => t("/remote.php/webdav (automático, se vazio)", "/remote.php/webdav (automatic if empty)"),
         Provider::WebDav => t("/dav ou /remote.php/dav/files/usuario (raiz /, se vazio)", "/dav or /remote.php/dav/files/user (root / if empty)"),
         Provider::Sftp => t("a pasta pessoal, se vazio", "the home folder if empty"),
-        Provider::Ftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox => t("a pasta do login, se vazio", "the login folder if empty"),
+        Provider::Ftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 => t("a pasta do login, se vazio", "the login folder if empty"),
     };
     let name_hint = match f.provider {
         Provider::Nextcloud => t("Nextcloud (servidor), se vazio", "Nextcloud (server) if empty"),
@@ -2014,7 +2036,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
                     .key("tls-toggle"),
             );
         }
-        Provider::Sftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox => {}
+        Provider::Sftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 => {}
     }
 
     inner = inner.child(field("folder", t("Pasta inicial", "Start folder"), &f.folder, folder_hint, |f| &mut f.folder));

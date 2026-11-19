@@ -119,6 +119,11 @@ icon32!(
     r##"<circle cx="16" cy="16" r="14" fill="#D9272E"/><path d="M9.2 21.5V10.8L16 17.6L22.8 10.8V21.5" fill="none" stroke="#FFFFFF" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>"##
 );
 icon32!(
+    PROVIDER_B2,
+    "provider-b2",
+    r##"<rect x="2" y="2" width="28" height="28" rx="7" fill="#E21E29"/><path d="M16.6 5.5c.5 3.6-1.9 5.6-3.6 7.6-1.4 1.6-2.6 3.3-2.6 5.7a5.6 5.6 0 0 0 11.2.2c0-2-.8-3.4-1.8-4.7.2 1.6-.4 2.9-1.6 3.4.6-3.3-.8-6.4-1.6-12.2Z" fill="#FFFFFF"/><path d="M13.3 22.6h5.4" stroke="#FFFFFF" stroke-width="1.6" stroke-linecap="round"/>"##
+);
+icon32!(
     PROVIDER_NEXTCLOUD,
     "provider-nextcloud",
     r##"<rect x="2" y="2" width="28" height="28" rx="7" fill="#0082C9"/><circle cx="8.2" cy="16" r="2.9" fill="none" stroke="#FFFFFF" stroke-width="2.2"/><circle cx="23.8" cy="16" r="2.9" fill="none" stroke="#FFFFFF" stroke-width="2.2"/><circle cx="16" cy="16" r="4.5" fill="none" stroke="#FFFFFF" stroke-width="2.4"/>"##

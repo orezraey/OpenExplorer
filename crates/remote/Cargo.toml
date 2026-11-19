@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 base64 = "0.22"
+openexplorer-b2 = { path = "../b2" }
 openexplorer-i18n = { path = "../i18n" }
 openexplorer-dropbox = { path = "../dropbox" }
 openexplorer-mega = { path = "../mega" }

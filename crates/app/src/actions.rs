@@ -92,7 +92,7 @@ pub fn editable(loc: &Location) -> bool {
         Location::Local(dir) => !crate::network::is_server(dir),
         Location::Mock(_) | Location::Found(_) => false,
         Location::Drive { .. } => drive_folder(loc).is_some(),
-        Location::Server { find, .. } => find.is_none() && crate::mega::why_not(loc).is_none(),
+        Location::Server { find, .. } => find.is_none() && crate::mega::why_not(loc).is_none() && crate::b2::why_not(loc).is_none(),
     }
 }
 
@@ -102,7 +102,7 @@ pub fn editable(loc: &Location) -> bool {
 pub fn items_editable(loc: &Location) -> bool {
     match loc {
         Location::Drive { space: Space::SharedDrives | Space::Trash, .. } => false,
-        Location::Server { .. } if crate::mega::items_fixed(loc) => false,
+        Location::Server { .. } if crate::mega::items_fixed(loc) || crate::b2::items_fixed(loc) => false,
         Location::Drive { .. } | Location::Found(_) | Location::Server { .. } => true,
         _ => editable(loc),
     }
@@ -116,7 +116,7 @@ pub fn in_trash(loc: &Location) -> bool {
 
 /// Why `loc` doesn't take what was asked (pasting, a new folder, cutting).
 fn why_not(loc: &Location) -> String {
-    if let Some(why) = crate::mega::why_not(loc) {
+    if let Some(why) = crate::mega::why_not(loc).or_else(|| crate::b2::why_not(loc)) {
         return why;
     }
     match loc {
@@ -1029,8 +1029,8 @@ pub fn ask_delete(s: &mut State, p: usize) {
     // Explorer does). By the items' own paths, so a search's results there count too.
     let loc = &s.panes[p].loc;
     // A MEGA account has its own Rubbish Bin; deleting inside it is for good.
-    // So does Dropbox, with its deleted files.
-    let mega_bin = crate::mega::at(loc).is_some() && !crate::mega::deletes_for_good(loc) || crate::dropbox::at(loc).is_some();
+    // So does Dropbox, with its deleted files; B2 hides what's deleted, and Desfazer brings it back.
+    let mega_bin = crate::mega::at(loc).is_some() && !crate::mega::deletes_for_good(loc) || crate::dropbox::at(loc).is_some() || crate::b2::at(loc).is_some();
     if (loc.is_local() && s.settings.skip_recycle_bin) || (matches!(loc, Location::Server { .. }) && !mega_bin) || items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_remote(&path)) {
         s.dialog = Some(Dialog::Purge { pane: p, items });
         return;
@@ -1069,6 +1069,7 @@ pub fn delete(s: &mut State) {
         }
         Location::Server { server, .. } if server.is_mega() => crate::mega::trash(s, &loc, items),
         Location::Server { server, .. } if server.is_dropbox() => crate::dropbox::delete(s, &loc, items),
+        Location::Server { server, .. } if server.is_b2() => crate::b2::hide(s, &loc, items),
         Location::Server { .. } => crate::servers::delete(s, &loc, items, vec![loc.clone()]),
         Location::Mock(_) => return not_here(s, pane),
     }
@@ -1122,6 +1123,11 @@ pub fn purge(s: &mut State) {
     if loc.is_local() {
         let paths: Vec<PathBuf> = items.iter().filter_map(|e| loc.local_path(e)).collect();
         local_job(s, vec![loc.clone()], move || ops::delete_forever(&paths).map(|_| tr!("Excluído permanentemente: {}.", "Deleted forever: {}.", count(n))));
+        s.status = tr!("Excluindo permanentemente {}…", "Deleting forever {}…", count(n));
+        return;
+    }
+    if crate::b2::at(&loc).is_some() {
+        crate::b2::purge(s, &loc, items);
         s.status = tr!("Excluindo permanentemente {}…", "Deleting forever {}…", count(n));
         return;
     }

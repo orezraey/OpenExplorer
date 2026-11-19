@@ -8,6 +8,7 @@ rune = { workspace = true }
 rune-kit = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 openexplorer-dropbox = { path = "../dropbox" }
+openexplorer-b2 = { path = "../b2" }
 openexplorer-gdrive = { path = "../gdrive" }
 openexplorer-mega = { path = "../mega" }
 openexplorer-i18n = { path = "../i18n" }

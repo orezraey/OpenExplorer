@@ -3,6 +3,7 @@
 //!
 //! Everything here blocks; the app runs it on background threads.
 
+mod b2;
 mod dav;
 mod dropbox;
 mod ftp;
@@ -48,6 +49,8 @@ pub enum Protocol {
     Mega,
     /// A Dropbox account (see `dropbox.rs`), kept apart like MEGA's.
     Dropbox,
+    /// A Backblaze B2 application key (see `b2.rs`); kept apart like MEGA.
+    B2,
 }
 
 impl Protocol {
@@ -62,6 +65,7 @@ impl Protocol {
             Protocol::Davs => "WebDAV (https)",
             Protocol::Mega => "MEGA",
             Protocol::Dropbox => "Dropbox",
+            Protocol::B2 => "Backblaze B2",
         }
     }
 
@@ -84,6 +88,7 @@ impl Protocol {
             Protocol::Davs => "https",
             Protocol::Mega => "mega",
             Protocol::Dropbox => "dropbox",
+            Protocol::B2 => "b2",
         }
     }
 
@@ -103,7 +108,7 @@ impl Protocol {
             Protocol::Ftp | Protocol::Ftps => 21,
             Protocol::Sftp => 22,
             Protocol::Dav => 80,
-            Protocol::Davs | Protocol::Mega | Protocol::Dropbox => 443,
+            Protocol::Davs | Protocol::Mega | Protocol::Dropbox | Protocol::B2 => 443,
         }
     }
 
@@ -211,6 +216,30 @@ impl Server {
         self.protocol == Protocol::Dropbox
     }
 
+    /// The server a Backblaze B2 key shows as in the panes: its key ID is the user, its
+    /// application key in the B2 crate's own store. `name` is what the tree shows.
+    pub fn b2(key_id: &str, name: &str) -> Server {
+        Server {
+            id: format!("b2:{key_id}"),
+            name: name.to_string(),
+            protocol: Protocol::B2,
+            brand: None,
+            host: "backblazeb2.com".into(),
+            port: 443,
+            user: key_id.to_string(),
+            root: "/".into(),
+            key: None,
+            host_key: None,
+            cert: None,
+            connections: 6,
+            implicit: false,
+        }
+    }
+
+    pub fn is_b2(&self) -> bool {
+        self.protocol == Protocol::B2
+    }
+
     /// `sftp://ana@host:2222`, the port only when it isn't the usual one. Never the password.
     pub fn address(&self) -> String {
         if self.is_mega() {
@@ -218,6 +247,10 @@ impl Server {
         }
         if self.is_dropbox() {
             return format!("dropbox://{}", self.user);
+        }
+        // Bucket names are unique across B2: an address names the bucket, not the key.
+        if self.is_b2() {
+            return "b2://".into();
         }
         let user = if self.user.is_empty() { String::new() } else { format!("{}@", encode_user(&self.user)) };
         let host = if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() };
@@ -356,6 +389,7 @@ fn open(server: &Server, secret: &str, trust: &tls::Trust) -> Result<Box<dyn Con
         Protocol::Dav | Protocol::Davs => Ok(Box::new(dav::Dav::connect(server, secret, trust)?)),
         Protocol::Mega => Ok(Box::new(mega::Mega::connect(server)?)),
         Protocol::Dropbox => Ok(Box::new(dropbox::Dropbox::connect(server)?)),
+        Protocol::B2 => Ok(Box::new(b2::B2::connect(server)?)),
     }
 }
 
