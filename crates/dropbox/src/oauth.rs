@@ -102,7 +102,13 @@ impl PendingLogin {
     /// Waits for the browser's redirect (up to five minutes) and exchanges its code for tokens
     /// at `api` (the api host: `https://api.dropboxapi.com`).
     pub fn finish(self, cfg: &AppConfig, api: &str) -> Result<Tokens> {
-        let code = self.wait_for_code()?;
+        self.finish_until(cfg, api, &|| false)
+    }
+
+    /// [`PendingLogin::finish`], given up (and the port freed) once `stop` says so: a newer
+    /// login began.
+    pub fn finish_until(self, cfg: &AppConfig, api: &str, stop: &dyn Fn() -> bool) -> Result<Tokens> {
+        let code = self.wait_for_code(stop)?;
         let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(60))).build().into();
         let resp = agent
             .post(&format!("{api}/oauth2/token"))
@@ -121,7 +127,7 @@ impl PendingLogin {
         Ok(tokens)
     }
 
-    fn wait_for_code(&self) -> Result<String> {
+    fn wait_for_code(&self, stop: &dyn Fn() -> bool) -> Result<String> {
         for l in &self.listeners {
             l.set_nonblocking(true).map_err(|e| e.to_string())?;
         }
@@ -142,6 +148,9 @@ impl PendingLogin {
                 }
             }
             if idle {
+                if stop() {
+                    return Err(t("Login substituído por um novo.", "Login replaced by a new one.").into());
+                }
                 if Instant::now() > deadline {
                     return Err(t("O login expirou: o navegador não voltou em 5 minutos.", "The login expired: the browser didn't come back within 5 minutes.").into());
                 }
@@ -260,14 +269,14 @@ mod tests {
         let l = begin(&cfg()).unwrap();
         let (p, state) = (l.listeners[0].local_addr().unwrap().port(), l.state.clone());
         let browser = std::thread::spawn(move || (browse(p, "/favicon.ico"), browse(p, &format!("/?code=abc%2Fdef&state={state}"))));
-        assert_eq!(l.wait_for_code().unwrap(), "abc/def");
+        assert_eq!(l.wait_for_code(&|| false).unwrap(), "abc/def");
         let (fav, page) = browser.join().unwrap();
         assert!(fav.starts_with("HTTP/1.1 404") && page.contains("Pode fechar esta aba"));
 
         let l = begin(&cfg()).unwrap();
         let p = l.listeners[0].local_addr().unwrap().port();
         let browser = std::thread::spawn(move || browse(p, "/?code=abc&state=forjado"));
-        assert!(l.wait_for_code().unwrap_err().contains("estado diferente"));
+        assert!(l.wait_for_code(&|| false).unwrap_err().contains("estado diferente"));
         browser.join().unwrap();
     }
 }
