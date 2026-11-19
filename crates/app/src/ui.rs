@@ -1242,7 +1242,7 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     }
     menu = menu.separator().item(item(t("Nova pasta", "New folder"), &icons::M_NEW_FOLDER, "Ctrl+Shift+N", editable, actions::ask_new_folder));
     // What was deleted from a Dropbox folder, to bring back.
-    if n == 0 && crate::dropbox::shows_folder(s, p) {
+    if crate::dropbox::shows_folder(s, p) {
         menu = menu.item(item(t("Itens excluídos…", "Deleted items…"), &icons::M_RESTORE, "", true, crate::dropbox::show_deleted));
     }
     if n > 0 {
