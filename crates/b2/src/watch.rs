@@ -28,11 +28,12 @@ use crate::account::{Item, PAGE};
 
 /// How often a folder of up to 10,000 names is read again while it shows.
 pub const EVERY: Duration = Duration::from_secs(45);
-/// The most requests a key's own readings make in an hour.
-pub const MOST_PER_HOUR: u32 = 120;
-/// The most requests a key's own readings make in a day (UTC). A pane left on a small folder
-/// all day takes about 80 an hour; this stops it after some 12 hours of that.
-pub const MOST_PER_DAY: u32 = 1_000;
+/// The most requests a key's own readings make in an hour. A pane on a folder takes about 80
+/// an hour, whatever its size ([`every`]), so both panes on the same key fit, with room.
+pub const MOST_PER_HOUR: u32 = 200;
+/// The most requests a key's own readings make in a day (UTC): both panes left on the key for
+/// some 12 hours, one for a day.
+pub const MOST_PER_DAY: u32 = 2_000;
 
 /// The requests one reading of a folder of `items` names takes.
 pub fn cost(items: usize) -> u32 {
@@ -142,6 +143,23 @@ mod tests {
         assert_eq!(b.take(now, 1), Err(Polled::Wait(next_day - now)));
         assert_eq!(b.take(next_day, 1), Ok(()));
         assert_eq!(b.spent(), (1, 1));
+    }
+
+    /// Both panes on folders of the same key, read again on their turns, for an hour: none is
+    /// held by the budget.
+    #[test]
+    fn two_panes_on_one_key_fit_in_the_hours_budget() {
+        let mut b = Budget::default();
+        let t0 = 20_000 * 86_400 + 10 * 3600;
+        for (items, offset) in [(500usize, 0u64), (25_000, 7)] {
+            let step = every(items).as_secs();
+            let mut now = t0 + offset;
+            while now < t0 + 3600 {
+                assert_eq!(b.take(now, cost(items)), Ok(()), "{items} items at {}", now - t0);
+                now += step;
+            }
+        }
+        assert!(b.spent().0 <= MOST_PER_HOUR, "{:?}", b.spent());
     }
 
     #[test]

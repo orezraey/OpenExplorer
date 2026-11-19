@@ -37,6 +37,8 @@ pub const PART_CAP: u64 = 32 * 1024 * 1024;
 pub const PARTS_AT_ONCE: usize = 4;
 /// B2's limit of parts per file.
 pub const MAX_PARTS: u64 = 10_000;
+/// The file info where B2's own tools note a file's time on the computer it came from.
+pub const MODIFIED: &str = "src_last_modified_millis";
 /// What all uploads together hold of parts in memory.
 pub const BUDGET: u64 = 256 * 1024 * 1024;
 
@@ -197,7 +199,7 @@ impl Account {
 
     /// Sends `data` as the file `name` in `bucket` through `up`'s URL, `report` told the bytes
     /// so far.
-    fn send_small(&self, up: &mut Uploads, bucket: &Bucket, name: &str, data: &[u8], report: &mut dyn FnMut(u64) -> bool) -> Result<Version> {
+    fn send_small(&self, up: &mut Uploads, bucket: &Bucket, name: &str, data: &[u8], modified: Option<i64>, report: &mut dyn FnMut(u64) -> bool) -> Result<Version> {
         let sha1 = sha1_hex(data);
         let mut delay = self.api.backoff;
         let mut tries = 0;
@@ -218,6 +220,9 @@ impl Account {
                 .header("X-Bz-Content-Sha1", &sha1);
             if let Some(m) = &self.api.test_mode {
                 req = req.header("X-Bz-Test-Mode", m);
+            }
+            if let Some(ms) = modified {
+                req = req.header(&format!("X-Bz-Info-{MODIFIED}"), &ms.to_string());
             }
             let r = req.send(ureq::SendBody::from_reader(&mut body));
             match sent(r, body.stopped) {
@@ -249,11 +254,18 @@ impl Account {
 
     /// A small file whose bytes are at hand (a folder's marker).
     pub(crate) fn put_bytes(&self, up: &mut Uploads, bucket: &Bucket, name: &str, data: Vec<u8>) -> Result<Version> {
-        self.send_small(up, bucket, name, &data, &mut |_| true)
+        self.send_small(up, bucket, name, &data, None, &mut |_| true)
     }
 
     /// Creates or replaces the file at `path` with the `len` bytes of `src`.
     pub fn upload(&self, up: &mut Uploads, path: &str, src: &mut dyn Read, len: u64, progress: Progress) -> Result<Version> {
+        self.upload_dated(up, path, src, len, None, progress)
+    }
+
+    /// [`Account::upload`], noting the file's own time (milliseconds since 1970) as B2's tools
+    /// do (`src_last_modified_millis`), so the panes show it rather than when it reached B2.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_dated(&self, up: &mut Uploads, path: &str, src: &mut dyn Read, len: u64, modified: Option<i64>, progress: Progress) -> Result<Version> {
         let s = match Spot::of(path) {
             Some(s) if !s.key.is_empty() => s,
             _ => return Err(t("No B2, arquivos ficam dentro de um bucket: abra um deles.", "On B2, files go inside a bucket: open one of them.").into()),
@@ -266,9 +278,9 @@ impl Account {
             let _held = hold(len);
             let mut data = vec![0u8; len as usize];
             src.read_exact(&mut data).map_err(|e| tr!("Não consegui ler o que seria enviado: {e}", "Couldn't read what was to be sent: {e}"))?;
-            self.send_small(up, &bucket, &s.key, &data, progress)
+            self.send_small(up, &bucket, &s.key, &data, modified, progress)
         } else {
-            self.upload_large(&bucket, &s.key, src, len, part, progress)
+            self.upload_large(&bucket, &s.key, src, len, part, modified, progress)
         };
         self.changed(&s, false);
         result
@@ -279,14 +291,16 @@ impl Account {
     /// take it up again if it stops midway.
     pub fn upload_file(&self, up: &mut Uploads, path: &str, local: &Path, progress: Progress) -> Result<Version> {
         let mut file = std::fs::File::open(local).map_err(|e| tr!("Não consegui abrir {}: {e}", "Couldn't open {}: {e}", local.display()))?;
-        let len = file.metadata().map_err(|e| tr!("Não consegui ler {}: {e}", "Couldn't read {}: {e}", local.display()))?.len();
+        let meta = file.metadata().map_err(|e| tr!("Não consegui ler {}: {e}", "Couldn't read {}: {e}", local.display()))?;
+        let len = meta.len();
+        let modified = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64);
         let auth = self.api.auth()?;
         let large = len > part_size(len, auth.recommended_part, auth.minimum_part);
         let spot = Spot::of(path).filter(|s| !s.key.is_empty() && large);
         if let Some(s) = &spot {
             crate::notes::begin(&self.key_id, &s.bucket, &s.key, len, local);
         }
-        let result = self.upload(up, path, &mut std::io::BufReader::with_capacity(1 << 20, &mut file), len, progress);
+        let result = self.upload_dated(up, path, &mut std::io::BufReader::with_capacity(1 << 20, &mut file), len, modified, progress);
         // Ended, or cancelled on B2: nothing to take up again. Failed: the note stays.
         if let Some(s) = &spot
             && result.as_ref().map_or_else(|e| e == CANCELLED, |_| true)
@@ -304,10 +318,13 @@ impl Account {
         // A key limited to a prefix must ask within it.
         let prefix = self.api.auth()?.allowed.name_prefix.clone().unwrap_or_default();
         let found = self.unfinished(&bucket, &prefix)?;
-        let parts = each(&found, |v| self.parts(&v.id))?;
+        // One that ended or was cancelled since it was listed has no parts to ask for (400):
+        // it's left out, not the whole list failed.
+        let parts = each(&found, |v| Ok(self.parts(&v.id).ok()))?;
         Ok(found
             .into_iter()
             .zip(parts)
+            .filter_map(|(v, parts)| Some((v, parts?)))
             .map(|(v, parts)| {
                 let size = v.info.get("oe_size").and_then(Value::as_str).and_then(|s| s.parse().ok());
                 Unfinished {
@@ -489,11 +506,18 @@ impl Account {
 
     /// Sends `src` as a large file: its parts read one after another here, sent by
     /// [`PARTS_AT_ONCE`] threads, each with its own part URL.
-    fn upload_large(&self, bucket: &Bucket, name: &str, src: &mut dyn Read, len: u64, part: u64, progress: Progress) -> Result<Version> {
+    #[allow(clippy::too_many_arguments)]
+    fn upload_large(&self, bucket: &Bucket, name: &str, src: &mut dyn Read, len: u64, part: u64, modified: Option<i64>, progress: Progress) -> Result<Version> {
         let count = len.div_ceil(part);
         let (file_id, have) = match self.resumable(bucket, name, len, part) {
             Some(found) => found,
-            None => (self.start_large(bucket, name, "b2/x-auto", json!({"oe_size": len.to_string(), "oe_part": part.to_string()}))?, HashMap::new()),
+            None => {
+                let mut info = json!({"oe_size": len.to_string(), "oe_part": part.to_string()});
+                if let Some(ms) = modified {
+                    info[MODIFIED] = ms.to_string().into();
+                }
+                (self.start_large(bucket, name, "b2/x-auto", info)?, HashMap::new())
+            }
         };
         let _sending = InFlight::new(&file_id);
         let sent = AtomicU64::new(0);
@@ -606,11 +630,19 @@ impl Account {
             Ok(a.get("contentSha1").and_then(Value::as_str).filter(|s| *s != "none").map(str::to_string))
         });
         // Each b2_copy_part answers with the part's contentSha1, and b2_finish_large_file joins
-        // the parts by those. One missing (B2 never leaves it out) gives the copy up rather than
-        // guessing; and a copy that fails anywhere is cancelled, as nothing can resume it (it
-        // starts over), so its parts don't stay billed.
-        let joined = match copied {
-            Ok(c) if c.iter().all(Option::is_some) => self.finish_large(&file_id, &c.into_iter().flatten().collect::<Vec<_>>()),
+        // the parts by their SHA-1s. Should an answer say "none" (its schema allows the word),
+        // the parts' SHA-1 are read back with b2_list_parts; one still missing gives the copy up
+        // rather than guessing. A copy that fails anywhere is cancelled, as nothing can resume
+        // it (it starts over), so its parts don't stay billed.
+        let sha1s = copied.and_then(|c| {
+            if c.iter().all(Option::is_some) {
+                return Ok(c.into_iter().flatten().collect::<Vec<_>>());
+            }
+            let parts = self.parts(&file_id)?;
+            Ok(ranges.iter().map(|(n, ..)| parts.get(n).map(|p| p.1.clone()).filter(|s| s != "none").unwrap_or_default()).collect())
+        });
+        let joined = match sha1s {
+            Ok(s) if s.iter().all(|x| !x.is_empty()) => self.finish_large(&file_id, &s),
             Ok(_) => Err(tr!("O B2 não deu o SHA-1 das partes copiadas de “{}”; copie baixando e enviando.", "B2 didn't give the SHA-1 of the copied parts of “{}”; copy it by downloading and uploading.", name)),
             Err(e) => Err(e),
         };

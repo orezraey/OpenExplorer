@@ -138,6 +138,8 @@ pub struct Faults {
     pub capped: AtomicUsize,
     /// The next `b2_copy_part` calls answer 400.
     pub copy_part_refused: AtomicUsize,
+    /// The next `b2_list_parts` calls answer 400, as for a file finished or cancelled meanwhile.
+    pub parts_gone: AtomicUsize,
     /// The next uploads (files and parts) answer 503.
     pub upload_busy: AtomicUsize,
     /// The next download sends only this many bytes, then closes.
@@ -400,6 +402,10 @@ fn serve(conn: TcpStream, state: &Mutex<State>, faults: &Faults, url: &str) -> s
         let wait = state.lock().unwrap().retry_after;
         return respond(&mut conn, s, &[("Content-Type", "application/json".into()), ("Retry-After", wait.to_string())], v.to_string().as_bytes());
     }
+    if call == "b2_list_parts" && take(&faults.parts_gone) {
+        let (s, v) = error(400, "bad_request", "no such file");
+        return json_reply(&mut conn, s, &v);
+    }
     if call == "b2_copy_part" && take(&faults.copy_part_refused) {
         let (s, v) = error(400, "bad_request", "range out of the file");
         return json_reply(&mut conn, s, &v);
@@ -422,8 +428,14 @@ fn upload(req: &Request, state: &Mutex<State>) -> (u16, Value) {
     if let Some(bucket) = req.path.strip_prefix("/upload/") {
         let name = decode(req.headers.get("x-bz-file-name").map(String::as_str).unwrap_or(""));
         let id = st.add(bucket, &name, &req.body);
-        let v = st.versions.iter().find(|v| v.id == id).unwrap().json();
-        return (200, v);
+        let v = st.versions.iter_mut().find(|v| v.id == id).unwrap();
+        // File info comes in X-Bz-Info-* headers (here lowercased, as read).
+        for (k, value) in &req.headers {
+            if let Some(key) = k.strip_prefix("x-bz-info-") {
+                v.info.insert(key.to_string(), decode(value).into());
+            }
+        }
+        return (200, v.json());
     }
     let file_id = req.path.trim_start_matches("/upload_part/").to_string();
     let n: u64 = req.headers.get("x-bz-part-number").and_then(|n| n.parse().ok()).unwrap_or(0);

@@ -435,6 +435,25 @@ fn unfinished_uploads_show_what_b2_holds_and_go_on_or_are_cancelled() {
 }
 
 #[test]
+fn a_file_from_the_computer_keeps_its_own_time_small_or_large() {
+    let m = mock();
+    small_parts(&m);
+    let a = m.account();
+    let mut up = Uploads::default();
+    let dir = std::env::temp_dir().join(format!("oe-b2-flows-dated-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_600_000_000_123);
+    for (name, len) in [("pequeno.txt", 10), ("grande.bin", 3 * (1 << 20) + 5)] {
+        let local = dir.join(name);
+        std::fs::write(&local, noise(len)).unwrap();
+        std::fs::File::options().write(true).open(&local).unwrap().set_modified(when).unwrap();
+        a.upload_file(&mut up, &format!("/fotos/{name}"), &local, &mut |_| true).unwrap();
+        assert_eq!(a.stat(&format!("/fotos/{name}")).unwrap().unwrap().modified, Some(1_600_000_000_123), "{name}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn unfinished_uploads_list_past_a_page_and_parts_past_theirs() {
     let m = mock();
     let a = m.account();
@@ -449,6 +468,9 @@ fn unfinished_uploads_list_past_a_page_and_parts_past_theirs() {
     assert_eq!(list.len(), 130);
     assert_eq!((list[0].parts, list[0].sent), (1500, 3000));
     assert_eq!(m.calls("b2_list_unfinished_large_files"), 2);
+    // One that ended between the listing and its parts is left out; the rest still show.
+    m.faults.parts_gone.store(1, Ordering::SeqCst);
+    assert_eq!(a.unfinished_uploads("docs").unwrap().len(), 129);
 }
 
 #[test]

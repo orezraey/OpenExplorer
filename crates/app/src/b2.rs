@@ -238,8 +238,12 @@ struct Turn {
 
 /// The window gained or lost the focus. Back in front, a folder whose turn came meanwhile is
 /// read at once.
-pub fn window_focus(s: &mut State, focused: bool, _: &mut Tx) {
+pub fn window_focus(s: &mut State, focused: bool, tx: &mut Tx) {
     s.servers.b2_watch.away = !focused;
+    // While away no wake was asked for: the next frame looks at the turns.
+    if focused {
+        tx.wake_after(Duration::ZERO);
+    }
 }
 
 /// How long until a folder of `items` names is read again.
