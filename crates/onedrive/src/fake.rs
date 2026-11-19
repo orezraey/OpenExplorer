@@ -54,9 +54,82 @@ pub struct State {
     pub refreshes: usize,
     /// Every delta link given out before this version is refused (410).
     pub resync_before: u64,
+    /// A work account: its drive is a SharePoint site (`/sp/…` here) whose recycle bin gets
+    /// what Graph deletes.
+    pub business: bool,
+    /// SharePoint's permission granted to the app: a token for it is refused until then.
+    pub sp_granted: bool,
+    /// SharePoint asks for `X-RequestDigest` on POSTs.
+    pub sp_digest: bool,
+    /// The site collection's recycle bin refused (403): only the site's, first stage.
+    pub sp_site_refused: bool,
+    /// `$filter` refused (400).
+    pub sp_no_filter: bool,
+    /// `$filter` answered with this status instead (a 500, say), when not 0.
+    pub sp_filter_status: u16,
+    /// The site's recycle bin refused too (403).
+    pub sp_web_refused: bool,
+    /// Recycle bin items per page (`odata.nextLink`), all at once if 0.
+    pub sp_page: usize,
+    /// The recycle bin, oldest first.
+    pub bin: Vec<FBin>,
+    /// Requests to SharePoint's REST API.
+    pub sp_requests: usize,
 }
 
+/// A recycle bin item of the work account's site.
+#[derive(Clone, Debug)]
+pub struct FBin {
+    pub guid: String,
+    pub item: String,
+    pub dir: String,
+    /// `DeletedDate`, ISO 8601 in UTC.
+    pub deleted: String,
+    pub stage: u8,
+}
+
+/// The work account's site, below the stand-in's address.
+pub const SITE: &str = "/sp/personal/ana_exemplo_com";
+
 impl State {
+    /// `DirName` of a folder: the library's path from the host, without the first slash.
+    fn dir_name(&self, folder: &str) -> String {
+        let mut names = Vec::new();
+        let mut at = Some(folder.to_string());
+        while let Some(id) = at {
+            let Some(it) = self.items.get(&id) else { break };
+            if it.parent.is_some() {
+                names.push(it.name.clone());
+            }
+            at = it.parent.clone();
+        }
+        names.reverse();
+        let mut d = format!("{}/Documents", SITE.trim_start_matches('/'));
+        for n in names {
+            d.push('/');
+            d.push_str(&n);
+        }
+        d
+    }
+
+    /// What deleting `id` puts in the recycle bin of a work account.
+    pub fn put_in_bin(&mut self, id: &str, deleted: &str) -> String {
+        self.next += 1;
+        let guid = format!("{:08x}-0000-4000-8000-{:012x}", self.next, self.next);
+        let parent = self.items[id].parent.clone().unwrap_or_default();
+        let dir = self.dir_name(&parent);
+        self.bin.push(FBin { guid: guid.clone(), item: id.to_string(), dir, deleted: deleted.to_string(), stage: 1 });
+        guid
+    }
+
+    fn drop_tree(&mut self, id: &str) {
+        let kids: Vec<String> = self.items.values().filter(|i| i.parent.as_deref() == Some(id)).map(|i| i.id.clone()).collect();
+        for k in kids {
+            self.drop_tree(&k);
+        }
+        self.items.remove(id);
+    }
+
     fn bump(&mut self) -> u64 {
         self.version += 1;
         self.version
@@ -98,7 +171,7 @@ impl State {
             v["deleted"] = json!({ "state": "deleted" });
         }
         match &it.parent {
-            Some(p) => v["parentReference"] = json!({ "driveId": DRIVE, "driveType": "personal", "id": p }),
+            Some(p) => v["parentReference"] = json!({ "driveId": DRIVE, "driveType": if self.business { "business" } else { "personal" }, "id": p }),
             None => v["root"] = json!({}),
         }
         if it.is_dir {
@@ -271,11 +344,37 @@ fn serve(mut conn: TcpStream, state: &Mutex<State>, count: &Count, base: &str) {
     let _ = conn.flush();
 }
 
+fn form(body: &[u8]) -> HashMap<String, String> {
+    let s = String::from_utf8_lossy(body).replace('+', " ");
+    s.split('&').filter(|kv| !kv.is_empty()).map(|kv| {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        (decode(k), decode(v))
+    }).collect()
+}
+
 fn answer(req: &Req, state: &Mutex<State>, base: &str) -> Resp {
     let mut st = state.lock().unwrap();
     if req.path.starts_with("/login/") {
+        // A token for SharePoint (`{host}/.default`) only once its permission is granted; Graph's
+        // otherwise. Each starts with its own letter, so a token sent to the wrong one fails.
+        let scope = form(&req.body).get("scope").cloned().unwrap_or_default();
+        let sharepoint = scope.contains("/.default");
+        if sharepoint && !st.sp_granted {
+            return Resp::json(400, json!({ "error": "invalid_grant", "error_description": "AADSTS65001: The user or administrator has not consented to use the application with ID '0b1c2d3e'. Send an interactive authorization request for this user and resource.\r\nTrace ID: x" }));
+        }
         st.refreshes += 1;
-        return Resp::json(200, json!({ "access_token": format!("a{}", st.refreshes), "refresh_token": format!("r{}", st.refreshes), "expires_in": 3600 }));
+        let letter = if sharepoint { "s" } else { "a" };
+        return Resp::json(200, json!({ "access_token": format!("{letter}{}", st.refreshes), "refresh_token": format!("r{}", st.refreshes), "expires_in": 3600 }));
+    }
+    if let Some(rest) = req.path.strip_prefix(&format!("{SITE}/_api/")) {
+        st.sp_requests += 1;
+        if !req.headers.get("authorization").is_some_and(|a| a.starts_with("Bearer s")) {
+            return Resp::json(401, json!({ "error_description": "Invalid audience." }));
+        }
+        if !req.headers.get("accept").is_some_and(|a| a.contains("application/json")) {
+            return Resp { status: 200, headers: vec![("Content-Type".into(), "application/atom+xml".into())], body: b"<feed/>".to_vec() };
+        }
+        return sharepoint(req, &mut st, rest, base);
     }
     if !req.path.starts_with("/dl/") && !req.path.starts_with("/up/") && !req.path.starts_with("/monitor/") {
         if st.throttle > 0 {
@@ -368,7 +467,15 @@ fn route(req: &Req, st: &mut State, base: &str) -> Resp {
     let alive = |st: &State, id: &str| st.items.get(id).is_some_and(|i| !i.deleted);
     match (req.method.as_str(), tail) {
         ("GET", "") => match target.filter(|t| alive(st, t)) {
-            Some(t) => Resp::json(200, st.json(&st.items[&t], full, base)),
+            Some(t) => {
+                let mut v = st.json(&st.items[&t], full, base);
+                // A work account's library and site, as SharePoint has them.
+                if st.business && t == ROOT && req.query.get("$select").is_some_and(|s| s.contains("sharepointIds")) {
+                    v["webUrl"] = format!("{base}{SITE}/Documents").into();
+                    v["sharepointIds"] = json!({ "siteUrl": format!("{base}{SITE}"), "listId": "L1" });
+                }
+                Resp::json(200, v)
+            }
             None => Resp::error(404, "itemNotFound"),
         },
         ("GET", "/children") => {
@@ -436,8 +543,13 @@ fn route(req: &Req, st: &mut State, base: &str) -> Resp {
         ("DELETE", "") => {
             let Some(t) = target.filter(|t| alive(st, t)) else { return Resp::error(404, "itemNotFound") };
             st.touch(&t, |i| i.deleted = true);
+            if st.business {
+                st.put_in_bin(&t, &now());
+            }
             Resp::empty(204)
         }
+        // Graph restores only on personal accounts.
+        ("POST", "/restore") if st.business => Resp::error(400, "invalidRequest"),
         ("POST", "/restore") => {
             let Some(t) = target.filter(|t| st.items.get(t).is_some_and(|i| i.deleted)) else { return Resp::error(404, "itemNotFound") };
             st.touch(&t, |i| i.deleted = false);
@@ -558,4 +670,88 @@ fn upload_part(req: &Req, st: &mut State, n: u64, base: &str) -> Resp {
         }
         _ => Resp::error(400, "invalidRequest"),
     }
+}
+
+/// Now, as SharePoint writes `DeletedDate`.
+pub fn now() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+fn sp_error(status: u16, code: &str, message: &str) -> Resp {
+    Resp::json(status, json!({ "odata.error": { "code": code, "message": { "lang": "en-US", "value": message } } }))
+}
+
+/// SharePoint's REST API for the work account's site: the recycle bin (both stages from the
+/// site collection, the first from the site), restoring and deleting its items for good, and
+/// `contextinfo`'s form digest, answering as with `odata=nometadata`.
+fn sharepoint(req: &Req, st: &mut State, rest: &str, base: &str) -> Resp {
+    if !st.business {
+        return sp_error(404, "-1, Microsoft.SharePoint.Client.ResourceNotFoundException", "Not found.");
+    }
+    if req.method == "POST" && rest == "contextinfo" {
+        return Resp::json(200, json!({ "FormDigestValue": "0x1234,19 Nov 2026 12:00:00 -0000", "FormDigestTimeoutSeconds": 1800 }));
+    }
+    if req.method == "POST" && st.sp_digest && !req.headers.contains_key("x-requestdigest") {
+        return sp_error(403, "-2130575251, Microsoft.SharePoint.SPException", "The security validation for this page is invalid and might be corrupted. Please use your web browser's Back button to try your operation again.");
+    }
+    let (coll, after) = if let Some(a) = rest.strip_prefix("site/RecycleBin") {
+        ("site", a)
+    } else if let Some(a) = rest.strip_prefix("web/RecycleBin") {
+        ("web", a)
+    } else {
+        return sp_error(404, "-1, Microsoft.SharePoint.Client.InvalidClientQueryException", "The expression is not valid.");
+    };
+    if (coll == "site" && st.sp_site_refused) || (coll == "web" && st.sp_web_refused) {
+        return sp_error(403, "-2147024891, System.UnauthorizedAccessException", "Access denied.");
+    }
+    let visible = |b: &FBin| coll == "site" || b.stage == 1;
+    if after.is_empty() && req.method == "GET" {
+        let since = match req.query.get("$filter") {
+            Some(_) if st.sp_no_filter => return sp_error(400, "-1, Microsoft.SharePoint.Client.InvalidClientQueryException", "The query is not valid."),
+            Some(_) if st.sp_filter_status != 0 => return sp_error(st.sp_filter_status, "-1, System.NotSupportedException", "Not supported."),
+            Some(f) => f.split("datetime'").nth(1).map(|s| s.trim_end_matches('\'').to_string()),
+            None => None,
+        };
+        let all: Vec<&FBin> = st.bin.iter().filter(|b| visible(b) && since.as_ref().is_none_or(|s| b.deleted >= *s)).collect();
+        let skip: usize = req.query.get("$skiptoken").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let take = if st.sp_page == 0 { usize::MAX } else { st.sp_page };
+        let page: Vec<Value> = all
+            .iter()
+            .skip(skip)
+            .take(take)
+            .map(|b| {
+                let it = &st.items[&b.item];
+                json!({
+                    "Id": b.guid, "LeafName": it.name, "DirName": b.dir, "DeletedDate": b.deleted,
+                    "ItemState": b.stage, "ItemType": if it.is_dir { 5 } else { 1 }, "Size": it.data.len().to_string(),
+                })
+            })
+            .collect();
+        let mut v = json!({ "value": page });
+        if skip.saturating_add(take) < all.len() {
+            let q: String = req.query.iter().filter(|(k, _)| *k != "$skiptoken").map(|(k, v)| format!("{k}={}", v.replace(' ', "%20").replace('\'', "%27"))).collect::<Vec<_>>().join("&");
+            v["odata.nextLink"] = format!("{base}{SITE}/_api/{coll}/RecycleBin?{q}&$skiptoken={}", skip + take).into();
+        }
+        return Resp::json(200, v);
+    }
+    // ('{guid}')/restore() or ('{guid}')/deleteObject()
+    let Some((id, verb)) = after.strip_prefix("('").and_then(|a| a.split_once("')/")) else {
+        return sp_error(400, "-1, Microsoft.SharePoint.Client.InvalidClientQueryException", "The expression is not valid.");
+    };
+    if req.method != "POST" {
+        return sp_error(405, "-1, Microsoft.SharePoint.Client.ClientServiceException", "The HTTP method 'GET' cannot be used.");
+    }
+    let Some(at) = st.bin.iter().position(|b| b.guid == id && visible(b)) else {
+        return sp_error(404, "-2147024809, System.ArgumentException", "Item does not exist. It may have been deleted by another user.");
+    };
+    let b = st.bin.remove(at);
+    match verb {
+        "restore()" => st.touch(&b.item, |i| i.deleted = false),
+        "deleteObject()" => st.drop_tree(&b.item),
+        _ => {
+            st.bin.insert(at, b);
+            return sp_error(400, "-1, Microsoft.SharePoint.Client.InvalidClientQueryException", "The expression is not valid.");
+        }
+    }
+    Resp::json(200, json!({ "odata.null": true }))
 }

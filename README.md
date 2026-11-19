@@ -13,8 +13,9 @@ Written in Rust.
 * MEGA: multiple accounts (two-factor login too), Cloud Drive, Rubbish Bin with restore,
   incoming shares and public file links. Encrypted and decrypted on your computer; open folders
   update when files change elsewhere.
-* OneDrive: personal and work or school accounts, sharing links, recycle bin with undo
-  (personal). Open folders update when files change elsewhere.
+* OneDrive: personal and work or school accounts, sharing links, recycle bin with undo (and, on
+  work accounts, the Lixeira through SharePoint). Open folders update when files change
+  elsewhere.
 * SFTP, FTP/FTPS, WebDAV, Nextcloud and ownCloud.
 * Copy and move between any of them, with a transfer queue.
 * Instant file name search on local NTFS drives, similar to Everything. Drive, MEGA and servers
@@ -61,13 +62,19 @@ your own (free, no secret):
 2. Authentication: add the platform "Mobile and desktop applications" with the redirect URI
    `http://localhost`, and turn on "Allow public client flows".
 3. API permissions: Microsoft Graph, delegated, `Files.ReadWrite.All`, `offline_access` and
-   `User.Read`.
+   `User.Read`. For the recycle bin of work or school accounts, also SharePoint, delegated,
+   `AllSites.Write` (see below).
 4. In Open Explorer, go to Add account → OneDrive and paste the Application (client) ID (it's
    kept in `%APPDATA%\OpenExplorer\onedrive-client.json`; `OPENEXPLORER_ONEDRIVE_CLIENT_ID`
    works too).
 
-Microsoft offers no way for apps to list or restore OneDrive's recycle bin on work or school
-accounts: there, deleted items are restored on the website.
+Microsoft Graph doesn't list a work or school account's recycle bin, nor restore from it, so
+Open Explorer reads it through SharePoint's REST API, which needs that SharePoint permission.
+With it in the registration, open the account's Lixeira and click Authorize in browser (or have
+an administrator grant consent for the organization); from then on the Lixeira lists what was
+deleted, where from and when, with Restore, Delete permanently and Empty trash, and Undo brings
+back what Open Explorer deleted. Without it the account works as before, without the Lixeira.
+Personal accounts have no Lixeira (Graph doesn't list theirs); Undo restores what was deleted.
 
 ## Building from source
 

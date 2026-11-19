@@ -147,10 +147,259 @@ fn several_items_go_to_the_bin_and_back_in_one_batch() {
 }
 
 #[test]
-fn work_accounts_say_restoring_is_on_the_website() {
-    let (_fake, a, _, _) = setup(Kind::Business);
-    let (_, err) = a.restore_many(&["x".into()]);
-    assert!(err.unwrap().contains("site"));
+fn personal_accounts_undo_and_redo_several_deletes() {
+    let (fake, a, _, _) = setup(Kind::Personal);
+    assert_eq!(names(&a, "/"), ["Meus arquivos"]);
+    assert!(a.stat("/Lixeira").unwrap().is_none() && a.list("/Lixeira").is_err());
+    let (gone, _) = a.trash_many(&["/Meus arquivos/Docs/a.txt".into(), "/Meus arquivos/Docs/b.txt".into(), "/Meus arquivos/Fotos".into()]);
+    let ids: Vec<String> = gone.iter().map(|(id, _)| id.clone()).collect();
+    assert!(ids.iter().all(|id| a.can_restore(id)));
+    // Desfazer goes item by item, as the undo steps do.
+    for id in &ids {
+        a.restore(id).unwrap();
+    }
+    assert_eq!(names(&a, TOP), ["Docs", "Fotos"]);
+    assert_eq!(names(&a, "/Meus arquivos/Docs"), ["a.txt", "b.txt"]);
+    // Refazer, then Desfazer again.
+    for id in &ids {
+        a.trash_id(id).unwrap();
+    }
+    assert!(names(&a, "/Meus arquivos/Docs").is_empty());
+    let (back, err) = a.restore_many(&ids);
+    assert_eq!((back.len(), err), (3, None));
+    assert_eq!(names(&a, "/Meus arquivos/Docs"), ["a.txt", "b.txt"]);
+    assert_eq!(fake.with(|st| st.sp_requests), 0);
+}
+
+/// A work account with SharePoint's permission granted, Docs (a.txt, b.txt) and Fotos.
+fn setup_work() -> (Fake, Account, String) {
+    let fake = Fake::start();
+    let docs = fake.with(|st| {
+        st.business = true;
+        st.sp_granted = true;
+        let docs = st.add(ROOT, "Docs", true, &[]);
+        st.add(&docs, "a.txt", false, b"alfa");
+        st.add(&docs, "b.txt", false, b"beta");
+        st.add(ROOT, "Fotos", true, &[]);
+        docs
+    });
+    let a = on(fake.ends(), Kind::Business, None).unwrap();
+    (fake, a, docs)
+}
+
+fn bin_names(a: &Account) -> Vec<String> {
+    let mut v = names(a, "/Lixeira");
+    v.sort();
+    v
+}
+
+#[test]
+fn a_work_account_shows_its_bin_and_restores_and_purges_from_it() {
+    let (fake, a, docs) = setup_work();
+    assert_eq!(names(&a, "/"), ["Lixeira", "Meus arquivos"]);
+    assert_eq!(names(&a, "/Recycle bin"), Vec::<String>::new());
+    let (gone, err) = a.trash_many(&["/Meus arquivos/Docs/a.txt".into(), "/Meus arquivos/Docs/b.txt".into(), "/Meus arquivos/Fotos".into()]);
+    assert_eq!((gone.len(), err), (3, None));
+    assert_eq!(bin_names(&a), ["Fotos", "a.txt", "b.txt"]);
+    let shown = a.bin_shown();
+    let a_txt = shown.iter().find(|b| b.name == "a.txt").unwrap();
+    assert_eq!((a_txt.origin.as_str(), a_txt.size, a_txt.is_dir), ("Meus arquivos/Docs", 4, false));
+    assert_eq!(shown.iter().find(|b| b.name == "Fotos").unwrap().origin, "Meus arquivos");
+    assert!(shown.iter().find(|b| b.name == "Fotos").unwrap().is_dir);
+    let it = a.stat("/Lixeira/a.txt").unwrap().unwrap();
+    assert_eq!((it.is_dir, it.size), (false, Some(4)));
+    assert!(a.stat("/Lixeira/nada").unwrap().is_none());
+    // Nothing is put in, renamed or opened there.
+    assert!(a.mkdir("/Lixeira/Nova").is_err());
+    assert!(a.rename("/Lixeira/a.txt", "/Meus arquivos/a.txt").is_err());
+    assert!(a.list("/Lixeira/Fotos").unwrap_err().contains("restaure"));
+    assert!(a.download("/Lixeira/a.txt", &mut Vec::new(), &mut |_| true).is_err());
+    // Restaurar: back where it was, the folder brought up to date.
+    let (back, err) = a.bin_restore(&["a.txt".into(), "Fotos".into()]);
+    assert_eq!((back.len(), err), (2, None));
+    assert_eq!(names(&a, "/Meus arquivos/Docs"), ["a.txt"]);
+    assert_eq!(names(&a, TOP), ["Docs", "Fotos"]);
+    // Excluir permanentemente.
+    let (purged, err) = a.bin_purge(&["b.txt".into()]);
+    assert_eq!((purged, err), (vec!["b.txt".to_string()], None));
+    assert!(fake.with(|st| !st.items.values().any(|i| i.name == "b.txt")));
+    assert!(bin_names(&a).is_empty());
+    // Esvaziar: exactly what's listed.
+    a.trash_many(&["/Meus arquivos/Docs/a.txt".into()]);
+    fake.with(|st| {
+        let id = st.add(&docs, "c.txt", false, b"c");
+        st.touch(&id, |i| i.deleted = true);
+        let when = crate::fake::now();
+        st.put_in_bin(&id, &when);
+        st.bin.last_mut().unwrap().stage = 2;
+    });
+    assert_eq!(a.bin_empty().unwrap(), 2);
+    assert!(fake.with(|st| st.bin.is_empty() && !st.items.values().any(|i| i.name == "a.txt" || i.name == "c.txt")));
+}
+
+#[test]
+fn undo_and_redo_on_a_work_account_go_through_sharepoint() {
+    let (fake, a, _) = setup_work();
+    names(&a, "/Meus arquivos/Docs");
+    let (gone, _) = a.trash_many(&["/Meus arquivos/Docs/a.txt".into(), "/Meus arquivos/Docs/b.txt".into()]);
+    let ids: Vec<String> = gone.iter().map(|(id, _)| id.clone()).collect();
+    assert!(ids.iter().all(|id| a.can_restore(id)));
+    // Desfazer.
+    let (back, err) = a.restore_many(&ids);
+    assert_eq!((back.len(), err), (2, None));
+    assert_eq!(names(&a, "/Meus arquivos/Docs"), ["a.txt", "b.txt"]);
+    assert!(fake.with(|st| st.bin.is_empty()));
+    // Refazer finds the new bin item, so Desfazer works again.
+    for id in &ids {
+        a.trash_id(id).unwrap();
+        assert!(a.can_restore(id));
+    }
+    for id in &ids {
+        a.restore(id).unwrap();
+    }
+    assert_eq!(names(&a, "/Meus arquivos/Docs"), ["a.txt", "b.txt"]);
+}
+
+#[test]
+fn twins_in_the_bin_are_told_apart_and_undo_takes_the_one_it_deleted() {
+    let (fake, a, docs) = setup_work();
+    let (first, _) = a.trash_many(&["/Meus arquivos/Docs/a.txt".into()]);
+    fake.with(|st| st.add(&docs, "a.txt", false, b"segunda"));
+    a.catch_up().unwrap();
+    let (second, _) = a.trash_many(&["/Meus arquivos/Docs/a.txt".into()]);
+    assert_eq!(bin_names(&a), ["a (2).txt", "a.txt"]);
+    // Undoing the second delete brings the second file back, not the first.
+    a.restore(&second[0].0).unwrap();
+    let mut out = Vec::new();
+    a.download("/Meus arquivos/Docs/a.txt", &mut out, &mut |_| true).unwrap();
+    assert_eq!(out, b"segunda");
+    assert!(a.can_restore(&first[0].0));
+    // The first is still in the bin under its own name.
+    assert_eq!(bin_names(&a), ["a.txt"]);
+}
+
+#[test]
+fn without_sharepoint_permission_the_account_keeps_working() {
+    let (fake, a, _) = setup_work();
+    fake.with(|st| st.sp_granted = false);
+    let err = a.list("/Lixeira").unwrap_err();
+    assert!(err.contains("AllSites.Write") && err.contains("Autorizar no navegador"), "{err}");
+    assert!(matches!(a.bin_access(), crate::bin::Access::NeedsConsent(why) if why.contains("AADSTS65001")));
+    // Deleting still works; only Desfazer is left out.
+    let (gone, err) = a.trash_many(&["/Meus arquivos/Docs/a.txt".into()]);
+    assert_eq!((gone.len(), err), (1, None));
+    assert!(!a.can_restore(&gone[0].0));
+    assert!(a.restore_many(&[gone[0].0.clone()]).1.unwrap().contains("autorize"));
+    assert_eq!(names(&a, "/Meus arquivos/Docs"), ["b.txt"]);
+    // The grant's sign-in asks SharePoint's host for what the registration lists.
+    let login = a.bin_grant().unwrap();
+    let url = url::Url::parse(&login.url).unwrap();
+    let q = |k: &str| url.query_pairs().find(|(n, _)| n == k).map(|(_, v)| v.into_owned());
+    assert_eq!(q("scope").unwrap(), format!("{}/.default offline_access", fake.base));
+    assert_eq!(q("login_hint").unwrap(), "ana@exemplo.com");
+    // Granted (by the person, or an administrator): the bin opens.
+    fake.with(|st| st.sp_granted = true);
+    assert_eq!(bin_names(&a), ["a.txt"]);
+    assert_eq!(a.bin_access(), crate::bin::Access::Ready);
+}
+
+/// Answers a sign-in's loopback as the browser would, with `query` after its state.
+fn browser_comes_back(login: &crate::PendingLogin, query: &str) -> std::thread::JoinHandle<()> {
+    use std::io::{Read, Write};
+    let url = url::Url::parse(&login.url).unwrap();
+    let q = |k: &str| url.query_pairs().find(|(n, _)| n == k).map(|(_, v)| v.into_owned()).unwrap();
+    let port = url::Url::parse(&q("redirect_uri")).unwrap().port().unwrap();
+    let target = format!("/?state={}&{query}", q("state"));
+    std::thread::spawn(move || {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(s, "GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+    })
+}
+
+#[test]
+fn authorizing_the_bin_keeps_the_new_refresh_token_and_graph_goes_on() {
+    let fake = Fake::start();
+    fake.with(|st| {
+        st.business = true;
+        let docs = st.add(ROOT, "Docs", true, &[]);
+        st.add(&docs, "a.txt", false, b"alfa");
+    });
+    let kept = Arc::new(Mutex::new(Vec::<String>::new()));
+    let k = kept.clone();
+    let cfg = crate::ClientConfig { client_id: "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0".into(), tenant: "common".into() };
+    let graph = Graph::new(cfg, fake.ends(), "r0".into(), Box::new(move |t| k.lock().unwrap().push(t.into())));
+    let a = Account::start(Meta { id: DRIVE.into(), email: "ana@exemplo.com".into(), name: "Ana".into(), kind: Kind::Business }, graph, None).unwrap();
+    assert!(a.list("/Lixeira").unwrap_err().contains("AllSites.Write"));
+    // Refused in the browser: what to add, not a failed sign-in.
+    let login = a.bin_grant().unwrap();
+    let b = browser_comes_back(&login, "error=invalid_client&error_description=AADSTS650057%3A+Invalid+resource");
+    let err = a.bin_granted(&login).unwrap_err();
+    b.join().unwrap();
+    assert!(err.contains("AllSites.Write") && !err.contains("administrador aprove"), "{err}");
+    // Granted on Microsoft's page: the code becomes SharePoint's token and a new refresh token.
+    fake.with(|st| st.sp_granted = true);
+    let login = a.bin_grant().unwrap();
+    let b = browser_comes_back(&login, "code=c1");
+    a.bin_granted(&login).unwrap();
+    b.join().unwrap();
+    let newest = kept.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(a.graph.refresh_token(), newest);
+    assert_eq!(a.bin_access(), crate::bin::Access::Ready);
+    // Graph's token is still Graph's: the files list.
+    assert_eq!(names(&a, "/Meus arquivos/Docs"), ["a.txt"]);
+    let (gone, _) = a.trash_many(&["/Meus arquivos/Docs/a.txt".into()]);
+    assert!(a.can_restore(&gone[0].0));
+}
+
+#[test]
+fn a_sharepoint_permission_that_isnt_enough_asks_for_the_right_one() {
+    let (fake, a, _) = setup_work();
+    // Both the site collection's bin and the site's answer 403.
+    fake.with(|st| {
+        st.sp_site_refused = true;
+        st.sp_web_refused = true;
+    });
+    let err = a.list("/Lixeira").unwrap_err();
+    assert!(err.contains("AllSites.Write"), "{err}");
+    assert!(matches!(a.bin_access(), crate::bin::Access::NeedsConsent(why) if why.contains("negou")));
+}
+
+#[test]
+fn a_filter_answered_with_any_error_reads_the_whole_bin() {
+    let (fake, a, _) = setup_work();
+    fake.with(|st| st.sp_filter_status = 500);
+    let (gone, _) = a.trash_many(&["/Meus arquivos/Docs/a.txt".into()]);
+    assert!(a.can_restore(&gone[0].0));
+}
+
+#[test]
+fn sharepoint_asking_for_a_digest_refusing_the_site_bin_paging_and_no_filter() {
+    let (fake, a, docs) = setup_work();
+    fake.with(|st| {
+        st.sp_digest = true;
+        st.sp_page = 1;
+        st.sp_no_filter = true;
+    });
+    let (gone, _) = a.trash_many(&["/Meus arquivos/Docs/a.txt".into(), "/Meus arquivos/Docs/b.txt".into()]);
+    assert!(gone.iter().all(|(id, _)| a.can_restore(id)));
+    assert_eq!(bin_names(&a), ["a.txt", "b.txt"]);
+    let (back, err) = a.bin_restore(&["a.txt".into()]);
+    assert_eq!((back.len(), err), (1, None));
+    // The site collection's bin refused: the site's, without the second stage.
+    fake.with(|st| {
+        st.sp_site_refused = true;
+        let id = st.add(&docs, "velho.txt", false, b"v");
+        st.touch(&id, |i| i.deleted = true);
+        let when = crate::fake::now();
+        st.put_in_bin(&id, &when);
+        st.bin.last_mut().unwrap().stage = 2;
+    });
+    assert_eq!(bin_names(&a), ["b.txt"]);
+    let (back, err) = a.bin_restore(&["b.txt".into()]);
+    assert_eq!((back.len(), err), (1, None));
+    assert_eq!(names(&a, "/Meus arquivos/Docs"), ["a.txt", "b.txt"]);
 }
 
 #[test]

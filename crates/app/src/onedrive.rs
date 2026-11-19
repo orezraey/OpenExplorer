@@ -1,14 +1,17 @@
 //! OneDrive accounts (personal and work or school) in the panes. Each account shows in the tree
 //! under Contas, beside the Google Drive and MEGA accounts and the servers, and opens like a
-//! server (see `servers.rs`): its top holds Meus arquivos. Listing, copying to and from
-//! anywhere, moving, renaming, new folders, searching and dragging go through the servers'
-//! code, with the account as the connection (`openexplorer_remote`'s `onedrive.rs`). What only
-//! OneDrive has lives here: signing in through the browser, deleting to its recycle bin (undone
-//! by restoring, on personal accounts), sharing links, the storage in the status bar, and
-//! folders that refresh when something changes elsewhere.
+//! server (see `servers.rs`): its top holds Meus arquivos, and on a work or school account the
+//! Lixeira. Listing, copying to and from anywhere, moving, renaming, new folders, searching and
+//! dragging go through the servers' code, with the account as the connection
+//! (`openexplorer_remote`'s `onedrive.rs`). What only OneDrive has lives here: signing in
+//! through the browser, deleting to its recycle bin (undone by restoring), the Lixeira with
+//! Restaurar, Excluir permanentemente and Esvaziar, sharing links, the storage in the status bar,
+//! and folders that refresh when something changes elsewhere.
 //!
-//! Graph has no way to list OneDrive's recycle bin, so no Lixeira shows in the tree: deleted
-//! items come back with Desfazer (personal accounts) or from the website.
+//! Graph has no way to list a personal account's recycle bin, so it shows no Lixeira: deleted
+//! items come back with Desfazer or from the website. A work or school account's comes through
+//! SharePoint (see `openexplorer_onedrive::bin`), once its permission is granted: until then the
+//! Lixeira says what to add to the app registration and offers to authorize it in the browser.
 
 use std::collections::HashMap;
 
@@ -64,11 +67,34 @@ pub fn at(loc: &Location) -> Option<(&Server, &[String])> {
     }
 }
 
-/// Where a OneDrive location doesn't take new items: the account's top. `None` where it does
-/// (or it isn't OneDrive).
+/// Where a OneDrive location doesn't take new items: the account's top, and the Lixeira. `None`
+/// where it does (or it isn't OneDrive).
 pub fn why_not(loc: &Location) -> Option<String> {
     let (_, path) = at(loc)?;
-    path.is_empty().then(|| t("O topo da conta OneDrive só tem Meus arquivos: abra essa pasta.", "The OneDrive account's top only holds My files: open that folder.").into())
+    if path.is_empty() {
+        return Some(t("O topo da conta OneDrive só tem as pastas dela: abra uma.", "The OneDrive account's top only holds its folders: open one.").into());
+    }
+    in_bin(loc).then(|| od::bin::fixed().into())
+}
+
+fn is_bin(path: &[String]) -> bool {
+    path.first().and_then(|p| od::Area::of(p)) == Some(od::Area::Bin)
+}
+
+/// Whether `loc` is in a OneDrive account's Lixeira.
+pub fn in_bin(loc: &Location) -> bool {
+    at(loc).is_some_and(|(_, path)| is_bin(path))
+}
+
+/// The Lixeira itself, where Restaurar, Excluir permanentemente and Esvaziar apply.
+pub fn bin_top(loc: &Location) -> bool {
+    matches!(loc, Location::Server { server, path, find: None } if server.is_onedrive() && path.len() == 1 && is_bin(path))
+}
+
+/// Whether the tree's node for `path` of `server` is a OneDrive Lixeira: its own icon, and no
+/// arrow (folders in it don't open).
+pub fn bin_node(server: &Server, path: &[String]) -> bool {
+    server.is_onedrive() && path.len() == 1 && is_bin(path)
 }
 
 /// Whether the items `loc` lists can be renamed, cut or deleted: not Meus arquivos itself.
@@ -105,6 +131,8 @@ pub enum Answer {
     Link { server: Box<Server>, path: String, item: Entry, result: Result<Option<String>, String> },
     /// A link made (`Some`) or removed for the item named `name`.
     Linked { name: String, result: Result<Option<String>, String> },
+    /// The sign-in that grants SharePoint for account `id` (its Lixeira) ended.
+    BinGranted { id: String, result: Result<(), String> },
 }
 
 pub fn arrived(s: &mut State, a: Answer, tx: &mut Tx, now: f64) {
@@ -131,6 +159,17 @@ pub fn arrived(s: &mut State, a: Answer, tx: &mut Tx, now: f64) {
                 s.status = tr!("Link criado e copiado: quem tiver o link pode abrir \"{name}\".", "Link made and copied: whoever has the link can open \"{name}\".");
             }
             Ok(None) => s.status = tr!("Link removido: \"{name}\" não abre mais pelo link.", "Link removed: \"{name}\" no longer opens from the link."),
+            Err(e) => crate::fail(s, e),
+        },
+        Answer::BinGranted { id, result } => match result {
+            Ok(()) => {
+                s.status = t("Lixeira autorizada.", "Recycle bin authorized.").into();
+                for p in 0..s.panes.len() {
+                    if matches!(&s.panes[p].loc, Location::Server { server, .. } if server.id == id) {
+                        crate::load(s, p);
+                    }
+                }
+            }
             Err(e) => crate::fail(s, e),
         },
     }
@@ -319,32 +358,169 @@ fn is_business(s: &State, server: &Server) -> bool {
     s.servers.onedrive.accounts.iter().any(|a| a.id == server.user && a.business)
 }
 
-/// Excluir: the items go to OneDrive's recycle bin; on a personal account Desfazer brings
-/// them back where they were.
+/// Excluir: the items go to OneDrive's recycle bin, from where Desfazer brings them back where
+/// they were (on a work or school account, through the Lixeira's SharePoint permission).
 pub fn trash(s: &mut State, loc: &Location, items: Vec<Entry>) {
     let Some((server, _)) = at(loc) else { return };
     let server = server.clone();
     let reload = panes_on(s, &server.id);
-    let business = is_business(s, &server);
     let paths: Vec<String> = items.iter().filter_map(|e| path_of(loc, e)).collect();
     let n = paths.len();
     let id = server.user.clone();
     undo::local_job(s, reload, move |n| tr!("mover {} para a lixeira do OneDrive", "move {} to the OneDrive recycle bin", crate::actions::count(n)), move |rec| {
         let a = od::reach(&id)?;
         let (gone, err) = a.trash_many(&paths);
-        // On a work or school account Graph can't bring them back: nothing to undo.
-        if !business {
-            for (item, name) in &gone {
-                rec.add([Step::OneDriveRestore { server: server.clone(), id: item.clone(), name: name.clone() }]);
-            }
+        // Only what can come back is undone: on a work account, what was found in the bin.
+        let back: Vec<&(String, String)> = gone.iter().filter(|(item, _)| a.can_restore(item)).collect();
+        for (item, name) in &back {
+            rec.add([Step::OneDriveRestore { server: server.clone(), id: item.clone(), name: name.clone() }]);
         }
+        let stuck = gone.len() - back.len();
         match err {
             Some(e) if gone.is_empty() => Err(e),
             Some(e) => Err(tr!("{e} (já na lixeira: {})", "{e} (already in the recycle bin: {})", gone.len())),
-            None if business => Ok(tr!("Movido para a lixeira do OneDrive: {}. Para restaurar, use a lixeira no site.", "Moved to the OneDrive recycle bin: {}. To restore, use the recycle bin on the website.", crate::actions::count(n))),
+            None if stuck > 0 => Ok(tr!(
+                "Movido para a lixeira do OneDrive: {}. Desfazer não traz de volta {}: autorize a Lixeira da conta, ou restaure pelo site.",
+                "Moved to the OneDrive recycle bin: {}. Undo can't bring back {}: authorize the account's recycle bin, or restore on the website.",
+                crate::actions::count(n),
+                crate::actions::count(stuck)
+            )),
             None => Ok(tr!("Movido para a lixeira do OneDrive: {}.", "Moved to the OneDrive recycle bin: {}.", crate::actions::count(n))),
         }
     });
+}
+
+/// The names the selected items have in the Lixeira (the names shown: twins have their own).
+fn bin_names(items: &[Entry]) -> Vec<String> {
+    items.iter().map(|e| e.name.clone()).collect()
+}
+
+/// Restaurar in the Lixeira: each item goes back to the folder it was deleted from.
+pub fn restore(s: &mut State, p: usize) {
+    let loc = s.panes[p].loc.clone();
+    let items = selected(s, p);
+    let (Some((server, _)), false) = (at(&loc), items.is_empty()) else { return };
+    let server = server.clone();
+    let reload = panes_on(s, &server.id);
+    let names = bin_names(&items);
+    let n = names.len();
+    task(
+        s,
+        &server,
+        t("restaurar da lixeira do OneDrive", "restore from the OneDrive recycle bin"),
+        move |a| match a.bin_restore(&names) {
+            (done, None) => Ok(tr!("Restaurado: {}.", "Restored: {}.", crate::actions::count(done.len()))),
+            (done, Some(e)) if done.is_empty() => Err(e),
+            (done, Some(e)) => Err(tr!("{e} (já restaurados: {})", "{e} (already restored: {})", done.len())),
+        },
+        move |result| Msg::Done { reload, result },
+    );
+    s.status = tr!("Restaurando {}…", "Restoring {}…", crate::actions::count(n));
+}
+
+/// Excluir permanentemente in the Lixeira, confirmed: the items are deleted for good.
+pub fn purge(s: &mut State, loc: &Location, items: Vec<Entry>) {
+    let Some((server, _)) = at(loc) else { return };
+    if !in_bin(loc) {
+        return;
+    }
+    let server = server.clone();
+    let reload = panes_on(s, &server.id);
+    let names = bin_names(&items);
+    task(
+        s,
+        &server,
+        t("excluir da lixeira do OneDrive", "delete from the OneDrive recycle bin"),
+        move |a| match a.bin_purge(&names) {
+            (done, None) => Ok(tr!("Excluído permanentemente: {}.", "Deleted forever: {}.", crate::actions::count(done.len()))),
+            (done, Some(e)) if done.is_empty() => Err(e),
+            (done, Some(e)) => Err(tr!("{e} (já excluídos para sempre: {})", "{e} (already deleted forever: {})", done.len())),
+        },
+        move |result| Msg::Done { reload, result },
+    );
+}
+
+/// Esvaziar lixeira, confirmed: everything in it, as read now, deleted for good.
+pub fn empty_bin(s: &mut State, id: &str) {
+    let Some(server) = s.servers.list.iter().find(|sv| sv.id == id).cloned() else { return };
+    let reload = panes_on(s, &server.id);
+    task(
+        s,
+        &server,
+        t("esvaziar a lixeira do OneDrive", "empty the OneDrive recycle bin"),
+        |a| a.bin_empty().map(|n| tr!("Lixeira do OneDrive esvaziada: {}.", "OneDrive recycle bin emptied: {}.", crate::actions::count(n))),
+        move |result| Msg::Done { reload, result },
+    );
+    s.status = t("Esvaziando a lixeira do OneDrive…", "Emptying the OneDrive recycle bin…").into();
+}
+
+/// Autorizar no navegador: the sign-in that grants the app SharePoint for the account (what
+/// the registration lists for it), then the Lixeira read again.
+pub fn authorize_bin(s: &mut State, p: usize, tx: &mut Tx) {
+    let Some((server, _)) = at(&s.panes[p].loc).map(|(sv, path)| (sv.clone(), path.to_vec())) else { return };
+    // The account is open: the Lixeira just asked SharePoint, and found the site.
+    let Some(account) = od::cached(&server.user) else { return };
+    let login = match account.bin_grant() {
+        Ok(l) => l,
+        Err(e) => return crate::fail(s, e),
+    };
+    if let Err(e) = tx.open_url(&login.url) {
+        return crate::fail(s, tr!("Não consegui abrir o navegador: {e:?}", "Couldn't open the browser: {e:?}"));
+    }
+    s.status = t("Autorize no navegador que abriu. Esperando a Microsoft…", "Authorize in the browser that opened. Waiting for Microsoft…").into();
+    let id = server.id.clone();
+    background(s, move |emit| {
+        let result = catch_panic(t("autorizar a lixeira do OneDrive", "authorize the OneDrive recycle bin"), || account.bin_granted(&login));
+        emit(Msg::OneDrive(Answer::BinGranted { id, result }));
+    });
+}
+
+/// What the Lixeira shows when SharePoint's permission is missing, in place of the error: what to
+/// add to the registration, Microsoft's own words, and the button that grants it.
+pub fn bin_notice(s: &State, k: &Kit, p: usize) -> Option<El> {
+    let loc = &s.panes[p].loc;
+    let (server, _) = at(loc)?;
+    if !bin_top(loc) || s.panes[p].error.is_none() {
+        return None;
+    }
+    let od::BinAccess::NeedsConsent(why) = od::bin::access(&server.user) else { return None };
+    let small = |words: String, color| text(words).font(k.ty.text_small).color(color).wrap().w_full().min_w(0.0);
+    let portal = Button::new(t("Abrir o portal do Entra", "Open the Entra portal")).icon(&crate::icons::EXTERNAL_LINK).variant(ButtonVariant::Neutral).on_press_tx(|s: &mut State, tx: &mut Tx| {
+        if let Err(e) = tx.open_url(PORTAL) {
+            crate::fail(s, tr!("Não consegui abrir o navegador: {e:?}", "Couldn't open the browser: {e:?}"));
+        }
+    });
+    let grant = Button::new(t("Autorizar no navegador", "Authorize in browser")).variant(ButtonVariant::Submit).on_press_tx(move |s: &mut State, tx: &mut Tx| authorize_bin(s, p, tx));
+    // As wide as the pane shows, not the columns (which may run past it): the words wrap.
+    let shown_w = s.views[p].rect[2];
+    Some(
+        col()
+            .key("onedrive-bin-consent")
+            .w_full()
+            .max_w(if shown_w > 0.0 { shown_w.max(320.0) } else { 460.0 })
+            .grow(1.0)
+            .padding(16.0)
+            .gap(12.0)
+            .child(text(t("A Lixeira desta conta precisa de autorização", "This account's recycle bin needs authorization")).font(k.ty.text_small_medium).color(k.c.text_base))
+            .child(small(od::bin::consent_help(), k.c.text_muted))
+            .children((!why.is_empty()).then(|| small(tr!("A Microsoft disse: {why}", "Microsoft said: {why}"), k.c.text_faint)))
+            .child(row().gap(8.0).child(grant.build(k)).child(portal.build(k))),
+    )
+}
+
+/// The Lixeira's Data and Tipo columns: when each item was deleted, and where from.
+pub fn bin_columns(loc: &Location) -> Option<(&'static str, &'static str)> {
+    bin_top(loc).then(|| (t("Excluído em", "Date deleted"), t("Local original", "Original location")))
+}
+
+/// Where a Lixeira item was deleted from, for its Local original column.
+pub fn origin_of(loc: &Location, e: &Entry) -> Option<String> {
+    let (server, _) = at(loc)?;
+    if !bin_top(loc) {
+        return None;
+    }
+    let b = od::bin::shown_item(&server.user, &e.name)?;
+    Some(if b.second_stage { tr!("{} (2º estágio)", "{} (second stage)", b.origin) } else { b.origin })
 }
 
 /// Desfazer's steps: item `id` of the account `server` stands for, back from the recycle bin
@@ -361,7 +537,10 @@ pub fn trash_id(server: &Server, id: &str) -> Result<(), String> {
 pub fn delete_note(s: &State, loc: &Location) -> Option<&'static str> {
     let (server, _) = at(loc)?;
     Some(if is_business(s, server) {
-        t("Os itens vão para a lixeira do OneDrive; numa conta corporativa ou de estudante, restaure pela lixeira no site.", "The items go to the OneDrive recycle bin; on a work or school account, restore them from the recycle bin on the website.")
+        t(
+            "Os itens vão para a lixeira do OneDrive, de onde Desfazer ou a Lixeira da conta os trazem de volta (depois de autorizada).",
+            "The items go to the OneDrive recycle bin, from where Undo or the account's recycle bin brings them back (once authorized).",
+        )
     } else {
         t("Os itens vão para a lixeira do OneDrive, de onde Desfazer os traz de volta.", "The items go to the OneDrive recycle bin, from where Undo brings them back.")
     })
@@ -546,6 +725,63 @@ fn changes_arrived(s: &mut State, id: String, result: Result<Changes, String>, n
     ask_quota(s, &server);
 }
 
+/// The scenes `onedrive-bin` (`granted`) and `onedrive-bin-consent`: a work account's Lixeira
+/// in the right pane, without a network.
+pub fn scene_bin(s: &mut State, granted: bool) {
+    let drive = "b!trabalho";
+    let account = StoredAccount { id: drive.into(), email: "voce@contoso.com".into(), name: "Você".into(), business: true };
+    let sv = server_of(&account);
+    s.servers.onedrive.accounts.push(account);
+    s.servers.list.push(sv.clone());
+    s.servers.onedrive.quotas.insert(sv.id.clone(), Some(Quota { total: 1_099_511_627_776, used: 214_748_364_800, remaining: 884_763_262_976, deleted: 52_428_800, state: "normal".into() }));
+    s.panes[1].go(folder(&sv, vec![od::Area::Bin.label().to_string()]));
+    s.active = 1;
+    // Narrow columns, so Excluído em and Local original show beside the tree.
+    s.layout.columns[1] = [190.0, 70.0, 120.0, 210.0];
+    s.layout.tree[1] = 120.0;
+    if !granted {
+        od::bin::show(drive, Vec::new(), od::BinAccess::NeedsConsent("AADSTS65001: The user or administrator has not consented to use the application with ID '0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0'.".into()));
+        s.panes[1].set_entries(Err(od::bin::consent_help()));
+        return;
+    }
+    let day = 86_400;
+    let now = 1_795_000_000;
+    let item = |name: &str, origin: &str, ago: i64, size: u64, is_dir: bool, second_stage: bool| od::BinItem {
+        id: format!("{:08x}-0000-4000-8000-000000000000", ago),
+        name: name.into(),
+        leaf: name.into(),
+        dir: String::new(),
+        origin: origin.into(),
+        deleted: now - ago,
+        size,
+        is_dir,
+        second_stage,
+    };
+    let items = vec![
+        item("Relatório trimestral.docx", "Meus arquivos/Trabalho", 3_600, 284_311, false, false),
+        item("Fotos do evento", "Meus arquivos", day, 0, true, false),
+        item("orçamento.xlsx", "Meus arquivos/Trabalho/2026", 2 * day, 51_200, false, false),
+        item("orçamento (2).xlsx", "Meus arquivos/Trabalho", 9 * day, 48_930, false, false),
+        item("notas.txt", "Meus arquivos/Pessoal", 40 * day, 1_204, false, true),
+    ];
+    let entries = items
+        .iter()
+        .map(|b| Entry {
+            id: b.name.clone(),
+            name: b.name.clone(),
+            is_dir: b.is_dir,
+            size: (!b.is_dir).then_some(b.size),
+            modified: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(b.deleted as u64)),
+            target: None,
+            mime: None,
+            md5: None,
+            starred: false,
+        })
+        .collect();
+    od::bin::show(drive, items, od::BinAccess::Ready);
+    s.panes[1].set_entries(Ok(entries));
+}
+
 /// A OneDrive address (`onedrive://ana@exemplo.com/Meus arquivos/…`): the e-mail is the whole
 /// authority, and only reaches an account already connected.
 pub fn address(rest: &str) -> Option<(String, String)> {
@@ -567,6 +803,18 @@ mod tests {
         assert!(why_not(&at_path(&[])).is_some() && items_fixed(&at_path(&[])));
         assert!(why_not(&at_path(&["Meus arquivos"])).is_none() && !items_fixed(&at_path(&["Meus arquivos"])));
         assert!(why_not(&Location::home()).is_none() && at(&Location::home()).is_none());
+    }
+
+    #[test]
+    fn the_lixeira_restores_and_purges_but_takes_nothing() {
+        assert!(bin_top(&at_path(&["Lixeira"])) && bin_top(&at_path(&["Recycle bin"])));
+        assert!(!bin_top(&at_path(&["Lixeira", "Fotos"])) && in_bin(&at_path(&["Lixeira", "Fotos"])));
+        assert!(!in_bin(&at_path(&["Meus arquivos", "Lixeira"])));
+        assert!(why_not(&at_path(&["Lixeira"])).is_some() && why_not(&at_path(&["Lixeira", "Fotos"])).is_some());
+        assert!(!items_fixed(&at_path(&["Lixeira"])));
+        assert!(bin_columns(&at_path(&["Lixeira"])).is_some() && bin_columns(&at_path(&["Meus arquivos"])).is_none());
+        let sv = Server::onedrive("d1", "ana@exemplo.com");
+        assert!(bin_node(&sv, &["Lixeira".into()]) && !bin_node(&sv, &["Meus arquivos".into()]) && !bin_node(&Server::mega("a@b.c"), &["Lixeira".into()]));
     }
 
     #[test]

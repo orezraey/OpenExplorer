@@ -1234,7 +1234,7 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         menu = menu.min_width(250.0).item(item(t("Excluir todas as versões", "Delete every version"), &icons::M_DELETE, "", true, crate::b2::ask_purge).danger(true));
     }
     // Sharing links, for one OneDrive item.
-    if n == 1 && changeable && crate::onedrive::at(&s.panes[p].loc).is_some() {
+    if n == 1 && changeable && crate::onedrive::at(&s.panes[p].loc).is_some() && !crate::onedrive::in_bin(&s.panes[p].loc) {
         menu = menu
             .separator()
             .item(item(t("Copiar link", "Copy link"), &icons::M_LINK, "", true, crate::onedrive::copy_link))
@@ -1320,6 +1320,8 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 crate::b2::purge_note().into()
             } else if crate::mega::in_bin(&s.panes[*pane].loc) {
                 t("Os itens serão apagados para sempre da Lixeira do MEGA. Isso não pode ser desfeito.", "The items will be deleted from the MEGA Rubbish Bin for good. This can't be undone.").into()
+            } else if crate::onedrive::in_bin(&s.panes[*pane].loc) {
+                t("Os itens serão apagados para sempre da lixeira do OneDrive. Isso não pode ser desfeito.", "The items will be deleted from the OneDrive recycle bin for good. This can't be undone.").into()
             } else if let Location::Server { server, .. } = &s.panes[*pane].loc {
                 tr!(
                     "Servidores não têm lixeira: os itens serão apagados para sempre de {}. Isso não pode ser desfeito.",
@@ -1350,6 +1352,19 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 .child(text(note).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
                 .child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Esvaziar lixeira", "Empty trash")).variant(ButtonVariant::Danger).on_press(actions::empty_trash)));
             Modal::new("empty-trash", t("Esvaziar a Lixeira do MEGA?", "Empty the MEGA Rubbish Bin?")).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
+        }
+        Dialog::EmptyTrash { email } if email.starts_with("onedrive:") => {
+            let who = s.servers.list.iter().find(|sv| sv.id == *email).map_or(email.as_str(), |sv| sv.name.as_str());
+            let note = tr!(
+                "Todos os itens que a lixeira do OneDrive de {who} mostra serão apagados para sempre. Isso não pode ser desfeito.",
+                "Everything the OneDrive recycle bin of {who} shows will be deleted for good. This can't be undone."
+            );
+            let body = col()
+                .w_full()
+                .gap(12.0)
+                .child(text(note).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
+                .child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Esvaziar lixeira", "Empty trash")).variant(ButtonVariant::Danger).on_press(actions::empty_trash)));
+            Modal::new("empty-trash", t("Esvaziar a lixeira do OneDrive?", "Empty the OneDrive recycle bin?")).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
         }
         Dialog::EmptyTrash { email } => {
             let note = tr!(
@@ -3410,8 +3425,8 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
         .child(head(0, "h-name", t("Nome", "Name"), SortCol::Name, false))
         .child(head(1, "h-size", t("Tamanho", "Size"), SortCol::Size, true))
-        .child(head(2, "h-mod", t("Data", "Date modified"), SortCol::Modified, false))
-        .child(head(3, "h-kind", if pane.loc.finds() { t("Pasta", "Folder") } else { t("Tipo", "Type") }, SortCol::Kind, false))
+        .child(head(2, "h-mod", crate::onedrive::bin_columns(&pane.loc).map_or(t("Data", "Date modified"), |c| c.0), SortCol::Modified, false))
+        .child(head(3, "h-kind", if let Some(c) = crate::onedrive::bin_columns(&pane.loc) { c.1 } else if pane.loc.finds() { t("Pasta", "Folder") } else { t("Tipo", "Type") }, SortCol::Kind, false))
         .children(grips);
 
     let selected = k.alpha(k.c.text_accent, if k.dark { 0.26 } else { 0.18 });
@@ -3459,7 +3474,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .child(cell(1).justify_end().child(muted(e.size.map(format_size).unwrap_or_default()).align(Align::End)))
         .child(cell(2).child(muted(e.modified.map(format_time).unwrap_or_default())))
         // A search's results show the folder each is in where the type goes.
-        .child(cell(3).child(muted(if found { crate::finder::folder_of(e) } else { e.kind_label() })))
+        .child(cell(3).child(muted(if found { crate::finder::folder_of(e) } else { crate::onedrive::origin_of(&pane.loc, e).unwrap_or_else(|| e.kind_label()) })))
         .on_press_tx(move |s: &mut State, tx: &mut Tx| {
             click(s, p, &id_press, tx.mods());
             tx.focus(pane_key(p), false);
@@ -3515,7 +3530,9 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .virtual_rows(n, ROW_H, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
         .virtual_rows_version((pane.version, w.map(f32::to_bits), s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))));
     let notice = |msg: String, color| col().key("notice").w_full().grow(1.0).padding(16.0).child(text(msg).font(k.ty.text_small).color(color).wrap());
-    let body = if let Some(err) = &pane.error {
+    let body = if let Some(consent) = crate::onedrive::bin_notice(s, k, p) {
+        consent
+    } else if let Some(err) = &pane.error {
         notice(err.clone(), k.c.danger.fg)
     } else if pane.loading && n == 0 {
         let searching = actions::shows_results(&pane.loc);

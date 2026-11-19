@@ -37,21 +37,37 @@ const PAGE: u32 = 1000;
 pub enum Area {
     /// The drive's root.
     Files,
+    /// A work or school account's recycle bin, read through SharePoint (see [`crate::bin`]).
+    Bin,
 }
 
 impl Area {
-    pub const ALL: [Area; 1] = [Area::Files];
+    pub const ALL: [Area; 2] = [Area::Files, Area::Bin];
+
+    /// The areas an account of `kind` shows at its top: Graph lists no recycle bin for a
+    /// personal account.
+    pub fn of_kind(kind: Kind) -> &'static [Area] {
+        match kind {
+            Kind::Personal => &[Area::Files],
+            Kind::Business => &Area::ALL,
+        }
+    }
 
     pub fn label(self) -> &'static str {
         match self {
             Area::Files => t("Meus arquivos", "My files"),
+            Area::Bin => t("Lixeira", "Recycle bin"),
         }
     }
 
     /// Its name in either language: an address typed in one still opens in the other.
     pub fn of(name: &str) -> Option<Area> {
-        Area::ALL.into_iter().find(|a| match a {
-            Area::Files => ["Meus arquivos", "My files"].iter().any(|n| crate::tree::same_name(n, name)),
+        Area::ALL.into_iter().find(|a| {
+            let both: [&str; 2] = match a {
+                Area::Files => ["Meus arquivos", "My files"],
+                Area::Bin => ["Lixeira", "Recycle bin"],
+            };
+            both.iter().any(|n| crate::tree::same_name(n, name))
         })
     }
 }
@@ -168,6 +184,8 @@ pub struct Account {
     keep: Option<(PathBuf, cache::Secret)>,
     mark: u64,
     from_cache: bool,
+    /// A work account's recycle bin, through SharePoint (see `bin.rs`).
+    pub(crate) bin: crate::bin::Side,
 }
 
 fn parts(path: &str) -> Vec<String> {
@@ -216,7 +234,7 @@ impl Account {
         });
         let from_cache = kept.is_some();
         let st = St { tree: kept.unwrap_or_default(), checked: None, epoch: 0, dirty: !from_cache, saved: Instant::now() };
-        let a = Account { meta, graph, st: Mutex::new(st), catching: Mutex::new(()), forgotten: AtomicBool::new(false), keep, mark, from_cache };
+        let a = Account { meta, graph, st: Mutex::new(st), catching: Mutex::new(()), forgotten: AtomicBool::new(false), keep, mark, from_cache, bin: Default::default() };
         if from_cache {
             a.catch_up()?;
         } else {
@@ -404,8 +422,11 @@ impl Account {
     fn locate(&self, path: &str) -> Res<Place> {
         let segs = parts(path);
         let Some(first) = segs.first() else { return Ok(Place::Top) };
-        if Area::of(first).is_none() {
-            return Ok(Place::Missing);
+        match self.area(first) {
+            None => return Ok(Place::Missing),
+            // What's in the bin is only listed, restored or deleted for good (see `bin.rs`).
+            Some(Area::Bin) => return Err(Fail::new(crate::bin::fixed())),
+            Some(Area::Files) => {}
         }
         self.fresh()?;
         let rest = &segs[1..];
@@ -474,10 +495,18 @@ impl Account {
         Ok((loc, name))
     }
 
+    /// The area a path's first segment names, among this account's.
+    pub(crate) fn area(&self, name: &str) -> Option<Area> {
+        Area::of(name).filter(|a| Area::of_kind(self.meta.kind).contains(a))
+    }
+
     /// Folder `path`'s items.
     pub fn list(&self, path: &str) -> Result<Vec<Item>> {
+        if let Some(rest) = self.in_bin(path) {
+            return self.bin_list_at(&rest);
+        }
         let loc = match self.locate(path)? {
-            Place::Top => return Ok(Area::ALL.into_iter().map(area_item).collect()),
+            Place::Top => return Ok(Area::of_kind(self.meta.kind).iter().map(|a| area_item(*a)).collect()),
             Place::Missing => return Err(not_found(path).into()),
             Place::Found(l) => l,
         };
@@ -499,6 +528,9 @@ impl Account {
 
     /// The item at `path`, if there's one.
     pub fn stat(&self, path: &str) -> Result<Option<Item>> {
+        if let Some(rest) = self.in_bin(path) {
+            return self.bin_stat(&rest);
+        }
         Ok(match self.locate(path)? {
             Place::Top => Some(Item { name: String::new(), is_dir: true, size: None, modified: None, id: None }),
             Place::Found(_) if parts(path).len() == 1 => Area::of(&parts(path)[0]).map(area_item),
@@ -511,7 +543,9 @@ impl Account {
     /// tells which folders changed by id.
     pub fn folder_id(&self, path: &str) -> Option<String> {
         let segs = parts(path);
-        Area::of(segs.first()?)?;
+        if self.area(segs.first()?)? != Area::Files {
+            return None;
+        }
         let st = self.st();
         match st.tree.walk(&segs[1..]) {
             Walk::Found(ix) | Walk::Unlisted(ix, _) | Walk::Remote(ix, _) => Some(st.tree.get(ix).id.to_string()),
@@ -621,24 +655,36 @@ impl Account {
 
     /// Sends item `id` (of this drive) to the recycle bin again: Refazer after an undone delete.
     pub fn trash_id(&self, id: &str) -> Result<()> {
+        let since = chrono::Utc::now().timestamp();
         let r = self.graph.send("DELETE", &format!("/drives/{}/items/{}", segment(self.drive()), segment(id)), Body::None, &[])?;
         if !r.ok() {
             return Err(crate::graph::failure(r.status, &r.body, t("Excluir", "Delete")).into());
         }
         self.gone(id);
+        // On a work account, its new recycle bin item, for Desfazer again.
+        if let Some((leaf, folder)) = self.gone_place(id) {
+            self.note_gone(&[(id.to_string(), leaf, folder)], since);
+        }
         Ok(())
     }
 
     /// Several items to the recycle bin in as few requests as it takes (`$batch`): what went
-    /// (id and name, for undo), and the first error.
+    /// (id and name, for undo), and the first error. On a work account each one's recycle bin
+    /// item is then looked up for Desfazer (see [`Account::can_restore`]).
     pub fn trash_many(&self, paths: &[String]) -> (Vec<(String, String)>, Option<String>) {
         let mut locs = Vec::new();
+        let mut folders = Vec::new();
         for p in paths {
             match self.found(p) {
-                Ok(l) => locs.push(l),
+                Ok(l) => {
+                    let segs = parts(p);
+                    folders.push(segs[1..segs.len().saturating_sub(1).max(1)].join("/"));
+                    locs.push(l);
+                }
                 Err(e) => return (Vec::new(), Some(e.text)),
             }
         }
+        let since = chrono::Utc::now().timestamp();
         let subs: Vec<Sub> = locs.iter().map(|l| Sub { method: "DELETE", url: l.addr.url(), body: None }).collect();
         let answers = match self.graph.batch(&subs, t("Excluir", "Delete")) {
             Ok(a) => a,
@@ -646,22 +692,29 @@ impl Account {
         };
         let mut done = Vec::new();
         let mut first = None;
-        for (l, (status, body)) in locs.iter().zip(answers) {
+        let mut noted = Vec::new();
+        for ((l, folder), (status, body)) in locs.iter().zip(&folders).zip(answers) {
             if (200..300).contains(&status) || status == 404 {
                 self.gone(&l.addr.id);
                 done.push((l.addr.id.clone(), l.item.name.clone()));
+                // Only this drive's own items are in its recycle bin.
+                if status != 404 && l.own {
+                    noted.push((l.addr.id.clone(), l.item.name.clone(), folder.clone()));
+                }
             } else if first.is_none() {
                 first = Some(crate::graph::failure(status, &body.to_string(), &l.item.name).text);
             }
         }
+        self.note_gone(&noted, since);
         (done, first)
     }
 
-    /// Brings items back from the recycle bin by id, where they were. Personal accounts only:
-    /// Graph doesn't restore on work or school ones.
+    /// Brings items back from the recycle bin by id, where they were: through Graph on a
+    /// personal account, through SharePoint on a work or school one (those the app deleted
+    /// and found in the bin, see [`Account::can_restore`]).
     pub fn restore_many(&self, ids: &[String]) -> (Vec<String>, Option<String>) {
         if self.meta.kind == Kind::Business {
-            return (Vec::new(), Some(business_bin().into()));
+            return self.restore_business(ids);
         }
         let subs: Vec<Sub> = ids.iter().map(|id| Sub { method: "POST", url: format!("/drives/{}/items/{}/restore", segment(self.drive()), segment(id)), body: Some(json!({})) }).collect();
         let answers = match self.graph.batch(&subs, t("Restaurar", "Restore")) {
@@ -1015,7 +1068,9 @@ mod tests {
         assert_eq!(a.url(), "/drives/b!x/items/01AB");
         assert_eq!(a.child("novo #1.txt").url(), "/drives/b!x/items/01AB:/novo%20%231.txt:");
         assert_eq!(Area::of("my FILES"), Some(Area::Files));
-        assert_eq!(Area::of("Lixeira"), None);
+        assert_eq!(Area::of("recycle BIN"), Some(Area::Bin));
+        assert_eq!(Area::of("Lixo"), None);
+        assert_eq!(Area::of_kind(Kind::Personal), &[Area::Files]);
     }
 
     #[test]

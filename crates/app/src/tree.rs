@@ -295,11 +295,14 @@ fn remote_node(server: &openexplorer_remote::Server, path: Vec<String>) -> Node 
         // A MEGA account's Rubbish Bin and Incoming shares, with icons of their own.
         Some(name) if server.is_mega() && path.len() == 1 && crate::mega::area_of(&path) == Some(openexplorer_mega::Area::Rubbish) => (name.clone(), None, &icons::TRASH),
         Some(name) if server.is_mega() && path.len() == 1 && crate::mega::area_of(&path) == Some(openexplorer_mega::Area::Incoming) => (name.clone(), None, &icons::SHARED_WITH_ME),
+        Some(name) if crate::onedrive::bin_node(server, &path) => (name.clone(), None, &icons::TRASH),
         Some(name) => (name.clone(), Some(IconKey::Folder), &icons::FOLDER),
         None => (server.name.clone(), None, crate::servers::Provider::of_server(server).icon()),
     };
     let to = crate::servers::folder(server, path.clone());
-    Node { id: NodeId::Server(server.id.clone(), path), label, icon, fallback, to: Some(to), opens: true }
+    // A OneDrive Lixeira's folders don't open.
+    let opens = !crate::onedrive::bin_node(server, &path);
+    Node { id: NodeId::Server(server.id.clone(), path), label, icon, fallback, to: Some(to), opens }
 }
 
 fn sorted(mut nodes: Vec<Node>) -> Vec<Node> {
