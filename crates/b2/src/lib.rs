@@ -37,7 +37,8 @@
 //! retires the old name by deleting the version just copied when it was the name's only one
 //! (nothing of its history is lost), and by hiding it otherwise.
 //!
-//! See [`cache`] for how listings are kept, and when they're read again.
+//! See [`cache`] for how listings are kept and when they're read again, and [`watch`] for the
+//! readings the app makes on its own so changes made elsewhere show.
 
 pub mod account;
 pub mod api;
@@ -45,6 +46,7 @@ pub mod cache;
 pub mod download;
 pub mod store;
 pub mod upload;
+pub mod watch;
 
 #[cfg(test)]
 mod bench;
@@ -53,7 +55,8 @@ mod flows;
 #[cfg(test)]
 pub(crate) mod mock;
 
-pub use account::{Account, Bucket, Item, Rule, cached, connect, disconnect, reach, save_caches};
+pub use account::{Account, Bucket, Fresh, Item, Rule, cached, connect, disconnect, reach, save_caches};
+pub use watch::Polled;
 pub use api::{Allowed, set_log};
 pub use cache::set_dir as set_cache_dir;
 pub use store::Store;

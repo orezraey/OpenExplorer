@@ -7,16 +7,17 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use openexplorer_i18n::{t, tr};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::api::Api;
+use crate::api::{Api, Fail};
 use crate::cache::{self, Listing, Listings};
 use crate::upload::Uploads;
+use crate::watch::{self, Polled};
 use crate::{Result, store};
 
 /// What B2's web interface puts in a folder made empty, and hides; so does the app.
@@ -254,6 +255,25 @@ pub struct Account {
     /// How many parts of a large upload go at once ([`crate::upload::PARTS_AT_ONCE`]; the
     /// benchmark compares).
     pub(crate) parallel: usize,
+    /// Counts the app's own changes, so a listing read across one isn't kept.
+    changes: AtomicU64,
+    /// What the app's own readings may still ask (see [`crate::watch`]).
+    budget: Mutex<watch::Budget>,
+}
+
+/// What B2 has at a name: a file, or a folder (names under it).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Found {
+    File(Version),
+    Dir,
+}
+
+/// A folder read again, against what was kept of it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Fresh {
+    /// As kept: nothing on screen needs to change.
+    Same,
+    Changed(Vec<Item>),
 }
 
 impl std::fmt::Debug for Account {
@@ -277,7 +297,7 @@ impl Account {
         let secret = cache::Secret::of(api.key_id(), api.key());
         let lists = Listings::open(file.map(|f| (f, secret)));
         let buckets = lists.get("", "").map(|l| l.items.iter().filter_map(Bucket::of_item).collect()).unwrap_or_default();
-        Account { key_id: api.key_id().to_string(), api, lists, buckets: Mutex::new(buckets), parallel: crate::upload::PARTS_AT_ONCE }
+        Account { key_id: api.key_id().to_string(), api, lists, buckets: Mutex::new(buckets), parallel: crate::upload::PARTS_AT_ONCE, changes: AtomicU64::new(0), budget: Mutex::default() }
     }
 
     pub fn api(&self) -> &Api {
@@ -360,39 +380,104 @@ impl Account {
         }
     }
 
-    /// The folder at `path`: kept if younger than [`cache::FRESH`], else read from B2.
+    /// The folder at `path`, read from B2 now (a copy's or an upload's check of the names taken
+    /// must see what others did a moment ago), and kept.
     pub fn list(&self, path: &str) -> Result<Vec<Item>> {
-        match self.cached(path) {
-            Some(l) if l.fresh() => Ok(l.items.clone()),
-            _ => self.list_fresh(path),
-        }
+        self.list_fresh(path)
     }
 
     /// The folder at `path`, read from B2 now, and kept.
     pub fn list_fresh(&self, path: &str) -> Result<Vec<Item>> {
-        let Some(s) = Spot::of(path) else {
-            return Ok(self.buckets_fresh()?.iter().map(Bucket::item).collect());
-        };
-        let bucket = self.bucket(&s.bucket)?;
-        let prefix = s.prefix();
-        let fetched = cache::now();
-        let items = self.read_folder(&bucket, &prefix)?;
-        self.lists.put(&bucket.name, &prefix, items.clone(), fetched);
-        Ok(items)
+        self.read(path, true).map(|(items, _)| items).map_err(String::from)
     }
 
-    fn read_folder(&self, bucket: &Bucket, prefix: &str) -> Result<Vec<Item>> {
+    /// The folder at `path` read again from B2, against what was kept of it: the pane shows the
+    /// kept listing at once and this behind it, changing nothing on screen when it's the same.
+    pub fn reread(&self, path: &str) -> Result<Fresh> {
+        self.read(path, true).map(|(items, same)| if same { Fresh::Same } else { Fresh::Changed(items) }).map_err(String::from)
+    }
+
+    /// The folder at `path` read again on the app's own (no one asked): within the key's
+    /// [`watch::Budget`], tried once, held while B2 asks for a pause. See [`crate::watch`].
+    pub fn poll(&self, path: &str) -> Polled {
+        let now = cache::now();
+        // The buckets change on the website only, and opening the top reads them.
+        if Spot::of(path).is_none() {
+            return Polled::Same;
+        }
+        if let Some(wait) = self.api.paused(now) {
+            return Polled::Wait(wait);
+        }
+        let cost = watch::cost(self.cached(path).map_or(0, |l| l.items.len()));
+        if let Err(hold) = self.budget.lock().unwrap_or_else(|e| e.into_inner()).take(now, cost) {
+            return hold;
+        }
+        match self.read(path, false) {
+            Ok((_, true)) => Polled::Same,
+            Ok((items, false)) => Polled::Changed(items),
+            Err(f) if f.capped() => {
+                self.budget.lock().unwrap_or_else(|e| e.into_inner()).cap(f.text());
+                Polled::Stopped(f.text())
+            }
+            Err(f) if f.transient() => Polled::Wait(self.api.paused(cache::now()).unwrap_or(watch::EVERY.as_secs())),
+            Err(f) => Polled::Failed(f.text()),
+        }
+    }
+
+    /// How many requests the key's own readings made this hour and this day.
+    pub fn polls_spent(&self) -> (u32, u32) {
+        self.budget.lock().unwrap_or_else(|e| e.into_inner()).spent()
+    }
+
+    /// Reads the folder at `path` and keeps it, unless one of the app's own changes came while
+    /// it was read (it may predate it). Gives the items and whether they're those kept.
+    fn read(&self, path: &str, patient: bool) -> std::result::Result<(Vec<Item>, bool), Fail> {
+        let Some(s) = Spot::of(path) else {
+            let kept = self.lists.get("", "");
+            let items: Vec<Item> = self.buckets_fresh().map_err(Fail::Other)?.iter().map(Bucket::item).collect();
+            let same = kept.is_some_and(|k| k.items == items);
+            return Ok((items, same));
+        };
+        let bucket = self.bucket(&s.bucket).map_err(Fail::Other)?;
+        let prefix = s.prefix();
+        let kept = self.lists.get(&bucket.name, &prefix);
+        let changes = self.changes.load(Ordering::SeqCst);
+        let fetched = cache::now();
+        let items = match self.read_folder(&bucket, &prefix, patient) {
+            Ok(items) => items,
+            Err(f) => {
+                if f.capped() {
+                    self.budget.lock().unwrap_or_else(|e| e.into_inner()).cap(f.text());
+                }
+                return Err(f);
+            }
+        };
+        if patient {
+            self.budget.lock().unwrap_or_else(|e| e.into_inner()).uncap();
+        }
+        let same = kept.as_ref().is_some_and(|k| k.items == items);
+        if self.changes.load(Ordering::SeqCst) == changes {
+            if same {
+                self.lists.touch(&bucket.name, &prefix, fetched);
+            } else {
+                self.lists.put(&bucket.name, &prefix, items.clone(), fetched);
+            }
+        }
+        Ok((items, same))
+    }
+
+    fn read_folder(&self, bucket: &Bucket, prefix: &str, patient: bool) -> std::result::Result<Vec<Item>, Fail> {
         let auth = self.api.auth()?;
         match within(auth.allowed.name_prefix.as_deref(), prefix) {
-            Within::Inside => self.names(bucket, prefix, prefix),
+            Within::Inside => self.names(bucket, prefix, prefix, patient),
             Within::Toward(seg) => Ok(vec![Item::dir(&seg)]),
-            Within::Partial(np) => self.names(bucket, &np, prefix),
-            Within::Outside => Err(t("Esta chave de aplicação só alcança outra pasta deste bucket.", "This application key only reaches another folder of this bucket.").into()),
+            Within::Partial(np) => self.names(bucket, &np, prefix, patient),
+            Within::Outside => Err(Fail::Other(t("Esta chave de aplicação só alcança outra pasta deste bucket.", "This application key only reaches another folder of this bucket.").into())),
         }
     }
 
     /// One folder level of names starting with `list_prefix`, named from after `rel_to`.
-    fn names(&self, bucket: &Bucket, list_prefix: &str, rel_to: &str) -> Result<Vec<Item>> {
+    fn names(&self, bucket: &Bucket, list_prefix: &str, rel_to: &str, patient: bool) -> std::result::Result<Vec<Item>, Fail> {
         let mut out = Vec::new();
         let mut start: Option<String> = None;
         loop {
@@ -400,7 +485,7 @@ impl Account {
             if let Some(s) = &start {
                 body["startFileName"] = s.clone().into();
             }
-            let v = self.api.run("b2_list_file_names", &body)?;
+            let v = self.api.call_with("b2_list_file_names", &body, patient)?;
             for f in v.get("files").and_then(Value::as_array).into_iter().flatten() {
                 let Some(ver) = Version::of(f) else { continue };
                 let Some(rel) = ver.name.strip_prefix(rel_to) else { continue };
@@ -476,19 +561,23 @@ impl Account {
         Ok(v.get("files").and_then(Value::as_array).and_then(|f| f.first()).and_then(Version::of).filter(|v| v.name == key && v.action == "upload"))
     }
 
-    /// The item at `path`, or `None` when nothing's there: from the folder's kept listing when
-    /// it's young, else asked of B2.
+    /// The item at `path`, or `None` when nothing's there, asked of B2 now: it's what a new
+    /// folder, a copy or a move checks before writing, and a name taken elsewhere a moment ago
+    /// must count. One request, mostly.
     pub fn stat(&self, path: &str) -> Result<Option<Item>> {
         let Some(s) = Spot::of(path) else { return Ok(Some(Item::dir(""))) };
         if s.key.is_empty() {
             return Ok(self.bucket(&s.bucket).ok().map(|b| b.item()));
         }
-        let (parent, name) = s.parent();
-        if let Some(l) = self.lists.get(&parent.bucket, &parent.prefix())
-            && l.fresh()
-        {
-            return Ok(l.items.iter().find(|i| i.name == name).cloned());
-        }
+        let name = s.parent().1;
+        Ok(self.lookup(&s)?.map(|found| match found {
+            Found::File(v) => v.item(name),
+            Found::Dir => Item::dir(name),
+        }))
+    }
+
+    /// What B2 has at `s` now: a file (its current version), a folder, or nothing.
+    pub(crate) fn lookup(&self, s: &Spot) -> Result<Option<Found>> {
         let bucket = self.bucket(&s.bucket)?;
         let auth = self.api.auth()?;
         // A name above the key's prefix can only be a folder on the way down to it (asking B2
@@ -498,15 +587,31 @@ impl Account {
         {
             return Ok(match within(Some(np), &s.prefix()) {
                 Within::Outside => None,
-                _ => Some(Item::dir(name)),
+                _ => Some(Found::Dir),
             });
         }
-        if let Some(v) = self.file(&bucket, &s.key)? {
-            return Ok(Some(v.item(name)));
+        // Names from `key` on, folders folded: the file `key` comes first, the folder `key/`
+        // after the names between ("key.txt", "key (2)"), so one page mostly holds the answer.
+        let folder = s.prefix();
+        let v = self.api.run("b2_list_file_names", &json!({"bucketId": bucket.id, "prefix": s.key, "startFileName": s.key, "delimiter": "/", "maxFileCount": 100}))?;
+        for f in v.get("files").and_then(Value::as_array).into_iter().flatten().filter_map(Version::of) {
+            if f.name == s.key && f.action == "upload" {
+                return Ok(Some(Found::File(f)));
+            }
+            if f.name == folder {
+                return Ok(Some(Found::Dir));
+            }
+            if f.name > folder {
+                return Ok(None);
+            }
         }
-        let v = self.api.run("b2_list_file_names", &json!({"bucketId": bucket.id, "prefix": s.prefix(), "maxFileCount": 1}))?;
+        if v.get("nextFileName").and_then(Value::as_str).is_none() {
+            return Ok(None);
+        }
+        // The names between filled the page: ask about the folder alone.
+        let v = self.api.run("b2_list_file_names", &json!({"bucketId": bucket.id, "prefix": folder, "maxFileCount": 1}))?;
         let any = v.get("files").and_then(Value::as_array).is_some_and(|f| !f.is_empty());
-        Ok(any.then(|| Item::dir(name)))
+        Ok(any.then_some(Found::Dir))
     }
 
     // -----------------------------------------------------------------------------------------
@@ -529,6 +634,8 @@ impl Account {
     /// Every folder above may gain or lose a folder too (a folder exists only while a name is
     /// under it), so their listings go as well.
     pub(crate) fn changed(&self, s: &Spot, tree: bool) {
+        // A listing being read meanwhile may predate the change: it isn't kept.
+        self.changes.fetch_add(1, Ordering::SeqCst);
         let parent = s.parent().0.prefix();
         self.lists.forget(&s.bucket, "");
         for (i, _) in parent.match_indices('/') {
@@ -647,26 +754,26 @@ impl Account {
 
     /// The source of a rename or a copy, and the place it goes, checked: the place free, and a
     /// folder not into itself.
-    fn source_and_target(&self, from: &str, to: &str) -> Result<(Spot, Spot, Item)> {
+    fn source_and_target(&self, from: &str, to: &str) -> Result<(Spot, Spot, Found)> {
         let (src, dst) = (Self::spot_for_change(from)?, Self::spot_for_change(to)?);
-        let item = self.stat(from)?.ok_or_else(|| not_there(&last(from)))?;
-        if item.is_dir && src.bucket == dst.bucket && (dst.key == src.key || dst.key.starts_with(&src.prefix())) {
-            return Err(tr!("Não dá para pôr a pasta “{}” dentro dela mesma.", "Can't put the folder “{}” inside itself.", item.name));
+        let found = self.lookup(&src)?.ok_or_else(|| not_there(&last(from)))?;
+        if matches!(found, Found::Dir) && src.bucket == dst.bucket && (dst.key == src.key || dst.key.starts_with(&src.prefix())) {
+            return Err(tr!("Não dá para pôr a pasta “{}” dentro dela mesma.", "Can't put the folder “{}” inside itself.", last(from)));
         }
-        if self.stat(to)?.is_some() {
+        if self.lookup(&dst)?.is_some() {
             return Err(tr!("Já existe “{}” nessa pasta do B2.", "“{}” already exists in that B2 folder.", dst.parent().1));
         }
-        Ok((src, dst, item))
+        Ok((src, dst, found))
     }
 
-    /// Copies what's at `src` to `dst` on B2's side: a file, or each file of a folder. Gives the
-    /// versions copied.
-    fn copy_spot(&self, src: &Spot, dst: &Spot, is_dir: bool) -> Result<Vec<Version>> {
+    /// Copies what's at `src` (`found` there) to `dst` on B2's side: a file, or each file of a
+    /// folder. Gives the versions copied.
+    fn copy_spot(&self, src: &Spot, dst: &Spot, found: Found) -> Result<Vec<Version>> {
         let (from, into) = (self.bucket(&src.bucket)?, self.bucket(&dst.bucket)?);
-        let files = if is_dir {
-            self.files_under(&from, &src.prefix())?
-        } else {
-            vec![self.file(&from, &src.key)?.ok_or_else(|| not_there(src.parent().1))?]
+        let is_dir = matches!(found, Found::Dir);
+        let files = match found {
+            Found::Dir => self.files_under(&from, &src.prefix())?,
+            Found::File(v) => vec![v],
         };
         let names: Vec<(Version, String)> = files
             .into_iter()
@@ -691,17 +798,18 @@ impl Account {
 
     /// Copies the file or folder at `from` to `to` on B2's side: no bytes go through the app.
     pub fn copy(&self, from: &str, to: &str) -> Result<()> {
-        let (src, dst, item) = self.source_and_target(from, to)?;
-        self.copy_spot(&src, &dst, item.is_dir).map(|_| ())
+        let (src, dst, found) = self.source_and_target(from, to)?;
+        self.copy_spot(&src, &dst, found).map(|_| ())
     }
 
     /// Renames or moves the item at `from` to `to`, within the account: a copy on B2's side,
     /// then the old name retired (see the crate docs).
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let (src, dst, item) = self.source_and_target(from, to)?;
-        let copied = self.copy_spot(&src, &dst, item.is_dir)?;
-        let result = self.retire(&src, item.is_dir, &copied);
-        self.changed(&src, item.is_dir);
+        let (src, dst, found) = self.source_and_target(from, to)?;
+        let is_dir = matches!(found, Found::Dir);
+        let copied = self.copy_spot(&src, &dst, found)?;
+        let result = self.retire(&src, is_dir, &copied);
+        self.changed(&src, is_dir);
         result
     }
 

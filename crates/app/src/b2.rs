@@ -6,6 +6,7 @@
 //! listings shown from the cache at once (`openexplorer_b2::cache`), deleting by hiding (with
 //! Desfazer) or every version for good, and `b2://bucket/…` addresses.
 
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use openexplorer_b2 as b2;
@@ -74,14 +75,21 @@ fn entry(i: b2::Item) -> Entry {
 // ---------------------------------------------------------------------------------------------
 // Listing
 
-/// Lists pane `p`'s B2 folder on a thread. A listing kept from before shows at once; one
-/// younger than `openexplorer_b2::cache::FRESH` stands without asking B2, unless `fresh`
-/// (Atualizar, a reload after a change), when B2 is asked all the same. A search goes the
-/// servers' way.
-pub fn load(s: &mut State, p: usize, request: u64, fresh: bool) {
+fn entries(items: Vec<b2::Item>, show_hidden: bool) -> Vec<Entry> {
+    items.into_iter().filter(|i| show_hidden || !i.name.starts_with('.')).map(entry).collect()
+}
+
+/// Lists pane `p`'s B2 folder on a thread. A listing kept from before shows at once, and B2 is
+/// always asked again behind it (B2 can't say what changed, and listing is free; see
+/// `openexplorer_b2::watch`): the pane changes only if B2's answer differs, so nothing blinks
+/// and the selection and the scroll stay. `_fresh` (Atualizar) changes nothing here: every
+/// opening reads. A search goes the servers' way.
+pub fn load(s: &mut State, p: usize, request: u64, _fresh: bool) {
     let Location::Server { server, path, find: None } = s.panes[p].loc.clone() else {
         return crate::servers::load(s, p, request);
     };
+    // The pane's next reading on the app's own comes a full turn after this one.
+    s.servers.b2_watch.panes[p] = None;
     let show_hidden = s.settings.show_hidden;
     let pane = &mut s.panes[p];
     pane.loading = true;
@@ -89,21 +97,153 @@ pub fn load(s: &mut State, p: usize, request: u64, fresh: bool) {
     pane.free = None;
     background(s, move |emit| {
         let listed = |part, result| Msg::Listed { pane: p, request, part, result, at: None };
-        let entries = |items: Vec<b2::Item>| -> Vec<Entry> { items.into_iter().filter(|i| show_hidden || !i.name.starts_with('.')).map(entry).collect() };
         let dir = server.path(&path);
         let account = match b2::reach(&server.user) {
             Ok(a) => a,
             Err(e) => return emit(listed(Part::WHOLE, Err(e))),
         };
-        if let Some(kept) = account.cached(&dir) {
-            if !fresh && kept.fresh() {
-                return emit(listed(Part::WHOLE, Ok(entries(kept.items.clone()))));
-            }
-            emit(listed(Part::Cached, Ok(entries(kept.items.clone()))));
+        let Some(kept) = account.cached(&dir) else {
+            let result = catch_panic(t("listar", "list"), || account.list_fresh(&dir).map(|items| entries(items, show_hidden)));
+            return emit(listed(Part::WHOLE, result));
+        };
+        emit(listed(Part::Cached, Ok(entries(kept.items.clone(), show_hidden))));
+        drop(kept);
+        match catch_panic(t("listar", "list"), || account.reread(&dir).map(Some)) {
+            Ok(Some(b2::Fresh::Changed(items))) => emit(listed(Part::WHOLE, Ok(entries(items, show_hidden)))),
+            Ok(_) => emit(Msg::B2(Answer::Same { pane: p, request })),
+            // The kept listing stays on screen; the error is said.
+            Err(e) => emit(listed(Part::Page { first: false, more: false }, Err(e))),
         }
-        let result = catch_panic(t("listar", "list"), || account.list_fresh(&dir).map(entries));
-        emit(listed(Part::WHOLE, result));
     });
+}
+
+/// B2 listed the folder just as the pane shows it: it only stops loading.
+fn same(s: &mut State, pane: usize, request: u64) {
+    if s.live[pane].load(Ordering::Relaxed) != request {
+        return;
+    }
+    let p = &mut s.panes[pane];
+    p.loading = false;
+    p.prune_selection();
+    crate::drop_stale_rename(s, pane);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Changes made elsewhere
+
+/// How long after a failed reading the next one comes, in seconds.
+const RETRY: f64 = 120.0;
+
+/// The panes' B2 folders, read again on the app's own while the window has the focus, so
+/// what changes elsewhere shows (see `openexplorer_b2::watch` for why and how often at most).
+#[derive(Default)]
+pub struct Watch {
+    /// The window lost the focus: nothing is read until it's back.
+    away: bool,
+    panes: [Option<Turn>; 2],
+}
+
+struct Turn {
+    loc: Location,
+    /// When it's read next (app clock, seconds).
+    next: f64,
+    busy: bool,
+}
+
+/// The window gained or lost the focus. Back in front, a folder whose turn came meanwhile is
+/// read at once.
+pub fn window_focus(s: &mut State, focused: bool, _: &mut Tx) {
+    s.servers.b2_watch.away = !focused;
+}
+
+/// How long until a folder of `items` names is read again.
+fn every(items: usize) -> f64 {
+    b2::watch::every(items).as_secs_f64()
+}
+
+/// Reads again each pane's B2 folder whose turn came.
+pub fn tick(s: &mut State, now: f64) {
+    for p in 0..2 {
+        let shows = matches!(&s.panes[p].loc, Location::Server { server, find: None, .. } if server.is_b2());
+        if !shows {
+            s.servers.b2_watch.panes[p] = None;
+            continue;
+        }
+        let (loc, items, loading) = (&s.panes[p].loc, s.panes[p].entries.len(), s.panes[p].loading);
+        let w = &mut s.servers.b2_watch;
+        let turn = match &mut w.panes[p] {
+            Some(t) if t.loc == *loc => t,
+            slot => slot.insert(Turn { loc: loc.clone(), next: now + every(items), busy: false }),
+        };
+        if w.away || turn.busy || loading || now < turn.next {
+            continue;
+        }
+        turn.busy = true;
+        poll(s, p);
+    }
+}
+
+/// When the next reading is due, for the frame loop to wake then.
+pub fn next_ask(s: &State) -> Option<f64> {
+    let w = &s.servers.b2_watch;
+    if w.away {
+        return None;
+    }
+    w.panes.iter().flatten().filter(|t| !t.busy).map(|t| t.next).reduce(f64::min)
+}
+
+/// Reads pane `p`'s folder again on a thread, without touching the pane until B2's answer
+/// differs from what it shows.
+fn poll(s: &State, p: usize) {
+    let request = s.live[p].load(Ordering::Relaxed);
+    let loc = s.panes[p].loc.clone();
+    let Location::Server { server, path, .. } = &loc else { return };
+    let (key_id, dir) = (server.user.clone(), server.path(path));
+    background(s, move |emit| {
+        // Only a key already open: opening one is the listing's job.
+        let result = match b2::cached(&key_id) {
+            Some(a) => catch_panic(t("ver o que mudou no B2", "see what changed on B2"), || Ok(a.poll(&dir))),
+            None => Ok(b2::Polled::Same),
+        };
+        emit(Msg::B2(Answer::Polled { pane: p, request, loc: Box::new(loc), result }));
+    });
+}
+
+fn polled(s: &mut State, pane: usize, request: u64, loc: Location, result: Result<b2::Polled, String>) {
+    let now = s.now;
+    let items = s.panes[pane].entries.len();
+    let wait = match &result {
+        Ok(b2::Polled::Same | b2::Polled::Changed(_)) => every(items),
+        Ok(b2::Polled::Wait(secs)) => (*secs as f64).max(1.0),
+        Ok(b2::Polled::Stopped(_) | b2::Polled::Failed(_)) | Err(_) => RETRY,
+    };
+    match &result {
+        Ok(b2::Polled::Wait(secs)) => openexplorer_gdrive::log(&format!("B2: releitura de {} adiada {secs} s", loc_text(&loc))),
+        Ok(b2::Polled::Stopped(e) | b2::Polled::Failed(e)) | Err(e) => openexplorer_gdrive::log(&format!("B2: releitura de {}: {e}", loc_text(&loc))),
+        _ => {}
+    }
+    if let Some(t) = &mut s.servers.b2_watch.panes[pane]
+        && t.loc == loc
+    {
+        t.busy = false;
+        t.next = now + wait;
+    }
+    let Ok(b2::Polled::Changed(items)) = result else { return };
+    // The pane moved on, or is loading anew, meanwhile: what it shows next comes from that.
+    if s.live[pane].load(Ordering::Relaxed) != request || s.panes[pane].loc != loc || s.panes[pane].loading {
+        return;
+    }
+    // The selection, the cursor and the scroll stay: entries are matched by name.
+    let show_hidden = s.settings.show_hidden;
+    s.panes[pane].set_entries(Ok(entries(items, show_hidden)));
+    crate::drop_stale_rename(s, pane);
+}
+
+fn loc_text(loc: &Location) -> String {
+    match at(loc) {
+        Some((_, path)) => address_text(path),
+        None => String::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -113,11 +253,17 @@ pub fn load(s: &mut State, p: usize, request: u64, fresh: bool) {
 pub enum Answer {
     /// The Adicionar conta dialog's check `attempt` ended: the key ID, its name, what it can't do.
     Connected { attempt: u64, result: Result<(String, String, Vec<&'static str>), String> },
+    /// Listing `request` of pane `pane` found the folder as kept, which the pane shows already.
+    Same { pane: usize, request: u64 },
+    /// A reading on the app's own of what pane `pane` showed at `request`, at `loc`.
+    Polled { pane: usize, request: u64, loc: Box<Location>, result: Result<b2::Polled, String> },
 }
 
 pub fn arrived(s: &mut State, a: Answer) {
     match a {
         Answer::Connected { attempt, result } => connected(s, attempt, result),
+        Answer::Same { pane, request } => same(s, pane, request),
+        Answer::Polled { pane, request, loc, result } => polled(s, pane, request, *loc, result),
     }
 }
 
@@ -481,6 +627,76 @@ mod tests {
         assert_eq!(crate::servers::address_text(&at_path(&["fotos", "2024"])), "b2://fotos/2024");
         let a = crate::servers::parse_address("b2://fotos/2024").unwrap();
         assert_eq!((a.protocol, a.path.as_str()), (Protocol::B2, "/fotos/2024"));
+    }
+
+    fn file(name: &str) -> Entry {
+        Entry { id: name.into(), name: name.into(), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false }
+    }
+
+    fn item(name: &str) -> b2::Item {
+        b2::Item { name: name.into(), is_dir: false, size: Some(1), modified: None, id: None, info: None }
+    }
+
+    fn shown(s: &State, p: usize) -> Vec<String> {
+        s.panes[p].entries.iter().map(|e| e.name.clone()).collect()
+    }
+
+    /// A reading on the app's own that found a change replaces the list in place, the selection
+    /// kept; one for a place the pane left, or one older than its last load, changes nothing.
+    #[test]
+    fn a_change_elsewhere_shows_in_place_keeping_the_selection() {
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        let loc = at_path(&["fotos"]);
+        s.panes[1].go(loc.clone());
+        s.panes[1].set_entries(Ok(vec![file("a.txt"), file("b.txt")]));
+        s.panes[1].selected = ["b.txt".to_string()].into();
+        let request = s.live[1].load(Ordering::Relaxed);
+        let changed = |names: &[&str]| Ok(b2::Polled::Changed(names.iter().map(|n| item(n)).collect()));
+        arrived(&mut s, Answer::Polled { pane: 1, request, loc: Box::new(loc.clone()), result: changed(&["b.txt", "c.txt"]) });
+        assert_eq!(shown(&s, 1), ["b.txt", "c.txt"]);
+        assert!(s.panes[1].selected.contains("b.txt") && !s.panes[1].loading);
+        // From before the pane's last load, or of another place: dropped.
+        arrived(&mut s, Answer::Polled { pane: 1, request: request + 1, loc: Box::new(loc.clone()), result: changed(&["x"]) });
+        arrived(&mut s, Answer::Polled { pane: 1, request, loc: Box::new(at_path(&["docs"])), result: changed(&["y"]) });
+        assert_eq!(shown(&s, 1), ["b.txt", "c.txt"]);
+        // An opening that found the folder as kept only stops loading.
+        s.panes[1].loading = true;
+        arrived(&mut s, Answer::Same { pane: 1, request });
+        assert!(!s.panes[1].loading && s.panes[1].selected.contains("b.txt"));
+    }
+
+    /// A folder is read again once its turn comes, one reading at a time, and not while the
+    /// window is away; back in front, a turn that came meanwhile goes at once.
+    #[test]
+    fn readings_wait_their_turn_and_the_window_in_front() {
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        let loc = at_path(&["fotos"]);
+        s.panes[1].go(loc.clone());
+        s.panes[1].set_entries(Ok(vec![file("a.txt")]));
+        let every = b2::watch::EVERY.as_secs_f64();
+        tick(&mut s, 0.0);
+        assert_eq!(next_ask(&s), Some(every));
+        tick(&mut s, every - 1.0);
+        assert_eq!(next_ask(&s), Some(every), "not yet");
+        let mut tx = rune::Tx::default();
+        window_focus(&mut s, false, &mut tx);
+        assert_eq!(next_ask(&s), None);
+        tick(&mut s, every + 60.0);
+        assert!(!s.servers.b2_watch.panes[1].as_ref().unwrap().busy, "nothing read while away");
+        window_focus(&mut s, true, &mut tx);
+        tick(&mut s, every + 61.0);
+        assert!(s.servers.b2_watch.panes[1].as_ref().unwrap().busy, "read on coming back");
+        assert_eq!(next_ask(&s), None, "one reading at a time");
+        s.now = every + 62.0;
+        let request = s.live[1].load(Ordering::Relaxed);
+        arrived(&mut s, Answer::Polled { pane: 1, request, loc: Box::new(loc.clone()), result: Ok(b2::Polled::Wait(300)) });
+        assert_eq!(next_ask(&s), Some(every + 62.0 + 300.0), "B2 asked for a pause");
+        // Leaving the key forgets the turn.
+        s.panes[1].go(Location::home());
+        tick(&mut s, every + 63.0);
+        assert_eq!(next_ask(&s), None);
     }
 
     #[test]

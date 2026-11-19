@@ -69,6 +69,8 @@ pub struct State {
     pub capabilities: Vec<String>,
     pub recommended: u64,
     pub minimum: u64,
+    /// What a 429 says in `Retry-After`, in seconds.
+    pub retry_after: u64,
 }
 
 impl State {
@@ -127,8 +129,10 @@ pub struct Faults {
     pub expire: AtomicUsize,
     /// The next API calls answer 503.
     pub busy: AtomicUsize,
-    /// The next API calls answer 429.
+    /// The next API calls answer 429 (with `State::retry_after`).
     pub too_many: AtomicUsize,
+    /// The next API calls answer 403 `transaction_cap_exceeded`.
+    pub capped: AtomicUsize,
     /// The next uploads (files and parts) answer 503.
     pub upload_busy: AtomicUsize,
     /// The next download sends only this many bytes, then closes.
@@ -388,6 +392,11 @@ fn serve(conn: TcpStream, state: &Mutex<State>, faults: &Faults, url: &str) -> s
     }
     if take(&faults.too_many) {
         let (s, v) = error(429, "too_many_requests", "");
+        let wait = state.lock().unwrap().retry_after;
+        return respond(&mut conn, s, &[("Content-Type", "application/json".into()), ("Retry-After", wait.to_string())], v.to_string().as_bytes());
+    }
+    if take(&faults.capped) {
+        let (s, v) = error(403, "transaction_cap_exceeded", "Transaction cap exceeded");
         return json_reply(&mut conn, s, &v);
     }
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
