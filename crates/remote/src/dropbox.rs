@@ -55,12 +55,10 @@ impl Conn for Dropbox {
         self.account.delete(path).map(|_| ())
     }
 
-    /// Only while it holds nothing: Dropbox would delete a full one whole.
+    /// Only while it holds nothing, as Dropbox says at that moment (not the kept listing):
+    /// Dropbox would delete a full one whole.
     fn remove_dir(&mut self, path: &str) -> Result<()> {
-        if !self.account.list(path)?.is_empty() {
-            return Err(openexplorer_i18n::tr!("A pasta “{}” não está vazia.", "The folder “{}” isn't empty.", path.rsplit('/').next().unwrap_or(path)));
-        }
-        self.account.delete(path).map(|_| ())
+        self.account.remove_empty_dir(path).map(|_| ())
     }
 
     /// A whole folder goes in one call.
@@ -167,6 +165,23 @@ mod tests {
         c.upload_file("/D/b.bin", &local, &mut |_| true).unwrap();
         assert_eq!(fake.calls_since(&before), ["files/upload"]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_folder_that_got_files_elsewhere_is_not_removed_as_empty() {
+        // Desfazer of Nova pasta, after another device put a file in it.
+        let fake = openexplorer_dropbox::fake::Fake::start();
+        let email = format!("rmdir-{}@exemplo.com", std::process::id());
+        openexplorer_dropbox::account::adopt(&email, std::sync::Arc::new(fake.account()));
+        let mut c = Dropbox::connect(&Server::dropbox(&email)).unwrap();
+        c.mkdir("/Nova pasta").unwrap();
+        assert!(c.list("/Nova pasta").unwrap().is_empty());
+        fake.put_file("/Nova pasta/foto.jpg", b"jpg");
+        assert!(c.remove_dir("/Nova pasta").is_err());
+        assert!(fake.has("/Nova pasta/foto.jpg"));
+        fake.remove("/Nova pasta/foto.jpg");
+        c.remove_dir("/Nova pasta").unwrap();
+        assert!(!fake.has("/Nova pasta"));
     }
 
     /// Requests to send `n` local files each over 8 MiB through `upload_file`, against the

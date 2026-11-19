@@ -403,6 +403,20 @@ impl Account {
         Ok(e)
     }
 
+    /// Deletes folder `path` only if it holds nothing, as Dropbox says now (a folder's
+    /// deletion takes all it holds, and the kept listing may not have heard of files another
+    /// device put there): one `list_folder` asked first, never the kept listing.
+    pub fn remove_empty_dir(&self, path: &str) -> Result<Entry> {
+        let v = self.api.rpc("files/list_folder", &json!({"path": api_path(path), "recursive": false, "include_deleted": false, "limit": 1})).map_err(|f| about(path, f))?;
+        let some = v.get("entries").and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+        if some || v.get("has_more").and_then(Value::as_bool).unwrap_or(false) {
+            // What's kept said otherwise: read whole next time.
+            self.forget(path);
+            return Err(tr!("A pasta “{}” não está vazia.", "The folder “{}” isn't empty.", last(&api_path(path))));
+        }
+        self.delete(path)
+    }
+
     /// Deletes several items in one batch job (`delete_batch`), waiting for it to end: each
     /// item's result, in order.
     pub fn delete_many(&self, paths: &[String]) -> Result<Vec<Result<Entry>>> {
@@ -815,6 +829,27 @@ mod tests {
         assert_eq!(kept_key("/fotos", &[]).as_deref(), Some("/fotos"));
         assert_eq!(kept_key(&key("/İzmir"), &[]), None);
         assert_eq!(kept_key("", &[e("/a.txt")]).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn an_empty_folder_is_removed_only_while_dropbox_says_so_now() {
+        let fake = Fake::start();
+        fake.make_dir("/Nova");
+        let a = fake.account();
+        assert!(a.list("/Nova").unwrap().is_empty());
+        // Another device puts a file in while the kept listing still counts as current.
+        fake.put_file("/Nova/de-outro-aparelho.txt", b"x");
+        assert!(a.list("/Nova").unwrap().is_empty(), "the kept listing hasn't heard yet");
+        let err = a.remove_empty_dir("/Nova").unwrap_err();
+        assert!(err.contains("não está vazia"), "{err}");
+        assert!(fake.has("/Nova/de-outro-aparelho.txt"));
+        // The listing that said otherwise is read again.
+        assert_eq!(a.list("/Nova").unwrap().len(), 1);
+        fake.make_dir("/Vazia");
+        let before = fake.calls();
+        a.remove_empty_dir("/Vazia").unwrap();
+        assert_eq!(fake.calls_since(&before), ["files/list_folder", "files/delete_v2"]);
+        assert!(!fake.has("/Vazia"));
     }
 
     #[test]
