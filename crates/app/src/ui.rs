@@ -853,6 +853,8 @@ fn cache_page(k: &Kit, page: &crate::caches::Page, card: El, head: El) -> El {
         .child(divider())
         .child(line("cache-mega", t("Contas MEGA", "MEGA accounts"), openexplorer_mega::cache::dir().map_or_else(String::new, |d| d.display().to_string()), usage.map(|u| u.mega)))
         .child(divider())
+        .child(line("cache-dropbox", t("Contas Dropbox", "Dropbox accounts"), openexplorer_dropbox::cache::dir().map_or_else(String::new, |d| d.display().to_string()), usage.map(|u| u.dropbox)))
+        .child(divider())
         .child(actions);
 
     let mut out = col().key("page-cache").w_full().gap(12.0).child(head).child(card);
@@ -1218,6 +1220,13 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             .item(item(t("Copiar link", "Copy link"), &icons::M_LINK, "", true, crate::mega::copy_link))
             .item(item(t("Remover link", "Remove link"), &icons::M_LINK, "", true, crate::mega::remove_link));
     }
+    // Shared links, for one Dropbox item.
+    if n == 1 && changeable && crate::dropbox::at(&s.panes[p].loc).is_some() {
+        menu = menu
+            .separator()
+            .item(item(t("Copiar link", "Copy link"), &icons::M_LINK, "", true, crate::dropbox::copy_link))
+            .item(item(t("Remover link", "Remove link"), &icons::M_LINK, "", true, crate::dropbox::remove_link));
+    }
     menu = menu.separator().item(item(t("Nova pasta", "New folder"), &icons::M_NEW_FOLDER, "Ctrl+Shift+N", editable, actions::ask_new_folder));
     if n > 0 {
         menu = menu.separator().item(item(t("Propriedades", "Properties"), &icons::M_PROPERTIES, "Alt+Enter", true, |s, p, _| actions::properties(s, p)));
@@ -1258,6 +1267,8 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 t("Os itens vão para a Lixeira do Windows, de onde podem ser restaurados.", "The items go to the Windows Recycle Bin, where they can be restored.")
             } else if crate::mega::at(&s.panes[*pane].loc).is_some() {
                 t("Os itens vão para a Lixeira do MEGA, de onde podem ser restaurados.", "The items go to the MEGA Rubbish Bin, where they can be restored.")
+            } else if crate::dropbox::at(&s.panes[*pane].loc).is_some() {
+                crate::dropbox::delete_note()
             } else {
                 t(
                     "Os itens vão para a lixeira do Google Drive, onde ficam 30 dias antes de serem apagados de vez.",
@@ -1370,6 +1381,7 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
         Dialog::Share(sh) => crate::sharing::share_dialog(s, k, sh, layer),
         Dialog::MakePublic(m) => crate::sharing::public_dialog(k, m, layer),
         Dialog::MegaLink(m) => crate::mega::link_dialog(k, m, layer),
+        Dialog::DropboxLink(m) => crate::dropbox::link_dialog(k, m, layer),
         Dialog::Server(f) => account_dialog(s, k, f, window_h, layer),
     }
 }
@@ -1611,6 +1623,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
     let (summary, badge_text) = match (f.provider, proto) {
         (Provider::GoogleDrive, _) => (t("Autorização segura OAuth 2.0 pelo navegador padrão", "Secure OAuth 2.0 sign-in through the default browser"), "OAuth 2.0"),
         (Provider::Mega, _) => (t("Criptografia de ponta a ponta · os arquivos são decifrados neste computador", "End-to-end encryption · files are decrypted on this computer"), "E2EE"),
+        (Provider::Dropbox, _) => (t("Autorização segura OAuth 2.0 (PKCE) pelo navegador padrão", "Secure OAuth 2.0 (PKCE) sign-in through the default browser"), "OAuth 2.0"),
         (Provider::Nextcloud, Protocol::Davs) => (t("Servidor Nextcloud · conexão criptografada", "Nextcloud server · encrypted connection"), "HTTPS"),
         (Provider::Nextcloud, _) => (t("Servidor Nextcloud · conexão sem criptografia", "Nextcloud server · unencrypted connection"), "HTTP"),
         (Provider::OwnCloud, Protocol::Davs) => (t("Servidor ownCloud · conexão criptografada", "ownCloud server · encrypted connection"), "HTTPS"),
@@ -1818,6 +1831,12 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         return;
     }
 
+    // Dropbox step: the app's key when none is set, then the browser (see `dropbox.rs`).
+    if f.provider == Provider::Dropbox {
+        crate::dropbox::account_step(s, k, f, banner, window_h, layer);
+        return;
+    }
+
     // MEGA step: e-mail and password, then the two-factor code once the account asks for it.
     if f.provider == Provider::Mega {
         let labeled = |key: &'static str, label: &'static str, input: El| col().key(key).w_full().gap(4.0).child(text(label).font(k.ty.text_small_medium).color(k.c.text_base)).child(input);
@@ -1943,13 +1962,13 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         Provider::OwnCloud => t("owncloud.exemplo.com ou https://owncloud.exemplo.com", "owncloud.example.com or https://owncloud.example.com"),
         Provider::Sftp => t("nas.local, 192.168.0.10 ou sftp://usuario@host", "nas.local, 192.168.0.10 or sftp://user@host"),
         Provider::Ftp => t("ftp.exemplo.com, 192.168.0.10 ou ftp://usuario@host", "ftp.example.com, 192.168.0.10 or ftp://user@host"),
-        Provider::WebDav | Provider::GoogleDrive | Provider::Mega => t("dav.exemplo.com, 192.168.0.10 ou https://host/dav", "dav.example.com, 192.168.0.10 or https://host/dav"),
+        Provider::WebDav | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox => t("dav.exemplo.com, 192.168.0.10 ou https://host/dav", "dav.example.com, 192.168.0.10 or https://host/dav"),
     };
     let folder_hint = match f.provider {
         Provider::Nextcloud | Provider::OwnCloud => t("/remote.php/webdav (automático, se vazio)", "/remote.php/webdav (automatic if empty)"),
         Provider::WebDav => t("/dav ou /remote.php/dav/files/usuario (raiz /, se vazio)", "/dav or /remote.php/dav/files/user (root / if empty)"),
         Provider::Sftp => t("a pasta pessoal, se vazio", "the home folder if empty"),
-        Provider::Ftp | Provider::GoogleDrive | Provider::Mega => t("a pasta do login, se vazio", "the login folder if empty"),
+        Provider::Ftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox => t("a pasta do login, se vazio", "the login folder if empty"),
     };
     let name_hint = match f.provider {
         Provider::Nextcloud => t("Nextcloud (servidor), se vazio", "Nextcloud (server) if empty"),
@@ -1995,7 +2014,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
                     .key("tls-toggle"),
             );
         }
-        Provider::Sftp | Provider::GoogleDrive | Provider::Mega => {}
+        Provider::Sftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox => {}
     }
 
     inner = inner.child(field("folder", t("Pasta inicial", "Start folder"), &f.folder, folder_hint, |f| &mut f.folder));
@@ -2662,6 +2681,10 @@ fn toolbar(s: &State, k: &Kit) -> El {
         (None, Some((id, name))) if id.starts_with("mega:") => bar.child(
             tool(k, "remove-server", &icons::SIGN_OUT, t("Remover conta", "Remove account"), true, move |s: &mut State, _| crate::servers::remove(s, &id))
                 .help(tr!("Tira {name} da lista e encerra a sessão do MEGA", "Removes {name} from the list and ends the MEGA session")),
+        ),
+        (None, Some((id, name))) if id.starts_with("dropbox:") => bar.child(
+            tool(k, "remove-server", &icons::SIGN_OUT, t("Remover conta", "Remove account"), true, move |s: &mut State, _| crate::servers::remove(s, &id))
+                .help(tr!("Tira {name} da lista e revoga o acesso do Open Explorer ao Dropbox", "Removes {name} from the list and revokes Open Explorer's access to Dropbox")),
         ),
         (None, Some((id, name))) => {
             let edit = id.clone();
@@ -3553,7 +3576,7 @@ fn statusbar(s: &State, k: &Kit, p: usize) -> El {
     let quota = match &pane.loc {
         Location::Drive { email, space: Space::MyDrive, .. } => s.quotas.get(email).copied().flatten().map(|q| (quota_label(&q), q.limit.filter(|l| *l > 0).map(|l| q.usage as f64 / l as f64), quota_help(q))),
         // A MEGA account's storage, anywhere in it.
-        loc => crate::mega::quota_of(s, loc).map(|q| (crate::mega::quota_label(&q), (q.total > 0).then(|| q.used as f64 / q.total as f64), crate::mega::quota_help(q))),
+        loc => crate::mega::quota_of(s, loc).map(|q| (crate::mega::quota_label(&q), (q.total > 0).then(|| q.used as f64 / q.total as f64), crate::mega::quota_help(q))).or_else(|| crate::dropbox::quota_status(s, loc)),
     };
     let (right, used, help) = match quota {
         Some((label, used, help)) => (label, used, help),

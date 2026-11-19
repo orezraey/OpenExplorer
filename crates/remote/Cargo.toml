@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 base64 = "0.22"
 openexplorer-i18n = { path = "../i18n" }
+openexplorer-dropbox = { path = "../dropbox" }
 openexplorer-mega = { path = "../mega" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }

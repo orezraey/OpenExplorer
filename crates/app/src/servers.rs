@@ -33,6 +33,10 @@ pub struct Servers {
     pub mega_quotas: std::collections::HashMap<String, Option<openexplorer_mega::Quota>>,
     /// When each MEGA account a pane shows is next asked what changed.
     pub mega_watch: std::collections::HashMap<String, crate::mega::Watch>,
+    /// The Dropbox accounts' own list, their storage and their longpolls (see `dropbox.rs`).
+    pub dropbox: openexplorer_dropbox::store::Store,
+    pub dropbox_quotas: std::collections::HashMap<String, Option<openexplorer_dropbox::Quota>>,
+    pub dropbox_watch: std::collections::HashMap<String, crate::dropbox::Watch>,
     /// Counts the add dialog's connection checks, to drop a stale answer.
     pub attempts: u64,
 }
@@ -43,7 +47,9 @@ impl Servers {
         let mega = crate::mega::store();
         let mut list = store.servers();
         list.extend(crate::mega::servers(&mega));
-        Servers { list, pool: Arc::default(), store, mega, mega_quotas: Default::default(), mega_watch: Default::default(), attempts: 0 }
+        let dropbox = crate::dropbox::store();
+        list.extend(crate::dropbox::servers(&dropbox));
+        Servers { list, pool: Arc::default(), store, mega, mega_quotas: Default::default(), mega_watch: Default::default(), dropbox, dropbox_quotas: Default::default(), dropbox_watch: Default::default(), attempts: 0 }
     }
 }
 
@@ -447,10 +453,8 @@ fn send(c: &mut dyn Conn, src: &Path, target: &str, p: &Progress) -> Result<(), 
         }
         return Ok(());
     }
-    let mut file = std::fs::File::open(src).map_err(|e| tr!("Não consegui abrir {}: {e}", "Couldn't open {}: {e}", src.display()))?;
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut last = 0;
-    c.upload(target, &mut file, len, &mut |n| {
+    c.upload_file(target, src, &mut |n| {
         p.add_bytes(n - last);
         last = n;
         !p.cancelled()
@@ -566,6 +570,7 @@ impl Category {
 pub enum Provider {
     GoogleDrive,
     Mega,
+    Dropbox,
     Nextcloud,
     OwnCloud,
     Sftp,
@@ -574,9 +579,10 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub const ALL: [Provider; 7] = [
+    pub const ALL: [Provider; 8] = [
         Provider::GoogleDrive,
         Provider::Mega,
+        Provider::Dropbox,
         Provider::Nextcloud,
         Provider::OwnCloud,
         Provider::Sftp,
@@ -588,6 +594,7 @@ impl Provider {
         match self {
             Provider::GoogleDrive => "Google Drive",
             Provider::Mega => "MEGA",
+            Provider::Dropbox => "Dropbox",
             Provider::Nextcloud => "Nextcloud",
             Provider::OwnCloud => "ownCloud",
             Provider::Sftp => "SFTP",
@@ -600,6 +607,7 @@ impl Provider {
         match self {
             Provider::GoogleDrive => t("OAuth no navegador", "OAuth in the browser"),
             Provider::Mega => t("E-mail e senha · criptografia de ponta a ponta", "E-mail and password · end-to-end encrypted"),
+            Provider::Dropbox => t("OAuth no navegador · contas pessoais e de times", "OAuth in the browser · personal and team accounts"),
             Provider::Nextcloud => t("Nuvem via WebDAV", "Cloud via WebDAV"),
             Provider::OwnCloud => t("Nuvem via WebDAV", "Cloud via WebDAV"),
             Provider::Sftp => t("SSH seguro · porta 22", "Secure SSH · port 22"),
@@ -612,6 +620,7 @@ impl Provider {
         match self {
             Provider::GoogleDrive => &crate::icons::PROVIDER_GDRIVE,
             Provider::Mega => &crate::icons::PROVIDER_MEGA,
+            Provider::Dropbox => &crate::icons::PROVIDER_DROPBOX,
             Provider::Nextcloud => &crate::icons::PROVIDER_NEXTCLOUD,
             Provider::OwnCloud => &crate::icons::PROVIDER_OWNCLOUD,
             Provider::Sftp => &crate::icons::PROVIDER_SFTP,
@@ -623,7 +632,7 @@ impl Provider {
     pub fn in_category(self, category: Category) -> bool {
         match category {
             Category::All => true,
-            Category::Cloud => matches!(self, Provider::GoogleDrive | Provider::Mega | Provider::Nextcloud | Provider::OwnCloud),
+            Category::Cloud => matches!(self, Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::Nextcloud | Provider::OwnCloud),
             Category::Nas => matches!(self, Provider::Nextcloud | Provider::OwnCloud | Provider::Sftp | Provider::Ftp | Provider::WebDav),
             Category::Protocols => matches!(self, Provider::Sftp | Provider::Ftp | Provider::WebDav),
         }
@@ -637,6 +646,7 @@ impl Provider {
         let keywords = match self {
             Provider::GoogleDrive => "google drive gdrive nuvem workspace oauth gmail cloud",
             Provider::Mega => "mega mega.nz nuvem cloud criptografia encrypted 2fa",
+            Provider::Dropbox => "dropbox nuvem cloud oauth time equipe team business",
             Provider::Nextcloud => "nextcloud webdav dav https nas nuvem cloud",
             Provider::OwnCloud => "owncloud webdav dav https nas nuvem cloud",
             Provider::Sftp => "sftp ssh servidor linux nas chave 22 server key secure",
@@ -650,6 +660,7 @@ impl Provider {
         match self {
             Provider::GoogleDrive | Provider::Sftp => Protocol::Sftp,
             Provider::Mega => Protocol::Mega,
+            Provider::Dropbox => Protocol::Dropbox,
             Provider::Ftp => Protocol::Ftp,
             Provider::Nextcloud | Provider::OwnCloud | Provider::WebDav => Protocol::Davs,
         }
@@ -671,6 +682,7 @@ impl Provider {
             (_, Protocol::Ftp | Protocol::Ftps) => Provider::Ftp,
             (_, Protocol::Dav | Protocol::Davs) => Provider::WebDav,
             (_, Protocol::Mega) => Provider::Mega,
+            (_, Protocol::Dropbox) => Provider::Dropbox,
         }
     }
 
@@ -680,6 +692,7 @@ impl Provider {
             Protocol::Ftp | Protocol::Ftps => Provider::Ftp,
             Protocol::Dav | Protocol::Davs => Provider::WebDav,
             Protocol::Mega => Provider::Mega,
+            Protocol::Dropbox => Provider::Dropbox,
         }
     }
 }
@@ -794,6 +807,13 @@ impl Form {
             self.user.focused = true;
             self.needs_code = false;
             self.code = TextEdit::new("");
+            return;
+        }
+        if provider == Provider::Dropbox {
+            self.host = TextEdit::new("dropbox.com");
+            self.client_id = TextEdit::new("");
+            self.custom_oauth = openexplorer_dropbox::AppConfig::load().is_err();
+            self.client_id.focused = self.custom_oauth;
             return;
         }
         if provider == Provider::GoogleDrive {
@@ -1091,6 +1111,10 @@ pub fn ask_edit(s: &mut State, id: &str) {
         s.status = t("Contas MEGA não têm o que editar: para trocar de conta, remova e conecte de novo.", "MEGA accounts have nothing to edit: to switch accounts, remove it and connect again.").into();
         return;
     }
+    if id.starts_with("dropbox:") {
+        s.status = t("Contas Dropbox não têm o que editar: para trocar de conta, remova e conecte de novo.", "Dropbox accounts have nothing to edit: to switch accounts, remove it and connect again.").into();
+        return;
+    }
     if let Some(server) = s.servers.list.iter().find(|sv| sv.id == id) {
         s.dialog = Some(Dialog::Server(Box::new(Form::of(server))));
     }
@@ -1154,7 +1178,7 @@ pub fn toggle_tls(s: &mut State) {
             Protocol::Ftps => Protocol::Ftp,
             Protocol::Dav => Protocol::Davs,
             Protocol::Davs => Protocol::Dav,
-            p @ (Protocol::Sftp | Protocol::Mega) => p,
+            p @ (Protocol::Sftp | Protocol::Mega | Protocol::Dropbox) => p,
         };
         let trimmed = f.host.text.trim_start();
         if let Some((scheme, rest)) = trimmed.split_once("://") {
@@ -1363,8 +1387,13 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
 /// Forgets a server and its password (a MEGA account and its session); panes on it go home.
 pub fn remove(s: &mut State, id: &str) {
     let mega = s.servers.list.iter().find(|sv| sv.id == id && sv.is_mega()).cloned();
+    let dropbox = s.servers.list.iter().find(|sv| sv.id == id && sv.is_dropbox()).cloned();
     if let Some(sv) = &mega {
         if !crate::mega::remove(s, sv) {
+            return;
+        }
+    } else if let Some(sv) = &dropbox {
+        if !crate::dropbox::remove(s, sv) {
             return;
         }
     } else if let Err(e) = s.servers.store.remove(id) {
@@ -1386,7 +1415,13 @@ pub fn remove(s: &mut State, id: &str) {
             crate::switch(s, p, Location::home());
         }
     }
-    s.status = if mega.is_some() { tr!("Conta MEGA removida: {name}", "MEGA account removed: {name}") } else { tr!("Servidor removido: {name}", "Server removed: {name}") };
+    s.status = if mega.is_some() {
+        tr!("Conta MEGA removida: {name}", "MEGA account removed: {name}")
+    } else if dropbox.is_some() {
+        tr!("Conta Dropbox removida: {name}", "Dropbox account removed: {name}")
+    } else {
+        tr!("Servidor removido: {name}", "Server removed: {name}")
+    };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1425,16 +1460,24 @@ fn decode(s: &str) -> String {
 /// Reads `scheme://[user[:password]@]host[:port][/path]`; `None` for any other text.
 pub fn parse_address(text: &str) -> Option<Address> {
     let (scheme, rest) = text.trim().split_once("://")?;
-    // A MEGA account's own address (`mega://ana@exemplo.com/Drive na nuvem`), which only
-    // reaches an account already connected: the e-mail is the whole authority.
-    if scheme.eq_ignore_ascii_case("mega") {
+    // A MEGA or Dropbox account's own address (`mega://ana@exemplo.com/Drive na nuvem`,
+    // `dropbox://ana@exemplo.com/Fotos`), which only reaches an account already connected: the
+    // e-mail is the whole authority.
+    let account = if scheme.eq_ignore_ascii_case("mega") {
+        Some((Protocol::Mega, "mega.nz"))
+    } else if scheme.eq_ignore_ascii_case("dropbox") {
+        Some((Protocol::Dropbox, "dropbox.com"))
+    } else {
+        None
+    };
+    if let Some((protocol, host)) = account {
         let (email, path) = rest.split_once('/').map_or((rest, "/"), |(e, p)| (e, p));
         let email = decode(email).trim().to_lowercase();
         if !email.contains('@') {
             return None;
         }
         let path = format!("/{}", decode(path).trim_start_matches('/'));
-        return Some(Address { protocol: Protocol::Mega, user: email, password: None, host: "mega.nz".into(), port: None, path });
+        return Some(Address { protocol, user: email, password: None, host: host.into(), port: None, path });
     }
     let protocol = Protocol::from_scheme(scheme)?;
     let (authority, path) = match rest.find('/') {
@@ -1569,9 +1612,9 @@ mod tests {
     fn unified_catalog_filters_and_configures_presets() {
         let mut f = Form::new();
         assert_eq!(f.step, Step::Pick);
-        assert_eq!(f.visible_providers().len(), 7);
+        assert_eq!(f.visible_providers().len(), 8);
         f.category = Category::Cloud;
-        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::Mega, Provider::Nextcloud, Provider::OwnCloud]);
+        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::Mega, Provider::Dropbox, Provider::Nextcloud, Provider::OwnCloud]);
         f.category = Category::Protocols;
         assert_eq!(f.visible_providers(), [Provider::Sftp, Provider::Ftp, Provider::WebDav]);
         f.category = Category::All;

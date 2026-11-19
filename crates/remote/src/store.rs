@@ -40,6 +40,9 @@ impl Store {
         if server.is_mega() {
             return Err(openexplorer_i18n::t("Contas MEGA não ficam na lista de servidores.", "MEGA accounts aren't kept in the list of servers.").into());
         }
+        if server.is_dropbox() {
+            return Err(openexplorer_i18n::t("Contas Dropbox não ficam na lista de servidores.", "Dropbox accounts aren't kept in the list of servers.").into());
+        }
         match secret {
             Some("") => forget_secret(&server.id),
             Some(s) => entry(&server.id)?.set_password(s).map_err(|e| tr!("Não consegui guardar a senha no cofre do sistema: {e}", "Couldn't keep the password in the system's credential store: {e}"))?,

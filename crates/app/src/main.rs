@@ -14,6 +14,7 @@ mod autoscroll;
 mod cache;
 mod caches;
 mod downloads;
+mod dropbox;
 #[cfg(windows)]
 mod dragout;
 mod finder;
@@ -99,6 +100,7 @@ enum Msg {
     Undo(undo::Answer),
     /// Something background work on a MEGA account brought back.
     Mega(mega::Answer),
+    Dropbox(dropbox::Answer),
     /// What the caches take, measured or cleared for Opções › Cache.
     Caches(caches::Answer),
     /// Installing the search service ended: search again in the panes `reload` shows.
@@ -538,9 +540,15 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                 for sv in megas {
                     mega::ask_quota(s, &sv);
                 }
+                let mut boxes: Vec<openexplorer_remote::Server> = reload.iter().filter_map(|l| dropbox::at(l).map(|(sv, _)| sv.clone())).collect();
+                boxes.dedup_by(|a, b| a.id == b.id);
+                for sv in boxes {
+                    dropbox::ask_quota(s, &sv);
+                }
             }
             Msg::Undo(answer) => undo::arrived(s, answer),
             Msg::Mega(answer) => mega::arrived(s, answer, tx, now),
+            Msg::Dropbox(answer) => dropbox::arrived(s, answer, tx, now),
             Msg::Caches(answer) => caches::arrived(s, answer),
             Msg::Changes { email, result } => watch::arrived(s, email, result, now),
             Msg::Quota { email, result } => {
@@ -632,6 +640,10 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     // messages, so a listing that just ended is read again here if changes came during it.
     changed |= watch::tick(s, now);
     mega::tick(s, now);
+    dropbox::tick(s, now);
+    if let Some(at) = dropbox::next_ask(s) {
+        tx.wake_at(at);
+    }
     if let Some(at) = mega::next_ask(s) {
         tx.wake_at(at);
     }
@@ -894,6 +906,13 @@ fn list(s: &mut State, p: usize, fresh: bool) {
             emit(Msg::Listed { pane: p, request, part: Part::WHOLE, result, at: None });
         });
         return;
+    }
+    // A Dropbox account's storage, the first time one of its folders opens.
+    if let Some((server, _)) = dropbox::at(&s.panes[p].loc)
+        && !s.servers.dropbox_quotas.contains_key(&server.id)
+    {
+        let sv = server.clone();
+        dropbox::ask_quota(s, &sv);
     }
     if let Location::Server { server, .. } = &s.panes[p].loc {
         // A MEGA account's storage, the first time one of its folders opens.
@@ -1619,7 +1638,7 @@ fn clash_scene(s: &mut State, all: bool) {
 /// Opções open on Cache, its sizes fixed, then `then` applied to the page.
 fn cache_scene(s: &mut State, then: fn(&mut caches::Page)) {
     let mut v = settings::OptionsView::open(settings::OptionsTab::Cache);
-    v.cache.usage = Some(caches::Usage { drive: 3_565_158, mega: 48_211_968 });
+    v.cache.usage = Some(caches::Usage { drive: 3_565_158, mega: 48_211_968, dropbox: 1_204_224 });
     then(&mut v.cache);
     s.dialog = Some(actions::Dialog::Options(Box::new(v)));
 }
@@ -1684,6 +1703,9 @@ fn main() {
     openexplorer_mega::set_log(openexplorer_gdrive::log);
     // Each MEGA account's tree, sealed, so a start reads only what changed since.
     openexplorer_mega::set_cache_dir(Some(openexplorer_gdrive::local_dir().join("mega")));
+    openexplorer_dropbox::set_log(openexplorer_gdrive::log);
+    // Each Dropbox account's listings, sealed, so a folder opened before isn't read again.
+    openexplorer_dropbox::cache::set_dir(Some(openexplorer_gdrive::local_dir().join("dropbox")));
     rune::App::new(AppSpec::<State> {
         min_size: Some((900.0, 420.0)),
         families: initial.font.families(),
@@ -1789,7 +1811,7 @@ fn main() {
             ("options-cache-confirm", |s| cache_scene(s, |p| p.confirming = true)),
             ("options-cache-error", |s| {
                 cache_scene(s, |p| {
-                    p.usage = Some(caches::Usage { drive: 0, mega: 48_211_968 });
+                    p.usage = Some(caches::Usage { drive: 0, mega: 48_211_968, dropbox: 0 });
                     p.error = Some(tr!(
                         "Não foi possível apagar {}: O arquivo já está sendo usado por outro processo. (os error 32). Feche o que estiver usando o arquivo e tente de novo.",
                         "Couldn't delete {}: The process cannot access the file because it is being used by another process. (os error 32). Close whatever is using the file and try again.",
@@ -1925,6 +1947,22 @@ fn main() {
                 s.active = 1;
             }),
             // Adding a MEGA account that asks for its two-factor code.
+            // A Dropbox account's top with its storage, without a network.
+            ("dropbox", |s| {
+                let sv = openexplorer_remote::Server::dropbox("voce@exemplo.com");
+                s.servers.list.push(sv.clone());
+                s.servers.dropbox_quotas.insert(sv.id.clone(), Some(openexplorer_dropbox::Quota { used: 1_288_490_189, total: 2_199_023_255_552, team: false }));
+                s.panes[1].go(dropbox::top(&sv));
+                s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
+                s.active = 1;
+            }),
+            // Adding a Dropbox account before its app is set up.
+            ("dropbox-add", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::Dropbox);
+                f.custom_oauth = true;
+                f.error = Some("App do Dropbox não configurado.".into());
+                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+            }),
             ("mega-add", |s| {
                 let mut f = servers::Form::for_provider(servers::Provider::Mega);
                 f.user = rune::TextEdit::new("voce@exemplo.com");
@@ -1980,7 +2018,10 @@ fn main() {
     .args(rune_args(std::env::args().skip(1)))
     // The app ends without returning from `run`: what MEGA changed since its trees were last
     // kept is kept here, so the next start has less to catch up on.
-    .on_quit(|_, _| openexplorer_mega::save_caches())
+    .on_quit(|_, _| {
+        openexplorer_mega::save_caches();
+        openexplorer_dropbox::save_caches();
+    })
     .run();
 }
 

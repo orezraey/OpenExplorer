@@ -4,6 +4,7 @@
 //! Everything here blocks; the app runs it on background threads.
 
 mod dav;
+mod dropbox;
 mod ftp;
 mod mega;
 mod sftp;
@@ -45,6 +46,8 @@ pub enum Protocol {
     /// A MEGA account (see `mega.rs`). Never written to `servers.json`: MEGA accounts are kept
     /// apart, so an older app reading that list doesn't meet a protocol it can't read.
     Mega,
+    /// A Dropbox account (see `dropbox.rs`), kept apart like MEGA's.
+    Dropbox,
 }
 
 impl Protocol {
@@ -58,6 +61,7 @@ impl Protocol {
             Protocol::Dav => "WebDAV (http)",
             Protocol::Davs => "WebDAV (https)",
             Protocol::Mega => "MEGA",
+            Protocol::Dropbox => "Dropbox",
         }
     }
 
@@ -79,6 +83,7 @@ impl Protocol {
             Protocol::Dav => "http",
             Protocol::Davs => "https",
             Protocol::Mega => "mega",
+            Protocol::Dropbox => "dropbox",
         }
     }
 
@@ -98,7 +103,7 @@ impl Protocol {
             Protocol::Ftp | Protocol::Ftps => 21,
             Protocol::Sftp => 22,
             Protocol::Dav => 80,
-            Protocol::Davs | Protocol::Mega => 443,
+            Protocol::Davs | Protocol::Mega | Protocol::Dropbox => 443,
         }
     }
 
@@ -196,10 +201,23 @@ impl Server {
         self.protocol == Protocol::Mega
     }
 
+    /// The server a Dropbox account shows as in the panes: its e-mail is the user, its refresh
+    /// token in the Dropbox crate's own store.
+    pub fn dropbox(email: &str) -> Server {
+        Server { id: format!("dropbox:{email}"), protocol: Protocol::Dropbox, host: "dropbox.com".into(), ..Server::mega(email) }
+    }
+
+    pub fn is_dropbox(&self) -> bool {
+        self.protocol == Protocol::Dropbox
+    }
+
     /// `sftp://ana@host:2222`, the port only when it isn't the usual one. Never the password.
     pub fn address(&self) -> String {
         if self.is_mega() {
             return format!("mega://{}", self.user);
+        }
+        if self.is_dropbox() {
+            return format!("dropbox://{}", self.user);
         }
         let user = if self.user.is_empty() { String::new() } else { format!("{}@", encode_user(&self.user)) };
         let host = if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() };
@@ -266,6 +284,12 @@ pub trait Conn: Send {
     /// The folder the server puts the user in at login.
     fn home(&mut self) -> Result<String>;
 
+    /// Sends the file `local` on this computer to `path`, as [`Conn::upload`] does; a server
+    /// that can tell it already has the same bytes may skip sending them.
+    fn upload_file(&mut self, path: &str, local: &std::path::Path, progress: Progress) -> Result<()> {
+        send_file(self, path, local, progress)
+    }
+
     /// Whether `path` is a symbolic link itself.
     fn is_link(&mut self, path: &str) -> Result<bool>;
 
@@ -303,6 +327,13 @@ pub trait Conn: Send {
     }
 }
 
+/// [`Conn::upload`] of the file `local`.
+pub(crate) fn send_file<C: Conn + ?Sized>(c: &mut C, path: &str, local: &std::path::Path, progress: Progress) -> Result<()> {
+    let mut file = std::fs::File::open(local).map_err(|e| tr!("Não consegui abrir {}: {e}", "Couldn't open {}: {e}", local.display()))?;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    c.upload(path, &mut file, len, progress)
+}
+
 /// Empties folder `path` and removes it, never going through a link.
 fn remove_tree<C: Conn + ?Sized>(c: &mut C, path: &str) -> Result<()> {
     for item in c.list(path)? {
@@ -324,6 +355,7 @@ fn open(server: &Server, secret: &str, trust: &tls::Trust) -> Result<Box<dyn Con
         Protocol::Sftp => Ok(Box::new(sftp::Sftp::connect(server, secret)?)),
         Protocol::Dav | Protocol::Davs => Ok(Box::new(dav::Dav::connect(server, secret, trust)?)),
         Protocol::Mega => Ok(Box::new(mega::Mega::connect(server)?)),
+        Protocol::Dropbox => Ok(Box::new(dropbox::Dropbox::connect(server)?)),
     }
 }
 
