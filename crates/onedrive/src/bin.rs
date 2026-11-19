@@ -31,7 +31,6 @@
 //! them, so an answer that isn't newest first is caught and the whole bin read).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use openexplorer_i18n::{t, tr};
@@ -318,25 +317,6 @@ fn name_twins(items: &mut [BinItem]) {
     items.sort_by(|a, b| b.deleted.cmp(&a.deleted).then_with(|| a.name.cmp(&b.name)));
 }
 
-/// Runs `work` on each of `items`, a few at once: each one's result, in order.
-fn each<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    let next = AtomicUsize::new(0);
-    let out: Mutex<Vec<Option<R>>> = Mutex::new((0..items.len()).map(|_| None).collect());
-    std::thread::scope(|sc| {
-        for _ in 0..AT_ONCE.min(items.len()) {
-            sc.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, Ordering::SeqCst);
-                    let Some(it) = items.get(i) else { break };
-                    let r = work(it);
-                    out.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(r);
-                }
-            });
-        }
-    });
-    out.into_inner().unwrap_or_else(|e| e.into_inner()).into_iter().map(|r| r.expect("every item ran")).collect()
-}
-
 /// An item Graph deleted on a work account, kept for Desfazer.
 #[derive(Clone, Debug)]
 struct Gone {
@@ -618,7 +598,7 @@ impl Account {
 
     fn bin_each(&self, items: &[BinItem], verb: &str, what: &'static str) -> (Vec<String>, Option<String>) {
         let coll = self.collection();
-        let results = each(items, |b| guid(&b.id).and_then(|id| self.sp("POST", &format!("{coll}('{id}')/{verb}()"), &b.leaf)).map(|_| ()));
+        let results = openexplorer_cloud::each(items, AT_ONCE, |b| guid(&b.id).and_then(|id| self.sp("POST", &format!("{coll}('{id}')/{verb}()"), &b.leaf)).map(|_| ()));
         let mut done = Vec::new();
         let mut first = None;
         for (b, r) in items.iter().zip(results) {
@@ -780,7 +760,7 @@ impl Account {
             first = Some(t("O item não pode ser restaurado por aqui: autorize a Lixeira da conta ou restaure pelo site.", "The item can't be restored from here: authorize the account's recycle bin or restore it on the website.").to_string());
         }
         let coll = self.collection();
-        let results = each(&ready, |(_, g)| guid(g.bin.as_deref().unwrap_or_default()).and_then(|b| self.sp("POST", &format!("{coll}('{b}')/restore()"), &g.leaf)).map(|_| ()));
+        let results = openexplorer_cloud::each(&ready, AT_ONCE, |(_, g)| guid(g.bin.as_deref().unwrap_or_default()).and_then(|b| self.sp("POST", &format!("{coll}('{b}')/restore()"), &g.leaf)).map(|_| ()));
         let mut done = Vec::new();
         for ((id, _), r) in ready.iter().zip(results) {
             match r {

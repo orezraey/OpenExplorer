@@ -51,7 +51,7 @@ use std::path::PathBuf;
 use openexplorer_i18n::{t, tr};
 use serde::{Deserialize, Serialize};
 
-pub use account::{Account, Changes, Quota, cached, connect, disconnect, forget_kept, reach, save_caches};
+pub use account::{Account, Changes, Quota, cached, connect, disconnect, reach, save_caches};
 pub use api::set_log;
 pub use deleted::Deleted;
 pub use meta::Entry;

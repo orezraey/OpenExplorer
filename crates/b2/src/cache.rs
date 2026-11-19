@@ -37,15 +37,15 @@
 //! another key's file from a damaged one without decrypting it, and is authenticated with the body.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use aes_gcm::KeyInit;
-use aes_gcm::aead::AeadInOut;
-use sha2::Digest;
+use openexplorer_cloud::sealed::{self, OnClear, Store};
+use openexplorer_cloud::varint::{Reader, put_bytes, put_len, put_signed};
+
+pub use openexplorer_cloud::sealed::Refusal;
 
 use crate::account::Item;
 
@@ -56,11 +56,14 @@ pub const MOST_ITEMS: usize = 400_000;
 /// How long after a change the file is written.
 const SAVE_AFTER: Duration = Duration::from_secs(3);
 
-const MAGIC: &[u8; 8] = b"OEB2LST\0";
 /// Bumped when the body's shape changes: a file of another format is thrown away.
 pub const FORMAT: u32 = 1;
-const HEADER: usize = 8 + 4 + 16 + 12;
-const TAG: usize = 16;
+const HEADER: usize = sealed::HEADER;
+const TAG: usize = sealed::TAG;
+
+/// The files, `<hash of the key ID>.lists`. A clear empties the listings the open keys hold
+/// too ([`forget_memory`]): every folder is read from B2 again.
+static STORE: Store = Store::new(b"OEB2LST\0", FORMAT, "lists", OnClear::Forget(forget_memory));
 
 /// Seconds since 1970.
 pub fn now() -> u64 {
@@ -82,46 +85,32 @@ impl Listing {
 
 /// What seals and opens one key's file.
 #[derive(Clone)]
-pub struct Secret {
-    key: [u8; 32],
-    id: [u8; 16],
-}
+pub struct Secret(sealed::Secret);
 
 impl Secret {
     pub fn of(key_id: &str, application_key: &str) -> Secret {
-        let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(key_id.as_bytes()), application_key.as_bytes());
-        let mut key = [0u8; 32];
-        let mut id = [0u8; 16];
-        hk.expand(b"OpenExplorer B2 listing cache: key", &mut key).expect("32 bytes is a valid length");
-        hk.expand(b"OpenExplorer B2 listing cache: key id", &mut id).expect("16 bytes is a valid length");
-        Secret { key, id }
+        Secret(sealed::Secret::derive("OpenExplorer B2 listing cache", key_id.as_bytes(), application_key.as_bytes()))
     }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Where
 
-static DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
-/// One file is written at a time, and a clear waits for a write in flight.
-static WRITING: Mutex<()> = Mutex::new(());
-/// How many clears ran: a snapshot taken before the last one isn't written.
-static CLEARS: AtomicU64 = AtomicU64::new(0);
 /// The keys' listings open now, emptied by a clear.
 static OPEN: Mutex<Vec<Weak<Listings>>> = Mutex::new(Vec::new());
 
 /// The folder the listings are kept in; `None` keeps none (the default, and tests').
 pub fn set_dir(dir: Option<PathBuf>) {
-    *DIR.lock().unwrap_or_else(|e| e.into_inner()) = dir;
+    STORE.set_dir(dir);
 }
 
 pub fn dir() -> Option<PathBuf> {
-    DIR.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    STORE.dir()
 }
 
 /// The file of key `key_id` in `dir`: named by a hash, so the folder doesn't list key IDs.
 pub fn file_in(dir: &Path, key_id: &str) -> PathBuf {
-    let digest = sha2::Sha256::digest(key_id.trim().as_bytes());
-    dir.join(format!("{}.lists", crate::api::hex(&digest[..16])))
+    STORE.file_in(dir, key_id.trim())
 }
 
 pub fn file_of(key_id: &str) -> Option<PathBuf> {
@@ -131,33 +120,26 @@ pub fn file_of(key_id: &str) -> Option<PathBuf> {
 /// Runs `clear` on the folder set (see [`set_dir`]) with every write held off, after emptying the
 /// listings in memory: every folder is read from B2 again. `None` with no folder set.
 pub fn clear_with<R>(clear: impl FnOnce(&Path) -> R) -> Option<R> {
-    let dir = dir()?;
-    Some(clear_in(&dir, clear))
+    STORE.clear_with(clear)
 }
 
 /// [`clear_with`] on folder `dir`.
 pub fn clear_in<R>(dir: &Path, clear: impl FnOnce(&Path) -> R) -> R {
-    let _held = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-    CLEARS.fetch_add(1, Ordering::SeqCst);
+    STORE.clear_in(dir, clear)
+}
+
+/// Empties the listings of every key open now (a clear's [`OnClear`]).
+fn forget_memory() {
     let open: Vec<Arc<Listings>> = OPEN.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(Weak::upgrade).collect();
     for l in open {
         l.clear_memory();
     }
-    clear(dir)
 }
 
 /// Deletes `file`, and any temporary file a write cut short left beside it, after any write in
 /// flight.
 pub fn forget_file(file: &Path) {
-    let _held = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = std::fs::remove_file(file);
-    let (Some(dir), Some(stem)) = (file.parent(), file.file_stem().and_then(|s| s.to_str())) else { return };
-    let prefix = format!("{stem}.tmp");
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        if entry.file_name().to_str().is_some_and(|n| n.starts_with(&prefix)) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
+    STORE.forget_file(file);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -336,7 +318,8 @@ impl Listings {
         if self.forgotten.load(Ordering::SeqCst) {
             return;
         }
-        let clears = CLEARS.load(Ordering::SeqCst);
+        // A clear after this (see [`clear_in`]) makes the snapshot one of listings no longer kept.
+        let mark = STORE.mark();
         let body = {
             let mut inner = self.lock();
             if !inner.dirty {
@@ -346,12 +329,7 @@ impl Listings {
             encode(&inner.map)
         };
         let sealed = seal(secret, body);
-        let _held = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-        // A clear came after the snapshot: it's of listings no longer kept.
-        if CLEARS.load(Ordering::SeqCst) != clears || self.forgotten.load(Ordering::SeqCst) {
-            return;
-        }
-        if let Err(e) = write(file, &sealed) {
+        if let Err(e) = STORE.write_unless(file, &sealed, &self.forgotten, mark) {
             crate::api::log(&format!("B2 cache: não consegui gravar as listagens: {e}"));
             self.lock().dirty = true;
         }
@@ -360,27 +338,6 @@ impl Listings {
 
 // ---------------------------------------------------------------------------------------------
 // Body
-
-fn put_len(out: &mut Vec<u8>, mut n: u64) {
-    loop {
-        let b = (n & 0x7f) as u8;
-        n >>= 7;
-        if n == 0 {
-            out.push(b);
-            return;
-        }
-        out.push(b | 0x80);
-    }
-}
-
-fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
-    put_len(out, b.len() as u64);
-    out.extend_from_slice(b);
-}
-
-fn put_signed(out: &mut Vec<u8>, n: i64) {
-    put_len(out, ((n << 1) ^ (n >> 63)) as u64);
-}
 
 const IS_DIR: u8 = 1;
 const HAS_SIZE: u8 = 2;
@@ -420,63 +377,14 @@ pub fn encode(map: &HashMap<Key, Arc<Listing>>) -> Vec<u8> {
     out
 }
 
-struct Reader<'a> {
-    data: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Refusal> {
-        let end = self.at.checked_add(n).filter(|&e| e <= self.data.len()).ok_or(Refusal::Malformed)?;
-        let out = &self.data[self.at..end];
-        self.at = end;
-        Ok(out)
-    }
-
-    fn byte(&mut self) -> Result<u8, Refusal> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn len(&mut self) -> Result<u64, Refusal> {
-        let mut n = 0u64;
-        for shift in (0..64).step_by(7) {
-            let b = self.byte()?;
-            n |= u64::from(b & 0x7f) << shift;
-            if b & 0x80 == 0 {
-                return Ok(n);
-            }
-        }
-        Err(Refusal::Malformed)
-    }
-
-    fn signed(&mut self) -> Result<i64, Refusal> {
-        let n = self.len()?;
-        Ok(((n >> 1) as i64) ^ -((n & 1) as i64))
-    }
-
-    /// A count of things at least `min` bytes each, checked against what's left.
-    fn count(&mut self, min: usize) -> Result<usize, Refusal> {
-        let n = usize::try_from(self.len()?).map_err(|_| Refusal::Malformed)?;
-        if n.saturating_mul(min) > self.data.len() - self.at {
-            return Err(Refusal::Malformed);
-        }
-        Ok(n)
-    }
-
-    fn text(&mut self) -> Result<String, Refusal> {
-        let n = usize::try_from(self.len()?).map_err(|_| Refusal::Malformed)?;
-        std::str::from_utf8(self.take(n)?).map(str::to_string).map_err(|_| Refusal::Malformed)
-    }
-}
-
 /// The listings [`encode`] wrote (`body` without the header).
 pub fn decode(body: &[u8]) -> Result<HashMap<Key, Listing>, Refusal> {
-    let mut r = Reader { data: body, at: 0 };
+    let mut r = Reader::new(body);
     let count = r.count(4)?;
     let mut map = HashMap::with_capacity(count);
     for _ in 0..count {
-        let key = (r.text()?, r.text()?);
-        let fetched = r.len()?;
+        let key = (r.text()?.to_string(), r.text()?.to_string());
+        let fetched = r.unsigned()?;
         let n = r.count(2)?;
         let mut items = Vec::with_capacity(n);
         for _ in 0..n {
@@ -484,18 +392,18 @@ pub fn decode(body: &[u8]) -> Result<HashMap<Key, Listing>, Refusal> {
             if flags & !(IS_DIR | HAS_SIZE | HAS_MODIFIED | HAS_ID | HAS_INFO) != 0 {
                 return Err(Refusal::Malformed);
             }
-            let name = r.text()?;
-            let size = if flags & HAS_SIZE != 0 { Some(r.len()?) } else { None };
+            let name = r.text()?.to_string();
+            let size = if flags & HAS_SIZE != 0 { Some(r.unsigned()?) } else { None };
             let modified = if flags & HAS_MODIFIED != 0 { Some(r.signed()?) } else { None };
-            let id = if flags & HAS_ID != 0 { Some(r.text()?) } else { None };
-            let info = if flags & HAS_INFO != 0 { Some(r.text()?) } else { None };
+            let id = if flags & HAS_ID != 0 { Some(r.text()?.to_string()) } else { None };
+            let info = if flags & HAS_INFO != 0 { Some(r.text()?.to_string()) } else { None };
             items.push(Item { name, is_dir: flags & IS_DIR != 0, size, modified, id, info });
         }
         if map.insert(key, Listing { items, fetched }).is_some() {
             return Err(Refusal::Malformed);
         }
     }
-    if r.at != body.len() {
+    if !r.done() {
         return Err(Refusal::Malformed);
     }
     Ok(map)
@@ -504,95 +412,25 @@ pub fn decode(body: &[u8]) -> Result<HashMap<Key, Listing>, Refusal> {
 // ---------------------------------------------------------------------------------------------
 // Sealing
 
-/// Why a kept file wasn't used.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Refusal {
-    Missing,
-    Io(String),
-    /// Not one of these files, or of another format.
-    Format,
-    /// Sealed under another key.
-    OtherKey,
-    /// Changed since it was written.
-    Tampered,
-    /// Opened, but it doesn't read as listings.
-    Malformed,
-}
-
-fn random<const N: usize>() -> [u8; N] {
-    let mut out = [0u8; N];
-    getrandom::fill(&mut out).expect("the operating system's random source");
-    out
-}
-
 /// Seals a body [`encode`] made, in place: the file's whole contents.
-pub fn seal(secret: &Secret, mut file: Vec<u8>) -> Vec<u8> {
-    let nonce = random::<12>();
-    file[..8].copy_from_slice(MAGIC);
-    file[8..12].copy_from_slice(&FORMAT.to_le_bytes());
-    file[12..28].copy_from_slice(&secret.id);
-    file[28..HEADER].copy_from_slice(&nonce);
-    let gcm = aes_gcm::Aes256Gcm::new_from_slice(&secret.key).expect("a 32-byte key");
-    let (head, body) = file.split_at_mut(HEADER);
-    let tag = gcm.encrypt_inout_detached((&nonce[..]).try_into().expect("12 bytes"), &head[..28], body.into()).expect("a body GCM takes");
-    file.extend_from_slice(&tag);
-    file
-}
-
-fn check_header(secret: &Secret, head: &[u8]) -> Result<(), Refusal> {
-    if head.len() < HEADER || &head[..8] != MAGIC || head[8..12] != FORMAT.to_le_bytes() {
-        return Err(Refusal::Format);
-    }
-    if head[12..28] != secret.id {
-        return Err(Refusal::OtherKey);
-    }
-    Ok(())
+pub fn seal(secret: &Secret, file: Vec<u8>) -> Vec<u8> {
+    STORE.seal(&secret.0, file)
 }
 
 /// Opens a file [`seal`] made, in place: the body's range.
 pub fn open(secret: &Secret, file: &mut [u8]) -> Result<std::ops::Range<usize>, Refusal> {
-    if file.len() < HEADER + TAG {
-        return Err(Refusal::Format);
-    }
-    check_header(secret, &file[..HEADER])?;
-    let end = file.len() - TAG;
-    let tag: [u8; TAG] = file[end..].try_into().expect("16 bytes");
-    let (head, rest) = file.split_at_mut(HEADER);
-    let gcm = aes_gcm::Aes256Gcm::new_from_slice(&secret.key).expect("a 32-byte key");
-    gcm.decrypt_inout_detached((&head[28..]).try_into().expect("12 bytes"), &head[..28], (&mut rest[..end - HEADER]).into(), (&tag[..]).try_into().expect("16 bytes")).map_err(|_| Refusal::Tampered)?;
-    Ok(HEADER..end)
+    STORE.open(&secret.0, file)
 }
 
 /// Writes `sealed` to `file` whole: a temporary file renamed over the old one.
+#[cfg(test)]
 fn write(file: &Path, sealed: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = file.with_extension(format!("tmp{}", u32::from_le_bytes(random::<4>())));
-    let result = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(sealed)?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, file)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
+    STORE.write_unless(file, sealed, &AtomicBool::new(false), STORE.mark()).map(|_| ())
 }
 
 /// The listings kept in `file`.
 pub fn read(file: &Path, secret: &Secret) -> Result<HashMap<Key, Listing>, Refusal> {
-    let io = |e: std::io::Error| Refusal::Io(e.to_string());
-    let mut f = match std::fs::File::open(file) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Refusal::Missing),
-        Err(e) => return Err(io(e)),
-    };
-    let mut data = Vec::new();
-    f.read_to_end(&mut data).map_err(io)?;
-    let body = open(secret, &mut data)?;
+    let (data, body) = STORE.read(file, &secret.0)?;
     decode(&data[body])
 }
 
@@ -619,6 +457,22 @@ mod tests {
 
     fn temp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("oe-b2-cache-{}-{name}", std::process::id()))
+    }
+
+    /// A file sealed before the shared crate (`openexplorer-cloud`) took over the sealing and
+    /// the body's encoding, and its name: all must still be what they were.
+    #[test]
+    fn a_file_kept_before_still_opens() {
+        let bytes = |hex: &str| (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect::<Vec<u8>>();
+        let mut old = bytes("4f4542324c53540001000000001923d7f32c42d3c0644e0f44824708f6de7c87c7c71b87f0b8bab3300eac22734ce199d5afa54f2b14b8baef1abba8354fb421ee5a0c3c7ddcec6c2d7d01758878d9e70cdf576b");
+        let body = open(&secret(), &mut old).unwrap();
+        assert_eq!(&old[body], b"kept before the shared crate");
+        let listing = Listing { items: vec![Item { name: "açaí.png".into(), is_dir: false, size: Some(12345), modified: Some(-5), id: Some("i".into()), info: Some("{}".into()) }, Item { name: "d".into(), is_dir: true, size: None, modified: None, id: None, info: None }], fetched: 1_700_000_000 };
+        let key = ("fotos".to_string(), "2024/".to_string());
+        let old_body = bytes("0105666f746f7305323032342f80e2cfaa06021e0a61c3a761c3ad2e706e67b960090169027b7d010164");
+        assert_eq!(decode(&old_body).unwrap(), HashMap::from([(key.clone(), listing.clone())]));
+        assert_eq!(encode(&HashMap::from([(key, Arc::new(listing))]))[HEADER..], old_body[..]);
+        assert_eq!(file_in(Path::new("d"), " 000ab12cd "), Path::new("d").join("c09e8609c7ee349cbc2d7238c113b9a7.lists"));
     }
 
     #[test]
@@ -660,7 +514,7 @@ mod tests {
         // Another application key under the same key ID (a key can't be read back, but a file
         // of a deleted key must not open with a new one).
         assert_eq!(open(&Secret::of("000ab12cd", "K000other"), &mut sealed.clone()).err(), Some(Refusal::OtherKey));
-        let forged = Secret { key: Secret::of("000ab12cd", "K000other").key, id: secret().id };
+        let forged = Secret(sealed::Secret { key: Secret::of("000ab12cd", "K000other").0.key, id: secret().0.id });
         assert_eq!(open(&forged, &mut sealed.clone()).err(), Some(Refusal::Tampered));
         let mut good = sealed;
         assert!(open(&secret(), &mut good).is_ok());

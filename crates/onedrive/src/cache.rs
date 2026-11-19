@@ -18,77 +18,45 @@
 //! the account makes it unreadable even if left behind. The magic, format and key id are
 //! authenticated with the body; any changed byte is refused and the file thrown away.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
-use aes_gcm::KeyInit;
-use aes_gcm::aead::AeadInOut;
-use sha2::Digest;
+use openexplorer_cloud::sealed::{self, OnClear, Store};
+
+pub use openexplorer_cloud::sealed::Refusal;
 
 use crate::tree::{Snapshot, Tree};
 
-const MAGIC: &[u8; 8] = b"OEODTRE\0";
 /// Bumped when the body's shape changes: a file of another format is thrown away.
 pub const FORMAT: u32 = 1;
-const HEADER: usize = 8 + 4 + 16 + 12;
-const TAG: usize = 16;
 
-/// Why a kept tree wasn't used.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Refusal {
-    Missing,
-    Io(String),
-    /// Not one of these files, or of another format.
-    Format,
-    /// Sealed with another key (the account was removed and added again).
-    OtherKey,
-    /// Changed since it was written.
-    Tampered,
-    /// Opened, but it isn't a tree.
-    Malformed,
-}
+/// The files, `<hash of the drive id>.tree`. A clear leaves the trees the open accounts hold:
+/// each is the account's live state, which its delta link keeps current, not a copy of its
+/// file; those accounts just never write it into the cleared folder again this run.
+static STORE: Store = Store::new(b"OEODTRE\0", FORMAT, "tree", OnClear::Keep);
 
 /// What seals and opens one account's file.
 #[derive(Clone)]
-pub struct Secret {
-    key: [u8; 32],
-    id: [u8; 16],
-}
+pub struct Secret(sealed::Secret);
 
 impl Secret {
     pub fn of(drive: &str, cache_key: &[u8; 32]) -> Secret {
-        let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(drive.as_bytes()), cache_key);
-        let mut key = [0u8; 32];
-        let mut id = [0u8; 16];
-        hk.expand(b"OpenExplorer OneDrive cache: key", &mut key).expect("32 bytes is a valid length");
-        hk.expand(b"OpenExplorer OneDrive cache: key id", &mut id).expect("16 bytes is a valid length");
-        Secret { key, id }
+        Secret(sealed::Secret::derive("OpenExplorer OneDrive cache", drive.as_bytes(), cache_key))
     }
 }
 
-static DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
-/// One file is written at a time, and a forget or a clear waits for a write in flight.
-static WRITING: Mutex<()> = Mutex::new(());
-/// How many clears ran, and each one's folder: no tree an account held before a clear is
-/// written into its folder after it.
-static CLEARS: Mutex<(u64, Vec<(u64, PathBuf)>)> = Mutex::new((0, Vec::new()));
-
 /// The folder the trees are kept in; `None` keeps none (the default, and tests').
 pub fn set_dir(dir: Option<PathBuf>) {
-    *DIR.lock().unwrap_or_else(|e| e.into_inner()) = dir;
+    STORE.set_dir(dir);
 }
 
 pub fn dir() -> Option<PathBuf> {
-    DIR.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    STORE.dir()
 }
 
 /// The file of drive `drive` in `dir`, named by a hash.
 pub fn file_in(dir: &Path, drive: &str) -> PathBuf {
-    let digest = sha2::Sha256::digest(drive.as_bytes());
-    let name: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
-    dir.join(format!("{name}.tree"))
+    STORE.file_in(dir, drive)
 }
 
 pub fn file_of(drive: &str) -> Option<PathBuf> {
@@ -97,112 +65,40 @@ pub fn file_of(drive: &str) -> Option<PathBuf> {
 
 /// Noted by an account as it starts (see [`cleared_since`]).
 pub fn mark() -> u64 {
-    CLEARS.lock().unwrap_or_else(|e| e.into_inner()).0
+    STORE.mark()
 }
 
 pub fn cleared_since(mark: u64, file: &Path) -> bool {
-    CLEARS.lock().unwrap_or_else(|e| e.into_inner()).1.iter().any(|(n, dir)| *n > mark && file.starts_with(dir))
+    STORE.cleared_since(mark, file)
 }
 
 /// Runs `clear` on the folder set, every write held off; accounts open now never write there
 /// again this run. `None` with no folder set.
 pub fn clear_with<R>(clear: impl FnOnce(&Path) -> R) -> Option<R> {
-    let dir = dir()?;
-    Some(clear_in(&dir, clear))
+    STORE.clear_with(clear)
 }
 
 pub fn clear_in<R>(dir: &Path, clear: impl FnOnce(&Path) -> R) -> R {
-    {
-        let mut c = CLEARS.lock().unwrap_or_else(|e| e.into_inner());
-        c.0 += 1;
-        let n = c.0;
-        c.1.push((n, dir.to_path_buf()));
-    }
-    let _held = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-    clear(dir)
+    STORE.clear_in(dir, clear)
 }
 
 /// Deletes `file` (and temporary files a crash left beside it), after any write in flight.
 pub fn forget_file(file: &Path) {
-    let _held = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = std::fs::remove_file(file);
-    let (Some(dir), Some(stem)) = (file.parent(), file.file_stem().and_then(|s| s.to_str())) else { return };
-    let prefix = format!("{stem}.tmp");
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        if entry.file_name().to_str().is_some_and(|n| n.starts_with(&prefix)) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
-pub fn seal(secret: &Secret, body: &[u8]) -> Vec<u8> {
-    let nonce = crate::oauth::random::<12>();
-    let mut file = Vec::with_capacity(HEADER + body.len() + TAG);
-    file.extend_from_slice(MAGIC);
-    file.extend_from_slice(&FORMAT.to_le_bytes());
-    file.extend_from_slice(&secret.id);
-    file.extend_from_slice(&nonce);
-    file.extend_from_slice(body);
-    let gcm = aes_gcm::Aes256Gcm::new_from_slice(&secret.key).expect("a 32-byte key");
-    let (head, rest) = file.split_at_mut(HEADER);
-    let tag = gcm.encrypt_inout_detached((&nonce[..]).try_into().expect("12 bytes"), &head[..28], rest.into()).expect("a body GCM takes");
-    file.extend_from_slice(&tag);
-    file
-}
-
-/// The body of a file [`seal`] made.
-pub fn open(secret: &Secret, mut file: Vec<u8>) -> Result<Vec<u8>, Refusal> {
-    if file.len() < HEADER + TAG || &file[..8] != MAGIC || file[8..12] != FORMAT.to_le_bytes() {
-        return Err(Refusal::Format);
-    }
-    if file[12..28] != secret.id {
-        return Err(Refusal::OtherKey);
-    }
-    let end = file.len() - TAG;
-    let tag: [u8; TAG] = file[end..].try_into().expect("16 bytes");
-    let (head, rest) = file.split_at_mut(HEADER);
-    let gcm = aes_gcm::Aes256Gcm::new_from_slice(&secret.key).expect("a 32-byte key");
-    gcm.decrypt_inout_detached((&head[28..]).try_into().expect("12 bytes"), &head[..28], (&mut rest[..end - HEADER]).into(), (&tag[..]).try_into().expect("16 bytes")).map_err(|_| Refusal::Tampered)?;
-    file.truncate(end);
-    file.drain(..HEADER);
-    Ok(file)
+    STORE.forget_file(file);
 }
 
 /// Writes `tree` to `file` whole, unless the account was removed (`forgotten`) or the folder
 /// cleared after `mark` by the time it's its turn. Whether it wrote.
 pub fn write(file: &Path, secret: &Secret, snap: &Snapshot, forgotten: &AtomicBool, mark: u64) -> std::io::Result<bool> {
     let body = serde_json::to_vec(snap).map_err(std::io::Error::other)?;
-    let sealed = seal(secret, &body);
-    let _held = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-    if forgotten.load(Ordering::SeqCst) || cleared_since(mark, file) {
-        return Ok(false);
-    }
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = file.with_extension(format!("tmp{}", u32::from_le_bytes(crate::oauth::random::<4>())));
-    let result = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&sealed)?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, file)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result.map(|()| true)
+    let sealed = STORE.seal_copy(&secret.0, &body);
+    STORE.write_unless(file, &sealed, forgotten, mark)
 }
 
 /// The tree kept in `file`.
 pub fn read(file: &Path, secret: &Secret) -> Result<Tree, Refusal> {
-    let data = match std::fs::read(file) {
-        Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Refusal::Missing),
-        Err(e) => return Err(Refusal::Io(e.to_string())),
-    };
-    let body = open(secret, data)?;
-    let snap: Snapshot = serde_json::from_slice(&body).map_err(|_| Refusal::Malformed)?;
+    let (data, body) = STORE.read(file, &secret.0)?;
+    let snap: Snapshot = serde_json::from_slice(&data[body]).map_err(|_| Refusal::Malformed)?;
     Tree::from_snapshot(snap).ok_or(Refusal::Malformed)
 }
 
@@ -218,6 +114,17 @@ mod tests {
         t.set_listing(r, &[folder("D", "R", "Relatórios"), file("x", "R", "x.txt")]);
         t.delta = Some("https://graph/delta?token=1".into());
         t
+    }
+
+    /// A file sealed before the shared crate (`openexplorer-cloud`) took over the sealing, and
+    /// its name: both must still be what they were.
+    #[test]
+    fn a_file_kept_before_still_opens() {
+        let hex = "4f454f44545245000100000040e4fa4cf24b2cd67e75352c2c056d16b6672432ca0ad990f788d2122d0d0ec511ff2b0106a181ff2a60f21042805c7cc4a9b2e3087d0eb9e308872366f38bcf2e2ee5cc71813397";
+        let mut old: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+        let body = STORE.open(&Secret::of("d1", &[7; 32]).0, &mut old).unwrap();
+        assert_eq!(&old[body], b"kept before the shared crate");
+        assert_eq!(file_in(Path::new("d"), "d1"), Path::new("d").join("8b53639f152c8fc6ef30802fde462ba0.tree"));
     }
 
     #[test]

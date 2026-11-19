@@ -24,10 +24,9 @@
 //! There's no batch route for `list_revisions` or `restore`: they go a few at once, reads
 //! ([`READS`]) more than writes ([`WRITES`]), which Dropbox serialises per account anyway.
 
-
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
+use openexplorer_cloud::each;
 use openexplorer_i18n::tr;
 use serde_json::{Value, json};
 
@@ -68,25 +67,6 @@ pub(crate) enum Found {
     Gone,
     /// A file that's there now.
     Live,
-}
-
-/// `work` on each of `items`, `at_once` at a time: the results, in order.
-fn each<T: Sync, R: Send>(items: &[T], at_once: usize, work: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    let next = AtomicUsize::new(0);
-    let out: Mutex<Vec<Option<R>>> = Mutex::new((0..items.len()).map(|_| None).collect());
-    std::thread::scope(|s| {
-        for _ in 0..at_once.min(items.len()) {
-            s.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(it) = items.get(i) else { break };
-                    let r = work(it);
-                    out.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(r);
-                }
-            });
-        }
-    });
-    out.into_inner().unwrap_or_else(|e| e.into_inner()).into_iter().map(|r| r.expect("every item done")).collect()
 }
 
 impl Account {

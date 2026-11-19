@@ -34,23 +34,22 @@
 //! old file: it's thrown away. The header is authenticated with the body.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
-use aes_gcm::KeyInit;
-use aes_gcm::aead::AeadInOut;
+use openexplorer_cloud::sealed::{self, OnClear, Store};
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
+
+pub use openexplorer_cloud::sealed::Refusal;
 
 use crate::meta::{Change, Entry, parent};
 
-const MAGIC: &[u8; 8] = b"OEDBXLS\0";
 /// Bumped when the body's shape changes: a file of another format is thrown away.
 pub const FORMAT: u32 = 1;
-const HEADER: usize = 8 + 4 + 16 + 12;
-const TAG: usize = 16;
+
+/// The files, `<hash of the e-mail>.lists`. A clear empties the listings the open accounts hold
+/// too (`account::forget_kept`): each folder is read whole again when it opens.
+static STORE: Store = Store::new(b"OEDBXLS\0", FORMAT, "lists", OnClear::Forget(crate::account::forget_kept));
 
 /// At most this many folders' listings are kept, and this many items in all: past either, the
 /// least recently opened go.
@@ -195,76 +194,13 @@ impl Lists {
 
 /// What seals and opens one login's file.
 #[derive(Clone)]
-pub struct Secret {
-    key: [u8; 32],
-    id: [u8; 16],
-}
+pub struct Secret(sealed::Secret);
 
 impl Secret {
     /// The secret of the login with refresh token `token`, of account `account_id`.
     pub fn of(account_id: &str, token: &str) -> Secret {
-        let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(account_id.as_bytes()), token.as_bytes());
-        let mut key = [0u8; 32];
-        let mut id = [0u8; 16];
-        hk.expand(b"OpenExplorer Dropbox listing cache: key", &mut key).expect("32 bytes is a valid length");
-        hk.expand(b"OpenExplorer Dropbox listing cache: key id", &mut id).expect("16 bytes is a valid length");
-        Secret { key, id }
+        Secret(sealed::Secret::derive("OpenExplorer Dropbox listing cache", account_id.as_bytes(), token.as_bytes()))
     }
-}
-
-/// Why a kept file wasn't used.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Refusal {
-    Missing,
-    Io(String),
-    /// Not one of these files, or of another format.
-    Format,
-    /// Sealed by another login (or account).
-    OtherLogin,
-    /// Changed since it was written.
-    Tampered,
-    /// Opened, but not a body of listings.
-    Malformed,
-}
-
-fn random<const N: usize>() -> [u8; N] {
-    let mut b = [0u8; N];
-    getrandom::fill(&mut b).expect("the system's random generator");
-    b
-}
-
-/// The whole file of `body`.
-pub fn seal(secret: &Secret, body: &[u8]) -> Vec<u8> {
-    let nonce = random::<12>();
-    let mut file = Vec::with_capacity(HEADER + body.len() + TAG);
-    file.extend_from_slice(MAGIC);
-    file.extend_from_slice(&FORMAT.to_le_bytes());
-    file.extend_from_slice(&secret.id);
-    file.extend_from_slice(&nonce);
-    file.extend_from_slice(body);
-    let gcm = aes_gcm::Aes256Gcm::new_from_slice(&secret.key).expect("a 32-byte key");
-    let (head, rest) = file.split_at_mut(HEADER);
-    let tag = gcm.encrypt_inout_detached((&nonce[..]).try_into().expect("12 bytes"), &head[..28], rest.into()).expect("a body GCM takes");
-    file.extend_from_slice(&tag);
-    file
-}
-
-/// The body of a file [`seal`] made.
-pub fn open(secret: &Secret, mut file: Vec<u8>) -> Result<Vec<u8>, Refusal> {
-    if file.len() < HEADER + TAG || &file[..8] != MAGIC || file[8..12] != FORMAT.to_le_bytes() {
-        return Err(Refusal::Format);
-    }
-    if file[12..28] != secret.id {
-        return Err(Refusal::OtherLogin);
-    }
-    let end = file.len() - TAG;
-    let tag: [u8; TAG] = file[end..].try_into().expect("16 bytes");
-    let (head, rest) = file.split_at_mut(HEADER);
-    let gcm = aes_gcm::Aes256Gcm::new_from_slice(&secret.key).expect("a 32-byte key");
-    gcm.decrypt_inout_detached((&head[28..]).try_into().expect("12 bytes"), &head[..28], (&mut rest[..end - HEADER]).into(), (&tag[..]).try_into().expect("16 bytes")).map_err(|_| Refusal::Tampered)?;
-    file.truncate(end);
-    file.drain(..HEADER);
-    Ok(file)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -304,27 +240,18 @@ pub fn decode(body: &[u8]) -> Result<Lists, Refusal> {
 // ---------------------------------------------------------------------------------------------
 // Where
 
-static DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
-/// One file is written at a time, so an older snapshot never lands over a newer one, and a
-/// forget waits for a write in flight.
-static WRITING: Mutex<()> = Mutex::new(());
-/// How many clears ran, and the folder of each (see [`mark`]).
-static CLEARS: Mutex<(u64, Vec<(u64, PathBuf)>)> = Mutex::new((0, Vec::new()));
-
 /// The folder the listings are kept in; `None` keeps none (the default, and tests').
 pub fn set_dir(dir: Option<PathBuf>) {
-    *DIR.lock().unwrap_or_else(|e| e.into_inner()) = dir;
+    STORE.set_dir(dir);
 }
 
 pub fn dir() -> Option<PathBuf> {
-    DIR.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    STORE.dir()
 }
 
 /// The file of account `email` in `dir`: named by a hash, so the folder doesn't list e-mails.
 pub fn file_in(dir: &Path, email: &str) -> PathBuf {
-    let digest = sha2::Sha256::digest(crate::store::normal_email(email).as_bytes());
-    let name: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
-    dir.join(format!("{name}.lists"))
+    STORE.file_in(dir, &crate::store::normal_email(email))
 }
 
 pub fn file_of(email: &str) -> Option<PathBuf> {
@@ -334,73 +261,36 @@ pub fn file_of(email: &str) -> Option<PathBuf> {
 /// What an account notes as it opens: [`cleared_since`] tells whether its folder was cleared
 /// after, and then it keeps nothing there for the rest of the run.
 pub fn mark() -> u64 {
-    CLEARS.lock().unwrap_or_else(|e| e.into_inner()).0
+    STORE.mark()
 }
 
 pub fn cleared_since(mark: u64, file: &Path) -> bool {
-    CLEARS.lock().unwrap_or_else(|e| e.into_inner()).1.iter().any(|(n, dir)| *n > mark && file.starts_with(dir))
+    STORE.cleared_since(mark, file)
 }
 
-/// Runs `clear` on the folder set, with writes held off: a listing an account open now holds is
-/// never written there again this run. `None` with no folder set.
+/// Runs `clear` on the folder set, with writes held off, after emptying the listings the open
+/// accounts hold: a listing an account open now held is never written there again this run.
+/// `None` with no folder set.
 pub fn clear_with<R>(clear: impl FnOnce(&Path) -> R) -> Option<R> {
-    let dir = dir()?;
-    {
-        let mut clears = CLEARS.lock().unwrap_or_else(|e| e.into_inner());
-        clears.0 += 1;
-        let n = clears.0;
-        clears.1.push((n, dir.clone()));
-    }
-    let _held = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-    Some(clear(&dir))
+    STORE.clear_with(clear)
 }
 
 /// Deletes `file`, after any write in flight, and temporary files a crash left beside it.
 pub fn forget_file(file: &Path) {
-    let _held = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = std::fs::remove_file(file);
-    let (Some(dir), Some(stem)) = (file.parent(), file.file_stem().and_then(|s| s.to_str())) else { return };
-    let prefix = format!("{stem}.tmp");
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        if entry.file_name().to_str().is_some_and(|n| n.starts_with(&prefix)) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
+    STORE.forget_file(file);
 }
 
 /// Writes `body` sealed to `file` whole, unless the account was forgotten or the folder cleared
 /// after `mark` by the time it's its turn. Whether it wrote.
 pub fn write_unless(file: &Path, secret: &Secret, body: &[u8], forgotten: &AtomicBool, mark: u64) -> std::io::Result<bool> {
-    let sealed = seal(secret, body);
-    let _held = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-    if forgotten.load(Ordering::SeqCst) || cleared_since(mark, file) {
-        return Ok(false);
-    }
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = file.with_extension(format!("tmp{}", u32::from_le_bytes(random::<4>())));
-    let result = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&sealed)?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, file)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result.map(|()| true)
+    let sealed = STORE.seal_copy(&secret.0, body);
+    STORE.write_unless(file, &sealed, forgotten, mark)
 }
 
 /// The listings kept in `file`.
 pub fn read(file: &Path, secret: &Secret) -> Result<Lists, Refusal> {
-    let bytes = match std::fs::read(file) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Refusal::Missing),
-        Err(e) => return Err(Refusal::Io(e.to_string())),
-    };
-    decode(&open(secret, bytes)?)
+    let (data, body) = STORE.read(file, &secret.0)?;
+    decode(&data[body])
 }
 
 #[cfg(test)]
@@ -451,6 +341,17 @@ mod tests {
         assert!(l.get("/p0", 1).is_some() && l.get("/p1", 1).is_none());
     }
 
+    /// A file sealed before the shared crate (`openexplorer-cloud`) took over the sealing, and
+    /// its name: both must still be what they were.
+    #[test]
+    fn a_file_kept_before_still_opens() {
+        let hex = "4f454442584c5300010000006566f828e2d1074a25afe54bb65d52278d2250b0f6a9e716cb3e29a152bfd75b4b709f25bb9f2e69dd4f41c88281f960641c7188e66a8375e06c01dcc1760df71e5fd5cd9d1771b1";
+        let mut old: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+        let body = STORE.open(&Secret::of("dbid:AAA", "refresh-1").0, &mut old).unwrap();
+        assert_eq!(&old[body], b"kept before the shared crate");
+        assert_eq!(file_in(Path::new("d"), "Ana@Exemplo.com"), Path::new("d").join("840d9902bc6853e59cd9585cd0ecb3ee.lists"));
+    }
+
     #[test]
     fn a_sealed_file_opens_only_with_its_login_and_unchanged() {
         let dir = std::env::temp_dir().join(format!("oe-dropbox-cache-{}", std::process::id()));
@@ -468,7 +369,7 @@ mod tests {
         let raw = std::fs::read(&path).unwrap();
         assert!(!raw.windows(4).any(|w| w == "ação".as_bytes()[..4].as_ref()));
         // Another login's key, or a changed byte: refused.
-        assert_eq!(read(&path, &Secret::of("dbid:AAA", "refresh-2")).err(), Some(Refusal::OtherLogin));
+        assert_eq!(read(&path, &Secret::of("dbid:AAA", "refresh-2")).err(), Some(Refusal::OtherKey));
         let mut bad = raw.clone();
         let n = bad.len() - 20;
         bad[n] ^= 1;

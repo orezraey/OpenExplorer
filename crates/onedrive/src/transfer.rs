@@ -11,6 +11,7 @@
 use std::io::{Read, Write};
 use std::time::Duration;
 
+use openexplorer_cloud::fill;
 use openexplorer_i18n::{t, tr};
 use serde_json::{Value, json};
 
@@ -37,20 +38,6 @@ fn mismatch(name: &str) -> String {
         "\"{name}\" chegou diferente do que saiu (o hash QuickXor não confere). Tente de novo.",
         "\"{name}\" arrived different from what was sent (the QuickXor hash doesn't match). Try again."
     )
-}
-
-/// Reads up to `buf.len()` bytes, fewer only at the end.
-fn fill(src: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<usize> {
-    let mut n = 0;
-    while n < buf.len() {
-        match src.read(&mut buf[n..]) {
-            Ok(0) => break,
-            Ok(k) => n += k,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(n)
 }
 
 impl Account {

@@ -94,7 +94,10 @@ pub fn confirm(s: &mut State, on: bool) {
 }
 
 /// Clears the caches: the Drive listings in memory now, then on a thread the files of all
-/// (after the Drive writes already asked for, and holding off MEGA's), and measures again.
+/// (after the Drive writes already asked for, and holding off the accounts'), and measures
+/// again. Each account crate's clear empties what its open accounts hold in memory, or not, as
+/// its `cache` module declares (Dropbox's and B2's listings go; MEGA's and OneDrive's trees,
+/// kept current by their change logs, stay).
 pub fn clear(s: &mut State) {
     let Some(page) = page(s) else { return };
     if page.clearing {
@@ -103,8 +106,6 @@ pub fn clear(s: &mut State) {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     *page = Page { usage: page.usage, waiting: id, clearing: true, confirming: false, error: None };
     let drive = s.cache.clear();
-    // Dropbox listings held in memory go too, not only their files.
-    openexplorer_dropbox::forget_kept();
     openexplorer_gdrive::log("cache: limpando as listagens do Google Drive e as árvores do MEGA");
     crate::background(s, move |emit| {
         // No answer only if the Drive cache's disk thread is gone: clear it from here.

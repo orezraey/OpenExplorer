@@ -7,15 +7,12 @@ edition.workspace = true
 # docs in `src/lib.rs`. Every version here is one Cargo.lock already had, so the build stays
 # offline-friendly.
 [dependencies]
-aes-gcm = "0.11"
 base64 = "0.22"
-getrandom = "0.3"
-hkdf = "0.13"
 # The application key lives in the OS credential store: Credential Manager on Windows.
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
+openexplorer-cloud = { path = "../cloud" }
 openexplorer-i18n = { path = "../i18n" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.11"
-sha2 = "0.11"
 ureq = "3"

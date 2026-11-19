@@ -857,9 +857,9 @@ pub(crate) fn kept_key(asked: &str, entries: &[Entry]) -> Option<String> {
     }
 }
 
-/// Forgets the listings every open account holds in memory (Limpar cache): each folder is read
-/// whole again when it opens.
-pub fn forget_kept() {
+/// Forgets the listings every open account holds in memory: each folder is read whole again
+/// when it opens. What a clear of the cache folder does to memory (see `cache::clear_with`).
+pub(crate) fn forget_kept() {
     let open: Vec<Arc<Account>> = OPEN.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
     for a in open {
         a.lists().clear();

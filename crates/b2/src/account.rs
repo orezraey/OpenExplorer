@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use openexplorer_i18n::{t, tr};
@@ -228,35 +228,9 @@ pub(crate) fn with_done(e: String, done: usize) -> String {
 /// Like [`each`], but what was done before the error comes back with it (in the items'
 /// order): a batch that changes B2 must know what it changed even when it stopped midway.
 pub(crate) fn each_done<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> Result<R> + Sync) -> (Vec<R>, Option<String>) {
-    if items.len() <= 1 {
-        let mut done = Vec::new();
-        for item in items {
-            match work(item) {
-                Ok(v) => done.push(v),
-                Err(e) => return (done, Some(e)),
-            }
-        }
-        return (done, None);
-    }
-    let next = AtomicUsize::new(0);
-    let failed = AtomicBool::new(false);
-    let out: Mutex<Vec<Option<Result<R>>>> = Mutex::new((0..items.len()).map(|_| None).collect());
-    std::thread::scope(|scope| {
-        for _ in 0..AT_ONCE.min(items.len()) {
-            scope.spawn(|| {
-                while !failed.load(Ordering::SeqCst) {
-                    let i = next.fetch_add(1, Ordering::SeqCst);
-                    let Some(item) = items.get(i) else { break };
-                    let r = work(item);
-                    failed.fetch_or(r.is_err(), Ordering::SeqCst);
-                    out.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(r);
-                }
-            });
-        }
-    });
     let mut done = Vec::with_capacity(items.len());
     let mut error = None;
-    for r in out.into_inner().unwrap_or_else(|e| e.into_inner()).into_iter().flatten() {
+    for r in openexplorer_cloud::each_until(items, AT_ONCE, work, Result::is_err).into_iter().flatten() {
         match r {
             Ok(v) => done.push(v),
             Err(e) => {

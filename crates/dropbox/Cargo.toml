@@ -10,12 +10,11 @@ edition.workspace = true
 fake = []
 
 [dependencies]
-aes-gcm = "0.11"
 base64 = "0.22"
 getrandom = "0.3"
-hkdf = "0.13"
 # Refresh tokens live in the OS credential store: Credential Manager on Windows.
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
+openexplorer-cloud = { path = "../cloud" }
 openexplorer-i18n = { path = "../i18n" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

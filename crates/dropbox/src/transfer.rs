@@ -37,16 +37,7 @@ pub type Progress<'a> = &'a mut dyn FnMut(u64) -> bool;
 
 /// Fills `buf` from `src` as far as it goes: how much it read.
 fn fill(src: &mut dyn Read, buf: &mut [u8]) -> Result<usize> {
-    let mut got = 0;
-    while got < buf.len() {
-        match src.read(&mut buf[got..]) {
-            Ok(0) => break,
-            Ok(n) => got += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(tr!("Não consegui ler o arquivo a enviar: {e}", "Couldn't read the file to send: {e}")),
-        }
-    }
-    Ok(got)
+    openexplorer_cloud::fill(src, buf).map_err(|e| tr!("Não consegui ler o arquivo a enviar: {e}", "Couldn't read the file to send: {e}"))
 }
 
 /// The offset an `incorrect_offset` error says Dropbox holds. A struct member of a union sits
