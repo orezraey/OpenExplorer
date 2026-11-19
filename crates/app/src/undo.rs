@@ -67,6 +67,10 @@ pub enum Step {
     B2Hide { server: Server, path: String, is_dir: bool },
     /// What was hidden at `path` at `since` (milliseconds, B2's clock) or later comes back.
     B2Unhide { server: Server, path: String, is_dir: bool, since: i64 },
+    /// OneDrive item `id` of account `server`, named `name`, goes to the recycle bin.
+    OneDriveTrash { server: Server, id: String, name: String },
+    /// OneDrive item `id`, named `name`, comes back from the recycle bin (personal accounts).
+    OneDriveRestore { server: Server, id: String, name: String },
 }
 
 /// What undoes one action, or redoes one undone.
@@ -657,6 +661,8 @@ impl Step {
             },
             Step::DropboxDelete { .. } | Step::DropboxRestore { .. } => crate::dropbox::check(self),
             Step::B2Hide { .. } | Step::B2Unhide { .. } => crate::b2::check(self),
+            // OneDrive says itself what's no longer there (or no longer in the bin).
+            Step::OneDriveTrash { .. } | Step::OneDriveRestore { .. } => Ok(()),
             Step::ServerRemoveDir { server, path } => reach.server(server, &mut |c| match c.stat(path)? {
                 None => Err(tr!("“{}” não está mais no servidor.", "“{}” is no longer on the server.", server_name(path))),
                 Some(it) if !it.is_dir || it.link => Err(tr!("“{}” não é mais uma pasta.", "“{}” is no longer a folder.", server_name(path))),
@@ -745,6 +751,14 @@ impl Step {
             }
             Step::DropboxDelete { .. } | Step::DropboxRestore { .. } => crate::dropbox::run(self)?,
             Step::B2Hide { .. } | Step::B2Unhide { .. } => crate::b2::run(self)?,
+            Step::OneDriveTrash { server, id, name } => {
+                crate::onedrive::trash_id(server, id).map_err(|e| tr!("“{name}”: {e}", "“{name}”: {e}"))?;
+                Step::OneDriveRestore { server: server.clone(), id: id.clone(), name: name.clone() }
+            }
+            Step::OneDriveRestore { server, id, name } => {
+                crate::onedrive::restore_id(server, id).map_err(|e| tr!("“{name}”: {e}", "“{name}”: {e}"))?;
+                Step::OneDriveTrash { server: server.clone(), id: id.clone(), name: name.clone() }
+            }
         })
     }
 }

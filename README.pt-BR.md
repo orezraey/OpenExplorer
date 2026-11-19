@@ -13,6 +13,8 @@ integrados. Escrito em Rust.
 * MEGA: várias contas (com login em duas etapas também), Drive na nuvem, Lixeira com restaurar,
   pastas compartilhadas com você e links públicos de arquivos. Tudo cifrado e decifrado no seu
   computador; as pastas abertas se atualizam quando algo muda em outro lugar.
+* OneDrive: contas pessoais, corporativas ou de estudante, links de compartilhamento, lixeira com
+  desfazer (pessoais). As pastas abertas se atualizam quando algo muda em outro lugar.
 * SFTP, FTP/FTPS, WebDAV, Nextcloud e ownCloud.
 * Copiar e mover entre qualquer um deles, com fila de transferências.
 * Pesquisa instantânea por nome nos discos NTFS locais, parecida com o Everything. Também dá para
@@ -50,6 +52,25 @@ Enquanto o app não passa pela verificação do Google, você precisa do seu pr�
 4. No Open Explorer, vá em Adicionar conta → Google Drive e cole o JSON.
 
 No modo Teste, o Google pede para entrar de novo a cada 7 dias.
+
+## OneDrive
+
+Contas pessoais, corporativas ou de estudante entram pelo navegador com um registro de
+aplicativo seu (gratuito, sem segredo):
+
+1. No [portal do Microsoft Entra](https://entra.microsoft.com), Registros de aplicativo → Novo
+   registro, tipos de conta "Contas em qualquer diretório organizacional e contas pessoais da
+   Microsoft".
+2. Autenticação: adicione a plataforma "Aplicativos móveis e da área de trabalho" com o URI de
+   redirecionamento `http://localhost`, e ligue "Permitir fluxos de clientes públicos".
+3. Permissões de API: Microsoft Graph, delegadas, `Files.ReadWrite.All`, `offline_access` e
+   `User.Read`.
+4. No Open Explorer, vá em Adicionar conta → OneDrive e cole o ID do aplicativo (cliente) (ele
+   fica em `%APPDATA%\OpenExplorer\onedrive-client.json`; `OPENEXPLORER_ONEDRIVE_CLIENT_ID`
+   também serve).
+
+A Microsoft não deixa aplicativos listarem nem restaurarem a lixeira do OneDrive em contas
+corporativas ou de estudante: nelas, itens excluídos são restaurados pelo site.
 
 ## Compilar
 

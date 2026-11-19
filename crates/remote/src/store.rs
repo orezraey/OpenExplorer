@@ -37,8 +37,8 @@ impl Store {
     pub fn save(&self, server: Server, secret: Option<&str>) -> Result<()> {
         // MEGA accounts live in the MEGA crate's store; one here would make an older app read
         // the whole list as empty.
-        if server.is_mega() {
-            return Err(openexplorer_i18n::t("Contas MEGA não ficam na lista de servidores.", "MEGA accounts aren't kept in the list of servers.").into());
+        if server.is_mega() || server.is_onedrive() {
+            return Err(openexplorer_i18n::t("Contas MEGA e OneDrive não ficam na lista de servidores.", "MEGA and OneDrive accounts aren't kept in the list of servers.").into());
         }
         if server.is_dropbox() {
             return Err(openexplorer_i18n::t("Contas Dropbox não ficam na lista de servidores.", "Dropbox accounts aren't kept in the list of servers.").into());

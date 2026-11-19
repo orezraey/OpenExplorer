@@ -27,6 +27,7 @@ mod layout;
 mod mega;
 mod model;
 mod network;
+mod onedrive;
 mod ops;
 mod settings;
 mod sharing;
@@ -104,6 +105,8 @@ enum Msg {
     Dropbox(dropbox::Answer),
     /// Something background work on a B2 key brought back.
     B2(b2::Answer),
+    /// Something background work on a OneDrive account brought back.
+    OneDrive(onedrive::Answer),
     /// What the caches take, measured or cleared for Opções › Cache.
     Caches(caches::Answer),
     /// Installing the search service ended: search again in the panes `reload` shows.
@@ -548,11 +551,17 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                 for sv in boxes {
                     dropbox::ask_quota(s, &sv);
                 }
+                let mut ones: Vec<openexplorer_remote::Server> = reload.iter().filter_map(|l| onedrive::at(l).map(|(sv, _)| sv.clone())).collect();
+                ones.dedup_by(|a, b| a.id == b.id);
+                for sv in ones {
+                    onedrive::ask_quota(s, &sv);
+                }
             }
             Msg::Undo(answer) => undo::arrived(s, answer),
             Msg::Mega(answer) => mega::arrived(s, answer, tx, now),
             Msg::Dropbox(answer) => dropbox::arrived(s, answer, tx, now),
             Msg::B2(answer) => b2::arrived(s, answer),
+            Msg::OneDrive(answer) => onedrive::arrived(s, answer, tx, now),
             Msg::Caches(answer) => caches::arrived(s, answer),
             Msg::Changes { email, result } => watch::arrived(s, email, result, now),
             Msg::Quota { email, result } => {
@@ -648,7 +657,8 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     if let Some(at) = dropbox::next_ask(s) {
         tx.wake_at(at);
     }
-    if let Some(at) = mega::next_ask(s) {
+    onedrive::tick(s, now);
+    if let Some(at) = mega::next_ask(s).into_iter().chain(onedrive::next_ask(s)).reduce(f64::min) {
         tx.wake_at(at);
     }
     for p in 0..2 {
@@ -932,6 +942,9 @@ fn list(s: &mut State, p: usize, fresh: bool) {
         if server.is_mega() && !s.servers.mega_quotas.contains_key(&server.id) {
             let sv = (**server).clone();
             mega::ask_quota(s, &sv);
+        } else if server.is_onedrive() && !s.servers.onedrive.quotas.contains_key(&server.id) {
+            let sv = (**server).clone();
+            onedrive::ask_quota(s, &sv);
         }
         return servers::load(s, p, request);
     }
@@ -1651,7 +1664,7 @@ fn clash_scene(s: &mut State, all: bool) {
 /// Opções open on Cache, its sizes fixed, then `then` applied to the page.
 fn cache_scene(s: &mut State, then: fn(&mut caches::Page)) {
     let mut v = settings::OptionsView::open(settings::OptionsTab::Cache);
-    v.cache.usage = Some(caches::Usage { drive: 3_565_158, mega: 48_211_968, dropbox: 1_204_224, b2: 1_204_224 });
+    v.cache.usage = Some(caches::Usage { drive: 3_565_158, mega: 48_211_968, dropbox: 1_204_224, b2: 1_204_224, onedrive: 1_310_720 });
     then(&mut v.cache);
     s.dialog = Some(actions::Dialog::Options(Box::new(v)));
 }
@@ -1722,6 +1735,9 @@ fn main() {
     openexplorer_b2::set_log(openexplorer_gdrive::log);
     // Each B2 key's folder listings, sealed, so a recent folder reopens without asking B2.
     openexplorer_b2::set_cache_dir(Some(b2::cache_dir()));
+    // Each OneDrive account's listings and delta position, sealed, so a start reads one page.
+    openexplorer_onedrive::set_log(openexplorer_gdrive::log);
+    openexplorer_onedrive::set_cache_dir(Some(openexplorer_gdrive::local_dir().join("onedrive")));
     rune::App::new(AppSpec::<State> {
         min_size: Some((900.0, 420.0)),
         families: initial.font.families(),
@@ -1827,7 +1843,7 @@ fn main() {
             ("options-cache-confirm", |s| cache_scene(s, |p| p.confirming = true)),
             ("options-cache-error", |s| {
                 cache_scene(s, |p| {
-                    p.usage = Some(caches::Usage { drive: 0, mega: 48_211_968, dropbox: 0, b2: 0 });
+                    p.usage = Some(caches::Usage { drive: 0, mega: 48_211_968, dropbox: 0, b2: 0, onedrive: 0 });
                     p.error = Some(tr!(
                         "Não foi possível apagar {}: O arquivo já está sendo usado por outro processo. (os error 32). Feche o que estiver usando o arquivo e tente de novo.",
                         "Couldn't delete {}: The process cannot access the file because it is being used by another process. (os error 32). Close whatever is using the file and try again.",
@@ -2003,6 +2019,29 @@ fn main() {
                 f.error = Some(openexplorer_i18n::t("O ID da chave ou a chave de aplicação estão errados (ou a chave foi apagada).", "The key ID or the application key is wrong (or the key was deleted).").into());
                 s.dialog = Some(actions::Dialog::Server(Box::new(f)));
             }),
+            // A OneDrive account's files with its storage, without a network.
+            ("onedrive", |s| {
+                let sv = openexplorer_remote::Server::onedrive("b!exemplo", "voce@exemplo.com");
+                s.servers.list.push(sv.clone());
+                s.servers.onedrive.quotas.insert(sv.id.clone(), Some(openexplorer_onedrive::Quota { total: 1_099_511_627_776, used: 214_748_364_800, remaining: 884_763_262_976, deleted: 1_073_741_824, state: "normal".into() }));
+                s.panes[1].go(onedrive::files(&sv));
+                s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
+                s.active = 1;
+            }),
+            // Adding a OneDrive account before an app registration is set up.
+            ("onedrive-add", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::OneDrive);
+                f.custom_oauth = true;
+                f.error = Some(t("Cliente OAuth do OneDrive não configurado.", "OneDrive OAuth client not set up.").into());
+                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+            }),
+            // The question Copiar link asks on a OneDrive file with no link.
+            ("onedrive-link", |s| {
+                let sv = openexplorer_remote::Server::onedrive("b!exemplo", "voce@exemplo.com");
+                if let Some(item) = MockDrive::new().list(&["Documentos".into()]).into_iter().find(|e| !e.is_dir) {
+                    s.dialog = Some(actions::Dialog::OneDriveLink(Box::new(onedrive::MakeLink { server: sv, path: "/Meus arquivos/x".into(), item })));
+                }
+            }),
             // Compartilhar on a file shared with a few people and the link, without a network.
             ("share", |s| {
                 s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
@@ -2054,6 +2093,7 @@ fn main() {
         openexplorer_mega::save_caches();
         openexplorer_dropbox::save_caches();
         openexplorer_b2::save_caches();
+        openexplorer_onedrive::save_caches();
     })
     .run();
 }

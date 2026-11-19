@@ -3044,6 +3044,7 @@ dependencies = [
  "openexplorer-i18n",
  "openexplorer-index",
  "openexplorer-mega",
+ "openexplorer-onedrive",
  "openexplorer-remote",
  "rune",
  "rune-kit",
@@ -3148,6 +3149,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "openexplorer-onedrive"
+version = "0.2.0"
+dependencies = [
+ "aes-gcm",
+ "base64 0.22.1",
+ "chrono",
+ "getrandom 0.3.4",
+ "hkdf",
+ "keyring",
+ "openexplorer-i18n",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "ureq",
+ "url",
+]
+
+[[package]]
 name = "openexplorer-remote"
 version = "0.2.0"
 dependencies = [
@@ -3158,6 +3177,7 @@ dependencies = [
  "openexplorer-dropbox",
  "openexplorer-i18n",
  "openexplorer-mega",
+ "openexplorer-onedrive",
  "percent-encoding",
  "quick-xml 0.38.4",
  "russh",

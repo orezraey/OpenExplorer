@@ -8,6 +8,7 @@ mod dav;
 mod dropbox;
 mod ftp;
 mod mega;
+mod onedrive;
 mod sftp;
 pub mod store;
 mod tls;
@@ -51,6 +52,8 @@ pub enum Protocol {
     Dropbox,
     /// A Backblaze B2 application key (see `b2.rs`); kept apart like MEGA.
     B2,
+    /// A OneDrive account (see `onedrive.rs`), kept apart from `servers.json` as MEGA is.
+    OneDrive,
 }
 
 impl Protocol {
@@ -66,6 +69,7 @@ impl Protocol {
             Protocol::Mega => "MEGA",
             Protocol::Dropbox => "Dropbox",
             Protocol::B2 => "Backblaze B2",
+            Protocol::OneDrive => "OneDrive",
         }
     }
 
@@ -89,6 +93,7 @@ impl Protocol {
             Protocol::Mega => "mega",
             Protocol::Dropbox => "dropbox",
             Protocol::B2 => "b2",
+            Protocol::OneDrive => "onedrive",
         }
     }
 
@@ -108,7 +113,7 @@ impl Protocol {
             Protocol::Ftp | Protocol::Ftps => 21,
             Protocol::Sftp => 22,
             Protocol::Dav => 80,
-            Protocol::Davs | Protocol::Mega | Protocol::Dropbox | Protocol::B2 => 443,
+            Protocol::Davs | Protocol::Mega | Protocol::Dropbox | Protocol::B2 | Protocol::OneDrive => 443,
         }
     }
 
@@ -240,6 +245,16 @@ impl Server {
         self.protocol == Protocol::B2
     }
 
+    /// The server a OneDrive account shows as: the drive's id is the user (the account's key in
+    /// the OneDrive crate), its e-mail the name.
+    pub fn onedrive(drive: &str, email: &str) -> Server {
+        Server { id: format!("onedrive:{drive}"), name: email.to_string(), protocol: Protocol::OneDrive, host: "graph.microsoft.com".into(), user: drive.to_string(), connections: 6, ..Server::mega("") }
+    }
+
+    pub fn is_onedrive(&self) -> bool {
+        self.protocol == Protocol::OneDrive
+    }
+
     /// `sftp://ana@host:2222`, the port only when it isn't the usual one. Never the password.
     pub fn address(&self) -> String {
         if self.is_mega() {
@@ -251,6 +266,9 @@ impl Server {
         // Bucket names are unique across B2: an address names the bucket, not the key.
         if self.is_b2() {
             return "b2://".into();
+        }
+        if self.is_onedrive() {
+            return format!("onedrive://{}", self.name);
         }
         let user = if self.user.is_empty() { String::new() } else { format!("{}@", encode_user(&self.user)) };
         let host = if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() };
@@ -390,6 +408,7 @@ fn open(server: &Server, secret: &str, trust: &tls::Trust) -> Result<Box<dyn Con
         Protocol::Mega => Ok(Box::new(mega::Mega::connect(server)?)),
         Protocol::Dropbox => Ok(Box::new(dropbox::Dropbox::connect(server)?)),
         Protocol::B2 => Ok(Box::new(b2::B2::connect(server)?)),
+        Protocol::OneDrive => Ok(Box::new(onedrive::OneDrive::connect(server)?)),
     }
 }
 
