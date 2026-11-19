@@ -15,7 +15,10 @@
 //!   file to the same name again finds it (`b2_list_unfinished_large_files`, with the size and
 //!   the part size the app notes in its `fileInfo`), and sends only the parts whose SHA-1 B2
 //!   doesn't already hold (`b2_list_parts`). Cancelar cancels it on B2 (`b2_cancel_large_file`),
-//!   so its parts stop taking storage; so does a new upload to the name with another size.
+//!   so its parts stop taking storage; so does a new upload to the name with another size, when
+//!   the old one has surely stopped: this app started it in this run, or no part reached it for
+//!   [`ABANDONED`] ([`IDLE`] for one this computer started earlier). One that may still be
+//!   going on another computer is left for the Envios inacabados dialog.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -41,6 +44,13 @@ pub const MAX_PARTS: u64 = 10_000;
 pub const MODIFIED: &str = "src_last_modified_millis";
 /// What all uploads together hold of parts in memory.
 pub const BUDGET: u64 = 256 * 1024 * 1024;
+/// How long an unfinished upload goes with no new part before a new upload to its name takes
+/// it for given up and cancels it (milliseconds): one going on, here or on another computer,
+/// sends a part every few minutes, and one taken up after that long starts over at worst.
+pub const ABANDONED: i64 = 7 * 24 * 3600 * 1000;
+/// The same for an upload this computer started in an earlier run (its note says): another
+/// computer could only have taken it up as the same file, and would be sending parts.
+pub const IDLE: i64 = 3600 * 1000;
 
 /// The part size for a file of `len` bytes: B2's recommendation, at most [`PART_CAP`], at least
 /// B2's minimum, and big enough to fit in [`MAX_PARTS`]. A file no bigger goes in one request.
@@ -102,6 +112,14 @@ pub struct Unfinished {
 /// The large uploads this app is sending now, by file id: not cancelled from the dialog, nor
 /// taken for another upload's leftover.
 static SENDING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+
+/// The large uploads this app started or took up in this run, by file id: one that isn't
+/// being sent now has stopped (see [`Account::abandoned`]).
+static STARTED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+
+fn started_here(file_id: &str) -> bool {
+    STARTED.lock().unwrap_or_else(|e| e.into_inner()).contains(file_id)
+}
 
 /// Whether this app is sending the large upload `file_id` now.
 pub fn sending(file_id: &str) -> bool {
@@ -377,7 +395,14 @@ impl Account {
 
     /// The parts B2 holds of unfinished file `file_id`: by number, their size and SHA-1.
     fn parts(&self, file_id: &str) -> Result<Parts> {
+        self.parts_seen(file_id).map(|(parts, _)| parts)
+    }
+
+    /// [`Account::parts`], and when the newest of them reached B2 (milliseconds since 1970; 0
+    /// with none).
+    fn parts_seen(&self, file_id: &str) -> Result<(Parts, i64)> {
         let mut out = HashMap::new();
+        let mut newest = 0;
         let mut start: Option<u64> = None;
         loop {
             let mut body = json!({"fileId": file_id, "maxPartCount": 1000});
@@ -386,19 +411,22 @@ impl Account {
             }
             let v = self.api.run("b2_list_parts", &body)?;
             for p in v.get("parts").and_then(Value::as_array).into_iter().flatten() {
+                newest = newest.max(p.get("uploadTimestamp").and_then(Value::as_i64).unwrap_or(0));
                 if let (Some(n), Some(len), Some(sha1)) = (p.get("partNumber").and_then(Value::as_u64), p.get("contentLength").and_then(Value::as_u64), p.get("contentSha1").and_then(Value::as_str)) {
                     out.insert(n, (len, sha1.to_string()));
                 }
             }
             match v.get("nextPartNumber").and_then(Value::as_u64) {
                 Some(n) => start = Some(n),
-                None => return Ok(out),
+                None => return Ok((out, newest)),
             }
         }
     }
 
     /// An unfinished upload of this same file to `name` to pick up, and the parts it has. The
-    /// app's other unfinished uploads to `name` (another size) are cancelled.
+    /// app's other unfinished uploads to `name` (another size, or older) are cancelled when
+    /// they're surely stopped (see [`Account::abandoned`]); the others may still be going on
+    /// another computer, and stay for the Envios inacabados dialog.
     fn resumable(&self, bucket: &Bucket, name: &str, len: u64, part: u64) -> Option<(String, Parts)> {
         let found = match self.unfinished(bucket, name) {
             Ok(f) => f,
@@ -413,9 +441,19 @@ impl Account {
         mine.sort_by_key(|v| std::cmp::Reverse(v.uploaded));
         let same = mine.iter().position(|v| ours(v, "oe_size") == Some(len.to_string()) && ours(v, "oe_part") == Some(part.to_string()));
         let pick = same.map(|i| mine.remove(i));
+        let now = crate::cache::now() as i64 * 1000;
         for other in mine {
-            if let Err(e) = self.cancel_large(&other.id) {
-                crate::api::log(&format!("B2: não consegui cancelar o envio inacabado {}: {e}", other.id));
+            if !self.abandoned(bucket, &other, now) {
+                crate::api::log(&format!("B2: o envio inacabado {} de {name} pode estar em andamento em outro computador; fica para Envios inacabados", other.id));
+                continue;
+            }
+            match self.cancel_large(&other.id) {
+                Ok(()) => {
+                    if let Some(size) = ours(&other, "oe_size").and_then(|s| s.parse().ok()) {
+                        crate::notes::end(&self.key_id, &bucket.name, name, size);
+                    }
+                }
+                Err(e) => crate::api::log(&format!("B2: não consegui cancelar o envio inacabado {}: {e}", other.id)),
             }
         }
         let pick = pick?;
@@ -429,6 +467,20 @@ impl Account {
                 None
             }
         }
+    }
+
+    /// Whether unfinished upload `v` (not being sent by this app now) has surely stopped, so a
+    /// new upload to its name may cancel it: this app started it in this run, or nothing reached
+    /// it for [`ABANDONED`] (for [`IDLE`] when a note says this computer started it). An upload
+    /// going on elsewhere sends a part every few minutes; one whose parts can't be read is kept.
+    fn abandoned(&self, bucket: &Bucket, v: &Version, now: i64) -> bool {
+        if started_here(&v.id) {
+            return true;
+        }
+        let Ok((_, newest)) = self.parts_seen(&v.id) else { return false };
+        let quiet = now - newest.max(v.uploaded);
+        let noted = v.info.get("oe_size").and_then(Value::as_str).and_then(|s| s.parse().ok()).is_some_and(|size| crate::notes::noted(&self.key_id, &bucket.name, &v.name, size));
+        quiet >= ABANDONED || (noted && quiet >= IDLE)
     }
 
     fn start_large(&self, bucket: &Bucket, name: &str, content_type: &str, info: Value) -> Result<String> {
@@ -520,6 +572,7 @@ impl Account {
             }
         };
         let _sending = InFlight::new(&file_id);
+        STARTED.lock().unwrap_or_else(|e| e.into_inner()).insert(file_id.clone());
         let sent = AtomicU64::new(0);
         let stop = AtomicBool::new(false);
         let failed: Mutex<Option<String>> = Mutex::new(None);

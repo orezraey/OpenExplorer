@@ -104,6 +104,14 @@ pub fn local_of(key_id: &str, bucket: &str, name: &str, size: u64) -> Option<Pat
     (std::fs::metadata(&n.local).ok()?.len() == size).then_some(n.local)
 }
 
+/// Whether this computer started an upload of `name` (`size` bytes) that hasn't ended: a note
+/// says so, wherever the file is now.
+pub fn noted(key_id: &str, bucket: &str, name: &str, size: u64) -> bool {
+    let Some(file) = file() else { return false };
+    let _held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    read(&file).iter().any(|n| same(n, key_id, bucket, name, size))
+}
+
 /// Forgets every note of key `key_id` (the key was removed).
 pub fn forget_key(key_id: &str) {
     change(|notes| notes.retain(|n| n.key_id != key_id));
