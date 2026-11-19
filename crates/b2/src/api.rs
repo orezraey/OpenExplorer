@@ -194,8 +194,14 @@ impl Api {
             renewing: Mutex::new(0),
             backoff: Duration::from_secs(1),
             attempts: 6,
-            test_mode: std::env::var("B2_TEST_MODE").ok().filter(|m| !m.is_empty()),
+            test_mode: None,
         }
+    }
+
+    /// Sends B2's `X-Bz-Test-Mode` header (`fail_some_uploads`,
+    /// `expire_some_account_authorization_tokens`…) with every request, for tests against B2.
+    pub fn set_test_mode(&mut self, mode: Option<String>) {
+        self.test_mode = mode.filter(|m| !m.is_empty());
     }
 
     pub fn key_id(&self) -> &str {

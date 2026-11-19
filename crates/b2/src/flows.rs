@@ -94,13 +94,21 @@ fn own_changes_drop_the_listings_they_touch() {
     names(&a, "/fotos/2024");
     names(&a, "/fotos/2024/ferias");
     put(&a, &mut up, "/fotos/2024/nova.jpg", b"nova");
-    assert!(a.cached("/fotos/2024").is_none());
-    assert!(a.cached("/fotos").is_some() && a.cached("/fotos/2024/ferias").is_some());
+    // The folder and those above it (a folder may have appeared there); not those beside or under.
+    assert!(a.cached("/fotos/2024").is_none() && a.cached("/fotos").is_none());
+    assert!(a.cached("/fotos/2024/ferias").is_some());
     assert!(names(&a, "/fotos/2024").contains(&"nova.jpg".to_string()));
     // A folder renamed: its old and new places and everything under them.
     a.rename("/fotos/2024", "/fotos/2023").unwrap();
     assert!(a.cached("/fotos").is_none() && a.cached("/fotos/2024/ferias").is_none());
     assert_eq!(names(&a, "/fotos"), ["2023/", "leia-me.txt", "vazia/"]);
+    // The last file of a folder hidden: the folder leaves the listing above.
+    names(&a, "/fotos/2023/ferias");
+    a.hide("/fotos/2023/ferias/a.jpg", false).unwrap();
+    assert_eq!(names(&a, "/fotos/2023"), ["nova.jpg", "praia.jpg"]);
+    // And a file into folders that didn't exist shows them.
+    put(&a, &mut up, "/fotos/x/y/z.txt", b"z");
+    assert!(names(&a, "/fotos").contains(&"x/".to_string()));
 }
 
 #[test]
@@ -150,6 +158,9 @@ fn a_key_limited_to_a_bucket_and_prefix_sees_the_way_down() {
         st.name_prefix = Some("2024/ferias/".into());
     }
     let a = m.account();
+    // The folder that is the key's prefix, asked about before any listing.
+    assert!(a.stat("/fotos/2024/ferias").unwrap().unwrap().is_dir);
+    assert!(a.stat("/fotos/outra").unwrap().is_none());
     assert_eq!(a.label().unwrap(), "B2 · fotos");
     assert_eq!(names(&a, "/"), ["fotos/"]);
     assert_eq!(names(&a, "/fotos"), ["2024/"]);
@@ -305,6 +316,11 @@ fn deleting_hides_and_undoing_brings_back() {
     assert_eq!(names(&a, "/fotos"), ["leia-me.txt", "vazia/"]);
     assert_eq!(a.unhide("/fotos/2024", true, since).unwrap(), 2);
     assert_eq!(names(&a, "/fotos/2024"), ["ferias/", "praia.jpg"]);
+    // A hide sent twice (its first answer lost) leaves two markers: both go.
+    let since = a.hide("/fotos/leia-me.txt", false).unwrap();
+    m.lock().hide("bkt_fotos", "leia-me.txt");
+    assert_eq!(a.unhide("/fotos/leia-me.txt", false, since).unwrap(), 1);
+    assert_eq!(get(&a, "/fotos/leia-me.txt"), b"oi");
     // A file hidden then uploaded again isn't brought back over the new one.
     let since = a.hide("/fotos/leia-me.txt", false).unwrap();
     put(&a, &mut Uploads::default(), "/fotos/leia-me.txt", b"novo");
@@ -315,11 +331,18 @@ fn deleting_hides_and_undoing_brings_back() {
 #[test]
 fn deleting_every_version_leaves_nothing() {
     let m = mock();
+    small_parts(&m);
     let a = m.account();
     let mut up = Uploads::default();
     put(&a, &mut up, "/fotos/2024/praia.jpg", b"v2");
     a.hide("/fotos/leia-me.txt", false).unwrap();
-    assert_eq!(a.purge("/fotos/2024", true).unwrap(), 3);
+    // An unfinished upload in the folder goes too.
+    let data = noise(3 << 20);
+    let mut broken = Breaks { data: &data, at: 0, stop_at: 1 << 20 };
+    assert!(a.upload(&mut up, "/fotos/2024/meio.bin", &mut broken, data.len() as u64, &mut |_| true).is_err());
+    assert_eq!(m.lock().large.len(), 1);
+    assert_eq!(a.purge("/fotos/2024", true).unwrap(), 4);
+    assert!(m.lock().large.is_empty());
     assert_eq!(a.purge("/fotos/leia-me.txt", false).unwrap(), 2);
     let st = m.lock();
     assert!(st.versions.iter().all(|v| !v.name.starts_with("2024/") && v.name != "leia-me.txt"));

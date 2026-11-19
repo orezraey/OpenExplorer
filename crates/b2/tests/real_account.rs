@@ -19,7 +19,9 @@ fn account() -> Option<Account> {
         eprintln!("B2_TEST_KEY_ID / B2_TEST_KEY not set: skipped");
         return None;
     };
-    Some(Account::new(Api::new(&id, &key), None))
+    let mut api = Api::new(&id, &key);
+    api.set_test_mode(std::env::var("B2_TEST_MODE").ok());
+    Some(Account::new(api, None))
 }
 
 fn bucket(a: &Account) -> String {

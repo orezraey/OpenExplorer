@@ -510,6 +510,12 @@ fn api(call: &str, b: &Value, state: &Mutex<State>, url: &str) -> (u16, Value) {
         "b2_list_file_versions" => {
             let (prefix, start, start_id) = (s(b, "prefix"), s(b, "startFileName"), s(b, "startFileId"));
             let mut all: Vec<Ver> = st.versions.iter().filter(|v| v.bucket == s(b, "bucketId") && v.name.starts_with(prefix) && v.name.as_str() >= start).cloned().collect();
+            // Unfinished large files show among the versions, as "start".
+            for (id, l) in &st.large {
+                if l.bucket == s(b, "bucketId") && l.name.starts_with(prefix) && l.name.as_str() >= start {
+                    all.push(Ver { id: id.clone(), bucket: l.bucket.clone(), name: l.name.clone(), action: "start", data: Arc::new(Vec::new()), sha1: "none".into(), info: l.info.clone(), ts: l.ts, content_type: "b2/x-auto".into() });
+                }
+            }
             all.sort_by(|x, y| x.name.cmp(&y.name).then(y.ts.cmp(&x.ts)));
             if !start_id.is_empty()
                 && let Some(i) = all.iter().position(|v| v.id == start_id)
@@ -537,6 +543,11 @@ fn api(call: &str, b: &Value, state: &Mutex<State>, url: &str) -> (u16, Value) {
             (200, st.hide(&bucket, &name).json())
         }
         "b2_delete_file_version" => {
+            // Deleting an unfinished large file cancels it.
+            if st.large.get(s(b, "fileId")).is_some_and(|l| l.name == s(b, "fileName")) {
+                st.large.remove(s(b, "fileId"));
+                return (200, json!({"fileId": s(b, "fileId"), "fileName": s(b, "fileName")}));
+            }
             let before = st.versions.len();
             st.versions.retain(|v| !(v.id == s(b, "fileId") && v.name == s(b, "fileName")));
             if st.versions.len() == before {

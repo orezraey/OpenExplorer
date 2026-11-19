@@ -345,7 +345,7 @@ impl Account {
     pub fn hidden_kept(&self, path: &str) -> Option<Option<u64>> {
         let s = Spot::of(path)?;
         let buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-        buckets.iter().find(|b| b.name == s.bucket)?.hidden_kept(&s.key)
+        buckets.iter().find(|b| b.name == s.bucket)?.hidden_kept(&s.prefix())
     }
 
     // -----------------------------------------------------------------------------------------
@@ -491,11 +491,15 @@ impl Account {
         }
         let bucket = self.bucket(&s.bucket)?;
         let auth = self.api.auth()?;
-        match within(auth.allowed.name_prefix.as_deref(), &s.prefix()) {
-            Within::Inside => {}
-            // A folder on the way down to the key's prefix.
-            Within::Toward(_) | Within::Partial(_) => return Ok(Some(Item::dir(name))),
-            Within::Outside => return Ok(None),
+        // A name above the key's prefix can only be a folder on the way down to it (asking B2
+        // about it would be refused).
+        if let Some(np) = auth.allowed.name_prefix.as_deref()
+            && !s.key.starts_with(np)
+        {
+            return Ok(match within(Some(np), &s.prefix()) {
+                Within::Outside => None,
+                _ => Some(Item::dir(name)),
+            });
         }
         if let Some(v) = self.file(&bucket, &s.key)? {
             return Ok(Some(v.item(name)));
@@ -522,8 +526,14 @@ impl Account {
 
     /// Drops the listings a change at `s` touches: its folder's, and with `tree` its own and
     /// every one under it.
+    /// Every folder above may gain or lose a folder too (a folder exists only while a name is
+    /// under it), so their listings go as well.
     pub(crate) fn changed(&self, s: &Spot, tree: bool) {
-        self.lists.forget(&s.bucket, &s.parent().0.prefix());
+        let parent = s.parent().0.prefix();
+        self.lists.forget(&s.bucket, "");
+        for (i, _) in parent.match_indices('/') {
+            self.lists.forget(&s.bucket, &parent[..=i]);
+        }
         if tree {
             self.lists.forget_under(&s.bucket, &s.prefix());
         }
@@ -587,21 +597,24 @@ impl Account {
         Ok(since)
     }
 
-    /// The hide markers at `path` (or under it) that are their name's newest version and were
-    /// made at `since` or after: what [`Account::unhide`] would delete.
+    /// The hide markers at `path` (or under it) made at `since` or after that are their name's
+    /// newest versions (a hide sent twice, its first answer lost, leaves two): what
+    /// [`Account::unhide`] would delete.
     pub fn hidden_since(&self, path: &str, is_dir: bool, since: i64) -> Result<Vec<Version>> {
         let s = Self::spot_for_change(path)?;
         let bucket = self.bucket(&s.bucket)?;
         let all = if is_dir { self.versions(&bucket, &s.prefix(), true)? } else { self.versions(&bucket, &s.key, false)? };
         let mut out = Vec::new();
-        let mut seen = String::new();
+        let mut name: Option<String> = None;
+        let mut leading = false;
         for v in all {
-            if v.name == seen {
-                continue;
+            // Each name's versions come newest first.
+            if name.as_deref() != Some(&v.name) {
+                name = Some(v.name.clone());
+                leading = true;
             }
-            seen = v.name.clone();
-            // Each name's first version is its newest.
-            if v.action == "hide" && v.uploaded >= since {
+            leading &= v.action == "hide" && v.uploaded >= since;
+            if leading {
                 out.push(v);
             }
         }
@@ -615,7 +628,10 @@ impl Account {
         let s = Self::spot_for_change(path)?;
         let done = each(&markers, |m| self.delete_version(m));
         self.changed(&s, is_dir);
-        done.map(|d| d.len())
+        done?;
+        let mut names: Vec<&str> = markers.iter().map(|m| m.name.as_str()).collect();
+        names.dedup();
+        Ok(names.len())
     }
 
     /// Deletes every version of the file (or of every file in the folder) at `path` for good,

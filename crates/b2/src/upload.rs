@@ -511,8 +511,13 @@ impl Account {
             copied.into_iter().flatten().collect()
         } else {
             let parts = self.parts(&file_id)?;
-            ranges.iter().map(|(n, ..)| parts.get(n).map(|p| p.1.clone()).unwrap_or_default()).collect()
+            ranges.iter().map(|(n, ..)| parts.get(n).map(|p| p.1.clone()).filter(|s| s != "none").unwrap_or_default()).collect()
         };
+        // Without every part's checksum B2 can't join them: the copy is given up, not guessed.
+        if sha1s.iter().any(String::is_empty) {
+            let _ = self.cancel_large(&file_id);
+            return Err(tr!("O B2 não deu o SHA-1 das partes copiadas de “{}”; copie baixando e enviando.", "B2 didn't give the SHA-1 of the copied parts of “{}”; copy it by downloading and uploading.", name));
+        }
         self.finish_large(&file_id, &sha1s).map(|_| ())
     }
 }
