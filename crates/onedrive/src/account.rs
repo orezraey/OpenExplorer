@@ -578,6 +578,16 @@ impl Account {
         Ok(())
     }
 
+    /// Sends item `id` (of this drive) to the recycle bin again: Refazer after an undone delete.
+    pub fn trash_id(&self, id: &str) -> Result<()> {
+        let r = self.graph.send("DELETE", &format!("/drives/{}/items/{}", segment(self.drive()), segment(id)), Body::None, &[])?;
+        if !r.ok() {
+            return Err(crate::graph::failure(r.status, &r.body, t("Excluir", "Delete")).into());
+        }
+        self.gone(id);
+        Ok(())
+    }
+
     /// Several items to the recycle bin in as few requests as it takes (`$batch`): what went
     /// (id and name, for undo), and the first error.
     pub fn trash_many(&self, paths: &[String]) -> (Vec<(String, String)>, Option<String>) {
