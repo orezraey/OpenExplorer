@@ -129,8 +129,33 @@ enum Auth {
 pub(crate) enum Body<'a> {
     Empty,
     Json(String),
+    /// Bytes in memory, sent again when Dropbox asks to wait or the connection drops; the
+    /// callback hears how many went in this try, and stops the call with [`crate::CANCELLED`]
+    /// by answering `false`.
+    Bytes(&'a [u8], Option<&'a mut dyn FnMut(usize) -> bool>),
     /// `len` bytes read as they go: sent once, never again on a failure (they're gone).
     Reader(&'a mut dyn Read, u64),
+}
+
+/// Reads a [`Body::Bytes`] out for one try, telling its callback how far it got.
+struct Sending<'a, 'b> {
+    data: &'a [u8],
+    at: usize,
+    told: Option<&'a mut (dyn FnMut(usize) -> bool + 'b)>,
+    stopped: bool,
+}
+
+impl Read for Sending<'_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = (self.data.len() - self.at).min(buf.len()).min(256 << 10);
+        buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+        self.at += n;
+        if n > 0 && let Some(told) = self.told.as_mut() && !told(self.at) {
+            self.stopped = true;
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, crate::CANCELLED));
+        }
+        Ok(n)
+    }
 }
 
 /// The connection to the API of one account.
@@ -271,13 +296,22 @@ impl Api {
             }
             self.requests.fetch_add(1, Ordering::Relaxed);
             let once = matches!(body, Body::Reader(..));
+            let mut stopped = false;
             let sent = match body {
                 Body::Empty => req.send_empty(),
                 Body::Json(text) => req.header("Content-Type", "application/json").send(text.as_bytes()),
+                Body::Bytes(data, _) if data.is_empty() => req.header("Content-Type", "application/octet-stream").send(&[][..]),
+                Body::Bytes(data, told) => {
+                    let mut sending = Sending { data, at: 0, told: told.as_deref_mut(), stopped: false };
+                    let sent = req.header("Content-Type", "application/octet-stream").header("Content-Length", &data.len().to_string()).send(ureq::SendBody::from_reader(&mut sending));
+                    stopped = sending.stopped;
+                    sent
+                }
                 Body::Reader(r, len) => req.header("Content-Type", "application/octet-stream").header("Content-Length", &len.to_string()).send(ureq::SendBody::from_reader(*r)),
             };
             let mut resp = match sent {
                 Ok(r) => r,
+                Err(_) if stopped => return Err(Fail::Other(crate::CANCELLED.into())),
                 Err(e) => {
                     tries += 1;
                     if once || tries >= TRIES {

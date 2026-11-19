@@ -212,6 +212,10 @@ impl Fake {
         self.changed();
     }
 
+    pub fn has(&self, display: &str) -> bool {
+        self.st().nodes.contains_key(&display.to_lowercase())
+    }
+
     pub fn content(&self, display: &str) -> Vec<u8> {
         self.st().nodes[&display.to_lowercase()].data.to_vec()
     }

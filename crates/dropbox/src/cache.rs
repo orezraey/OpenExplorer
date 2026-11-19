@@ -135,6 +135,14 @@ impl Lists {
         self.dirty = true;
     }
 
+    /// Forgets folder `key`'s listing alone.
+    pub fn drop_folder(&mut self, key: &str) {
+        if let Some(f) = self.folders.remove(key) {
+            self.total -= f.entries.len();
+            self.dirty = true;
+        }
+    }
+
     /// Forgets the listings of `lower` and of every folder in it.
     fn drop_under(&mut self, lower: &str) {
         let inside = format!("{lower}/");

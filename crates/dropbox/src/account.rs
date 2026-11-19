@@ -82,8 +82,9 @@ pub struct Account {
     log_gate: Mutex<()>,
     /// When the log was last read to its end.
     caught_up: Mutex<Option<Instant>>,
-    /// The cursor a longpoll is waiting on now: while it's the log's, nothing changed since.
-    watching: Mutex<Option<String>>,
+    /// The cursor a longpoll is waiting on now, since when and for how long: while it's the
+    /// log's and the wait hasn't overrun, nothing changed since.
+    watching: Mutex<Option<(String, Instant, u64)>>,
     /// Folders the log changed since the watcher last asked.
     pending: Mutex<(HashSet<String>, bool)>,
     /// Where the listings are kept between runs and what seals them; `None` keeps nothing.
@@ -199,12 +200,23 @@ impl Account {
 
     /// Whether the kept listings are known current without asking: the log was just read to
     /// its end, or a longpoll is waiting on its cursor (it would have answered on a change).
+    /// A wait past its timeout and the up to 90 s Dropbox may add is no proof: its connection
+    /// may be dead.
     fn fresh(&self) -> bool {
         if self.caught_up.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|at| at.elapsed() < FRESH) {
             return true;
         }
         let watching = self.watching.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        watching.is_some() && watching == self.lists().log
+        match watching {
+            Some((cursor, since, timeout)) => since.elapsed() < Duration::from_secs(timeout + 90) && Some(cursor) == self.lists().log,
+            None => false,
+        }
+    }
+
+    /// Forgets folder `path`'s kept listing: the next opening reads it whole (Atualizar).
+    pub fn forget(&self, path: &str) {
+        let mut lists = self.lists();
+        lists.drop_folder(&key(path));
     }
 
     /// Applies `changes` to the listings, noting the folders they touch for the watcher.
@@ -293,8 +305,10 @@ impl Account {
             self.ensure_log()?;
         }
         let entries = self.read_folder(path)?;
-        self.lists().put(&k, entries.clone(), now());
-        self.maybe_save();
+        if let Some(k) = kept_key(&k, &entries) {
+            self.lists().put(&k, entries.clone(), now());
+            self.maybe_save();
+        }
         Ok(entries)
     }
 
@@ -302,7 +316,9 @@ impl Account {
     pub fn reload(&self, path: &str) -> Result<Vec<Entry>> {
         self.ensure_log()?;
         let entries = self.read_folder(path)?;
-        self.lists().put(&key(path), entries.clone(), now());
+        if let Some(k) = kept_key(&key(path), &entries) {
+            self.lists().put(&k, entries.clone(), now());
+        }
         Ok(entries)
     }
 
@@ -553,8 +569,9 @@ impl Account {
     pub fn watch(&self, timeout: u64) -> Result<Changes> {
         self.ensure_log()?;
         let cursor = self.lists().log.clone().unwrap_or_default();
-        *self.watching.lock().unwrap_or_else(|e| e.into_inner()) = Some(cursor.clone());
-        let polled = self.api.longpoll(&cursor, timeout.clamp(30, 480));
+        let timeout = timeout.clamp(30, 480);
+        *self.watching.lock().unwrap_or_else(|e| e.into_inner()) = Some((cursor.clone(), Instant::now(), timeout));
+        let polled = self.api.longpoll(&cursor, timeout);
         *self.watching.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let polled = match polled {
             Ok(v) => v,
@@ -617,6 +634,27 @@ impl Account {
     /// Ends the login on Dropbox's side: the refresh token stops working.
     pub fn logout(&self) {
         let _ = self.api.rpc("auth/token/revoke", &Value::Null);
+    }
+}
+
+/// The key a folder's listing is kept under, `None` when it can't be kept: the log names items
+/// by Dropbox's own lowercase (`path_lower`), so the key must be that. An ASCII path lowercases
+/// the same anywhere; any other is checked against the items' `path_lower`, and a folder with
+/// none to check against isn't kept (it's read whole each time it opens, never shown stale).
+pub(crate) fn kept_key(asked: &str, entries: &[Entry]) -> Option<String> {
+    match entries.first() {
+        Some(e) => Some(parent(&e.lower).to_string()),
+        None if asked.is_ascii() => Some(asked.to_string()),
+        None => None,
+    }
+}
+
+/// Forgets the listings every open account holds in memory (Limpar cache): each folder is read
+/// whole again when it opens.
+pub fn forget_kept() {
+    let open: Vec<Arc<Account>> = OPEN.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
+    for a in open {
+        a.lists().clear();
     }
 }
 
@@ -819,6 +857,28 @@ mod tests {
         assert!(a.stat("/Pasta").unwrap().is_none());
         assert_eq!(a.restore_folder("/Pasta", since).unwrap(), 2);
         assert_eq!(a.stat("/Pasta/Sub/c.txt").unwrap().unwrap().size, 4);
+    }
+
+    #[test]
+    fn listings_are_kept_under_dropbox_s_own_lowercase() {
+        let e = |lower: &str| Entry { name: last(lower).into(), lower: lower.into(), dir: false, size: 0, modified: None, rev: String::new(), hash: String::new() };
+        // Dropbox's lowercase of "İ" may not be Rust's: the items say which it is.
+        assert_eq!(kept_key(&key("/İzmir"), &[e("/izmir/a.txt")]).as_deref(), Some("/izmir"));
+        assert_eq!(kept_key("/fotos", &[]).as_deref(), Some("/fotos"));
+        assert_eq!(kept_key(&key("/İzmir"), &[]), None);
+        assert_eq!(kept_key("", &[e("/a.txt")]).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn atualizar_reads_the_folder_whole_again() {
+        let fake = Fake::start();
+        fake.put_file("/a.txt", b"1");
+        let a = fake.account();
+        a.list("/").unwrap();
+        a.forget("/");
+        let before = fake.calls();
+        a.list("/").unwrap();
+        assert!(fake.calls_since(&before).contains(&"files/list_folder".to_string()));
     }
 
     #[test]

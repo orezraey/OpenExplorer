@@ -55,28 +55,6 @@ impl Read for Tap<'_> {
     }
 }
 
-/// Counts what's sent from a block, for the progress.
-struct Sending<'a> {
-    data: &'a [u8],
-    at: usize,
-    before: u64,
-    progress: &'a mut dyn FnMut(u64) -> bool,
-    stopped: bool,
-}
-
-impl Read for Sending<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = (self.data.len() - self.at).min(buf.len()).min(256 << 10);
-        buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
-        self.at += n;
-        if n > 0 && !(self.progress)(self.before + self.at as u64) {
-            self.stopped = true;
-            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, CANCELLED));
-        }
-        Ok(n)
-    }
-}
-
 /// Fills `buf` from `src` as far as it goes: how much it read.
 fn fill(src: &mut dyn Read, buf: &mut [u8]) -> Result<usize> {
     let mut got = 0;
@@ -178,7 +156,19 @@ impl Account {
     pub fn upload_limited(&self, path: &str, src: &mut dyn Read, len: u64, simple_max: u64, progress: Progress) -> Result<Entry> {
         let commit = json!({"path": api_path(path), "mode": "overwrite", "autorename": false, "mute": true, "strict_conflict": false});
         let mut hash = Hasher::default();
-        let v = if len <= simple_max {
+        let named = |f: Fail| if matches!(&f, Fail::Other(e) if e == CANCELLED) { CANCELLED.to_string() } else { format!("“{}”: {}", last(&api_path(path)), f.text()) };
+        let v = if len <= (BLOCK as u64).min(simple_max) {
+            // Small enough to hold: sent again if Dropbox asks to wait (several uploads writing
+            // to one account at once get `too_many_write_operations`).
+            let mut data = vec![0u8; len as usize];
+            let got = fill(src, &mut data)?;
+            if got != data.len() || src.read(&mut [0u8; 1]).map_err(|e| e.to_string())? != 0 {
+                return Err(tr!("O arquivo mudou de tamanho durante o envio ({got} de {len} bytes).", "The file changed size while being sent ({got} of {len} bytes)."));
+            }
+            hash.update(&data);
+            let mut told = |n: usize| progress(n as u64);
+            self.api.upload("files/upload", &commit, &mut Body::Bytes(&data, Some(&mut told))).map_err(named)?
+        } else if len <= simple_max {
             let mut tap = Tap { src, done: 0, hash: &mut hash, progress: &mut *progress, stopped: false };
             let sent = self.api.upload("files/upload", &commit, &mut Body::Reader(&mut tap, len));
             if tap.stopped {
@@ -187,7 +177,7 @@ impl Account {
             if tap.done != len {
                 return Err(tr!("O arquivo mudou de tamanho durante o envio ({} de {len} bytes).", "The file changed size while being sent ({} of {len} bytes).", tap.done));
             }
-            sent.map_err(|f| format!("“{}”: {}", last(&api_path(path)), f.text()))?
+            sent.map_err(named)?
         } else {
             self.upload_session(src, len, &commit, &mut hash, progress)?
         };
@@ -213,15 +203,16 @@ impl Account {
             let mut tries = 0;
             loop {
                 let data = &block[sent_from..n];
-                let mut sending = Sending { data, at: 0, before: offset + sent_from as u64, progress: &mut *progress, stopped: false };
+                let before = offset + sent_from as u64;
+                let mut told = |k: usize| progress(before + k as u64);
+                // From memory: sent again when Dropbox asks to wait or the connection drops.
+                let mut body = Body::Bytes(data, Some(&mut told));
                 let result = match &session {
-                    None => self.api.upload("files/upload_session/start", &json!({"close": false}), &mut Body::Reader(&mut sending, data.len() as u64)),
-                    Some(id) => self.api.upload("files/upload_session/append_v2", &json!({"cursor": {"session_id": id, "offset": offset + sent_from as u64}, "close": false}), &mut Body::Reader(&mut sending, data.len() as u64)),
+                    None => self.api.upload("files/upload_session/start", &json!({"close": false}), &mut body),
+                    Some(id) => self.api.upload("files/upload_session/append_v2", &json!({"cursor": {"session_id": id, "offset": before}, "close": false}), &mut body),
                 };
-                if sending.stopped {
-                    return Err(CANCELLED.into());
-                }
                 match result {
+                    Err(Fail::Other(e)) if e == CANCELLED => return Err(CANCELLED.into()),
                     Ok(v) => {
                         if session.is_none() {
                             session = Some(v.get("session_id").and_then(Value::as_str).ok_or(t("O Dropbox não abriu a sessão de envio.", "Dropbox didn't open the upload session."))?.to_string());
@@ -256,7 +247,7 @@ impl Account {
             return Err(tr!("O arquivo mudou de tamanho durante o envio ({offset} de {len} bytes).", "The file changed size while being sent ({offset} of {len} bytes)."));
         }
         let id = session.unwrap_or_default();
-        self.api.upload("files/upload_session/finish", &json!({"cursor": {"session_id": id, "offset": offset}, "commit": commit}), &mut Body::Empty).map_err(String::from)
+        self.api.upload("files/upload_session/finish", &json!({"cursor": {"session_id": id, "offset": offset}, "commit": commit}), &mut Body::Bytes(&[], None)).map_err(String::from)
     }
 
     /// Whether the file at `path` on Dropbox has the same bytes as `local` (same size, same
@@ -356,5 +347,26 @@ mod tests {
         let data = bytes(1_000_000);
         let err = a.upload("/c.bin", &mut &data[..], data.len() as u64, &mut |n| n < 300_000).unwrap_err();
         assert_eq!(err, crate::CANCELLED);
+        assert!(!fake.has("/c.bin"));
+        let big = bytes(super::BLOCK + 10);
+        let err = a.upload_limited("/d.bin", &mut &big[..], big.len() as u64, 0, &mut |n| n < 1_000_000).unwrap_err();
+        assert_eq!(err, crate::CANCELLED);
+        assert!(!fake.has("/d.bin"));
+    }
+
+    #[test]
+    fn uploads_wait_as_long_as_dropbox_asks_and_go_again() {
+        let fake = Fake::start();
+        let a = fake.account();
+        a.list("/").unwrap();
+        let small = bytes(50_000);
+        fake.throttle(2);
+        a.upload("/pequeno.bin", &mut &small[..], small.len() as u64, &mut |_| true).unwrap();
+        assert_eq!(fake.content("/pequeno.bin"), small);
+        let big = bytes(super::BLOCK + 10);
+        fake.throttle(1);
+        a.upload_limited("/grande.bin", &mut &big[..], big.len() as u64, 0, &mut |_| true).unwrap();
+        assert_eq!(fake.content("/grande.bin"), big);
+        assert_eq!(fake.throttled(), 3);
     }
 }
