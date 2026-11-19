@@ -77,10 +77,9 @@ impl Fail {
 /// twice ends as sending it once. Reads and job checks; the longpoll; an upload session's start
 /// (a second one only leaves an unused session) and its blocks, each sent at an offset Dropbox
 /// checks (`incorrect_offset` says what it holds); a whole-file upload, which overwrites with the
-/// same bytes; a revision restored, which puts the same bytes at the path again (`RestoreError`
-/// has no conflict); a shared link made or taken away, whose second try's
-/// `shared_link_already_exists` / `shared_link_not_found` are taken as done. Anything else (a
-/// new folder, a move, a copy, a deletion, a commit of upload sessions, a batch job) would fail
+/// same bytes; a shared link made or taken away, whose second try's `shared_link_already_exists`
+/// / `shared_link_not_found` are taken as done. Anything else (a new folder, a move, a copy, a
+/// deletion, a restore, a commit of upload sessions, a batch job) would fail
 /// the second time where the first succeeded, or do the work twice.
 pub fn repeatable(route: &str) -> bool {
     route.ends_with("/check")
@@ -102,7 +101,6 @@ pub fn repeatable(route: &str) -> bool {
                 | "files/upload_session/start_batch"
                 | "files/upload_session/append_v2"
                 | "files/upload_session/append_batch"
-                | "files/restore"
                 | "sharing/list_shared_links"
                 | "sharing/create_shared_link_with_settings"
                 | "sharing/revoke_shared_link"
@@ -336,6 +334,8 @@ impl Api {
         let arg = arg.map(|a| header_json(&a.to_string()));
         let mut refreshed: Option<String> = None;
         let (mut waits, mut tries) = (0u32, 0u32);
+        // Whether a try may have reached Dropbox (its answer lost).
+        let mut reached = false;
         loop {
             let mut req = agent.post(url);
             if let Some(d) = limit {
@@ -374,6 +374,11 @@ impl Api {
                 Err(_) if stopped => return Err(Fail::Other(crate::CANCELLED.into())),
                 Err(e) => {
                     tries += 1;
+                    reached |= !never_sent(&e);
+                    if !reached && tries >= TRIES {
+                        // It never reached Dropbox: nothing to find out.
+                        return Err(Fail::Other(net_text(&e)));
+                    }
                     if tries >= TRIES || !(repeat || never_sent(&e)) {
                         log(&format!("Dropbox {url}: {e}, sem resposta"));
                         return Err(Fail::Lost(net_text(&e)));

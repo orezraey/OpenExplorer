@@ -399,12 +399,21 @@ impl Account {
     /// Sends a write that mustn't go twice blindly (see [`crate::api::repeatable`]): `send`
     /// once, and when its answer is lost, `settled` asks Dropbox how things stand: `Some`, the
     /// answer the write would have given (it was done); `None`, it wasn't, and it goes again,
-    /// a few times at most.
+    /// a few times at most. A try sent again that Dropbox refuses (`not_found`, `conflict`...)
+    /// may be meeting the first one, done after all once the check had looked: asked once more
+    /// before the refusal stands.
     pub(crate) fn write(&self, what: &str, send: impl Fn() -> std::result::Result<Value, Fail>, settled: impl Fn() -> std::result::Result<Option<Value>, Fail>) -> std::result::Result<Value, Fail> {
         let mut tries = 0;
         loop {
             let lost = match send() {
                 Err(Fail::Lost(e)) => e,
+                Err(refused @ Fail::Route { .. }) if tries > 0 => {
+                    if let Some(v) = settled()? {
+                        crate::api::log(&format!("Dropbox {what}: o primeiro pedido terminou depois de conferido"));
+                        return Ok(v);
+                    }
+                    return Err(refused);
+                }
                 r => return r,
             };
             tries += 1;
@@ -474,17 +483,15 @@ impl Account {
 
     /// After a batch of deletions whose answer was lost: the item at `path` deleted, if it's
     /// still there (gone meanwhile counts as deleted), else as the batch left it.
-    fn delete_rest(&self, path: &str) -> Result<Value> {
-        match self.metadata(path) {
-            Ok(None) => {}
-            Ok(Some(_)) => match self.delete_v2(path) {
+    fn delete_rest(&self, path: &str) -> std::result::Result<Value, Fail> {
+        if self.metadata(path)?.is_some() {
+            match self.delete_v2(path) {
                 Ok(v) => return Ok(v.get("metadata").cloned().unwrap_or(v)),
                 Err(f) if f.is("not_found") => {}
-                Err(f) => return Err(about(path, f)),
-            },
-            Err(f) => return Err(about(path, f)),
+                Err(f) => return Err(f),
+            }
         }
-        self.deleted_metadata(path).map_err(|f| about(path, f))
+        self.deleted_metadata(path)
     }
 
     /// [`Account::delete`]'s request, and whether the item is gone when its answer was lost.
@@ -612,7 +619,28 @@ impl Account {
                 Err(Fail::Lost(e)) => {
                     crate::api::log(&format!("Dropbox delete_batch: a resposta não veio ({e}); conferindo item a item"));
                     std::thread::sleep(SETTLE);
-                    chunk.iter().map(|p| self.delete_rest(p).and_then(|v| Account::metadata_of(&v))).collect()
+                    // Dropbox out of reach: the items left get the same answer, not each its
+                    // own round of tries.
+                    let mut unreachable: Option<String> = None;
+                    chunk
+                        .iter()
+                        .map(|p| {
+                            if let Some(e) = &unreachable {
+                                return Err(e.clone());
+                            }
+                            match self.delete_rest(p) {
+                                Ok(v) => Account::metadata_of(&v),
+                                Err(f) => {
+                                    let lost = matches!(f, Fail::Lost(_));
+                                    let e = about(p, f);
+                                    if lost {
+                                        unreachable = Some(e.clone());
+                                    }
+                                    Err(e)
+                                }
+                            }
+                        })
+                        .collect()
                 }
                 Err(f) => return Err(f.text()),
             };
@@ -654,9 +682,22 @@ impl Account {
     // -----------------------------------------------------------------------------------------
     // What was deleted
 
-    /// Brings back revision `rev` of the file at `path`.
+    /// Brings back revision `rev` of the file at `path`. Its answer lost, it's done when the file
+    /// there has that revision's bytes (`RestoreError` has `path_write` and `in_progress`: a
+    /// second try isn't sure to end as the first).
     pub fn restore(&self, path: &str, rev: &str) -> Result<Entry> {
-        let v = self.api.rpc("files/restore", &json!({"path": api_path(path), "rev": rev})).map_err(|f| about(path, f))?;
+        let v = self
+            .write(
+                "restore",
+                || self.api.rpc("files/restore", &json!({"path": api_path(path), "rev": rev})),
+                || {
+                    let Some(now) = self.metadata(path)? else { return Ok(None) };
+                    let was = self.api.rpc("files/get_metadata", &json!({"path": format!("rev:{rev}")}))?;
+                    let hash = |m: &Value| m.get("content_hash").and_then(Value::as_str).map(str::to_string);
+                    Ok((now.get(".tag").and_then(Value::as_str) == Some("file") && hash(&now).is_some() && hash(&now) == hash(&was)).then_some(now))
+                },
+            )
+            .map_err(|f| about(path, f))?;
         let e = Account::metadata_of(&v)?;
         self.note(&[Change::Is(e.clone())]);
         Ok(e)
@@ -1073,11 +1114,62 @@ mod tests {
         let e = a.delete("/A/g.txt").unwrap();
         assert_eq!((e.dir, e.rev.as_str()), (false, rev.as_str()));
         assert_eq!(fake.count_since(&before, "files/delete_v2"), 1);
+        fake.lose_answer("files/restore");
+        let before = fake.calls();
         a.restore("/A/g.txt", &e.rev).unwrap();
         assert_eq!(fake.content("/A/g.txt"), b"g");
+        assert_eq!(fake.count_since(&before, "files/restore"), 1);
         // Every one of them shows in the kept listings at once.
         let names: Vec<String> = a.list("/").unwrap().into_iter().map(|e| e.name).collect();
         assert!(names.contains(&"Nova".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn a_write_done_after_its_check_is_not_reported_as_failed() {
+        let fake = Fake::start();
+        fake.put_file("/A/f.txt", b"f");
+        let a = fake.account();
+        // Not done when looked at; done just before it's sent again, which then finds nothing
+        // to move.
+        fake.late("files/move_v2");
+        a.rename("/A/f.txt", "/B/f.txt").unwrap();
+        assert!(fake.has("/B/f.txt") && !fake.has("/A/f.txt"));
+        // A refusal that isn't that stands.
+        fake.put_file("/A/g.txt", b"g");
+        fake.put_file("/B/g.txt", b"ja estava");
+        fake.late("files/move_v2");
+        assert!(a.rename("/A/g.txt", "/C/g.txt").is_ok());
+        fake.drop_before("files/move_v2");
+        assert!(a.rename("/C/g.txt", "/B/g.txt").unwrap_err().contains("Já existe"));
+    }
+
+    #[test]
+    fn a_lost_batch_of_deletions_stops_at_the_first_check_that_can_t_reach_dropbox() {
+        let fake = Fake::start();
+        let paths: Vec<String> = (0..20).map(|i| format!("/D/f{i}.txt")).collect();
+        for p in &paths {
+            fake.put_file(p, b"x");
+        }
+        let a = fake.account();
+        fake.lose_answer("files/delete_batch");
+        fake.drop_many("files/get_metadata", 3);
+        let before = fake.calls();
+        let r = a.delete_many(&paths).unwrap();
+        assert!(r.iter().all(Result::is_err), "{r:?}");
+        assert_eq!(fake.count_since(&before, "files/get_metadata"), 3);
+        assert_eq!(fake.calls_since(&before).len(), 4);
+    }
+
+    #[test]
+    fn a_route_given_its_own_time_gives_up_then_and_is_checked() {
+        let fake = Fake::start();
+        let a = fake.account();
+        fake.delay(1500);
+        let started = Instant::now();
+        let r = a.api.rpc_waiting("files/create_folder_v2", &json!({"path": "/T", "autorename": false}), Duration::from_millis(300));
+        assert!(matches!(r, Err(Fail::Lost(_))), "{r:?}");
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(fake.has("/T"), "the work was done, its answer late");
     }
 
     #[test]

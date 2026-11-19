@@ -46,6 +46,9 @@ enum Outcome {
     Done(Entry),
     /// Dropbox was too busy, or failed on its side: worth another try.
     Busy,
+    /// Of a job whose answer was lost, not done when looked at: worth another try, its failure
+    /// looked at again (the job may end after the look).
+    Unsure,
     /// The entry's own failure: an `error_summary`-like text.
     Failed(String),
 }
@@ -85,6 +88,8 @@ impl Account {
 
     fn relocate_many(&self, pairs: &[(String, String)], moving: bool) -> Vec<Result<Entry>> {
         let mut out: Vec<Option<Result<Entry>>> = vec![None; pairs.len()];
+        // Entries of a job whose answer was lost, not found done when checked.
+        let mut unsure = vec![false; pairs.len()];
         let mut todo = Vec::new();
         for (i, (from, to)) in pairs.iter().enumerate() {
             if moving && key(from) == key(to) {
@@ -114,6 +119,10 @@ impl Account {
                                     out[i] = Some(Ok(e));
                                 }
                                 Outcome::Busy => again.push(i),
+                                Outcome::Unsure => {
+                                    unsure[i] = true;
+                                    again.push(i);
+                                }
                                 Outcome::Failed(summary) => out[i] = Some(Err(named(&pairs[i].0, &summary))),
                             }
                         }
@@ -127,6 +136,26 @@ impl Account {
         for i in todo {
             let (from, to) = &pairs[i];
             out[i] = Some(if moving { self.rename(from, to) } else { self.copy(from, to) });
+        }
+        // An entry of a job whose answer was lost that failed when sent again may have met that
+        // job's own work, done after the check: looked at once more before it counts as failed.
+        let doubtful: Vec<usize> = (0..pairs.len()).filter(|&i| unsure[i] && matches!(out[i], Some(Err(_)))).collect();
+        if !doubtful.is_empty() {
+            std::thread::sleep(crate::account::SETTLE);
+            let paths: Vec<&str> = doubtful.iter().flat_map(|&i| [pairs[i].0.as_str(), pairs[i].1.as_str()]).collect();
+            if let Ok(seen) = self.look(&paths) {
+                let mut changes = Vec::new();
+                for i in doubtful {
+                    if let Some(e) = Account::relocated(&seen, &pairs[i].0, &pairs[i].1, moving) {
+                        if moving {
+                            changes.push(Change::Gone(key(&pairs[i].0)));
+                        }
+                        changes.push(Change::Is(e.clone()));
+                        out[i] = Some(Ok(e));
+                    }
+                }
+                self.note(&changes);
+            }
         }
         out.into_iter().map(|r| r.expect("every entry ends")).collect()
     }
@@ -152,7 +181,7 @@ impl Account {
                 std::thread::sleep(crate::account::SETTLE);
                 let paths: Vec<&str> = entries.iter().flat_map(|(f, t)| [*f, *t]).collect();
                 let seen = self.look(&paths).map_err(String::from)?;
-                return Ok(entries.iter().map(|(f, t)| Account::relocated(&seen, f, t, moving).map_or(Outcome::Busy, Outcome::Done)).collect());
+                return Ok(entries.iter().map(|(f, t)| Account::relocated(&seen, f, t, moving).map_or(Outcome::Unsure, Outcome::Done)).collect());
             }
             Err(f) => return Err(f.text()),
         };
@@ -365,6 +394,8 @@ impl Account {
                 Ok(e)
             });
         };
+        // Files of a commit whose answer was lost, not found committed when looked at.
+        let mut unsure: Vec<(usize, &Vec<u8>)> = Vec::new();
         for _ in 0..ROUNDS {
             if ready.is_empty() {
                 break;
@@ -397,7 +428,10 @@ impl Account {
                     for (i, id, d) in ready {
                         match seen.get(&key(&files[i].0)).filter(|e| !e.dir && e.size == d.len() as u64 && e.hash == hash_of(d)) {
                             Some(e) => done(i, e.clone(), d, out),
-                            None => again.push((i, id, d)),
+                            None => {
+                                unsure.push((i, d));
+                                again.push((i, id, d));
+                            }
                         }
                     }
                     ready = again;
@@ -437,6 +471,20 @@ impl Account {
                     None => out[i] = Some(Err(t("O Dropbox respondeu sem os dados do arquivo.", "Dropbox answered without the file's details.").into())),
                 },
                 Err(f) => out[i] = Some(Err(format!("“{}”: {}", last(&api_path(&files[i].0)), f.text()))),
+            }
+        }
+        // One of those that failed when committed again (its session taken: `not_found`) may
+        // have met that commit, done after the look: looked at once more before it counts.
+        unsure.retain(|(i, _)| matches!(out[*i], Some(Err(_))));
+        if !unsure.is_empty() {
+            std::thread::sleep(crate::account::SETTLE);
+            let paths: Vec<&str> = unsure.iter().map(|(i, _)| files[*i].0.as_str()).collect();
+            if let Ok(seen) = self.look(&paths) {
+                for (i, d) in unsure {
+                    if let Some(e) = seen.get(&key(&files[i].0)).filter(|e| !e.dir && e.size == d.len() as u64 && e.hash == hash_of(d)) {
+                        done(i, e.clone(), d, out);
+                    }
+                }
             }
         }
         drop(done);
@@ -612,6 +660,30 @@ mod tests {
         assert_eq!(fake.count_since(&before, "files/delete_batch"), 1);
         assert_eq!(fake.count_since(&before, "files/delete_v2"), 0);
         assert!(!fake.has("/C/f0.txt"));
+    }
+
+    #[test]
+    fn a_batch_done_after_its_check_is_not_reported_as_failed() {
+        let fake = Fake::start();
+        for i in 0..4 {
+            fake.put_file(&format!("/A/f{i}.txt"), b"x");
+        }
+        let a = fake.account();
+        // The job lands after the look, just before it's launched again (whose entries then
+        // all fail: nothing left to move).
+        fake.late("files/move_batch_v2");
+        let pairs: Vec<(String, String)> = (0..4).map(|i| (format!("/A/f{i}.txt"), format!("/B/f{i}.txt"))).collect();
+        let r = a.move_many(&pairs);
+        assert!(r.iter().all(Result::is_ok), "{r:?}");
+        assert!(fake.has("/B/f3.txt") && !fake.has("/A/f3.txt"));
+        // The same for a commit of small files.
+        let (dir, locals) = local_files("late", &[10, 3000]);
+        let files: Vec<(String, PathBuf)> = locals.iter().enumerate().map(|(i, l)| (format!("/U/f{i}.bin"), l.clone())).collect();
+        fake.late("files/upload_session/finish_batch_v2");
+        let r = a.upload_many(&files, &mut |_, _| true);
+        assert!(r.iter().all(Result::is_ok), "{r:?}");
+        assert_eq!(fake.content("/U/f1.bin"), std::fs::read(&locals[1]).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

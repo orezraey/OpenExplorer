@@ -71,8 +71,11 @@ struct State {
     tokens: u64,
     /// The next call to this route is done, but its answer never leaves (the connection drops).
     lose_answer: Option<String>,
-    /// The next call to this route drops its connection before anything is done.
-    drop_before: Option<String>,
+    /// The next calls to this route (how many) drop their connection before anything is done.
+    drop_before: Option<(String, usize)>,
+    /// The next call to this route is held, and done just before the call after it.
+    late: Option<String>,
+    held: Option<(String, Request)>,
     /// Longpolls waiting now, and the most that ever waited at once.
     polling: usize,
     most_polling: usize,
@@ -416,7 +419,19 @@ impl Fake {
 
     /// The next call to `route` drops the connection before doing anything.
     pub fn drop_before(&self, route: &str) {
-        self.st().drop_before = Some(route.into());
+        self.drop_many(route, 1);
+    }
+
+    /// The next `n` calls to `route` drop the connection before doing anything.
+    pub fn drop_many(&self, route: &str, n: usize) {
+        self.st().drop_before = Some((route.into(), n));
+    }
+
+    /// The next call to `route` drops its connection at once, and its work is done only when
+    /// the next call to the same route comes, just before that one: a request whose answer was
+    /// lost, done after the check that found it not done.
+    pub fn late(&self, route: &str) {
+        self.st().late = Some(route.into());
     }
 
     /// The most longpolls that ever waited at once.
@@ -483,6 +498,22 @@ fn respond(conn: &mut TcpStream, status: u16, headers: &[(String, String)], body
     let _ = conn.write_all(body);
 }
 
+/// Sends `req` again to the stand-in `conn` came to, and waits for its answer.
+fn replay(conn: &TcpStream, req: &Request) {
+    let Ok(addr) = conn.local_addr() else { return };
+    let Ok(mut s) = TcpStream::connect(addr) else { return };
+    let mut head = format!("POST {} HTTP/1.1\r\n", req.path);
+    for (k, v) in &req.headers {
+        if !matches!(k.as_str(), "content-length" | "transfer-encoding" | "connection") {
+            head.push_str(&format!("{k}: {v}\r\n"));
+        }
+    }
+    head.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n", req.body.len()));
+    let _ = s.write_all(head.as_bytes());
+    let _ = s.write_all(&req.body);
+    let _ = s.read_to_end(&mut Vec::new());
+}
+
 fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
     let Some(req) = read_request(&conn) else { return };
     let route = req.path.trim_start_matches("/2/").trim_start_matches('/').to_string();
@@ -511,11 +542,31 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
         }
         st.last_root = req.headers.get("dropbox-api-path-root").cloned();
     }
-    if st.drop_before.as_deref() == Some(route.as_str()) {
-        st.drop_before = None;
+    if let Some((r, n)) = &mut st.drop_before
+        && *r == route
+    {
+        *n -= 1;
+        if *n == 0 {
+            st.drop_before = None;
+        }
         drop(st);
         let _ = conn.shutdown(std::net::Shutdown::Both);
         return;
+    }
+    if st.late.as_deref() == Some(route.as_str()) {
+        st.late = None;
+        st.held = Some((route.clone(), req));
+        drop(st);
+        let _ = conn.shutdown(std::net::Shutdown::Both);
+        return;
+    }
+    // A call held back (`late`) is done now, just before this one to its route.
+    if st.held.as_ref().is_some_and(|(r, _)| *r == route)
+        && let Some((_, old)) = st.held.take()
+    {
+        drop(st);
+        replay(&conn, &old);
+        st = state.0.lock().unwrap();
     }
     let s = |k: &str| arg.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let lower = |p: String| p.to_lowercase();
@@ -621,9 +672,16 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
             st.polling -= 1;
             answer
         }
-        "files/get_metadata" => match st.nodes.get(&lower(s("path"))) {
-            Some(n) => ok(meta(&lower(s("path")), n)),
-            None => not_found("path"),
+        "files/get_metadata" => match s("path").strip_prefix("rev:") {
+            // A path of the form rev:<rev> names that revision of a file.
+            Some(rev) => match st.revs.get(rev) {
+                Some((d, data)) => ok(meta(&d.to_lowercase(), &Node { display: d.clone(), dir: false, data: data.clone(), rev: rev.to_string() })),
+                None => not_found("path"),
+            },
+            None => match st.nodes.get(&lower(s("path"))) {
+                Some(n) => ok(meta(&lower(s("path")), n)),
+                None => not_found("path"),
+            },
         },
         "files/create_folder_v2" => {
             let (display, l) = (s("path"), lower(s("path")));
