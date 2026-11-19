@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 use openexplorer_b2 as b2;
 use openexplorer_i18n::{t, tr};
 use openexplorer_remote::{Protocol, Server};
-use rune::{El, Tx, col, row, text};
+use rune::{El, ScrollSpec, Tx, col, row, text};
 use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit};
 
 use crate::actions::{Dialog, selected};
@@ -29,6 +29,12 @@ pub fn store() -> b2::Store {
 /// The servers the connected keys show as.
 pub fn servers(store: &b2::Store) -> Vec<Server> {
     store.accounts().into_iter().map(|a| Server::b2(&a.key_id, &a.name)).collect()
+}
+
+/// Which file on this computer each large upload sends (see `openexplorer_b2::notes`), beside
+/// the keys' list.
+pub fn notes_file() -> std::path::PathBuf {
+    openexplorer_gdrive::config_dir().join("b2-uploads.json")
 }
 
 /// Where the listings are kept, sealed (see `openexplorer_b2::cache`).
@@ -257,6 +263,10 @@ pub enum Answer {
     Same { pane: usize, request: u64 },
     /// A reading on the app's own of what pane `pane` showed at `request`, at `loc`.
     Polled { pane: usize, request: u64, loc: Box<Location>, result: Result<b2::Polled, String> },
+    /// The unfinished uploads of `bucket` on key `key_id`.
+    Unfinished { key_id: String, bucket: String, result: Result<Vec<b2::Unfinished>, String> },
+    /// Cancelling some of them ended: how many went.
+    Cancelled { key_id: String, bucket: String, result: Result<usize, String> },
 }
 
 pub fn arrived(s: &mut State, a: Answer) {
@@ -264,6 +274,8 @@ pub fn arrived(s: &mut State, a: Answer) {
         Answer::Connected { attempt, result } => connected(s, attempt, result),
         Answer::Same { pane, request } => same(s, pane, request),
         Answer::Polled { pane, request, loc, result } => polled(s, pane, request, *loc, result),
+        Answer::Unfinished { key_id, bucket, result } => unfinished_listed(s, &key_id, &bucket, result),
+        Answer::Cancelled { key_id, bucket, result } => uploads_cancelled(s, &key_id, &bucket, result),
     }
 }
 
@@ -477,6 +489,252 @@ pub fn run(step: &Step) -> Result<Step, String> {
         }
         other => Ok(other.clone()),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Envios inacabados
+
+/// The Envios inacabados dialog of a bucket: the large uploads that stopped midway (B2 keeps
+/// their parts, billed as storage, until each is finished or cancelled), what B2 holds of each,
+/// and Retomar, Cancelar envio or Cancelar todos.
+pub struct Unfinished {
+    pub server: Server,
+    pub bucket: String,
+    /// `None` while B2 is asked the first time.
+    pub rows: Option<Result<Vec<b2::Unfinished>, String>>,
+    /// B2 is being asked, or a cancel is on its way.
+    pub busy: bool,
+    /// Cancelar todos was pressed once: pressed again, it cancels.
+    pub confirm_all: bool,
+}
+
+/// The bucket the menu's Envios inacabados opens: the one the pane is in, or at the key's top
+/// the one bucket selected.
+pub fn menu_bucket(s: &State, p: usize) -> Option<(Server, String)> {
+    let (server, path) = at(&s.panes[p].loc)?;
+    match path.first() {
+        Some(bucket) => Some((server.clone(), bucket.clone())),
+        None => match selected(s, p).as_slice() {
+            [one] if one.is_dir => Some((server.clone(), one.name.clone())),
+            _ => None,
+        },
+    }
+}
+
+/// Envios inacabados…, from the menu.
+pub fn ask_unfinished(s: &mut State, p: usize, _: &mut Tx) {
+    let Some((server, bucket)) = menu_bucket(s, p) else { return };
+    s.dialog = Some(Dialog::B2Unfinished(Box::new(Unfinished { server, bucket, rows: None, busy: false, confirm_all: false })));
+    list_unfinished(s);
+}
+
+/// Asks B2 for the open dialog's unfinished uploads, on a thread.
+fn list_unfinished(s: &mut State) {
+    let Some(Dialog::B2Unfinished(d)) = &mut s.dialog else { return };
+    d.busy = true;
+    d.confirm_all = false;
+    let (key_id, bucket) = (d.server.user.clone(), d.bucket.clone());
+    background(s, move |emit| {
+        let result = catch_panic(t("ver os envios inacabados", "see the unfinished uploads"), || b2::reach(&key_id)?.unfinished_uploads(&bucket));
+        emit(Msg::B2(Answer::Unfinished { key_id, bucket, result }));
+    });
+}
+
+/// The open dialog, if it's of `bucket` on key `key_id`.
+fn unfinished_of<'a>(s: &'a mut State, key_id: &str, bucket: &str) -> Option<&'a mut Unfinished> {
+    match &mut s.dialog {
+        Some(Dialog::B2Unfinished(d)) if d.server.user == key_id && d.bucket == bucket => Some(d),
+        _ => None,
+    }
+}
+
+fn unfinished_listed(s: &mut State, key_id: &str, bucket: &str, result: Result<Vec<b2::Unfinished>, String>) {
+    if let Some(d) = unfinished_of(s, key_id, bucket) {
+        d.rows = Some(result);
+        d.busy = false;
+    }
+}
+
+/// Cancels the uploads `ids` of the open dialog's bucket on a thread: their parts are deleted.
+fn cancel_uploads(s: &mut State, ids: Vec<String>) {
+    let Some(Dialog::B2Unfinished(d)) = &mut s.dialog else { return };
+    if d.busy || ids.is_empty() {
+        return;
+    }
+    d.busy = true;
+    let (key_id, bucket) = (d.server.user.clone(), d.bucket.clone());
+    background(s, move |emit| {
+        let result = catch_panic(t("cancelar os envios", "cancel the uploads"), || b2::reach(&key_id)?.cancel_unfinished(&ids));
+        emit(Msg::B2(Answer::Cancelled { key_id, bucket, result }));
+    });
+}
+
+fn uploads_cancelled(s: &mut State, key_id: &str, bucket: &str, result: Result<usize, String>) {
+    match result {
+        Ok(n) => s.status = tr!("Envios inacabados cancelados no B2: {n}. As partes enviadas foram apagadas.", "Unfinished uploads cancelled on B2: {n}. The parts sent were deleted."),
+        Err(e) => crate::fail(s, e),
+    }
+    if let Some(d) = unfinished_of(s, key_id, bucket) {
+        d.busy = false;
+        list_unfinished(s);
+    }
+}
+
+/// Cancelar todos: the first press asks, the second cancels every upload not being sent now.
+fn cancel_all_uploads(s: &mut State) {
+    let Some(Dialog::B2Unfinished(d)) = &mut s.dialog else { return };
+    if !d.confirm_all {
+        d.confirm_all = true;
+        return;
+    }
+    let ids = match &d.rows {
+        Some(Ok(rows)) => rows.iter().filter(|r| !r.sending).map(|r| r.id.clone()).collect(),
+        _ => Vec::new(),
+    };
+    cancel_uploads(s, ids);
+}
+
+/// Retomar: sends the file on this computer the upload was sending to the same name again, in
+/// the queue; the parts B2 holds aren't sent again (see `openexplorer_b2::upload`).
+fn resume_upload(s: &mut State, id: &str) {
+    let Some(Dialog::B2Unfinished(d)) = &s.dialog else { return };
+    let Some(Ok(rows)) = &d.rows else { return };
+    let Some(row) = rows.iter().find(|r| r.id == id) else { return };
+    let (Some(local), Some(size)) = (row.local.clone(), row.size) else { return };
+    let (server, bucket, name) = (d.server.clone(), d.bucket.clone(), row.name.clone());
+    s.dialog = None;
+    let mut dirs: Vec<String> = std::iter::once(bucket.clone()).chain(name.split('/').map(str::to_string)).collect();
+    let file = dirs.pop().unwrap_or_default();
+    let into = folder(&server, dirs);
+    let reload = panes_on(s, &server.id);
+    let batch = crate::transfers::queue(&mut s.transfers, s.waker.clone(), crate::transfers::Op::Upload, [(crate::transfers::End::local(&local), crate::servers::end(&into, Some(&file)))]);
+    let (pool, path) = (s.servers.pool.clone(), format!("/{bucket}/{name}"));
+    background(s, move |emit| {
+        let result = catch_panic(t("retomar o envio", "resume the upload"), || {
+            batch.rows()[0].size(size);
+            batch.run(|_, p| {
+                crate::servers::with(&pool, &server, |c| {
+                    let mut last = 0;
+                    c.upload_file(&path, &local, &mut |n| {
+                        p.add_bytes(n.saturating_sub(last));
+                        last = last.max(n);
+                        !p.cancelled()
+                    })
+                })
+            })
+        });
+        emit(Msg::Done { reload, result });
+    });
+}
+
+fn day_and_time(ms: i64) -> String {
+    let t = SystemTime::UNIX_EPOCH + Duration::from_millis(ms.max(0) as u64);
+    crate::model::format_time(t)
+}
+
+/// What a row says under its name.
+fn unfinished_detail(r: &b2::Unfinished) -> String {
+    let sent = crate::model::format_size(r.sent);
+    let started = day_and_time(r.started);
+    let parts = if r.parts == 1 { t("1 parte", "1 part").to_string() } else { tr!("{} partes", "{} parts", r.parts) };
+    let mut out = match r.size {
+        Some(size) => tr!("{sent} de {} no B2 ({parts}) · começado em {started}", "{sent} of {} on B2 ({parts}) · started {started}", crate::model::format_size(size)),
+        None => tr!("{sent} no B2 ({parts}) · começado em {started}", "{sent} on B2 ({parts}) · started {started}"),
+    };
+    out.push_str(if r.sending {
+        t(" · enviando agora", " · being sent now")
+    } else if r.local.is_some() {
+        t(" · deste computador, pode ser retomado", " · from this computer, can be resumed")
+    } else if r.size.is_some() {
+        t(" · do Open Explorer em outro computador (ou o arquivo mudou)", " · from Open Explorer on another computer (or the file changed)")
+    } else {
+        t(" · de outro programa", " · from another program")
+    });
+    out
+}
+
+pub fn unfinished_dialog(k: &Kit, d: &Unfinished, layer: &mut Vec<El>) {
+    let close = |s: &mut State| s.dialog = None;
+    let small = |s: String| text(s).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
+    let mut inner = col().key("content").w_full().px(16.0).gap(12.0).child(small(
+        t(
+            "Envios grandes que pararam no meio. As partes já enviadas ficam no B2, ocupando (e custando) espaço, até o envio terminar ou ser cancelado. Cancelar apaga as partes; Retomar envia só o que falta. Um envio que outro computador esteja fazendo agora também aparece aqui: não o cancele.",
+            "Large uploads that stopped midway. The parts sent stay on B2, taking (and costing) space, until the upload finishes or is cancelled. Cancel deletes the parts; Resume sends only what's missing. An upload another computer is making right now shows here too: don't cancel it.",
+        )
+        .into(),
+    ));
+    match d.rows.as_ref().map(|r| r.as_deref()) {
+        None => inner = inner.child(small(t("Perguntando ao B2…", "Asking B2…").into())),
+        Some(Err(e)) => inner = inner.child(text(e.to_string()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0)),
+        Some(Ok([])) => inner = inner.child(small(t("Nenhum envio inacabado neste bucket.", "No unfinished uploads in this bucket.").into())),
+        Some(Ok(rows)) => {
+            let mut list = col().w_full().gap(10.0);
+            for r in rows {
+                let (id, again) = (r.id.clone(), r.id.clone());
+                let mut line = row()
+                    .key(format!("u:{}", r.id))
+                    .w_full()
+                    .gap(8.0)
+                    .center_y()
+                    .child(col().grow(1.0).min_w(0.0).gap(2.0).child(text(r.name.clone()).font(k.ty.text_small_medium).color(k.c.text_base).wrap().w_full().min_w(0.0)).child(small(unfinished_detail(r))));
+                if r.local.is_some() && !r.sending {
+                    line = line.child(Button::new(t("Retomar", "Resume")).variant(ButtonVariant::Neutral).disabled(d.busy).on_press(move |s: &mut State| resume_upload(s, &again)).build(k));
+                }
+                line = line.child(Button::new(t("Cancelar envio", "Cancel upload")).variant(ButtonVariant::Neutral).disabled(d.busy || r.sending).on_press(move |s: &mut State| cancel_uploads(s, vec![id.clone()])).build(k));
+                list = list.child(line);
+            }
+            inner = inner.child(col().key("unfinished-rows").w_full().max_h(320.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(list));
+        }
+    }
+    let cancellable = match &d.rows {
+        Some(Ok(rows)) => rows.iter().filter(|r| !r.sending).count(),
+        _ => 0,
+    };
+    let all = if d.confirm_all {
+        tr!("Confirmar: cancelar {cancellable}", "Confirm: cancel {cancellable}")
+    } else {
+        t("Cancelar todos", "Cancel all").to_string()
+    };
+    let actions = row()
+        .key("actions")
+        .w_full()
+        .px(16.0)
+        .pt(12.0)
+        .pb(16.0)
+        .gap(8.0)
+        .center_y()
+        .child(Button::new(t("Atualizar", "Refresh")).variant(ButtonVariant::Neutral).disabled(d.busy).on_press(list_unfinished).build(k))
+        .child(rune::el().grow(1.0))
+        .child(Button::new(all).variant(ButtonVariant::Danger).disabled(d.busy || cancellable == 0).on_press(cancel_all_uploads).build(k))
+        .child(Button::new(t("Fechar", "Close")).variant(ButtonVariant::Neutral).on_press(close).build(k).default_button());
+    let title = tr!("Envios inacabados · {}", "Unfinished uploads · {}", d.bucket);
+    Modal::new("b2-unfinished", title).open(true).child(col().w_full().child(inner).child(actions)).width(620.0).fit().on_close(close).build(k, layer);
+}
+
+/// The headless scene `b2-unfinished`: a bucket's dialog with an upload of this computer, one
+/// being sent and one of another program, without a network.
+pub fn unfinished_scene(s: &mut State) {
+    let server = Server::b2("0051a2b3c4d5e6f0000000001", "B2 · fotos-familia");
+    s.servers.list.push(server.clone());
+    s.panes[1].go(folder(&server, vec!["fotos-familia".into()]));
+    s.active = 1;
+    let day = 1_763_560_000_000;
+    let row = |id: &str, name: &str, sent: u64, parts: usize, size: Option<u64>, sending: bool, local: Option<&str>| b2::Unfinished {
+        id: id.into(),
+        name: name.into(),
+        started: day,
+        sent,
+        parts,
+        size,
+        sending,
+        local: local.map(std::path::PathBuf::from),
+    };
+    let rows = vec![
+        row("4_za", "videos/ferias-2025.mp4", 1_610_612_736, 48, Some(4_294_967_296), false, Some("C:\\Users\\voce\\Videos\\ferias-2025.mp4")),
+        row("4_zb", "backup/fotos.zip", 335_544_320, 10, Some(2_147_483_648), true, None),
+        row("4_zc", "arquivo-antigo.tar", 104_857_600, 1, None, false, None),
+    ];
+    s.dialog = Some(Dialog::B2Unfinished(Box::new(Unfinished { server, bucket: "fotos-familia".into(), rows: Some(Ok(rows)), busy: false, confirm_all: false })));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -697,6 +955,56 @@ mod tests {
         s.panes[1].go(Location::home());
         tick(&mut s, every + 63.0);
         assert_eq!(next_ask(&s), None);
+    }
+
+    /// Envios inacabados opens for the bucket a pane is in, or the one bucket selected at the
+    /// top; Cancelar todos asks first, and leaves the upload being sent now.
+    #[test]
+    fn unfinished_uploads_open_for_the_bucket_and_cancel_all_asks_first() {
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        s.panes[1].go(at_path(&["fotos", "2024"]));
+        assert_eq!(menu_bucket(&s, 1).map(|(_, b)| b).as_deref(), Some("fotos"));
+        s.panes[1].go(at_path(&[]));
+        let bucket = |n: &str| Entry { is_dir: true, size: None, ..file(n) };
+        s.panes[1].set_entries(Ok(vec![bucket("docs"), bucket("fotos")]));
+        assert!(menu_bucket(&s, 1).is_none(), "which bucket?");
+        s.panes[1].selected = ["fotos".to_string()].into();
+        assert_eq!(menu_bucket(&s, 1).map(|(_, b)| b).as_deref(), Some("fotos"));
+        assert!(menu_bucket(&s, 0).is_none(), "not on B2");
+        unfinished_scene(&mut s);
+        cancel_all_uploads(&mut s);
+        let Some(Dialog::B2Unfinished(d)) = &s.dialog else { panic!("no dialog") };
+        assert!(d.confirm_all && !d.busy, "the first press only asks");
+        cancel_all_uploads(&mut s);
+        let Some(Dialog::B2Unfinished(d)) = &s.dialog else { panic!("no dialog") };
+        assert!(d.busy, "the second cancels");
+    }
+
+    #[test]
+    fn rows_say_what_b2_holds_and_who_started_them() {
+        let mut s = crate::init();
+        unfinished_scene(&mut s);
+        let Some(Dialog::B2Unfinished(d)) = &s.dialog else { panic!("no dialog") };
+        let Some(Ok(rows)) = &d.rows else { panic!("no rows") };
+        let said: Vec<String> = rows.iter().map(unfinished_detail).collect();
+        assert!(said[0].starts_with("1,5 GB de 4,0 GB no B2 (48 partes)") && said[0].ends_with("pode ser retomado"), "{}", said[0]);
+        assert!(said[1].ends_with("enviando agora"));
+        assert!(said[2].starts_with("100,0 MB no B2 (1 parte)") && said[2].ends_with("outro programa"), "{}", said[2]);
+    }
+
+    /// Retomar puts the file in the queue and closes the dialog; an upload with no file on this
+    /// computer can't be taken up.
+    #[test]
+    fn resuming_queues_the_file_on_this_computer() {
+        let mut s = crate::init();
+        unfinished_scene(&mut s);
+        resume_upload(&mut s, "4_zc");
+        assert!(s.dialog.is_some() && s.transfers.is_empty());
+        resume_upload(&mut s, "4_za");
+        assert!(s.dialog.is_none());
+        assert_eq!(s.transfers.len(), 1);
+        assert!(s.transfers[0].from.text.ends_with("ferias-2025.mp4") && s.transfers[0].to.text.contains("fotos-familia\\videos\\ferias-2025.mp4"), "{}", s.transfers[0].to.text);
     }
 
     #[test]

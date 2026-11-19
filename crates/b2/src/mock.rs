@@ -79,8 +79,11 @@ impl State {
         1_700_000_000_000 + self.clock
     }
 
+    /// Unique across every stand-in of the run, as B2's ids are (the uploads this app is sending
+    /// are known by id, process-wide).
     fn id(&mut self) -> String {
-        self.next += 1;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        self.next = NEXT.fetch_add(1, Ordering::SeqCst) + 1;
         format!("4_z{:08}", self.next)
     }
 
@@ -584,19 +587,30 @@ fn api(call: &str, b: &Value, state: &Mutex<State>, url: &str) -> (u16, Value) {
             st.large.insert(id.clone(), Large { bucket: s(b, "bucketId").into(), name: s(b, "fileName").into(), info: info.clone(), parts: BTreeMap::new(), ts });
             (200, json!({"fileId": id, "fileName": s(b, "fileName"), "bucketId": s(b, "bucketId"), "action": "start", "fileInfo": info, "uploadTimestamp": ts, "contentLength": 0, "contentSha1": "none"}))
         }
+        // Oldest first, at most 100 a page, from `startFileId` (as B2 documents).
         "b2_list_unfinished_large_files" => {
-            let files: Vec<Value> = st
-                .large
+            let mut all: Vec<(&String, &Large)> = st.large.iter().filter(|(_, l)| l.bucket == s(b, "bucketId") && l.name.starts_with(s(b, "namePrefix"))).collect();
+            all.sort_by_key(|(id, l)| (l.ts, (*id).clone()));
+            if let Some(i) = all.iter().position(|(id, _)| id.as_str() == s(b, "startFileId")) {
+                all.drain(..i);
+            }
+            let count = count.min(100);
+            let next = all.get(count).map(|(id, _)| (*id).clone());
+            let files: Vec<Value> = all
                 .iter()
-                .filter(|(_, l)| l.bucket == s(b, "bucketId") && l.name.starts_with(s(b, "namePrefix")))
+                .take(count)
                 .map(|(id, l)| json!({"fileId": id, "fileName": l.name, "bucketId": l.bucket, "action": "start", "fileInfo": l.info, "uploadTimestamp": l.ts, "contentLength": 0, "contentSha1": "none"}))
                 .collect();
-            (200, json!({"files": files, "nextFileId": null}))
+            (200, json!({"files": files, "nextFileId": next}))
         }
         "b2_list_parts" => match st.large.get(s(b, "fileId")) {
             Some(l) => {
-                let parts: Vec<Value> = l.parts.iter().map(|(n, (d, sha1))| json!({"fileId": s(b, "fileId"), "partNumber": n, "contentLength": d.len(), "contentSha1": sha1, "uploadTimestamp": 1})).collect();
-                (200, json!({"parts": parts, "nextPartNumber": null}))
+                let from = b.get("startPartNumber").and_then(Value::as_u64).unwrap_or(1);
+                let most = b.get("maxPartCount").and_then(Value::as_u64).unwrap_or(1000).min(1000) as usize;
+                let all: Vec<(&u64, &(Arc<Vec<u8>>, String))> = l.parts.range(from..).collect();
+                let next = all.get(most).map(|(n, _)| **n);
+                let parts: Vec<Value> = all.iter().take(most).map(|(n, (d, sha1))| json!({"fileId": s(b, "fileId"), "partNumber": n, "contentLength": d.len(), "contentSha1": sha1, "uploadTimestamp": 1})).collect();
+                (200, json!({"parts": parts, "nextPartNumber": next}))
             }
             None => error(400, "bad_request", "no such file"),
         },

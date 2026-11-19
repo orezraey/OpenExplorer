@@ -886,6 +886,7 @@ pub fn disconnect(key_id: &str) {
             }
         }
     }
+    crate::notes::forget_key(key_id);
     store::forget_secret(key_id);
 }
 

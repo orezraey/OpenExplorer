@@ -36,6 +36,17 @@ fn same_cancel(e: String) -> String {
     if e == openexplorer_b2::CANCELLED { CANCELLED.into() } else { e }
 }
 
+/// An upload's progress that never goes back: a part or a file sent again after a busy answer
+/// starts its count over, and the queue's rows add what's new since the last count (a count
+/// going back would wrap around).
+fn onward(progress: Progress<'_>) -> impl FnMut(u64) -> bool + '_ {
+    let mut top = 0;
+    move |n| {
+        top = top.max(n);
+        progress(top)
+    }
+}
+
 impl Conn for B2 {
     fn list(&mut self, dir: &str) -> Result<Vec<Item>> {
         Ok(self.account.list(dir)?.into_iter().map(item).collect())
@@ -72,7 +83,13 @@ impl Conn for B2 {
     }
 
     fn upload(&mut self, path: &str, src: &mut dyn Read, len: u64, progress: Progress) -> Result<()> {
-        self.account.upload(&mut self.up, path, src, len, progress).map(|_| ()).map_err(same_cancel)
+        self.account.upload(&mut self.up, path, src, len, &mut onward(progress)).map(|_| ()).map_err(same_cancel)
+    }
+
+    /// From this computer, a large file's upload notes which file it sends, so one that stops
+    /// midway can be taken up again from the Envios inacabados dialog.
+    fn upload_file(&mut self, path: &str, local: &std::path::Path, progress: Progress) -> Result<()> {
+        self.account.upload_file(&mut self.up, path, local, &mut onward(progress)).map(|_| ()).map_err(same_cancel)
     }
 
     fn home(&mut self) -> Result<String> {
@@ -90,5 +107,23 @@ impl Conn for B2 {
 
     fn alive(&mut self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn upload_progress_never_goes_back() {
+        let mut seen = Vec::new();
+        let mut report = |n| {
+            seen.push(n);
+            true
+        };
+        let mut onward = super::onward(&mut report);
+        for n in [10, 20, 0, 5, 30] {
+            onward(n);
+        }
+        drop(onward);
+        assert_eq!(seen, [10, 20, 20, 20, 30]);
     }
 }

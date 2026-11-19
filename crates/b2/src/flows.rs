@@ -366,6 +366,66 @@ fn a_large_upload_that_failed_resumes_with_the_parts_b2_has() {
 }
 
 #[test]
+fn unfinished_uploads_show_what_b2_holds_and_go_on_or_are_cancelled() {
+    let _one = crate::notes::TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("oe-b2-flows-unfinished-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::notes::set_file(Some(dir.join("b2-uploads.json")));
+    let m = mock();
+    small_parts(&m);
+    let a = m.account();
+    let mut up = Uploads::default();
+    let data = noise(6 * (1 << 20));
+    let len = data.len() as u64;
+    let local = dir.join("video.bin");
+    std::fs::write(&local, &data).unwrap();
+    // This app sent the file from here and stopped midway (as upload_file notes it).
+    crate::notes::begin(crate::mock::KEY_ID, "fotos", "video.bin", len, &local);
+    let mut broken = Breaks { data: &data, at: 0, stop_at: 3 * (1 << 20) + 10 };
+    assert!(a.upload(&mut up, "/fotos/video.bin", &mut broken, len, &mut |_| true).is_err());
+    // Another program's, older, with one part.
+    let part = std::sync::Arc::new(vec![1u8; 100]);
+    m.lock().large.insert("4_zoutro".into(), crate::mock::Large { bucket: "bkt_fotos".into(), name: "de-outro.bin".into(), info: Default::default(), parts: [(1, (part.clone(), crate::api::sha1_hex(&part)))].into(), ts: 1 });
+    let list = a.unfinished_uploads("fotos").unwrap();
+    assert_eq!(list.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(), ["de-outro.bin", "video.bin"], "oldest first");
+    assert_eq!((list[0].size, list[0].local.as_ref(), list[0].sent, list[0].parts), (None, None, 100, 1));
+    let mine = &list[1];
+    assert_eq!((mine.size, mine.local.as_ref(), mine.sending), (Some(len), Some(&local), false));
+    assert!(mine.parts >= 1 && mine.sent == mine.parts as u64 * (1 << 20), "{mine:?}");
+    // Taken up again from the file on this computer: only the parts B2 doesn't hold go.
+    m.reset_counts();
+    a.upload_file(&mut up, "/fotos/video.bin", &local, &mut |_| true).unwrap();
+    assert_eq!(m.calls("b2_upload_part"), 6 - mine.parts);
+    assert_eq!(get(&a, "/fotos/video.bin"), data);
+    assert_eq!(crate::notes::local_of(crate::mock::KEY_ID, "fotos", "video.bin", len), None, "its note went with it");
+    // One being sent now isn't cancelled from the list; otherwise it is, its parts deleted.
+    let busy = crate::upload::InFlight::new("4_zoutro");
+    assert_eq!(a.cancel_unfinished(&["4_zoutro".into()]).unwrap(), 0);
+    drop(busy);
+    assert_eq!(a.cancel_unfinished(&["4_zoutro".into()]).unwrap(), 1);
+    assert!(m.lock().large.is_empty() && a.unfinished_uploads("fotos").unwrap().is_empty());
+    crate::notes::set_file(None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn unfinished_uploads_list_past_a_page_and_parts_past_theirs() {
+    let m = mock();
+    let a = m.account();
+    {
+        let mut st = m.lock();
+        for i in 0..130u64 {
+            let parts = if i == 0 { (1..=1500u64).map(|n| (n, (std::sync::Arc::new(vec![0u8; 2]), String::new()))).collect() } else { Default::default() };
+            st.large.insert(format!("4_zl{i:04}"), crate::mock::Large { bucket: "bkt_docs".into(), name: format!("l{i}"), info: Default::default(), parts, ts: i as i64 });
+        }
+    }
+    let list = a.unfinished_uploads("docs").unwrap();
+    assert_eq!(list.len(), 130);
+    assert_eq!((list[0].parts, list[0].sent), (1500, 3000));
+    assert_eq!(m.calls("b2_list_unfinished_large_files"), 2);
+}
+
+#[test]
 fn cancelling_a_large_upload_cancels_it_on_b2() {
     let m = mock();
     small_parts(&m);

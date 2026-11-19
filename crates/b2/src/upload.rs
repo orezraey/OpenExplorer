@@ -17,10 +17,11 @@
 //!   doesn't already hold (`b2_list_parts`). Cancelar cancels it on B2 (`b2_cancel_large_file`),
 //!   so its parts stop taking storage; so does a new upload to the name with another size.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, LazyLock, Mutex};
 use std::time::Duration;
 
 use openexplorer_i18n::{t, tr};
@@ -74,6 +75,52 @@ impl Drop for Held {
 
 /// The parts B2 holds of an unfinished file: by number, their size and SHA-1.
 type Parts = HashMap<u64, (u64, String)>;
+
+/// An unfinished large upload, as the Envios inacabados dialog shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Unfinished {
+    pub id: String,
+    /// Its name in the bucket.
+    pub name: String,
+    /// When it was started, milliseconds since 1970.
+    pub started: i64,
+    /// What B2 holds of it: its parts' bytes, and how many.
+    pub sent: u64,
+    pub parts: usize,
+    /// The whole file's size, for an upload this app started (it notes it); `None` for one
+    /// another program started.
+    pub size: Option<u64>,
+    /// This app is sending it now.
+    pub sending: bool,
+    /// The file on this computer it sends, when this app started it here and the file is still
+    /// there as it was: it can be taken up again.
+    pub local: Option<PathBuf>,
+}
+
+/// The large uploads this app is sending now, by file id: not cancelled from the dialog, nor
+/// taken for another upload's leftover.
+static SENDING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+
+/// Whether this app is sending the large upload `file_id` now.
+pub fn sending(file_id: &str) -> bool {
+    SENDING.lock().unwrap_or_else(|e| e.into_inner()).contains(file_id)
+}
+
+/// Marks a large upload as being sent, until dropped.
+pub(crate) struct InFlight(String);
+
+impl InFlight {
+    pub(crate) fn new(file_id: &str) -> InFlight {
+        SENDING.lock().unwrap_or_else(|e| e.into_inner()).insert(file_id.to_string());
+        InFlight(file_id.to_string())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        SENDING.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+    }
+}
 
 /// An upload URL and its token.
 #[derive(Clone, Debug)]
@@ -227,6 +274,63 @@ impl Account {
         result
     }
 
+    /// Sends the file `local` on this computer to `path`, as [`Account::upload`] does, noting
+    /// which file a large upload sends (see [`crate::notes`]) so the Envios inacabados dialog can
+    /// take it up again if it stops midway.
+    pub fn upload_file(&self, up: &mut Uploads, path: &str, local: &Path, progress: Progress) -> Result<Version> {
+        let mut file = std::fs::File::open(local).map_err(|e| tr!("Não consegui abrir {}: {e}", "Couldn't open {}: {e}", local.display()))?;
+        let len = file.metadata().map_err(|e| tr!("Não consegui ler {}: {e}", "Couldn't read {}: {e}", local.display()))?.len();
+        let auth = self.api.auth()?;
+        let large = len > part_size(len, auth.recommended_part, auth.minimum_part);
+        let spot = Spot::of(path).filter(|s| !s.key.is_empty() && large);
+        if let Some(s) = &spot {
+            crate::notes::begin(&self.key_id, &s.bucket, &s.key, len, local);
+        }
+        let result = self.upload(up, path, &mut std::io::BufReader::with_capacity(1 << 20, &mut file), len, progress);
+        // Ended, or cancelled on B2: nothing to take up again. Failed: the note stays.
+        if let Some(s) = &spot
+            && result.as_ref().map_or_else(|e| e == CANCELLED, |_| true)
+        {
+            crate::notes::end(&self.key_id, &s.bucket, &s.key, len);
+        }
+        result
+    }
+
+    /// The unfinished large uploads in the bucket named `bucket`, oldest first, each with what
+    /// B2 holds of it (its parts summed: B2 gives an unfinished file no length) and, for one the
+    /// app started, its size and the file on this computer it sends, if known.
+    pub fn unfinished_uploads(&self, bucket: &str) -> Result<Vec<Unfinished>> {
+        let bucket = self.bucket(bucket)?;
+        // A key limited to a prefix must ask within it.
+        let prefix = self.api.auth()?.allowed.name_prefix.clone().unwrap_or_default();
+        let found = self.unfinished(&bucket, &prefix)?;
+        let parts = each(&found, |v| self.parts(&v.id))?;
+        Ok(found
+            .into_iter()
+            .zip(parts)
+            .map(|(v, parts)| {
+                let size = v.info.get("oe_size").and_then(Value::as_str).and_then(|s| s.parse().ok());
+                Unfinished {
+                    local: size.and_then(|n| crate::notes::local_of(&self.key_id, &bucket.name, &v.name, n)),
+                    sending: sending(&v.id),
+                    sent: parts.values().map(|p| p.0).sum(),
+                    parts: parts.len(),
+                    size,
+                    started: v.uploaded,
+                    id: v.id,
+                    name: v.name,
+                }
+            })
+            .collect())
+    }
+
+    /// Cancels the unfinished uploads `ids` (their parts are deleted), not one this app is
+    /// sending now. How many went.
+    pub fn cancel_unfinished(&self, ids: &[String]) -> Result<usize> {
+        let ids: Vec<&String> = ids.iter().filter(|id| !sending(id)).collect();
+        each(&ids, |id| self.cancel_large(id)).map(|done| done.len())
+    }
+
     /// The unfinished large uploads in `bucket` (under `name_prefix`), oldest first.
     pub fn unfinished(&self, bucket: &Bucket, name_prefix: &str) -> Result<Vec<Version>> {
         let mut out = Vec::new();
@@ -287,7 +391,8 @@ impl Account {
             }
         };
         let ours = |v: &Version, key: &str| v.info.get(key).and_then(Value::as_str).map(str::to_string);
-        let mut mine: Vec<Version> = found.into_iter().filter(|v| v.name == name && ours(v, "oe_size").is_some()).collect();
+        // Not one being sent now (the same file twice in the queue): it's taken by its own upload.
+        let mut mine: Vec<Version> = found.into_iter().filter(|v| v.name == name && ours(v, "oe_size").is_some() && !sending(&v.id)).collect();
         mine.sort_by_key(|v| std::cmp::Reverse(v.uploaded));
         let same = mine.iter().position(|v| ours(v, "oe_size") == Some(len.to_string()) && ours(v, "oe_part") == Some(part.to_string()));
         let pick = same.map(|i| mine.remove(i));
@@ -390,6 +495,7 @@ impl Account {
             Some(found) => found,
             None => (self.start_large(bucket, name, "b2/x-auto", json!({"oe_size": len.to_string(), "oe_part": part.to_string()}))?, HashMap::new()),
         };
+        let _sending = InFlight::new(&file_id);
         let sent = AtomicU64::new(0);
         let stop = AtomicBool::new(false);
         let failed: Mutex<Option<String>> = Mutex::new(None);
