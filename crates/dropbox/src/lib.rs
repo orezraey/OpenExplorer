@@ -68,9 +68,14 @@ pub const CANCELLED: &str = "Cancelado.";
 /// `http://localhost:53719`.
 pub const DEFAULT_PORT: u16 = 53719;
 
-/// The Dropbox app the login goes through. Each person registers their own in the Dropbox App
-/// Console (a "Scoped access", "Full Dropbox" app) until Open Explorer has one of its own: only
-/// its app key is needed, as the login uses PKCE and keeps no secret.
+/// Open Explorer's own Dropbox app ("Scoped access", "Full Dropbox", redirect
+/// `http://localhost:53719`): what the login uses unless an app of one's own is set (see
+/// [`AppConfig::load`]). An app key isn't a secret; the login proves itself with PKCE.
+pub const BUILT_IN_APP_KEY: &str = "m1q7brv2z7mzqcf";
+
+/// The Dropbox app the login goes through: Open Explorer's own ([`BUILT_IN_APP_KEY`]), or one a
+/// person registered in the Dropbox App Console and set instead. Only its app key is needed, as
+/// the login uses PKCE and keeps no secret.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub app_key: String,
@@ -85,7 +90,7 @@ fn default_port() -> u16 {
 
 impl AppConfig {
     /// Reads [`app_file`] when there is one, else `OPENEXPLORER_DROPBOX_APP_KEY` (and
-    /// `OPENEXPLORER_DROPBOX_PORT`).
+    /// `OPENEXPLORER_DROPBOX_PORT`), else Open Explorer's own app ([`BUILT_IN_APP_KEY`]).
     pub fn load() -> Result<AppConfig> {
         let path = app_file();
         if let Ok(text) = std::fs::read_to_string(&path) {
@@ -99,11 +104,12 @@ impl AppConfig {
             };
             return Ok(AppConfig { app_key, port });
         }
-        Err(tr!(
-            "App do Dropbox não configurado. Informe a App key do seu app (Dropbox App Console) ou salve {{\"app_key\": \"…\"}} em {}",
-            "Dropbox app not set up. Enter your app's App key (Dropbox App Console) or save {{\"app_key\": \"…\"}} to {}",
-            path.display()
-        ))
+        Ok(AppConfig::built_in())
+    }
+
+    /// Open Explorer's own app, on [`DEFAULT_PORT`].
+    pub fn built_in() -> AppConfig {
+        AppConfig { app_key: BUILT_IN_APP_KEY.into(), port: DEFAULT_PORT }
     }
 
     /// `{"app_key": "…", "port": 53719}`, the port optional.
@@ -152,6 +158,13 @@ pub fn app_file() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_built_in_app_is_a_valid_app() {
+        let c = AppConfig::built_in();
+        assert_eq!(AppConfig::parse(&serde_json::to_string(&c).unwrap()).unwrap(), c);
+        assert_eq!(c.redirect(), "http://localhost:53719");
+    }
 
     #[test]
     fn the_app_file_needs_a_key_and_may_name_a_port() {

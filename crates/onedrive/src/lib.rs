@@ -63,9 +63,15 @@ pub type Result<T> = std::result::Result<T, String>;
 /// The error of a transfer stopped by Cancelar.
 pub const CANCELLED: &str = "Cancelado.";
 
-/// The OAuth client the app signs in with: an app registration in Microsoft Entra that each
-/// person (or organization) makes, since an app's id isn't shipped in the program. Public: it
-/// has no secret.
+/// Open Explorer's own app registration in Microsoft Entra (personal and work or school
+/// accounts, public client, no secret): what the login uses unless a client of one's own is set
+/// (see [`ClientConfig::load`]). An app's client id isn't a secret; the login proves itself with
+/// PKCE.
+pub const BUILT_IN_CLIENT_ID: &str = "9f69a854-17ff-417a-a6a7-dda1351adcb7";
+
+/// The OAuth client the app signs in with: Open Explorer's own registration
+/// ([`BUILT_IN_CLIENT_ID`]), or one a person or organization registered in Microsoft Entra and
+/// set instead. Public: it has no secret.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ClientConfig {
     pub client_id: String,
@@ -86,7 +92,8 @@ pub fn registration_help() -> String {
 
 impl ClientConfig {
     /// Reads the client from [`client_file`] when saved, else from
-    /// `OPENEXPLORER_ONEDRIVE_CLIENT_ID` (and `OPENEXPLORER_ONEDRIVE_TENANT`, `common` if unset).
+    /// `OPENEXPLORER_ONEDRIVE_CLIENT_ID` (and `OPENEXPLORER_ONEDRIVE_TENANT`, `common` if unset),
+    /// else Open Explorer's own ([`BUILT_IN_CLIENT_ID`]).
     pub fn load() -> Result<ClientConfig> {
         let path = client_file();
         if let Ok(text) = std::fs::read_to_string(&path) {
@@ -98,7 +105,12 @@ impl ClientConfig {
             cfg.check()?;
             return Ok(cfg);
         }
-        Err(tr!("Cliente OAuth do OneDrive não configurado. {}", "OneDrive OAuth client not set up. {}", registration_help()))
+        Ok(ClientConfig::built_in())
+    }
+
+    /// Open Explorer's own registration, for personal and work or school accounts.
+    pub fn built_in() -> ClientConfig {
+        ClientConfig { client_id: BUILT_IN_CLIENT_ID.into(), tenant: "common".into() }
     }
 
     /// `{"client_id": "…", "tenant": "common"}`, the tenant optional; also the application
@@ -182,6 +194,13 @@ pub(crate) fn log(line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_built_in_registration_is_a_valid_client() {
+        let c = ClientConfig::built_in();
+        assert!(c.check().is_ok());
+        assert_eq!((c.client_id.as_str(), c.tenant.as_str()), (BUILT_IN_CLIENT_ID, "common"));
+    }
 
     #[test]
     fn the_client_reads_as_json_or_as_the_id_alone() {

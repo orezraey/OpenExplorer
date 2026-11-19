@@ -16,6 +16,10 @@ Written in Rust.
 * OneDrive: personal and work or school accounts, sharing links, recycle bin with undo (and, on
   work accounts, the Lixeira through SharePoint). Open folders update when files change
   elsewhere.
+* Dropbox: personal and team accounts, shared links, deleted items with undo. Open folders
+  update when files change elsewhere.
+* Backblaze B2: buckets and folders, large uploads in parallel parts (and resumed), hidden
+  versions with undo.
 * SFTP, FTP/FTPS, WebDAV, Nextcloud and ownCloud.
 * Copy and move between any of them, with a transfer queue.
 * Instant file name search on local NTFS drives, similar to Everything. Drive, MEGA and servers
@@ -53,28 +57,39 @@ In Testing mode Google signs you out after 7 days.
 
 ## OneDrive
 
-Personal and work or school accounts sign in through the browser with an app registration of
-your own (free, no secret):
-
-1. In the [Microsoft Entra portal](https://entra.microsoft.com), App registrations → New
-   registration, account types "Accounts in any organizational directory and personal
-   Microsoft accounts".
-2. Authentication: add the platform "Mobile and desktop applications" with the redirect URI
-   `http://localhost`, and turn on "Allow public client flows".
-3. API permissions: Microsoft Graph, delegated, `Files.ReadWrite.All`, `offline_access` and
-   `User.Read`. For the recycle bin of work or school accounts, also SharePoint, delegated,
-   `AllSites.Write` (see below).
-4. In Open Explorer, go to Add account → OneDrive and paste the Application (client) ID (it's
-   kept in `%APPDATA%\OpenExplorer\onedrive-client.json`; `OPENEXPLORER_ONEDRIVE_CLIENT_ID`
-   works too).
+Add account → OneDrive opens Microsoft's sign-in in the browser: pick the account (personal,
+work or school), allow Open Explorer to access your files, and that's it.
 
 Microsoft Graph doesn't list a work or school account's recycle bin, nor restore from it, so
-Open Explorer reads it through SharePoint's REST API, which needs that SharePoint permission.
-With it in the registration, open the account's Lixeira and click Authorize in browser (or have
-an administrator grant consent for the organization); from then on the Lixeira lists what was
-deleted, where from and when, with Restore, Delete permanently and Empty trash, and Undo brings
-back what Open Explorer deleted. Without it the account works as before, without the Lixeira.
-Personal accounts have no Lixeira (Graph doesn't list theirs); Undo restores what was deleted.
+Open Explorer reads it through SharePoint's REST API. Open the account's Lixeira and click
+Authorize in browser (some organizations need an administrator to grant consent); from then on
+the Lixeira lists what was deleted, where from and when, with Restore, Delete permanently and
+Empty trash, and Undo brings back what Open Explorer deleted. Without it the account works as
+before, without the Lixeira. Personal accounts have no Lixeira (Graph doesn't list theirs); Undo
+restores what was deleted. The Personal Vault only opens on Microsoft's website or app.
+
+To use an app registration of your own instead (Microsoft Entra, "Accounts in any organizational
+directory and personal Microsoft accounts", platform "Mobile and desktop applications" with
+`http://localhost`, public client flows on, Graph `Files.ReadWrite.All`, `offline_access`,
+`User.Read`, and SharePoint `AllSites.Write`), save `{"client_id": "…"}` to
+`%APPDATA%\OpenExplorer\onedrive-client.json` or set `OPENEXPLORER_ONEDRIVE_CLIENT_ID`.
+
+## Dropbox
+
+Add account → Dropbox opens Dropbox's sign-in in the browser: allow Open Explorer, and that's it.
+
+To use an app of your own instead (Dropbox App Console: Scoped access, Full Dropbox; scopes
+`account_info.read`, `files.metadata.*`, `files.content.*`, `sharing.*`; redirect URI
+`http://localhost:53719`), save `{"app_key": "…"}` to
+`%APPDATA%\OpenExplorer\dropbox-client.json` or set `OPENEXPLORER_DROPBOX_APP_KEY`.
+
+## Backblaze B2
+
+Make an application key under Application Keys on the Backblaze website, for every bucket or
+just one (and, if you like, just a prefix). Seeing and downloading needs `listBuckets`,
+`listFiles` and `readFiles`; uploading, making folders, renaming and deleting needs
+`writeFiles`; Delete every version needs `deleteFiles`. Then Add account → Backblaze B2 with the
+key ID and the application key (shown only once on the website).
 
 ## Building from source
 

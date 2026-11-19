@@ -16,6 +16,10 @@ integrados. Escrito em Rust.
 * OneDrive: contas pessoais, corporativas ou de estudante, links de compartilhamento, lixeira com
   desfazer (e, nas corporativas, a Lixeira pelo SharePoint). As pastas abertas se atualizam
   quando algo muda em outro lugar.
+* Dropbox: contas pessoais e de times, links compartilhados, itens excluídos com desfazer. As
+  pastas abertas se atualizam quando algo muda em outro lugar.
+* Backblaze B2: buckets e pastas, envios grandes em partes paralelas (e retomados), versões
+  escondidas com desfazer.
 * SFTP, FTP/FTPS, WebDAV, Nextcloud e ownCloud.
 * Copiar e mover entre qualquer um deles, com fila de transferências.
 * Pesquisa instantânea por nome nos discos NTFS locais, parecida com o Everything. Também dá para
@@ -56,29 +60,41 @@ No modo Teste, o Google pede para entrar de novo a cada 7 dias.
 
 ## OneDrive
 
-Contas pessoais, corporativas ou de estudante entram pelo navegador com um registro de
-aplicativo seu (gratuito, sem segredo):
-
-1. No [portal do Microsoft Entra](https://entra.microsoft.com), Registros de aplicativo → Novo
-   registro, tipos de conta "Contas em qualquer diretório organizacional e contas pessoais da
-   Microsoft".
-2. Autenticação: adicione a plataforma "Aplicativos móveis e da área de trabalho" com o URI de
-   redirecionamento `http://localhost`, e ligue "Permitir fluxos de clientes públicos".
-3. Permissões de API: Microsoft Graph, delegadas, `Files.ReadWrite.All`, `offline_access` e
-   `User.Read`. Para a lixeira de contas corporativas ou de estudante, também SharePoint,
-   delegada, `AllSites.Write` (veja abaixo).
-4. No Open Explorer, vá em Adicionar conta → OneDrive e cole o ID do aplicativo (cliente) (ele
-   fica em `%APPDATA%\OpenExplorer\onedrive-client.json`; `OPENEXPLORER_ONEDRIVE_CLIENT_ID`
-   também serve).
+Adicionar conta → OneDrive abre o login da Microsoft no navegador: escolha a conta (pessoal,
+corporativa ou de estudante), permita que o Open Explorer acesse seus arquivos, e pronto.
 
 O Microsoft Graph não lista a lixeira de uma conta corporativa ou de estudante nem restaura dela,
-então o Open Explorer a lê pela API REST do SharePoint, que precisa daquela permissão do
-SharePoint. Com ela no registro, abra a Lixeira da conta e clique em Autorizar no navegador (ou
-peça a um administrador que conceda o consentimento para a organização); daí em diante a Lixeira
-lista o que foi excluído, de onde e quando, com Restaurar, Excluir permanentemente e Esvaziar
-lixeira, e Desfazer traz de volta o que o Open Explorer excluiu. Sem ela a conta funciona como
-antes, sem a Lixeira. Contas pessoais não têm Lixeira (o Graph não lista a delas); Desfazer
-restaura o que foi excluído.
+então o Open Explorer a lê pela API REST do SharePoint. Abra a Lixeira da conta e clique em
+Autorizar no navegador (algumas organizações exigem que um administrador conceda o
+consentimento); daí em diante a Lixeira lista o que foi excluído, de onde e quando, com
+Restaurar, Excluir permanentemente e Esvaziar lixeira, e Desfazer traz de volta o que o Open
+Explorer excluiu. Sem isso a conta funciona como antes, sem a Lixeira. Contas pessoais não têm
+Lixeira (o Graph não lista a delas); Desfazer restaura o que foi excluído. O Cofre Pessoal só abre
+no site ou no app da Microsoft.
+
+Para usar um registro de aplicativo seu (Microsoft Entra, "Contas em qualquer diretório
+organizacional e contas pessoais da Microsoft", plataforma "Aplicativos móveis e da área de
+trabalho" com `http://localhost`, fluxos de clientes públicos ligados, Graph
+`Files.ReadWrite.All`, `offline_access`, `User.Read`, e SharePoint `AllSites.Write`), salve
+`{"client_id": "…"}` em `%APPDATA%\OpenExplorer\onedrive-client.json` ou defina
+`OPENEXPLORER_ONEDRIVE_CLIENT_ID`.
+
+## Dropbox
+
+Adicionar conta → Dropbox abre o login do Dropbox no navegador: permita o Open Explorer, e pronto.
+
+Para usar um app seu (Dropbox App Console: Scoped access, Full Dropbox; escopos
+`account_info.read`, `files.metadata.*`, `files.content.*`, `sharing.*`; URI de redirecionamento
+`http://localhost:53719`), salve `{"app_key": "…"}` em
+`%APPDATA%\OpenExplorer\dropbox-client.json` ou defina `OPENEXPLORER_DROPBOX_APP_KEY`.
+
+## Backblaze B2
+
+Crie uma chave em Application Keys, no site da Backblaze, para todos os buckets ou só um (e, se
+quiser, só um prefixo). Ver e baixar pede `listBuckets`, `listFiles` e `readFiles`; enviar, criar
+pastas, renomear e excluir pede `writeFiles`; Excluir todas as versões pede `deleteFiles`. Depois
+vá em Adicionar conta → Backblaze B2 com o ID da chave e a chave de aplicação (o site mostra só
+uma vez).
 
 ## Compilar
 
