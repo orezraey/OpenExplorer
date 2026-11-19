@@ -94,7 +94,11 @@ pub fn login_failure(status: u16, body: &str) -> Fail {
     let first = desc.lines().next().unwrap_or_default().to_string();
     let has = |c: &str| desc.contains(c);
     let text = if has("AADSTS7000218") || has("AADSTS700025") {
-        t("O registro do aplicativo não está como cliente público: ligue \"Permitir fluxos de clientes públicos\" em Autenticação, no portal do Microsoft Entra.", "The app registration isn't a public client: turn on \"Allow public client flows\" under Authentication, in the Microsoft Entra portal.").into()
+        t(
+            "O registro do aplicativo não está como cliente público: em Autenticação, no portal do Microsoft Entra, ligue \"Permitir fluxos de clientes públicos\" e confira que http://localhost está na plataforma \"Aplicativos móveis e da área de trabalho\" (não em \"Web\").",
+            "The app registration isn't a public client: under Authentication, in the Microsoft Entra portal, turn on \"Allow public client flows\" and check that http://localhost is under the platform \"Mobile and desktop applications\" (not \"Web\").",
+        )
+        .into()
     } else if has("AADSTS50011") {
         t("O registro do aplicativo não tem o URI de redirecionamento http://localhost (plataforma \"Aplicativos móveis e da área de trabalho\").", "The app registration lacks the redirect URI http://localhost (platform \"Mobile and desktop applications\").").into()
     } else if has("AADSTS700016") {

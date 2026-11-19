@@ -135,8 +135,8 @@ impl Addr {
 #[derive(Clone, Debug)]
 pub(crate) struct Loc {
     pub addr: Addr,
-    /// Its place in the tree, when it's this drive's and listed.
-    pub own: Option<Ix>,
+    /// It's in the tree (this drive's, listed): found there again by its id.
+    pub own: bool,
     pub item: Item,
     pub parent: Option<String>,
 }
@@ -272,7 +272,18 @@ impl Account {
 
     /// Reads the delta feed from the kept position and takes it in.
     pub fn catch_up(&self) -> Res<Changes> {
+        self.catch_up_unless(None)
+    }
+
+    /// [`Account::catch_up`], unless another thread did within `fresh` while this one waited
+    /// for it (several connections opening folders at once ask once).
+    fn catch_up_unless(&self, fresh: Option<Duration>) -> Res<Changes> {
         let _one = self.catching.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(fresh) = fresh
+            && self.st().checked.is_some_and(|c| c.elapsed() < fresh)
+        {
+            return Ok(Changes::default());
+        }
         let Some(mut url) = self.st().tree.delta.clone() else {
             self.establish()?;
             return Ok(Changes { all: true, folders: HashSet::new() });
@@ -320,7 +331,7 @@ impl Account {
         if self.st().checked.is_some_and(|c| c.elapsed() < FRESH) {
             return Ok(());
         }
-        self.catch_up().map(|_| ())
+        self.catch_up_unless(Some(FRESH)).map(|_| ())
     }
 
     /// What changed elsewhere since the last ask (the app asks every few seconds while a pane
@@ -370,7 +381,7 @@ impl Account {
             Some(r) => Addr { drive: r.drive.clone(), id: r.id.clone(), rest: Vec::new() },
             None => Addr { drive: self.meta.id.clone(), id: n.id.to_string(), rest: Vec::new() },
         };
-        Loc { addr, own: n.remote.is_none().then_some(ix), item, parent: n.parent.map(|p| tree.get(p).id.to_string()) }
+        Loc { addr, own: n.remote.is_none(), item, parent: n.parent.map(|p| tree.get(p).id.to_string()) }
     }
 
     /// An item asked of Graph by its address.
@@ -383,7 +394,7 @@ impl Account {
                     Some(r) => Addr { drive: r.drive.clone(), id: r.id.clone(), rest: Vec::new() },
                     None => Addr { drive, id: s.id.clone(), rest: Vec::new() },
                 };
-                Ok(Some(Loc { addr: a, own: None, item: item_of(&s), parent: s.parent.clone() }))
+                Ok(Some(Loc { addr: a, own: false, item: item_of(&s), parent: s.parent.clone() }))
             }
             Err(f) if f.not_found() => Ok(None),
             Err(f) => Err(f),
@@ -398,27 +409,35 @@ impl Account {
         }
         self.fresh()?;
         let rest = &segs[1..];
+        enum Next {
+            Done(Loc),
+            Missing,
+            Remote(Loc, usize),
+            List(String),
+        }
         for _ in 0..rest.len() + 2 {
-            let walk = self.st().tree.walk(rest);
-            match walk {
-                Walk::Found(ix) => {
-                    let st = self.st();
-                    return Ok(Place::Found(self.own_loc(&st.tree, ix)));
+            // Walked and read under one hold of the tree: a change taken in on another thread
+            // may free a node's slot once it's let go, so only ids leave it.
+            let next = {
+                let st = self.st();
+                match st.tree.walk(rest) {
+                    Walk::Found(ix) => Next::Done(self.own_loc(&st.tree, ix)),
+                    Walk::Missing => Next::Missing,
+                    Walk::Remote(ix, depth) => Next::Remote(self.own_loc(&st.tree, ix), depth),
+                    Walk::Unlisted(ix, _) => Next::List(st.tree.get(ix).id.to_string()),
                 }
-                Walk::Missing => return Ok(Place::Missing),
-                Walk::Remote(ix, depth) => {
-                    let base = {
-                        let st = self.st();
-                        self.own_loc(&st.tree, ix)
-                    };
+            };
+            match next {
+                Next::Done(loc) => return Ok(Place::Found(loc)),
+                Next::Missing => return Ok(Place::Missing),
+                Next::Remote(base, depth) => {
                     if depth == rest.len() {
                         return Ok(Place::Found(base));
                     }
                     let addr = Addr { rest: rest[depth..].to_vec(), ..base.addr };
                     return Ok(self.live(&addr)?.map_or(Place::Missing, Place::Found));
                 }
-                Walk::Unlisted(ix, _) => {
-                    let id = self.st().tree.get(ix).id.to_string();
+                Next::List(id) => {
                     self.list_own(&id)?;
                 }
             }
@@ -465,9 +484,10 @@ impl Account {
         if !loc.item.is_dir {
             return Err(tr!("{path} não é uma pasta.", "{path} isn't a folder."));
         }
-        if let Some(ix) = loc.own {
+        if loc.own {
+            // Found again by id: the tree may have changed since `locate` let it go.
             let st = self.st();
-            if let Some(kids) = st.tree.children(ix) {
+            if let Some(kids) = st.tree.find(&loc.addr.id).and_then(|ix| st.tree.children(ix)) {
                 return Ok(kids.iter().map(|k| self.own_loc(&st.tree, *k).item).collect());
             }
             drop(st);
@@ -523,6 +543,8 @@ impl Account {
         if let Some(s) = Seen::of(v) {
             let mut st = self.st();
             st.tree.apply(&s, &mut HashSet::new());
+            // A listing read before this write mustn't land over it.
+            st.epoch += 1;
             st.dirty = true;
         }
     }
@@ -531,6 +553,7 @@ impl Account {
         let mut st = self.st();
         if let Some(ix) = st.tree.find(id) {
             st.tree.remove(ix);
+            st.epoch += 1;
             st.dirty = true;
         }
     }
@@ -570,6 +593,24 @@ impl Account {
     /// Sends a file or a whole folder to the recycle bin.
     pub fn remove(&self, path: &str) -> Result<()> {
         let src = self.found(path)?;
+        let r = self.graph.send("DELETE", &src.addr.url(), Body::None, &[])?;
+        if !r.ok() && r.status != 404 {
+            return Err(crate::graph::failure(r.status, &r.body, t("Excluir", "Delete")).into());
+        }
+        self.gone(&src.addr.id);
+        Ok(())
+    }
+
+    /// Sends folder `path` to the recycle bin only while it's empty, as asked of Graph now (not
+    /// the kept listing): undoing Nova pasta must never take what arrived in it since.
+    pub fn remove_empty_dir(&self, path: &str) -> Result<()> {
+        let src = self.found(path)?;
+        let v = self.graph.get(&format!("{}?$select=id,folder", src.addr.url()), t("Excluir", "Delete"))?;
+        match v.pointer("/folder/childCount").and_then(Value::as_u64) {
+            None => return Err(tr!("{path} não é uma pasta.", "{path} isn't a folder.")),
+            Some(n) if n > 0 => return Err(tr!("A pasta {path} não está vazia.", "The folder {path} isn't empty.")),
+            Some(_) => {}
+        }
         let r = self.graph.send("DELETE", &src.addr.url(), Body::None, &[])?;
         if !r.ok() && r.status != 404 {
             return Err(crate::graph::failure(r.status, &r.body, t("Excluir", "Delete")).into());
@@ -631,10 +672,21 @@ impl Account {
         let mut first = None;
         for (id, (status, body)) in ids.iter().zip(answers) {
             if (200..300).contains(&status) {
-                self.took(&body);
                 done.push(id.clone());
             } else if first.is_none() {
                 first = Some(crate::graph::failure(status, &body.to_string(), t("Restaurar", "Restore")).text);
+            }
+        }
+        // Where each came back to, asked as listings ask (the restore's answer may leave out
+        // the parent): into the tree at once.
+        let subs: Vec<Sub> = done.iter().map(|id| Sub { method: "GET", url: format!("/drives/{}/items/{}?$select={SELECT}", segment(self.drive()), segment(id)), body: None }).collect();
+        if !subs.is_empty()
+            && let Ok(items) = self.graph.batch(&subs, t("Restaurar", "Restore"))
+        {
+            for (status, body) in items {
+                if (200..300).contains(&status) {
+                    self.took(&body);
+                }
             }
         }
         (done, first)

@@ -101,6 +101,37 @@ fn folders_are_made_renamed_moved_and_deleted() {
 }
 
 #[test]
+fn an_empty_folder_goes_only_while_graph_says_it_is_empty() {
+    let (fake, a, _, fotos) = setup(Kind::Personal);
+    assert!(names(&a, "/Meus arquivos/Fotos").is_empty());
+    // Something arrived from elsewhere, not yet in the kept listing.
+    fake.with(|st| st.add(&fotos, "novo.jpg", false, b"x"));
+    assert!(a.remove_empty_dir("/Meus arquivos/Fotos").unwrap_err().contains("não está vazia"));
+    assert!(a.remove_empty_dir("/Meus arquivos/Docs/a.txt").is_err());
+    a.mkdir("/Meus arquivos/Vazia").unwrap();
+    a.remove_empty_dir("/Meus arquivos/Vazia").unwrap();
+    assert_eq!(names(&a, TOP), ["Docs", "Fotos"]);
+}
+
+#[test]
+fn folders_opened_at_once_ask_the_delta_feed_once() {
+    let (fake, a, _, _) = setup(Kind::Personal);
+    names(&a, "/Meus arquivos/Docs");
+    names(&a, "/Meus arquivos/Fotos");
+    std::thread::sleep(std::time::Duration::from_millis(3100));
+    let before = fake.requests();
+    std::thread::scope(|sc| {
+        for p in ["/Meus arquivos/Docs", "/Meus arquivos/Fotos", "/Meus arquivos", "/Meus arquivos/Docs"] {
+            let a = &a;
+            sc.spawn(move || a.list(p).unwrap());
+        }
+        // Changes taken in meanwhile, on another thread, as the watch does.
+        sc.spawn(|| a.catch_up().unwrap());
+    });
+    assert!(fake.requests() - before <= 2, "{} requests", fake.requests() - before);
+}
+
+#[test]
 fn several_items_go_to_the_bin_and_back_in_one_batch() {
     let (fake, a, _, _) = setup(Kind::Personal);
     names(&a, "/Meus arquivos/Docs");
