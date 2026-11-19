@@ -32,6 +32,10 @@ pub struct PendingLogin {
     pub url: String,
     pub cfg: ClientConfig,
     pub ends: Endpoints,
+    /// What it asks for: [`SCOPES`] for an account, or another resource's (see [`grant`]).
+    scopes: String,
+    /// A grant for another resource: a refusal reads as [`crate::graph::resource_failure`].
+    resource: bool,
 }
 
 pub(crate) fn random<const N: usize>() -> [u8; N] {
@@ -42,6 +46,18 @@ pub(crate) fn random<const N: usize>() -> [u8; N] {
 
 /// Opens the loopback listener and builds the sign-in address.
 pub fn begin(cfg: &ClientConfig, ends: &Endpoints) -> Res<PendingLogin> {
+    open(cfg, ends, SCOPES, &[("prompt", "select_account")], false)
+}
+
+/// A sign-in that only grants the app another resource for an account already connected
+/// (`scope` like `https://contoso-my.sharepoint.com/.default`), the account picked by its e-mail:
+/// Microsoft asks the person to consent to what the registration lists for that resource.
+pub fn grant(cfg: &ClientConfig, ends: &Endpoints, scope: &str, email: &str) -> Res<PendingLogin> {
+    let scopes = format!("{scope} offline_access");
+    open(cfg, ends, &scopes, &[("login_hint", email)], true)
+}
+
+fn open(cfg: &ClientConfig, ends: &Endpoints, scopes: &str, extra: &[(&str, &str)], resource: bool) -> Res<PendingLogin> {
     let v4 = TcpListener::bind("127.0.0.1:0").map_err(|e| Fail::new(tr!("Não consegui abrir a porta local do login: {e}", "Couldn't open the login's local port: {e}")))?;
     let port = v4.local_addr().map_err(|e| Fail::new(e.to_string()))?.port();
     let mut listeners = vec![v4];
@@ -53,42 +69,35 @@ pub fn begin(cfg: &ClientConfig, ends: &Endpoints) -> Res<PendingLogin> {
     let verifier = URL_SAFE_NO_PAD.encode(random::<32>());
     let state = URL_SAFE_NO_PAD.encode(random::<16>());
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    let url = url::Url::parse_with_params(
-        &format!("{}/{}/oauth2/v2.0/authorize", ends.login, cfg.tenant),
-        &[
-            ("client_id", cfg.client_id.as_str()),
-            ("response_type", "code"),
-            ("redirect_uri", redirect.as_str()),
-            ("response_mode", "query"),
-            ("scope", SCOPES),
-            ("state", state.as_str()),
-            ("code_challenge", challenge.as_str()),
-            ("code_challenge_method", "S256"),
-            ("prompt", "select_account"),
-        ],
-    )
-    .map_err(|e| Fail::new(e.to_string()))?
-    .to_string();
-    Ok(PendingLogin { listeners, redirect, verifier, state, url, cfg: cfg.clone(), ends: ends.clone() })
+    let mut params = vec![
+        ("client_id", cfg.client_id.as_str()),
+        ("response_type", "code"),
+        ("redirect_uri", redirect.as_str()),
+        ("response_mode", "query"),
+        ("scope", scopes),
+        ("state", state.as_str()),
+        ("code_challenge", challenge.as_str()),
+        ("code_challenge_method", "S256"),
+    ];
+    params.extend_from_slice(extra);
+    let url = url::Url::parse_with_params(&format!("{}/{}/oauth2/v2.0/authorize", ends.login, cfg.tenant), &params).map_err(|e| Fail::new(e.to_string()))?.to_string();
+    Ok(PendingLogin { listeners, redirect, verifier, state, url, cfg: cfg.clone(), ends: ends.clone(), scopes: scopes.to_string(), resource })
 }
 
 impl PendingLogin {
     /// Waits for the browser's redirect (up to five minutes) and exchanges its code for tokens.
     pub fn finish(&self) -> Res<TokenAnswer> {
         let code = self.wait_for_code()?;
-        token_call(
-            &api_agent(),
-            &self.ends,
-            &self.cfg,
-            &[
-                ("client_id", self.cfg.client_id.as_str()),
-                ("grant_type", "authorization_code"),
-                ("code", code.as_str()),
-                ("redirect_uri", self.redirect.as_str()),
-                ("code_verifier", self.verifier.as_str()),
-                ("scope", SCOPES),
-            ],
-        )
+        let form = [
+            ("client_id", self.cfg.client_id.as_str()),
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", self.redirect.as_str()),
+            ("code_verifier", self.verifier.as_str()),
+            ("scope", self.scopes.as_str()),
+        ];
+        let read = if self.resource { crate::graph::resource_failure } else { crate::graph::login_failure };
+        token_call(&api_agent(), &self.ends, &self.cfg, &form, read)
     }
 
     fn wait_for_code(&self) -> Res<String> {

@@ -2,8 +2,9 @@
 //! the login of a desktop app (OAuth 2.0 authorization code with PKCE, a public client with a
 //! loopback redirect), the accounts and their refresh tokens in the OS credential store, and the
 //! calls the panes need: listing, new folders, renaming, moving, deleting to the recycle bin and
-//! restoring from it (personal accounts), copying on the server, resumable downloads, uploads in
-//! sessions, the storage quota, sharing links and the changes made elsewhere.
+//! restoring from it, copying on the server, resumable downloads, uploads in sessions, the
+//! storage quota, sharing links and the changes made elsewhere. A work or school account's
+//! recycle bin, which Graph doesn't reach, goes through SharePoint's REST API (see [`bin`]).
 //!
 //! Everything here blocks; the app runs it on background threads.
 //!
@@ -26,6 +27,7 @@
 //! [`cache`]). Throttling (429, 503) pauses the whole account for as long as `Retry-After` says.
 
 pub mod account;
+pub mod bin;
 pub mod cache;
 pub mod graph;
 pub mod oauth;
@@ -49,6 +51,7 @@ use openexplorer_i18n::{t, tr};
 use serde::{Deserialize, Serialize};
 
 pub use account::{Account, Area, Changes, Item, Kind, Quota, cached, connect, disconnect, reach, save_caches};
+pub use bin::{Access as BinAccess, BinItem};
 pub use cache::set_dir as set_cache_dir;
 pub use oauth::PendingLogin;
 pub use store::{Store, StoredAccount};
@@ -75,8 +78,8 @@ pub struct ClientConfig {
 /// client is missing.
 pub fn registration_help() -> String {
     tr!(
-        "Registre um aplicativo no portal do Microsoft Entra (entra.microsoft.com › Registros de aplicativo): tipos de conta \"Contas em qualquer diretório organizacional e contas pessoais da Microsoft\"; plataforma \"Aplicativos móveis e da área de trabalho\" com o URI de redirecionamento http://localhost; \"Permitir fluxos de clientes públicos\" ligado; permissões delegadas do Microsoft Graph Files.ReadWrite.All, offline_access e User.Read. Depois salve {{\"client_id\": \"<ID do aplicativo>\"}} em {} ou defina OPENEXPLORER_ONEDRIVE_CLIENT_ID.",
-        "Register an app in the Microsoft Entra portal (entra.microsoft.com › App registrations): account types \"Accounts in any organizational directory and personal Microsoft accounts\"; platform \"Mobile and desktop applications\" with the redirect URI http://localhost; \"Allow public client flows\" on; Microsoft Graph delegated permissions Files.ReadWrite.All, offline_access and User.Read. Then save {{\"client_id\": \"<Application ID>\"}} to {} or set OPENEXPLORER_ONEDRIVE_CLIENT_ID.",
+        "Registre um aplicativo no portal do Microsoft Entra (entra.microsoft.com › Registros de aplicativo): tipos de conta \"Contas em qualquer diretório organizacional e contas pessoais da Microsoft\"; plataforma \"Aplicativos móveis e da área de trabalho\" com o URI de redirecionamento http://localhost; \"Permitir fluxos de clientes públicos\" ligado; permissões delegadas do Microsoft Graph Files.ReadWrite.All, offline_access e User.Read (e, para a Lixeira de contas corporativas ou de estudante, a do SharePoint AllSites.Write). Depois salve {{\"client_id\": \"<ID do aplicativo>\"}} em {} ou defina OPENEXPLORER_ONEDRIVE_CLIENT_ID.",
+        "Register an app in the Microsoft Entra portal (entra.microsoft.com › App registrations): account types \"Accounts in any organizational directory and personal Microsoft accounts\"; platform \"Mobile and desktop applications\" with the redirect URI http://localhost; \"Allow public client flows\" on; Microsoft Graph delegated permissions Files.ReadWrite.All, offline_access and User.Read (and, for work or school accounts' recycle bin, SharePoint's AllSites.Write). Then save {{\"client_id\": \"<Application ID>\"}} to {} or set OPENEXPLORER_ONEDRIVE_CLIENT_ID.",
         client_file().display()
     )
 }

@@ -5,6 +5,7 @@
 //! asks for that: going on meanwhile gets the app blocked), then the request is sent again, a few
 //! times at most.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -113,6 +114,29 @@ pub fn login_failure(status: u16, body: &str) -> Fail {
     Fail { status, code, text }
 }
 
+/// The code a [`Fail`] carries when the app may not reach a resource (SharePoint) yet: its
+/// registration lacks the permission, or nobody granted it.
+pub const NEEDS_CONSENT: &str = "needsConsent";
+
+/// A refused token for another resource than Graph: not granted is [`NEEDS_CONSENT`], which the
+/// account lives with (the files still work through Graph); anything else reads as a login error.
+pub fn resource_failure(status: u16, body: &str) -> Fail {
+    let v: Value = serde_json::from_str(body).unwrap_or_default();
+    let code = v.get("error").and_then(Value::as_str).unwrap_or_default().to_string();
+    let desc = v.get("error_description").and_then(Value::as_str).unwrap_or(body);
+    // AADSTS65001: not granted. AADSTS650057: not among the registration's permissions.
+    // AADSTS70011: a scope that can't be asked. AADSTS500011: no such resource in the tenant.
+    // AADSTS90094/90095: only an administrator may grant it. AADSTS50076/50079 and
+    // interaction_required: the organization wants the person to sign in again for it.
+    let codes = ["AADSTS65001", "AADSTS650057", "AADSTS70011", "AADSTS500011", "AADSTS90094", "AADSTS90095", "AADSTS50076", "AADSTS50079"];
+    let refused = codes.iter().any(|c| desc.contains(c)) || matches!(code.as_str(), "consent_required" | "invalid_scope" | "interaction_required" | "invalid_resource");
+    if refused {
+        let first: String = desc.lines().next().unwrap_or_default().chars().take(300).collect();
+        return Fail { status, code: NEEDS_CONSENT.into(), text: first };
+    }
+    login_failure(status, body)
+}
+
 /// An answer as it came: status, the headers that matter, the body.
 #[derive(Debug)]
 pub struct Reply {
@@ -151,6 +175,9 @@ struct Tokens {
     access: String,
     expires: Instant,
     refresh: String,
+    /// Access tokens for other resources (SharePoint's REST, for a work account's recycle bin),
+    /// by the scope they were asked with, from the same refresh token.
+    others: HashMap<String, (String, Instant)>,
 }
 
 /// How many times a throttled or failed request is sent again.
@@ -201,13 +228,13 @@ pub struct TokenAnswer {
 }
 
 /// Posts a form to the token endpoint.
-pub(crate) fn token_call(agent: &ureq::Agent, ends: &Endpoints, cfg: &ClientConfig, form: &[(&str, &str)]) -> Res<TokenAnswer> {
+pub(crate) fn token_call(agent: &ureq::Agent, ends: &Endpoints, cfg: &ClientConfig, form: &[(&str, &str)], read: fn(u16, &str) -> Fail) -> Res<TokenAnswer> {
     let url = format!("{}/{}/oauth2/v2.0/token", ends.login, cfg.tenant);
     let mut resp = agent.post(&url).send_form(form.iter().copied()).map_err(|e| Fail::new(tr!("Não consegui falar com a Microsoft: {e}", "Couldn't talk to Microsoft: {e}")))?;
     let status = resp.status().as_u16();
     let body = resp.body_mut().read_to_string().map_err(|e| Fail::new(e.to_string()))?;
     if !(200..300).contains(&status) {
-        return Err(login_failure(status, &body));
+        return Err(read(status, &body));
     }
     serde_json::from_str(&body).map_err(|e| Fail::new(tr!("Resposta inesperada do login: {e}", "Unexpected answer from the login: {e}")))
 }
@@ -215,7 +242,7 @@ pub(crate) fn token_call(agent: &ureq::Agent, ends: &Endpoints, cfg: &ClientConf
 impl Graph {
     /// A connection that gets its first access token from `refresh` when first used.
     pub fn new(cfg: ClientConfig, ends: Endpoints, refresh: String, rotated: Box<dyn Fn(&str) + Send + Sync>) -> Graph {
-        let tokens = Tokens { access: String::new(), expires: Instant::now(), refresh };
+        let tokens = Tokens { access: String::new(), expires: Instant::now(), refresh, others: HashMap::new() };
         Graph { ends, cfg, agent: api_agent(), tokens: Mutex::new(tokens), pause: Mutex::new(None), rotated }
     }
 
@@ -244,7 +271,7 @@ impl Graph {
             return Ok(tk.access.clone());
         }
         let refresh = tk.refresh.clone();
-        let answer = token_call(&self.agent, &self.ends, &self.cfg, &[("client_id", self.cfg.client_id.as_str()), ("grant_type", "refresh_token"), ("refresh_token", refresh.as_str()), ("scope", crate::oauth::SCOPES)])?;
+        let answer = token_call(&self.agent, &self.ends, &self.cfg, &[("client_id", self.cfg.client_id.as_str()), ("grant_type", "refresh_token"), ("refresh_token", refresh.as_str()), ("scope", crate::oauth::SCOPES)], login_failure)?;
         tk.access = answer.access_token;
         tk.expires = Instant::now() + Duration::from_secs(answer.expires_in.max(60));
         if let Some(new) = answer.refresh_token.filter(|r| *r != tk.refresh) {
@@ -253,6 +280,54 @@ impl Graph {
             tk.refresh = new;
         }
         Ok(tk.access.clone())
+    }
+
+    /// An access token for another resource than Graph (`scope`, like
+    /// `https://contoso-my.sharepoint.com/.default`), from the same refresh token: Microsoft's
+    /// refresh tokens hold for every permission the app was granted, whatever resource the
+    /// sign-in asked for. Graph's token is left alone, and a refusal is read by
+    /// [`resource_failure`], so a resource the app wasn't granted never reads as a dead account.
+    pub fn token_for(&self, scope: &str, stale: Option<&str>) -> Res<String> {
+        let mut tk = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((access, expires)) = tk.others.get(scope)
+            && stale != Some(access.as_str())
+            && *expires > Instant::now() + Duration::from_secs(60)
+        {
+            return Ok(access.clone());
+        }
+        let refresh = tk.refresh.clone();
+        let wanted = format!("{scope} offline_access");
+        let url = format!("{}/{}/oauth2/v2.0/token", self.ends.login, self.cfg.tenant);
+        let form = [("client_id", self.cfg.client_id.as_str()), ("grant_type", "refresh_token"), ("refresh_token", refresh.as_str()), ("scope", wanted.as_str())];
+        let mut resp = self.agent.post(&url).send_form(form).map_err(|e| Fail::new(tr!("Não consegui falar com a Microsoft: {e}", "Couldn't talk to Microsoft: {e}")))?;
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().map_err(|e| Fail::new(e.to_string()))?;
+        if !(200..300).contains(&status) {
+            return Err(resource_failure(status, &body));
+        }
+        let answer: TokenAnswer = serde_json::from_str(&body).map_err(|e| Fail::new(tr!("Resposta inesperada do login: {e}", "Unexpected answer from the login: {e}")))?;
+        self.keep_answer(&mut tk, scope, &answer);
+        Ok(answer.access_token)
+    }
+
+    /// Takes in what a sign-in for another resource gave: its access token, and the refresh
+    /// token, which from then on holds for that resource too.
+    pub fn adopt(&self, scope: &str, answer: &TokenAnswer) {
+        let mut tk = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        self.keep_answer(&mut tk, scope, answer);
+    }
+
+    fn keep_answer(&self, tk: &mut Tokens, scope: &str, answer: &TokenAnswer) {
+        tk.others.insert(scope.to_string(), (answer.access_token.clone(), Instant::now() + Duration::from_secs(answer.expires_in.max(60))));
+        if let Some(new) = answer.refresh_token.clone().filter(|r| *r != tk.refresh) {
+            // Kept before the old one is let go, as for Graph's renewals.
+            (self.rotated)(&new);
+            tk.refresh = new;
+        }
+    }
+
+    pub fn client(&self) -> &ClientConfig {
+        &self.cfg
     }
 
     /// Waits out a pause another request was told to make.
@@ -284,7 +359,12 @@ impl Graph {
     /// throttled (429, 503) or Graph stumbled (502, 504), a few times at most. A request with
     /// no answer at all is sent again only when it reads (`GET`).
     pub fn send(&self, method: &str, path: &str, body: Body<'_>, headers: &[(&str, &str)]) -> Res<Reply> {
-        let url = self.url(path);
+        self.send_as(None, method, &self.url(path), body, headers)
+    }
+
+    /// [`Graph::send`] to the whole address `url` of another resource, with a token for `scope`
+    /// (see [`Graph::token_for`]); `None` is Graph.
+    pub fn send_as(&self, scope: Option<&str>, method: &str, url: &str, body: Body<'_>, headers: &[(&str, &str)]) -> Res<Reply> {
         let bytes: Option<(std::borrow::Cow<'_, [u8]>, &str)> = match body {
             Body::None => None,
             Body::Json(v) => Some((serde_json::to_vec(v).expect("JSON values serialize").into(), "application/json")),
@@ -294,9 +374,12 @@ impl Graph {
         let mut renewed = false;
         for attempt in 0..TRIES {
             self.wait_pause();
-            let token = self.access(stale.as_deref())?;
+            let token = match scope {
+                None => self.access(stale.as_deref())?,
+                Some(sc) => self.token_for(sc, stale.as_deref())?,
+            };
             let started = Instant::now();
-            let mut req = ureq::http::Request::builder().method(method).uri(&url).header("Authorization", format!("Bearer {token}"));
+            let mut req = ureq::http::Request::builder().method(method).uri(url).header("Authorization", format!("Bearer {token}"));
             for (k, v) in headers {
                 req = req.header(*k, *v);
             }
@@ -321,7 +404,7 @@ impl Graph {
                 retry_after: retry_after(&resp),
                 body: resp.body_mut().read_to_string().unwrap_or_default(),
             };
-            log(&format!("OneDrive {method} {} → {status} em {} ms", short(&url), started.elapsed().as_millis()));
+            log(&format!("OneDrive {method} {} → {status} em {} ms", short(url), started.elapsed().as_millis()));
             match status {
                 401 if !renewed => {
                     renewed = true;
