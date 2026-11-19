@@ -665,7 +665,8 @@ mod tests {
         assert_eq!(w.len(), 2);
         assert!(name_matches(&w, "Relatório anual 2025.pdf") && !name_matches(&w, "Relatório 2024.pdf"));
 
-        let root = std::env::temp_dir().join("openexplorer-finder-walk").join("relatorio");
+        // Of this run alone: other checkouts run the same test at once.
+        let root = std::env::temp_dir().join(format!("openexplorer-finder-walk-{}", std::process::id())).join("relatorio");
         let _ = std::fs::remove_dir_all(&root);
         for d in ["a/b/c", "Relatórios", "x"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
