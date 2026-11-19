@@ -11,8 +11,8 @@
 //!   The `content_hash` Dropbox computes is checked against the one computed here. (Files up to
 //!   150 MiB once went in one streamed request, which a 429 midway lost for good.)
 //! - Many small files go together (see [`crate::batch`]).
-//! - [`Account::same_content`] tells a file already on Dropbox with the same bytes, so it isn't
-//!   sent again.
+//! - [`Account::same_content`] tells, from a kept listing known current and without a request, a
+//!   file already on Dropbox with the same bytes, so it isn't sent again.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -59,6 +59,11 @@ pub(crate) fn correct_offset(error: &Value) -> Option<u64> {
     error.get("correct_offset").or_else(|| error.pointer("/incorrect_offset/correct_offset")).and_then(Value::as_u64)
 }
 
+/// Whether metadata `m` is of a file of `len` bytes whose content hash is `hash`.
+pub(crate) fn holds(m: &Value, len: u64, hash: &str) -> bool {
+    entry(m).is_some_and(|e| !e.dir && e.size == len && e.hash == hash)
+}
+
 impl Account {
     /// Writes the file at `path` into `out`.
     pub fn download(&self, path: &str, out: &mut dyn Write, progress: Progress) -> Result<()> {
@@ -75,7 +80,7 @@ impl Account {
             let (meta, resp) = match self.api.download("files/download", &json!({"path": target}), done) {
                 Ok(r) => r,
                 Err(f) => {
-                    let retry = matches!(f, Fail::Other(_)) && tries + 1 < TRIES && done > 0;
+                    let retry = matches!(f, Fail::Other(_) | Fail::Lost(_)) && tries + 1 < TRIES && done > 0;
                     if !retry {
                         return Err(match f {
                             Fail::Route { .. } => format!("“{}”: {}", last(&api_path(path)), f.text()),
@@ -210,7 +215,7 @@ impl Account {
                             break;
                         }
                     }
-                    Err(Fail::Other(e)) if tries + 1 < TRIES => {
+                    Err(Fail::Lost(e) | Fail::Other(e)) if tries + 1 < TRIES => {
                         tries += 1;
                         crate::api::log(&format!("Dropbox envio: bloco em {offset} falhou ({e}), de novo"));
                         std::thread::sleep(Duration::from_millis(500 << tries));
@@ -227,13 +232,31 @@ impl Account {
             return Err(tr!("O arquivo mudou de tamanho durante o envio ({offset} de {len} bytes).", "The file changed size while being sent ({offset} of {len} bytes)."));
         }
         let id = session.unwrap_or_default();
-        self.api.upload("files/upload_session/finish", &json!({"cursor": {"session_id": id, "offset": offset}, "commit": commit}), &mut Body::Bytes(&[], None)).map_err(String::from)
+        self.finish(&id, offset, commit, &hash.clone().finish()).map_err(String::from)
+    }
+
+    /// Commits upload session `id`, `len` bytes long, as `commit` says. Its answer lost, the
+    /// commit is done when the file at the commit's path has these bytes (`len` and `hash`, the
+    /// content hash); else the session, not taken yet, is committed again.
+    pub(crate) fn finish(&self, id: &str, len: u64, commit: &Value, hash: &str) -> std::result::Result<Value, Fail> {
+        let path = commit.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        let arg = json!({"cursor": {"session_id": id, "offset": len}, "commit": commit});
+        self.write(
+            "upload_session/finish",
+            || self.api.upload("files/upload_session/finish", &arg, &mut Body::Bytes(&[], None)),
+            || Ok(self.metadata(&path)?.filter(|m| holds(m, len, hash))),
+        )
     }
 
     /// Whether the file at `path` on Dropbox has the same bytes as `local` (same size, same
-    /// `content_hash`): then it needn't be sent. Reads `local` only when the sizes agree.
+    /// `content_hash`): then it needn't be sent. Answered from the kept listing of its folder
+    /// alone, and only while that's known current (a watcher waiting, the log just read): no
+    /// request, ever. A file sent into a new folder or under a free name (the panes' usual case)
+    /// would only pay a `get_metadata` to hear "not there"; the case it saves, a file sent again
+    /// over the same bytes, is one the pane showing that folder has just listed. Reads `local`
+    /// only when the sizes agree.
     pub fn same_content(&self, path: &str, local: &Path, stop: &dyn Fn() -> bool) -> Result<bool> {
-        let Some(there) = self.stat(path)? else { return Ok(false) };
+        let Some(Some(there)) = self.known(path) else { return Ok(false) };
         let len = std::fs::metadata(local).map(|m| m.len()).unwrap_or(u64::MAX);
         if there.dir || there.size != len || there.hash.is_empty() {
             return Ok(false);
@@ -309,14 +332,45 @@ mod tests {
         std::fs::write(&local, &data).unwrap();
         fake.put_file("/x.bin", &data);
         let a = fake.account();
+        a.list("/").unwrap();
+        a.catch_up().unwrap();
+        let before = fake.calls();
         assert!(a.same_content("/x.bin", &local, &|| false).unwrap());
+        assert!(fake.calls_since(&before).is_empty(), "answered from the kept listing");
         let mut other = data.clone();
         other[10] ^= 1;
         fake.put_file("/x.bin", &other);
-        a.reload("/").unwrap();
+        a.catch_up().unwrap();
         assert!(!a.same_content("/x.bin", &local, &|| false).unwrap());
         assert!(!a.same_content("/nada.bin", &local, &|| false).unwrap());
+        // Not known current: sent, without asking first.
+        fake.put_file("/x.bin", &data);
+        a.forget_fresh();
+        let before = fake.calls();
+        assert!(!a.same_content("/x.bin", &local, &|| false).unwrap());
+        assert!(fake.calls_since(&before).is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_commit_whose_answer_was_lost_is_checked_by_its_bytes() {
+        let fake = Fake::start();
+        let a = fake.account();
+        let data = bytes(super::BLOCK + 10);
+        // Committed, the answer lost: the file there has these bytes, so it's done.
+        fake.lose_answer("files/upload_session/finish");
+        let before = fake.calls();
+        let e = a.upload("/um.bin", &mut &data[..], data.len() as u64, &mut |_| true).unwrap();
+        assert_eq!(e.size, data.len() as u64);
+        assert_eq!(fake.count_since(&before, "files/upload_session/finish"), 1);
+        assert_eq!(fake.content("/um.bin"), data);
+        // Over a file that was there: the old bytes don't count as committed.
+        fake.put_file("/dois.bin", b"antigo");
+        fake.drop_before("files/upload_session/finish");
+        let before = fake.calls();
+        a.upload("/dois.bin", &mut &data[..], data.len() as u64, &mut |_| true).unwrap();
+        assert_eq!(fake.count_since(&before, "files/upload_session/finish"), 2);
+        assert_eq!(fake.content("/dois.bin"), data);
     }
 
     #[test]

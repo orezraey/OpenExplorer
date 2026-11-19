@@ -10,6 +10,10 @@
 //! a few rounds, then one by one, which waits as long as Dropbox asks. Every other failure is
 //! that entry's own (a name taken, a folder into itself), as in the one-item calls: nothing is
 //! renamed on the way (`autorename` stays off).
+//!
+//! A batch whose answer was lost (the job's launch, its check, the commit) isn't sent again
+//! blindly: the folders on both sides are read once, entries found done are taken as done, and
+//! only the others go again.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,8 +30,9 @@ use crate::{CANCELLED, Result};
 
 /// Entries per relocation batch: the most Dropbox takes.
 const RELOCATE_MAX: usize = 1000;
-/// Files per upload batch. Dropbox takes 500 per append and 1,000 per finish, but the finish
-/// answers only once all are committed, within the minute and a half an RPC is given.
+/// Files per upload batch. Dropbox takes 500 per append and 1,000 per finish; the finish answers
+/// only once all are committed (it's given [`crate::api::commit_timeout`] for that), and a
+/// smaller batch keeps what a lost answer leaves to check small.
 pub const UPLOAD_FILES: usize = 250;
 /// Bytes per upload batch: all held in memory, to be sent again when Dropbox asks to wait.
 const UPLOAD_BYTES: usize = 32 << 20;
@@ -41,6 +46,9 @@ enum Outcome {
     Done(Entry),
     /// Dropbox was too busy, or failed on its side: worth another try.
     Busy,
+    /// Of a job whose answer was lost, not done when looked at: worth another try, its failure
+    /// looked at again (the job may end after the look).
+    Unsure,
     /// The entry's own failure: an `error_summary`-like text.
     Failed(String),
 }
@@ -50,6 +58,13 @@ fn failed(f: &Value) -> Outcome {
     let summary = failure_summary(f);
     let busy = summary.split(['/', '.']).any(|w| w == "too_many_write_operations" || w == "internal_error");
     if busy { Outcome::Busy } else { Outcome::Failed(summary) }
+}
+
+/// The content hash of `data`.
+fn hash_of(data: &[u8]) -> String {
+    let mut h = Hasher::default();
+    h.update(data);
+    h.finish()
 }
 
 /// An item's failure in the user's words.
@@ -73,6 +88,8 @@ impl Account {
 
     fn relocate_many(&self, pairs: &[(String, String)], moving: bool) -> Vec<Result<Entry>> {
         let mut out: Vec<Option<Result<Entry>>> = vec![None; pairs.len()];
+        // Entries of a job whose answer was lost, not found done when checked.
+        let mut unsure = vec![false; pairs.len()];
         let mut todo = Vec::new();
         for (i, (from, to)) in pairs.iter().enumerate() {
             if moving && key(from) == key(to) {
@@ -102,6 +119,10 @@ impl Account {
                                     out[i] = Some(Ok(e));
                                 }
                                 Outcome::Busy => again.push(i),
+                                Outcome::Unsure => {
+                                    unsure[i] = true;
+                                    again.push(i);
+                                }
                                 Outcome::Failed(summary) => out[i] = Some(Err(named(&pairs[i].0, &summary))),
                             }
                         }
@@ -116,6 +137,26 @@ impl Account {
             let (from, to) = &pairs[i];
             out[i] = Some(if moving { self.rename(from, to) } else { self.copy(from, to) });
         }
+        // An entry of a job whose answer was lost that failed when sent again may have met that
+        // job's own work, done after the check: looked at once more before it counts as failed.
+        let doubtful: Vec<usize> = (0..pairs.len()).filter(|&i| unsure[i] && matches!(out[i], Some(Err(_)))).collect();
+        if !doubtful.is_empty() {
+            std::thread::sleep(crate::account::SETTLE);
+            let paths: Vec<&str> = doubtful.iter().flat_map(|&i| [pairs[i].0.as_str(), pairs[i].1.as_str()]).collect();
+            if let Ok(seen) = self.look(&paths) {
+                let mut changes = Vec::new();
+                for i in doubtful {
+                    if let Some(e) = Account::relocated(&seen, &pairs[i].0, &pairs[i].1, moving) {
+                        if moving {
+                            changes.push(Change::Gone(key(&pairs[i].0)));
+                        }
+                        changes.push(Change::Is(e.clone()));
+                        out[i] = Some(Ok(e));
+                    }
+                }
+                self.note(&changes);
+            }
+        }
         out.into_iter().map(|r| r.expect("every entry ends")).collect()
     }
 
@@ -127,9 +168,23 @@ impl Account {
         if moving {
             arg["allow_ownership_transfer"] = json!(false);
         }
-        let _gate = self.batch_gate.lock().unwrap_or_else(|e| e.into_inner());
-        let first = self.api.rpc(route, &arg).map_err(String::from)?;
-        let done = self.wait_job(check, first)?;
+        let answer = {
+            let _gate = self.batch_gate.lock().unwrap_or_else(|e| e.into_inner());
+            self.api.rpc(route, &arg).and_then(|first| self.wait_job(check, first))
+        };
+        let done = match answer {
+            Ok(v) => v,
+            // Whether the job ran is unknown: each entry as Dropbox has it now (the folders on
+            // both sides read once); what isn't done goes again.
+            Err(Fail::Lost(e)) => {
+                crate::api::log(&format!("Dropbox {route}: a resposta não veio ({e}); conferindo"));
+                std::thread::sleep(crate::account::SETTLE);
+                let paths: Vec<&str> = entries.iter().flat_map(|(f, t)| [*f, *t]).collect();
+                let seen = self.look(&paths).map_err(String::from)?;
+                return Ok(entries.iter().map(|(f, t)| Account::relocated(&seen, f, t, moving).map_or(Outcome::Unsure, Outcome::Done)).collect());
+            }
+            Err(f) => return Err(f.text()),
+        };
         let results: Vec<Value> = done.get("entries").and_then(Value::as_array).cloned().unwrap_or_default();
         let mut out: Vec<Outcome> = results
             .iter()
@@ -339,6 +394,8 @@ impl Account {
                 Ok(e)
             });
         };
+        // Files of a commit whose answer was lost, not found committed when looked at.
+        let mut unsure: Vec<(usize, &Vec<u8>)> = Vec::new();
         for _ in 0..ROUNDS {
             if ready.is_empty() {
                 break;
@@ -346,10 +403,40 @@ impl Account {
             let entries: Vec<Value> = ready.iter().map(|(i, id, d)| json!({"cursor": {"session_id": id, "offset": d.len()}, "commit": commit(&files[*i].0)})).collect();
             let answer = {
                 let _gate = self.batch_gate.lock().unwrap_or_else(|e| e.into_inner());
-                self.api.rpc("files/upload_session/finish_batch_v2", &json!({"entries": entries}))
+                // It answers once all are committed: given as long as that may take.
+                self.api.rpc_waiting("files/upload_session/finish_batch_v2", &json!({"entries": entries}), crate::api::commit_timeout(entries.len()))
             };
             let results = match answer {
                 Ok(v) => v.get("entries").and_then(Value::as_array).cloned().unwrap_or_default(),
+                // Whether it committed is unknown: the files whose bytes are where they go
+                // (their folders read once) are done, the others committed again.
+                Err(Fail::Lost(e)) => {
+                    crate::api::log(&format!("Dropbox finish_batch_v2: a resposta não veio ({e}); conferindo"));
+                    std::thread::sleep(crate::account::SETTLE);
+                    let paths: Vec<&str> = ready.iter().map(|(i, ..)| files[*i].0.as_str()).collect();
+                    let seen = match self.look(&paths) {
+                        Ok(s) => s,
+                        Err(f) => {
+                            for (i, ..) in &ready {
+                                out[*i] = Some(Err(format!("“{}”: {}", last(&api_path(&files[*i].0)), f.text())));
+                            }
+                            ready.clear();
+                            break;
+                        }
+                    };
+                    let mut again = Vec::new();
+                    for (i, id, d) in ready {
+                        match seen.get(&key(&files[i].0)).filter(|e| !e.dir && e.size == d.len() as u64 && e.hash == hash_of(d)) {
+                            Some(e) => done(i, e.clone(), d, out),
+                            None => {
+                                unsure.push((i, d));
+                                again.push((i, id, d));
+                            }
+                        }
+                    }
+                    ready = again;
+                    continue;
+                }
                 Err(f) => {
                     for (i, ..) in &ready {
                         out[*i] = Some(Err(format!("“{}”: {}", last(&api_path(&files[*i].0)), f.text())));
@@ -378,13 +465,26 @@ impl Account {
         }
         // Still too busy: each session finished alone, waiting as long as Dropbox asks.
         for (i, id, d) in ready {
-            let arg = json!({"cursor": {"session_id": id, "offset": d.len()}, "commit": commit(&files[i].0)});
-            match self.api.upload("files/upload_session/finish", &arg, &mut Body::Bytes(&[], None)) {
+            match self.finish(&id, d.len() as u64, &commit(&files[i].0), &hash_of(d)) {
                 Ok(v) => match entry(&v) {
                     Some(e) => done(i, e, d, out),
                     None => out[i] = Some(Err(t("O Dropbox respondeu sem os dados do arquivo.", "Dropbox answered without the file's details.").into())),
                 },
                 Err(f) => out[i] = Some(Err(format!("“{}”: {}", last(&api_path(&files[i].0)), f.text()))),
+            }
+        }
+        // One of those that failed when committed again (its session taken: `not_found`) may
+        // have met that commit, done after the look: looked at once more before it counts.
+        unsure.retain(|(i, _)| matches!(out[*i], Some(Err(_))));
+        if !unsure.is_empty() {
+            std::thread::sleep(crate::account::SETTLE);
+            let paths: Vec<&str> = unsure.iter().map(|(i, _)| files[*i].0.as_str()).collect();
+            if let Ok(seen) = self.look(&paths) {
+                for (i, d) in unsure {
+                    if let Some(e) = seen.get(&key(&files[i].0)).filter(|e| !e.dir && e.size == d.len() as u64 && e.hash == hash_of(d)) {
+                        done(i, e.clone(), d, out);
+                    }
+                }
             }
         }
         drop(done);
@@ -528,6 +628,90 @@ mod tests {
         // The append stopped midway never reached Dropbox, nor did any other.
         assert_eq!(fake.calls_since(&before), ["files/upload_session/start_batch"]);
         assert!(a.list("/F").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn batches_whose_answer_was_lost_are_checked_not_sent_again() {
+        let fake = Fake::start();
+        for i in 0..4 {
+            fake.put_file(&format!("/A/f{i}.txt"), format!("{i}").as_bytes());
+        }
+        let a = fake.account();
+        let pairs: Vec<(String, String)> = (0..4).map(|i| (format!("/A/f{i}.txt"), format!("/B/f{i}.txt"))).collect();
+        fake.lose_answer("files/move_batch_v2");
+        let before = fake.calls();
+        let r = a.move_many(&pairs);
+        assert!(r.iter().all(Result::is_ok), "{r:?}");
+        assert_eq!(fake.count_since(&before, "files/move_batch_v2"), 1);
+        assert_eq!(fake.count_since(&before, "files/move_v2"), 0);
+        let copies: Vec<(String, String)> = (0..4).map(|i| (format!("/B/f{i}.txt"), format!("/C/f{i}.txt"))).collect();
+        fake.lose_answer("files/copy_batch_v2");
+        let before = fake.calls();
+        assert!(a.copy_many(&copies).iter().all(Result::is_ok));
+        assert_eq!(fake.count_since(&before, "files/copy_batch_v2") + fake.count_since(&before, "files/copy_v2"), 1);
+        assert_eq!(fake.content("/C/f3.txt"), b"3");
+        // Deletions: each item's last revision, for Desfazer.
+        fake.lose_answer("files/delete_batch");
+        let before = fake.calls();
+        let gone: Vec<String> = (0..4).map(|i| format!("/C/f{i}.txt")).collect();
+        let r = a.delete_many(&gone).unwrap();
+        assert!(r.iter().all(|e| e.as_ref().is_ok_and(|e| !e.rev.is_empty())), "{r:?}");
+        assert_eq!(fake.count_since(&before, "files/delete_batch"), 1);
+        assert_eq!(fake.count_since(&before, "files/delete_v2"), 0);
+        assert!(!fake.has("/C/f0.txt"));
+    }
+
+    #[test]
+    fn a_batch_done_after_its_check_is_not_reported_as_failed() {
+        let fake = Fake::start();
+        for i in 0..4 {
+            fake.put_file(&format!("/A/f{i}.txt"), b"x");
+        }
+        let a = fake.account();
+        // The job lands after the look, just before it's launched again (whose entries then
+        // all fail: nothing left to move).
+        fake.late("files/move_batch_v2");
+        let pairs: Vec<(String, String)> = (0..4).map(|i| (format!("/A/f{i}.txt"), format!("/B/f{i}.txt"))).collect();
+        let r = a.move_many(&pairs);
+        assert!(r.iter().all(Result::is_ok), "{r:?}");
+        assert!(fake.has("/B/f3.txt") && !fake.has("/A/f3.txt"));
+        // The same for a commit of small files.
+        let (dir, locals) = local_files("late", &[10, 3000]);
+        let files: Vec<(String, PathBuf)> = locals.iter().enumerate().map(|(i, l)| (format!("/U/f{i}.bin"), l.clone())).collect();
+        fake.late("files/upload_session/finish_batch_v2");
+        let r = a.upload_many(&files, &mut |_, _| true);
+        assert!(r.iter().all(Result::is_ok), "{r:?}");
+        assert_eq!(fake.content("/U/f1.bin"), std::fs::read(&locals[1]).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_upload_commit_whose_answer_was_lost_is_checked_by_its_bytes() {
+        let fake = Fake::start();
+        let (dir, locals) = local_files("lost", &[10, 3000, 70_000]);
+        fake.put_file("/L/f1.bin", b"antes");
+        let a = fake.account();
+        let files: Vec<(String, PathBuf)> = locals.iter().enumerate().map(|(i, l)| (format!("/L/f{i}.bin"), l.clone())).collect();
+        fake.lose_answer("files/upload_session/finish_batch_v2");
+        let before = fake.calls();
+        let r = a.upload_many(&files, &mut |_, _| true);
+        assert!(r.iter().all(Result::is_ok), "{r:?}");
+        assert_eq!(fake.count_since(&before, "files/upload_session/finish_batch_v2"), 1);
+        assert_eq!(fake.count_since(&before, "files/upload_session/finish"), 0);
+        for (i, l) in locals.iter().enumerate() {
+            assert_eq!(fake.content(&format!("/L/f{i}.bin")), std::fs::read(l).unwrap());
+        }
+        // Never reached Dropbox: committed again, the same sessions.
+        let files: Vec<(String, PathBuf)> = locals.iter().enumerate().map(|(i, l)| (format!("/M/f{i}.bin"), l.clone())).collect();
+        fake.drop_before("files/upload_session/finish_batch_v2");
+        let before = fake.calls();
+        assert!(a.upload_many(&files, &mut |_, _| true).iter().all(Result::is_ok));
+        assert_eq!(fake.count_since(&before, "files/upload_session/finish_batch_v2"), 2);
+        assert_eq!(fake.count_since(&before, "files/upload_session/start_batch"), 1);
+        assert_eq!(fake.content("/M/f2.bin"), std::fs::read(&locals[2]).unwrap());
+        // As long as the batch may take: more than an RPC's minute and a half.
+        assert!(crate::api::commit_timeout(UPLOAD_FILES) > std::time::Duration::from_secs(5 * 60));
         let _ = std::fs::remove_dir_all(dir);
     }
 

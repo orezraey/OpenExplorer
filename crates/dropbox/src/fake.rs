@@ -69,6 +69,16 @@ struct State {
     cut_download: Option<u64>,
     ranges: Vec<(String, u64)>,
     tokens: u64,
+    /// The next call to this route is done, but its answer never leaves (the connection drops).
+    lose_answer: Option<String>,
+    /// The next calls to this route (how many) drop their connection before anything is done.
+    drop_before: Option<(String, usize)>,
+    /// The next call to this route is held, and done just before the call after it.
+    late: Option<String>,
+    held: Option<(String, Request)>,
+    /// Longpolls waiting now, and the most that ever waited at once.
+    polling: usize,
+    most_polling: usize,
 }
 
 /// The stand-in, serving until dropped.
@@ -401,6 +411,34 @@ impl Fake {
         self.st().batches.iter().filter(|(r, _)| r == route).map(|(_, n)| *n).collect()
     }
 
+    /// The next call to `route` does its work, then drops the connection without answering:
+    /// a request that reached Dropbox whose answer was lost.
+    pub fn lose_answer(&self, route: &str) {
+        self.st().lose_answer = Some(route.into());
+    }
+
+    /// The next call to `route` drops the connection before doing anything.
+    pub fn drop_before(&self, route: &str) {
+        self.drop_many(route, 1);
+    }
+
+    /// The next `n` calls to `route` drop the connection before doing anything.
+    pub fn drop_many(&self, route: &str, n: usize) {
+        self.st().drop_before = Some((route.into(), n));
+    }
+
+    /// The next call to `route` drops its connection at once, and its work is done only when
+    /// the next call to the same route comes, just before that one: a request whose answer was
+    /// lost, done after the check that found it not done.
+    pub fn late(&self, route: &str) {
+        self.st().late = Some(route.into());
+    }
+
+    /// The most longpolls that ever waited at once.
+    pub fn most_longpolls(&self) -> usize {
+        self.st().most_polling
+    }
+
     /// Calls made since `before` to `route`.
     pub fn count_since(&self, before: &usize, route: &str) -> usize {
         self.calls_since(before).iter().filter(|c| c.as_str() == route).count()
@@ -460,6 +498,22 @@ fn respond(conn: &mut TcpStream, status: u16, headers: &[(String, String)], body
     let _ = conn.write_all(body);
 }
 
+/// Sends `req` again to the stand-in `conn` came to, and waits for its answer.
+fn replay(conn: &TcpStream, req: &Request) {
+    let Ok(addr) = conn.local_addr() else { return };
+    let Ok(mut s) = TcpStream::connect(addr) else { return };
+    let mut head = format!("POST {} HTTP/1.1\r\n", req.path);
+    for (k, v) in &req.headers {
+        if !matches!(k.as_str(), "content-length" | "transfer-encoding" | "connection") {
+            head.push_str(&format!("{k}: {v}\r\n"));
+        }
+    }
+    head.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n", req.body.len()));
+    let _ = s.write_all(head.as_bytes());
+    let _ = s.write_all(&req.body);
+    let _ = s.read_to_end(&mut Vec::new());
+}
+
 fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
     let Some(req) = read_request(&conn) else { return };
     let route = req.path.trim_start_matches("/2/").trim_start_matches('/').to_string();
@@ -487,6 +541,32 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
             return respond(&mut conn, 401, &[], json!({"error_summary": "invalid_access_token/..", "error": {".tag": "invalid_access_token"}}).to_string().as_bytes());
         }
         st.last_root = req.headers.get("dropbox-api-path-root").cloned();
+    }
+    if let Some((r, n)) = &mut st.drop_before
+        && *r == route
+    {
+        *n -= 1;
+        if *n == 0 {
+            st.drop_before = None;
+        }
+        drop(st);
+        let _ = conn.shutdown(std::net::Shutdown::Both);
+        return;
+    }
+    if st.late.as_deref() == Some(route.as_str()) {
+        st.late = None;
+        st.held = Some((route.clone(), req));
+        drop(st);
+        let _ = conn.shutdown(std::net::Shutdown::Both);
+        return;
+    }
+    // A call held back (`late`) is done now, just before this one to its route.
+    if st.held.as_ref().is_some_and(|(r, _)| *r == route)
+        && let Some((_, old)) = st.held.take()
+    {
+        drop(st);
+        replay(&conn, &old);
+        st = state.0.lock().unwrap();
     }
     let s = |k: &str| arg.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let lower = |p: String| p.to_lowercase();
@@ -577,7 +657,9 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
             let c: Value = serde_json::from_str(&s("cursor")).unwrap_or(Value::Null);
             let (at, path, recursive) = (c[1].as_u64().unwrap_or(0) as usize, c[2].as_str().unwrap_or("").to_string(), c[3].as_bool().unwrap_or(false));
             let until = Instant::now() + Duration::from_secs(arg["timeout"].as_u64().unwrap_or(30));
-            loop {
+            st.polling += 1;
+            st.most_polling = st.most_polling.max(st.polling);
+            let answer = loop {
                 if st.log[at.min(st.log.len())..].iter().any(|(k, _)| under(k, &path, recursive)) {
                     break ok(json!({"changes": true}));
                 }
@@ -586,11 +668,20 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
                     break ok(json!({"changes": false}));
                 }
                 st = state.1.wait_timeout(st, left).unwrap().0;
-            }
+            };
+            st.polling -= 1;
+            answer
         }
-        "files/get_metadata" => match st.nodes.get(&lower(s("path"))) {
-            Some(n) => ok(meta(&lower(s("path")), n)),
-            None => not_found("path"),
+        "files/get_metadata" => match s("path").strip_prefix("rev:") {
+            // A path of the form rev:<rev> names that revision of a file.
+            Some(rev) => match st.revs.get(rev) {
+                Some((d, data)) => ok(meta(&d.to_lowercase(), &Node { display: d.clone(), dir: false, data: data.clone(), rev: rev.to_string() })),
+                None => not_found("path"),
+            },
+            None => match st.nodes.get(&lower(s("path"))) {
+                Some(n) => ok(meta(&lower(s("path")), n)),
+                None => not_found("path"),
+            },
         },
         "files/create_folder_v2" => {
             let (display, l) = (s("path"), lower(s("path")));
@@ -794,11 +885,16 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
         }
         "files/upload_session/finish" => {
             let id = arg.pointer("/cursor/session_id").and_then(Value::as_str).unwrap_or("").to_string();
-            let (mut data, _) = st.sessions.remove(&id).unwrap_or_default();
-            data.extend_from_slice(&req.body);
-            let path = arg.pointer("/commit/path").and_then(Value::as_str).unwrap_or("").to_string();
-            let m = st.put(&path, data);
-            ok(untagged(m))
+            match st.sessions.remove(&id) {
+                // Committed already (or never opened): its id is no more.
+                None => route_error("lookup_failed/not_found/", json!({".tag": "lookup_failed", "lookup_failed": {".tag": "not_found"}})),
+                Some((mut data, _)) => {
+                    data.extend_from_slice(&req.body);
+                    let path = arg.pointer("/commit/path").and_then(Value::as_str).unwrap_or("").to_string();
+                    let m = st.put(&path, data);
+                    ok(untagged(m))
+                }
+            }
         }
         "files/upload_session/finish_batch_v2" => {
             let entries = arg["entries"].as_array().cloned().unwrap_or_default();
@@ -857,8 +953,16 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
         other => (400, vec![], format!("Error in call to API function \"{other}\": unknown route").into_bytes()),
     };
     let delay = st.delay;
+    let lose = st.lose_answer.as_deref() == Some(route.as_str());
+    if lose {
+        st.lose_answer = None;
+    }
     drop(st);
     state.1.notify_all();
+    if lose {
+        let _ = conn.shutdown(std::net::Shutdown::Both);
+        return;
+    }
     if !delay.is_zero() {
         std::thread::sleep(delay);
     }
