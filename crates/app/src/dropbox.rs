@@ -3,9 +3,10 @@
 //! account's top, a team space's top for a team member (team folders beside their own).
 //! Listing, copying to and from anywhere, moving, renaming, new folders, searching and dragging
 //! go through the servers' code, with the account as the connection (`openexplorer_remote`'s
-//! `dropbox.rs`). What only Dropbox has lives here: adding an account (OAuth in the browser),
-//! deleting into Dropbox's deleted files and undoing it, shared links, the storage in the status
-//! bar, and folders that refresh when something changes elsewhere (a longpoll per account).
+//! `dropbox.rs`; many items at once in Dropbox's batches). What only Dropbox has lives here:
+//! adding an account (OAuth in the browser), deleting into Dropbox's deleted files and undoing
+//! it, a folder's deleted items and restoring them, shared links, the storage in the status bar,
+//! and folders that refresh when something changes elsewhere (a longpoll per account).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -14,7 +15,7 @@ use openexplorer_dropbox::{self as dropbox, Account, AppConfig, Changes, Quota};
 use openexplorer_i18n::{t, tr};
 use openexplorer_remote::Server;
 use rune::{El, ScrollSpec, Tx, col, el, icon, row, text};
-use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit};
+use rune_kit::{Button, ButtonVariant, Checkbox, Dialog as Modal, Kit};
 
 use crate::actions::{Dialog, selected};
 use crate::model::{Entry, Location};
@@ -80,6 +81,8 @@ pub enum Answer {
     Link { server: Box<Server>, path: String, item: Entry, result: Result<Option<String>, String> },
     /// A link made (`Some`) or taken away (`None`) for the item named `name`.
     Linked { name: String, result: Result<Option<String>, String> },
+    /// What was deleted from the folder at `path` (Itens excluídos).
+    Deleted { path: String, result: Result<Vec<dropbox::Deleted>, String> },
 }
 
 pub fn arrived(s: &mut State, a: Answer, tx: &mut Tx, now: f64) {
@@ -108,6 +111,14 @@ pub fn arrived(s: &mut State, a: Answer, tx: &mut Tx, now: f64) {
             Ok(None) => s.status = tr!("Link removido: \"{name}\" não abre mais pelo link.", "Link removed: \"{name}\" no longer opens from the link."),
             Err(e) => crate::fail(s, e),
         },
+        Answer::Deleted { path, result } => {
+            if let Some(v) = view_mut(s)
+                && v.path == path
+            {
+                v.picked = vec![false; result.as_ref().map_or(0, Vec::len)];
+                v.items = Some(result);
+            }
+        }
     }
 }
 
@@ -353,10 +364,6 @@ pub fn delete_note() -> &'static str {
     )
 }
 
-/// How far before a folder's deletion files deleted from it count as deleted with it: the
-/// computer's clock and Dropbox's may disagree a little.
-const SKEW: i64 = 120;
-
 /// Excluir: the items go to Dropbox's deleted files (several in one batch), and Desfazer brings
 /// them back.
 pub fn delete(s: &mut State, loc: &Location, items: Vec<Entry>) {
@@ -366,18 +373,20 @@ pub fn delete(s: &mut State, loc: &Location, items: Vec<Entry>) {
     let paths: Vec<(String, String)> = items.iter().filter_map(|e| path_of(loc, e).map(|p| (p, e.name.clone()))).collect();
     undo::local_job(s, reload, |n| tr!("excluir {} do Dropbox", "delete {} from Dropbox", crate::actions::count(n)), move |rec| {
         let a = dropbox::reach(&server.user)?;
-        let since = undo::now_secs() - SKEW;
+        // The deletion's window on Dropbox's clock, for Desfazer to bring back what it took.
+        let since = a.api.server_now() - 2;
         let results = match paths.as_slice() {
             [(one, _)] => vec![a.delete(one)],
             many => a.delete_many(&many.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>())?,
         };
+        let until = a.api.server_now() + 1;
         let mut failed = Vec::new();
         let mut done = 0;
         for (r, (path, name)) in results.into_iter().zip(&paths) {
             match r {
                 Ok(e) => {
                     done += 1;
-                    rec.add([Step::DropboxRestore { server: server.clone(), path: path.clone(), name: name.clone(), rev: (!e.dir).then_some(e.rev), since }]);
+                    rec.add([Step::DropboxRestore { server: server.clone(), path: path.clone(), name: name.clone(), rev: (!e.dir).then_some(e.rev), since, until }]);
                 }
                 Err(e) => failed.push(e),
             }
@@ -410,24 +419,173 @@ pub fn run(step: &Step) -> Result<Step, String> {
     match step {
         Step::DropboxDelete { server, path, name } => {
             let a = dropbox::reach(&server.user)?;
-            let since = undo::now_secs() - SKEW;
+            let since = a.api.server_now() - 2;
             let e = a.delete(path)?;
-            Ok(Step::DropboxRestore { server: server.clone(), path: path.clone(), name: name.clone(), rev: (!e.dir).then_some(e.rev), since })
+            let until = a.api.server_now() + 1;
+            Ok(Step::DropboxRestore { server: server.clone(), path: path.clone(), name: name.clone(), rev: (!e.dir).then_some(e.rev), since, until })
         }
-        Step::DropboxRestore { server, path, name, rev, since } => {
+        Step::DropboxRestore { server, path, name, rev, since, until } => {
             let a = dropbox::reach(&server.user)?;
             match rev {
                 Some(rev) => {
                     a.restore(path, rev)?;
                 }
                 None => {
-                    a.restore_folder(path, *since)?;
+                    a.restore_folder(path, Some((*since, *until)))?;
                 }
             }
             Ok(Step::DropboxDelete { server: server.clone(), path: path.clone(), name: name.clone() })
         }
         other => Ok(other.clone()),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A folder's deleted items
+
+/// Itens excluídos: what was deleted from a folder, as the Dropbox website's "deleted files"
+/// shows it, to pick and bring back.
+pub struct DeletedView {
+    pub server: Server,
+    /// The folder's path on the account.
+    pub path: String,
+    /// Its name, for the title.
+    pub place: String,
+    /// What was deleted there: `None` while it's asked.
+    pub items: Option<Result<Vec<dropbox::Deleted>, String>>,
+    /// Which of `items` are ticked.
+    pub picked: Vec<bool>,
+}
+
+fn view_mut(s: &mut State) -> Option<&mut DeletedView> {
+    match &mut s.dialog {
+        Some(Dialog::DropboxDeleted(v)) => Some(v),
+        _ => None,
+    }
+}
+
+/// Whether pane `p` shows a Dropbox folder (not a search), where Itens excluídos applies.
+pub fn shows_folder(s: &State, p: usize) -> bool {
+    matches!(&s.panes[p].loc, Location::Server { server, find: None, .. } if server.is_dropbox())
+}
+
+/// Itens excluídos: the deleted items of the folder pane `p` shows, in a dialog.
+pub fn show_deleted(s: &mut State, p: usize, _: &mut Tx) {
+    if !shows_folder(s, p) {
+        return;
+    }
+    let Some((server, path)) = at(&s.panes[p].loc) else { return };
+    let (server, dir) = (server.clone(), server.path(path));
+    let place = path.last().cloned().unwrap_or_else(|| server.name.clone());
+    s.dialog = Some(Dialog::DropboxDeleted(Box::new(DeletedView { server: server.clone(), path: dir.clone(), place, items: None, picked: Vec::new() })));
+    let at_path = dir.clone();
+    task(s, &server, t("listar os itens excluídos", "list the deleted items"), move |a| a.deleted_in(&at_path), move |result| Msg::Dropbox(Answer::Deleted { path: dir, result }));
+}
+
+/// Restaurar, in the dialog: the items ticked come back (a folder with what its deletion took),
+/// and Desfazer deletes them again.
+pub fn restore_picked(s: &mut State) {
+    let Some(Dialog::DropboxDeleted(v)) = s.dialog.take() else { return };
+    let DeletedView { server, items, picked, .. } = *v;
+    let chosen: Vec<dropbox::Deleted> = items.and_then(Result::ok).unwrap_or_default().into_iter().zip(&picked).filter(|(_, on)| **on).map(|(d, _)| d).collect();
+    if chosen.is_empty() {
+        return;
+    }
+    let reload = panes_on(s, &server.id);
+    s.status = tr!("Restaurando {}…", "Restoring {}…", crate::actions::count(chosen.len()));
+    undo::local_job(s, reload, |n| tr!("restaurar {} no Dropbox", "restore {} on Dropbox", crate::actions::count(n)), move |rec| {
+        let a = dropbox::reach(&server.user)?;
+        let (mut done, mut files, mut failed) = (0, 0, Vec::new());
+        for d in &chosen {
+            match a.restore_deleted(d) {
+                Ok(n) => {
+                    done += 1;
+                    files += n;
+                    rec.add([Step::DropboxDelete { server: server.clone(), path: d.path.clone(), name: d.name.clone() }]);
+                }
+                Err(e) => failed.push(e),
+            }
+        }
+        match failed.first() {
+            None if files == done => Ok(tr!("Restaurado no Dropbox: {}.", "Restored on Dropbox: {}.", crate::actions::count(done))),
+            None => Ok(tr!("Restaurado no Dropbox: {} ({files} arquivos).", "Restored on Dropbox: {} ({files} files).", crate::actions::count(done))),
+            Some(_) if done == 0 => Err(failed.join("\n")),
+            Some(first) => Err(tr!("Restaurado: {}; {} falharam ({first})", "Restored: {}; {} failed ({first})", crate::actions::count(done), failed.len())),
+        }
+    });
+}
+
+/// What a deleted item's line says under its name.
+fn deleted_detail(d: &dropbox::Deleted) -> String {
+    let when = |w: i64| crate::model::format_time(std::time::UNIX_EPOCH + std::time::Duration::from_secs(w.max(0) as u64));
+    match (d.dir, d.size, d.when) {
+        (Some(true), ..) => t("Pasta", "Folder").into(),
+        (Some(false), Some(size), Some(w)) => tr!("{} · excluído em {}", "{} · deleted on {}", crate::model::format_size(size), when(w)),
+        (Some(false), Some(size), None) => crate::model::format_size(size),
+        _ => t("Arquivo ou pasta", "File or folder").into(),
+    }
+}
+
+pub fn deleted_dialog(k: &Kit, v: &DeletedView, layer: &mut Vec<El>) {
+    let close = |s: &mut State| s.dialog = None;
+    let muted = |words: String| text(words).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
+    let mut body = col().key("content").w_full().px(16.0).pb(16.0).gap(10.0).child(muted(
+        t(
+            "Itens excluídos desta pasta que o Dropbox ainda guarda. Marque os que quer de volta: uma pasta volta com o que foi excluído junto com ela.",
+            "Items deleted from this folder that Dropbox still keeps. Tick the ones you want back: a folder comes back with what was deleted along with it.",
+        )
+        .into(),
+    ));
+    let picked = v.picked.iter().filter(|p| **p).count();
+    match &v.items {
+        None => body = body.child(muted(t("Procurando os itens excluídos…", "Looking for the deleted items…").into())),
+        Some(Err(e)) => body = body.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0)),
+        Some(Ok(items)) if items.is_empty() => body = body.child(muted(t("Nada excluído aqui.", "Nothing deleted here.").into())),
+        Some(Ok(items)) => {
+            let all = picked == items.len();
+            body = body.child(
+                Checkbox::new(all)
+                    .label(tr!("Todos ({})", "All ({})", items.len()))
+                    .on_toggle(move |s: &mut State| {
+                        if let Some(v) = view_mut(s) {
+                            v.picked.iter_mut().for_each(|p| *p = !all);
+                        }
+                    })
+                    .build(k)
+                    .key("all"),
+            );
+            let mut list = col().key("deleted").w_full().gap(6.0);
+            for (i, d) in items.iter().enumerate() {
+                let on = v.picked.get(i).copied().unwrap_or(false);
+                list = list.child(
+                    Checkbox::new(on)
+                        .label(d.name.clone())
+                        .description(deleted_detail(d))
+                        .on_toggle(move |s: &mut State| {
+                            if let Some(p) = view_mut(s).and_then(|v| v.picked.get_mut(i)) {
+                                *p = !*p;
+                            }
+                        })
+                        .build(k)
+                        .key(format!("deleted-{i}")),
+                );
+            }
+            body = body.child(col().key("deleted-scroll").w_full().max_h(320.0).min_h(0.0).shrink().child(list.scroll(ScrollSpec { stick_bottom: false })));
+        }
+    }
+    let label = if picked > 0 { tr!("Restaurar ({picked})", "Restore ({picked})") } else { t("Restaurar", "Restore").into() };
+    body = body.child(
+        row()
+            .key("actions")
+            .w_full()
+            .pt(8.0)
+            .gap(8.0)
+            .justify_end()
+            .child(Button::new(t("Fechar", "Close")).variant(ButtonVariant::Neutral).on_press(close).build(k))
+            .child(Button::new(label).variant(ButtonVariant::Submit).disabled(picked == 0).on_press(restore_picked).build(k).default_button()),
+    );
+    let title = tr!("Itens excluídos de “{}”", "Deleted items of “{}”", v.place);
+    Modal::new("dropbox-deleted", title).open(true).child(body).width(520.0).fit().on_close(close).build(k, layer);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -642,6 +800,14 @@ mod tests {
         assert_eq!(quota_label(&q), "2,0 TB livres de 2 TB");
         assert!(!quota_help(q).contains("time"));
         assert!(quota_help(Quota { team: true, ..q }).contains("Espaço do time"));
+    }
+
+    #[test]
+    fn deleted_items_say_what_they_are() {
+        let d = |dir, size, when| dropbox::Deleted { name: "x".into(), path: "/x".into(), dir, rev: None, size, when };
+        assert_eq!(deleted_detail(&d(Some(true), None, None)), "Pasta");
+        assert!(deleted_detail(&d(Some(false), Some(2048), Some(1_700_000_000))).contains("excluído em"));
+        assert_eq!(deleted_detail(&d(None, None, None)), "Arquivo ou pasta");
     }
 
     #[test]

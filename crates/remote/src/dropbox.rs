@@ -6,7 +6,7 @@
 //! account happen on Dropbox's side, and a file sent where the same bytes already are isn't sent.
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -96,6 +96,26 @@ impl Conn for Dropbox {
     /// Within the account Dropbox copies by itself: a file's bytes aren't sent again.
     fn copy(&mut self, from: &str, to: &str) -> Result<bool> {
         self.account.copy(from, to).map(|_| true)
+    }
+
+    /// In batch jobs (`move_batch_v2`), up to 1,000 items each.
+    fn rename_many(&mut self, moves: &[(String, String)]) -> Vec<Result<()>> {
+        self.account.move_many(moves).into_iter().map(|r| r.map(|_| ())).collect()
+    }
+
+    /// In batch jobs (`copy_batch_v2`), on Dropbox's side.
+    fn copy_many(&mut self, copies: &[(String, String)]) -> Vec<Result<bool>> {
+        self.account.copy_many(copies).into_iter().map(|r| r.map(|_| true)).collect()
+    }
+
+    /// Small files together, a few requests for up to 250 of them; bigger ones each alone. A
+    /// file whose same bytes are already there isn't sent.
+    fn upload_files(&mut self, files: &[(String, PathBuf)], progress: &mut dyn FnMut(usize, u64) -> bool) -> Vec<Result<()>> {
+        self.account.upload_many(files, progress).into_iter().map(|r| r.map(|_| ()).map_err(same_cancel)).collect()
+    }
+
+    fn batches(&self) -> (usize, u64) {
+        (openexplorer_dropbox::batch::UPLOAD_FILES, openexplorer_dropbox::batch::BATCH_FILE_MAX)
     }
 
     fn alive(&mut self) -> bool {
