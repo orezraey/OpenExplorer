@@ -171,6 +171,75 @@ fn personal_accounts_undo_and_redo_several_deletes() {
     assert_eq!(fake.with(|st| st.sp_requests), 0);
 }
 
+/// 25 files in Docs besides a.txt and b.txt, their paths, and Docs listed.
+fn many(fake: &Fake, a: &Account, docs: &str) -> Vec<String> {
+    let paths = fake.with(|st| {
+        (0..25)
+            .map(|i| {
+                st.add(docs, &format!("f{i:02}.txt"), false, b"f");
+                format!("/Meus arquivos/Docs/f{i:02}.txt")
+            })
+            .collect::<Vec<_>>()
+    });
+    a.catch_up().unwrap();
+    assert_eq!(names(a, "/Meus arquivos/Docs").len(), 27);
+    paths
+}
+
+/// What's left of f00…f24 in Docs, as the account has it and as Graph does.
+fn left(fake: &Fake, a: &Account) -> (Vec<String>, Vec<String>) {
+    let mut graph: Vec<String> = fake.with(|st| st.items.values().filter(|i| !i.deleted && i.name.starts_with('f')).map(|i| i.name.clone()).collect());
+    graph.sort();
+    (names(a, "/Meus arquivos/Docs").into_iter().filter(|n| n.starts_with('f')).collect(), graph)
+}
+
+#[test]
+fn a_batch_cut_midway_keeps_what_its_first_part_deleted() {
+    for kind in [Kind::Personal, Kind::Business] {
+        let (fake, a, docs, _) = setup(kind);
+        fake.with(|st| {
+            st.business = kind == Kind::Business;
+            st.sp_granted = true;
+        });
+        let paths = many(&fake, &a, &docs);
+        // The second $batch (items 21 to 25) gets no answer.
+        fake.with(|st| st.drop_batch = Some(1));
+        let (gone, err) = a.trash_many(&paths);
+        assert_eq!(gone.len(), 20, "{kind:?}");
+        assert!(err.unwrap().contains("Não consegui falar com o OneDrive"));
+        let rest: Vec<String> = (20..25).map(|i| format!("f{i:02}.txt")).collect();
+        // Out of the kept tree at once, without waiting for the delta feed.
+        assert_eq!(names(&a, "/Meus arquivos/Docs").into_iter().filter(|n| n.starts_with('f')).collect::<Vec<_>>(), rest);
+        assert_eq!(left(&fake, &a), (rest.clone(), rest.clone()));
+        // Each of the 20 can be undone.
+        let ids: Vec<String> = gone.iter().map(|(id, _)| id.clone()).collect();
+        assert!(ids.iter().all(|id| a.can_restore(id)), "{kind:?}");
+        // Undone. On a personal account the 20 restores go in one $batch and the reading of
+        // where they came back to, cut, in another: they're back all the same, and the delta
+        // feed brings them to the tree.
+        fake.with(|st| st.drop_batch = Some(1));
+        let (back, err) = a.restore_many(&ids);
+        assert_eq!((back.len(), err), (20, None), "{kind:?}");
+        a.catch_up().unwrap();
+        assert_eq!(left(&fake, &a).0.len(), 25);
+    }
+}
+
+#[test]
+fn restores_cut_midway_say_which_came_back() {
+    let (fake, a, docs, _) = setup(Kind::Personal);
+    let paths = many(&fake, &a, &docs);
+    let (gone, err) = a.trash_many(&paths);
+    assert_eq!((gone.len(), err), (25, None));
+    let ids: Vec<String> = gone.iter().map(|(id, _)| id.clone()).collect();
+    fake.with(|st| st.drop_batch = Some(1));
+    let (back, err) = a.restore_many(&ids);
+    assert_eq!(back, ids[..20]);
+    assert!(err.unwrap().contains("Não consegui falar com o OneDrive"));
+    let first: Vec<String> = (0..20).map(|i| format!("f{i:02}.txt")).collect();
+    assert_eq!(left(&fake, &a), (first.clone(), first));
+}
+
 /// A work account with SharePoint's permission granted, Docs (a.txt, b.txt) and Fotos.
 fn setup_work() -> (Fake, Account, String) {
     let fake = Fake::start();

@@ -75,6 +75,9 @@ pub struct State {
     pub sp_no_orderby: bool,
     /// `$orderby` taken but not followed: the bin comes oldest first (`$top` still cuts it).
     pub sp_ignore_orderby: bool,
+    /// After this many more `$batch` requests, the next one gets no answer (the connection
+    /// closes before any of it is done).
+    pub drop_batch: Option<usize>,
     /// The recycle bin, oldest first.
     pub bin: Vec<FBin>,
     /// Requests to SharePoint's REST API.
@@ -329,6 +332,17 @@ fn read(conn: &TcpStream) -> Option<Req> {
 
 fn serve(mut conn: TcpStream, state: &Mutex<State>, count: &Count, base: &str) {
     let Some(req) = read(&conn) else { return };
+    if req.path == "/$batch" {
+        let mut st = state.lock().unwrap();
+        match st.drop_batch {
+            Some(0) => {
+                st.drop_batch = None;
+                return;
+            }
+            Some(n) => st.drop_batch = Some(n - 1),
+            None => {}
+        }
+    }
     let resp = answer(&req, state, base);
     count.requests.fetch_add(1, Ordering::SeqCst);
     count.bytes.fetch_add(resp.body.len(), Ordering::SeqCst);

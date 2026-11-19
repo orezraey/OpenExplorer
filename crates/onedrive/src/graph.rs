@@ -429,11 +429,13 @@ impl Graph {
         self.call("GET", path, None, what)
     }
 
-    /// Several small requests in one (`$batch`, 20 at most each): the answers in the order
-    /// asked, each `(status, body)`. Those throttled are asked again after the longest
-    /// `Retry-After` among them.
-    pub fn batch(&self, subs: &[Sub], what: &str) -> Res<Vec<(u16, Value)>> {
-        let mut out: Vec<Option<(u16, Value)>> = vec![None; subs.len()];
+    /// Several small requests in one (`$batch`, 20 at most each): each one's answer, in the
+    /// order asked, as `(status, body)`. Those throttled are asked again after the longest
+    /// `Retry-After` among them. A `$batch` that fails (no answer, say) fails its requests, and
+    /// those not sent yet, with its error, and nothing more is sent (a request that got no answer
+    /// may have been done, so it isn't sent again); what earlier ones answered stays.
+    pub fn batch(&self, subs: &[Sub], what: &str) -> Vec<Res<(u16, Value)>> {
+        let mut out: Vec<Option<Res<(u16, Value)>>> = vec![None; subs.len()];
         let mut todo: Vec<usize> = (0..subs.len()).collect();
         for round in 0..TRIES {
             if todo.is_empty() {
@@ -441,7 +443,9 @@ impl Graph {
             }
             let mut again = Vec::new();
             let mut wait = 0;
-            for chunk in todo.chunks(20) {
+            let mut chunks = todo.chunks(20);
+            let mut failed = None;
+            for chunk in chunks.by_ref() {
                 let requests: Vec<Value> = chunk
                     .iter()
                     .map(|&i| {
@@ -454,9 +458,18 @@ impl Graph {
                         r
                     })
                     .collect();
-                let answer = self.call("POST", "/$batch", Some(&json!({ "requests": requests })), what)?;
+                let answer = match self.call("POST", "/$batch", Some(&json!({ "requests": requests })), what) {
+                    Ok(a) => a,
+                    Err(f) => {
+                        for &i in chunk {
+                            out[i] = Some(Err(f.clone()));
+                        }
+                        failed = Some(f);
+                        break;
+                    }
+                };
                 for r in answer.get("responses").and_then(Value::as_array).into_iter().flatten() {
-                    let Some(i) = r.get("id").and_then(Value::as_str).and_then(|s| s.parse::<usize>().ok()).filter(|i| *i < subs.len()) else { continue };
+                    let Some(i) = r.get("id").and_then(Value::as_str).and_then(|s| s.parse::<usize>().ok()).filter(|i| chunk.contains(i)) else { continue };
                     let status = r.get("status").and_then(Value::as_u64).unwrap_or(0) as u16;
                     if matches!(status, 429 | 503) && round + 1 < TRIES {
                         let secs = r.pointer("/headers/Retry-After").or_else(|| r.pointer("/headers/retry-after")).and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or(v.as_u64())).unwrap_or(1 << round.min(5));
@@ -464,15 +477,22 @@ impl Graph {
                         again.push(i);
                         continue;
                     }
-                    out[i] = Some((status, r.get("body").cloned().unwrap_or(Value::Null)));
+                    out[i] = Some(Ok((status, r.get("body").cloned().unwrap_or(Value::Null))));
                 }
+            }
+            if let Some(f) = failed {
+                // Neither those not sent yet nor those waiting to be asked again go.
+                for i in chunks.flatten().chain(&again) {
+                    out[*i] = Some(Err(f.clone()));
+                }
+                break;
             }
             if wait > 0 {
                 self.throttled(wait);
             }
             todo = again;
         }
-        Ok(out.into_iter().map(|o| o.unwrap_or((0, Value::Null))).collect())
+        out.into_iter().map(|o| o.unwrap_or_else(|| Err(Fail::new(tr!("{what}: o OneDrive não respondeu a este pedido.", "{what}: OneDrive didn't answer this request."))))).collect()
     }
 }
 
