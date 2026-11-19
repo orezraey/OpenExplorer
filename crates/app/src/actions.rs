@@ -51,6 +51,7 @@ pub enum Dialog {
     MakePublic(Box<crate::sharing::MakePublic>),
     /// Copiar link on a MEGA file with no link yet: make one?
     MegaLink(Box<crate::mega::MakeLink>),
+    DropboxLink(Box<crate::dropbox::MakeLink>),
     /// Adicionar servidor, or Editar servidor.
     Server(Box<crate::servers::Form>),
 }
@@ -1028,7 +1029,8 @@ pub fn ask_delete(s: &mut State, p: usize) {
     // Explorer does). By the items' own paths, so a search's results there count too.
     let loc = &s.panes[p].loc;
     // A MEGA account has its own Rubbish Bin; deleting inside it is for good.
-    let mega_bin = crate::mega::at(loc).is_some() && !crate::mega::deletes_for_good(loc);
+    // So does Dropbox, with its deleted files.
+    let mega_bin = crate::mega::at(loc).is_some() && !crate::mega::deletes_for_good(loc) || crate::dropbox::at(loc).is_some();
     if (loc.is_local() && s.settings.skip_recycle_bin) || (matches!(loc, Location::Server { .. }) && !mega_bin) || items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_remote(&path)) {
         s.dialog = Some(Dialog::Purge { pane: p, items });
         return;
@@ -1066,6 +1068,7 @@ pub fn delete(s: &mut State) {
             });
         }
         Location::Server { server, .. } if server.is_mega() => crate::mega::trash(s, &loc, items),
+        Location::Server { server, .. } if server.is_dropbox() => crate::dropbox::delete(s, &loc, items),
         Location::Server { .. } => crate::servers::delete(s, &loc, items, vec![loc.clone()]),
         Location::Mock(_) => return not_here(s, pane),
     }

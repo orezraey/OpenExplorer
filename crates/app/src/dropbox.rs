@@ -1,0 +1,654 @@
+//! Dropbox accounts in the panes. Each account shows in the tree under Contas, beside the Google
+//! Drive and MEGA accounts and the servers, and opens like a server (see `servers.rs`) at the
+//! account's top, a team space's top for a team member (team folders beside their own).
+//! Listing, copying to and from anywhere, moving, renaming, new folders, searching and dragging
+//! go through the servers' code, with the account as the connection (`openexplorer_remote`'s
+//! `dropbox.rs`). What only Dropbox has lives here: adding an account (OAuth in the browser),
+//! deleting into Dropbox's deleted files and undoing it, shared links, the storage in the status
+//! bar, and folders that refresh when something changes elsewhere (a longpoll per account).
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use openexplorer_dropbox::store::StoredAccount;
+use openexplorer_dropbox::{self as dropbox, Account, AppConfig, Changes, Quota};
+use openexplorer_i18n::{t, tr};
+use openexplorer_remote::Server;
+use rune::{El, ScrollSpec, Tx, col, el, icon, row, text};
+use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit};
+
+use crate::actions::{Dialog, selected};
+use crate::model::{Entry, Location};
+use crate::servers::{Form, folder, path_of};
+use crate::undo::{self, Step};
+use crate::{Msg, State, background, catch_panic, icons};
+
+/// The accounts' list, beside the app's other settings.
+pub fn store() -> dropbox::store::Store {
+    dropbox::store::Store::at(openexplorer_gdrive::config_dir().join("dropbox-accounts.json"))
+}
+
+/// The servers the connected accounts show as.
+pub fn servers(store: &dropbox::store::Store) -> Vec<Server> {
+    store.accounts().into_iter().map(|a| Server::dropbox(&a.email)).collect()
+}
+
+/// The Dropbox account a location is in, and the path below its top.
+pub fn at(loc: &Location) -> Option<(&Server, &[String])> {
+    match loc {
+        Location::Server { server, path, .. } if server.is_dropbox() => Some((server, path)),
+        _ => None,
+    }
+}
+
+/// The account's top, where a new account opens.
+pub fn top(server: &Server) -> Location {
+    folder(server, Vec::new())
+}
+
+/// Atualizar on pane `p`: a Dropbox folder's kept listing goes, so it's read whole (the reloads
+/// after changes keep using it, brought up to date by the account's change log).
+pub fn forget_shown(s: &State, p: usize) {
+    if let Some((server, path)) = at(&s.panes[p].loc)
+        && let Some(a) = dropbox::cached(&server.user)
+    {
+        a.forget(&server.path(path));
+    }
+}
+
+/// The panes' places on account `id`, reloaded after a change there.
+fn panes_on(s: &State, id: &str) -> Vec<Location> {
+    s.panes.iter().map(|p| p.loc.clone()).filter(|l| matches!(l, Location::Server { server, .. } if server.id == id)).collect()
+}
+
+/// Runs `work` with the account on a thread, then `done` with the result.
+fn task<T: Send + 'static>(s: &State, server: &Server, doing: &'static str, work: impl FnOnce(&Account) -> Result<T, String> + Send + 'static, done: impl FnOnce(Result<T, String>) -> Msg + Send + 'static) {
+    let email = server.user.clone();
+    background(s, move |emit| {
+        let result = catch_panic(doing, || dropbox::reach(&email).and_then(|a| work(&a)));
+        emit(done(result));
+    });
+}
+
+/// What background work on Dropbox brought back.
+pub enum Answer {
+    /// A login in the browser ended: the account it opened.
+    Connected { result: Result<StoredAccount, String> },
+    Quota { id: String, result: Result<Quota, String> },
+    /// What changed in account `id` while its longpoll waited.
+    Changes { id: String, result: Result<Changes, String> },
+    /// What Copiar link found: the item's link, or `None` when it has none yet.
+    Link { server: Box<Server>, path: String, item: Entry, result: Result<Option<String>, String> },
+    /// A link made (`Some`) or taken away (`None`) for the item named `name`.
+    Linked { name: String, result: Result<Option<String>, String> },
+}
+
+pub fn arrived(s: &mut State, a: Answer, tx: &mut Tx, now: f64) {
+    match a {
+        Answer::Connected { result } => connected(s, result),
+        Answer::Quota { id, result } => match result {
+            Ok(q) => {
+                s.servers.dropbox_quotas.insert(id, Some(q));
+            }
+            Err(e) => openexplorer_gdrive::log(&format!("cota do Dropbox {id}: {e}")),
+        },
+        Answer::Changes { id, result } => changes_arrived(s, id, result, now),
+        Answer::Link { server, path, item, result } => match result {
+            Ok(Some(link)) => {
+                tx.copy(link);
+                s.status = tr!("Link copiado: quem tiver o link pode abrir \"{}\".", "Link copied: anyone with the link can open \"{}\".", item.name);
+            }
+            Ok(None) => s.dialog = Some(Dialog::DropboxLink(Box::new(MakeLink { server: *server, path, item }))),
+            Err(e) => crate::fail(s, e),
+        },
+        Answer::Linked { name, result } => match result {
+            Ok(Some(link)) => {
+                tx.copy(link);
+                s.status = tr!("Link criado e copiado: quem tiver o link pode abrir \"{name}\".", "Link made and copied: anyone with the link can open \"{name}\".");
+            }
+            Ok(None) => s.status = tr!("Link removido: \"{name}\" não abre mais pelo link.", "Link removed: \"{name}\" no longer opens from the link."),
+            Err(e) => crate::fail(s, e),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Adding and removing an account
+
+/// The login waiting for the browser now: a newer one stops it (and frees the port).
+static LOGIN: AtomicU64 = AtomicU64::new(0);
+
+/// The App key the dialog has, else the saved app: `None` (and the dialog asks for the key)
+/// when there's neither.
+fn app_of(f: &mut Form) -> Option<AppConfig> {
+    let typed = f.client_id.text.trim().trim_start_matches('\u{feff}').to_string();
+    if f.custom_oauth || !typed.is_empty() {
+        let port = AppConfig::load().map(|c| c.port).unwrap_or(dropbox::DEFAULT_PORT);
+        let parsed = if typed.starts_with('{') { AppConfig::parse(&typed) } else { AppConfig::parse(&serde_json::json!({"app_key": typed, "port": port}).to_string()) };
+        let cfg = match parsed {
+            Ok(c) => c,
+            Err(e) => {
+                f.error = Some(tr!("App key: {e}", "App key: {e}"));
+                return None;
+            }
+        };
+        if let Err(e) = cfg.save() {
+            f.error = Some(e);
+            return None;
+        }
+        return Some(cfg);
+    }
+    match AppConfig::load() {
+        Ok(c) => Some(c),
+        Err(e) => {
+            f.custom_oauth = true;
+            f.client_id.focused = true;
+            f.error = Some(e);
+            None
+        }
+    }
+}
+
+/// Conectar no navegador with Dropbox picked: opens Dropbox's authorization page and waits for
+/// it on a thread; the dialog closes, as Google Drive's does.
+pub fn submit(s: &mut State, tx: &mut Tx) {
+    let Some(Dialog::Server(f)) = &mut s.dialog else { return };
+    f.error = None;
+    let Some(cfg) = app_of(f) else { return };
+    // An older login still waiting holds the port: it's stopped, and gives the port back
+    // within a moment.
+    let attempt = LOGIN.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut begun = dropbox::oauth::begin(&cfg);
+    for _ in 0..10 {
+        if begun.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        begun = dropbox::oauth::begin(&cfg);
+    }
+    let pending = match begun {
+        Ok(p) => p,
+        Err(e) => {
+            if let Some(Dialog::Server(f)) = &mut s.dialog {
+                f.error = Some(e);
+            }
+            return;
+        }
+    };
+    if let Err(e) = tx.open_url(&pending.url) {
+        if let Some(Dialog::Server(f)) = &mut s.dialog {
+            f.error = Some(tr!("Não consegui abrir o navegador: {e:?}", "Couldn't open the browser: {e:?}"));
+        }
+        return;
+    }
+    s.dialog = None;
+    s.status = t("Entre no Dropbox no navegador que abriu e autorize o Open Explorer. Esperando o Dropbox…", "Sign in to Dropbox in the browser that opened and allow Open Explorer. Waiting for Dropbox…").into();
+    background(s, move |emit| {
+        let result = catch_panic(t("conectar ao Dropbox", "connect to Dropbox"), || {
+            let tokens = pending.finish_until(&cfg, &dropbox::api::Hosts::default().api, &|| LOGIN.load(Ordering::SeqCst) != attempt)?;
+            let a = dropbox::connect(&cfg, &tokens)?;
+            Ok(StoredAccount { email: a.email.clone(), name: a.name.clone(), account_id: a.account_id.clone() })
+        });
+        emit(Msg::Dropbox(Answer::Connected { result }));
+    });
+}
+
+fn connected(s: &mut State, result: Result<StoredAccount, String>) {
+    let account = match result {
+        Ok(a) => a,
+        Err(e) => {
+            openexplorer_gdrive::log(&format!("falha ao conectar Dropbox: {e}"));
+            return crate::fail(s, e);
+        }
+    };
+    let email = account.email.clone();
+    if let Err(e) = s.servers.dropbox.add(account) {
+        return crate::fail(s, e);
+    }
+    openexplorer_gdrive::log(&format!("conta Dropbox conectada: {email}"));
+    let server = Server::dropbox(&email);
+    if !s.servers.list.iter().any(|sv| sv.id == server.id) {
+        s.servers.list.push(server.clone());
+    }
+    s.servers.pool.forget(&server.id);
+    s.tree.server_changed(&server.id);
+    s.tree.server_opened(&server.id);
+    s.status = tr!("Conta Dropbox conectada: {email}", "Dropbox account connected: {email}");
+    let p = s.active;
+    crate::navigate(s, p, top(&server));
+}
+
+/// Remover conta: the access is revoked on Dropbox's side and leaves the credential store.
+/// Whether the account left the list.
+pub fn remove(s: &mut State, server: &Server) -> bool {
+    if let Err(e) = s.servers.dropbox.remove(&server.user) {
+        crate::fail(s, e);
+        return false;
+    }
+    dropbox::disconnect(&server.user);
+    s.servers.dropbox_quotas.remove(&server.id);
+    s.servers.dropbox_watch.remove(&server.id);
+    true
+}
+
+/// The Dropbox step of Adicionar conta: the App key when none is set, then the browser.
+pub fn account_step(s: &State, k: &Kit, f: &Form, banner: El, window_h: Option<f32>, layer: &mut Vec<El>) {
+    fn key_edit(s: &mut State) -> &mut rune::TextEdit {
+        match &mut s.dialog {
+            Some(Dialog::Server(f)) => &mut f.client_id,
+            _ => &mut s.name_edit,
+        }
+    }
+    let close = |s: &mut State| s.dialog = None;
+    let note = |words: &str| text(words.to_string()).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
+    let mut inner = col().w_full().px(16.0).pb(4.0).gap(12.0).child(banner).child(note(t(
+        "Ao continuar, o navegador abre a página do Dropbox para você entrar e autorizar o Open Explorer. Contas de um time veem também as pastas da equipe.",
+        "When you continue, the browser opens Dropbox's page so you can sign in and allow Open Explorer. Team accounts also see the team's folders.",
+    )));
+    let connected: Vec<&str> = s.servers.list.iter().filter(|sv| sv.is_dropbox()).map(|sv| sv.user.as_str()).collect();
+    if !connected.is_empty() {
+        inner = inner.child(
+            row()
+                .key("connected-dropbox")
+                .w_full()
+                .px(10.0)
+                .py(7.0)
+                .gap(6.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .fill(k.alpha(k.c.text_accent, if k.dark { 0.10 } else { 0.06 }))
+                .child(el().size(6.0, 6.0).radius(3.0).fill(k.c.success.fg))
+                .child(text(tr!("Já conectadas: {}", "Already connected: {}", connected.join(", "))).font(k.ty.text_xsmall).color(k.c.text_base).truncate().min_w(0.0).grow(1.0)),
+        );
+    }
+    if f.custom_oauth {
+        let port = AppConfig::load().map(|c| c.port).unwrap_or(dropbox::DEFAULT_PORT);
+        let key_input = rune_kit::TextInput::new(&f.client_id)
+            .width(None)
+            .label(t("App key", "App key"))
+            .placeholder(t("a App key do seu app (aba Settings)", "your app's App key (Settings tab)"))
+            .on_edit(key_edit)
+            .on_submit(submit);
+        let console = Button::new(t("Abrir App Console", "Open App Console"))
+            .icon(&icons::EXTERNAL_LINK)
+            .variant(ButtonVariant::Neutral)
+            .on_press_tx(|s: &mut State, tx: &mut Tx| {
+                if let Err(e) = tx.open_url("https://www.dropbox.com/developers/apps") {
+                    crate::fail(s, tr!("Não consegui abrir o navegador: {e:?}", "Couldn't open the browser: {e:?}"));
+                }
+            })
+            .build(k);
+        let how = tr!(
+            "Crie um app em Create app: Scoped access, Full Dropbox. Em Permissions marque files.metadata.read e .write, files.content.read e .write, sharing.read e .write e account_info.read, e clique em Submit. Em Settings › OAuth 2 › Redirect URIs adicione http://localhost:{port}. Depois cole a App key aqui (não é preciso o App secret).",
+            "Create an app with Create app: Scoped access, Full Dropbox. On Permissions tick files.metadata.read and .write, files.content.read and .write, sharing.read and .write and account_info.read, then click Submit. On Settings › OAuth 2 › Redirect URIs add http://localhost:{port}. Then paste the App key here (the App secret isn't needed)."
+        );
+        inner = inner.child(
+            col()
+                .key("dropbox-app")
+                .w_full()
+                .padding(12.0)
+                .gap(8.0)
+                .radius(k.radius.md)
+                .fill(k.c.bg_base)
+                .border(1.0, k.c.border_weak)
+                .child(row().w_full().center_y().child(text(t("App do Dropbox", "Dropbox app")).font(k.ty.text_small_medium).color(k.c.text_base).grow(1.0)).child(console))
+                .child(text(how).font(k.ty.caption()).color(k.c.text_muted).wrap().w_full().min_w(0.0))
+                .child(col().w_full().gap(4.0).child(text(t("App key", "App key")).font(k.ty.text_xsmall_medium).color(k.c.text_base)).child(key_input.build(k))),
+        );
+    } else {
+        inner = inner.child(
+            row()
+                .key("dropbox-ready")
+                .w_full()
+                .px(12.0)
+                .py(8.0)
+                .gap(8.0)
+                .center_y()
+                .radius(k.radius.md)
+                .fill(k.c.bg_base)
+                .border(1.0, k.c.border_weak)
+                .child(icon(k.glyph.lock, 15.0).color(k.c.success.fg))
+                .child(text(t("App do Dropbox configurado e pronto para conectar.", "Dropbox app set up and ready to connect.")).font(k.ty.text_xsmall).color(k.c.text_muted).grow(1.0).min_w(0.0))
+                .child(
+                    Button::new(t("Alterar App key", "Change App key"))
+                        .variant(ButtonVariant::GhostMuted)
+                        .on_press(|s: &mut State| {
+                            if let Some(Dialog::Server(f)) = &mut s.dialog {
+                                f.custom_oauth = true;
+                                f.client_id.focused = true;
+                            }
+                        })
+                        .build(k),
+                ),
+        );
+    }
+    if let Some(e) = &f.error {
+        inner = inner.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0));
+    }
+    let actions = row()
+        .key("actions")
+        .w_full()
+        .px(16.0)
+        .pt(12.0)
+        .pb(16.0)
+        .gap(8.0)
+        .center_y()
+        .child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).on_press(crate::servers::back_to_pick).build(k))
+        .child(el().grow(1.0))
+        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k))
+        .child(Button::new(t("Conectar no navegador", "Connect in browser")).variant(ButtonVariant::Submit).on_press_tx(submit).build(k).default_button());
+    let max_h = window_h.map_or(620.0, |h| (h - 2.0 * 16.0 - 48.0 - 62.0).max(120.0));
+    let scroll = col().w_full().max_h(max_h).min_h(0.0).shrink().child(col().key("dropbox-scroll").w_full().shrink().min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(inner));
+    let body = col().key("dropbox-content").w_full().child(scroll).child(actions);
+    Modal::new("server", t("Conectar Dropbox", "Connect Dropbox")).open(true).child(body).width(560.0).fit().on_close(close).build(k, layer);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deleting, and undoing it
+
+/// What the Excluir question says before deleting in a Dropbox account.
+pub fn delete_note() -> &'static str {
+    t(
+        "Os itens vão para os arquivos excluídos do Dropbox, de onde podem ser restaurados por um tempo (Desfazer, ou pelo site).",
+        "The items go to Dropbox's deleted files, where they can be restored for a while (Undo, or on the website).",
+    )
+}
+
+/// How far before a folder's deletion files deleted from it count as deleted with it: the
+/// computer's clock and Dropbox's may disagree a little.
+const SKEW: i64 = 120;
+
+/// Excluir: the items go to Dropbox's deleted files (several in one batch), and Desfazer brings
+/// them back.
+pub fn delete(s: &mut State, loc: &Location, items: Vec<Entry>) {
+    let Some((server, _)) = at(loc) else { return };
+    let server = server.clone();
+    let reload = panes_on(s, &server.id);
+    let paths: Vec<(String, String)> = items.iter().filter_map(|e| path_of(loc, e).map(|p| (p, e.name.clone()))).collect();
+    undo::local_job(s, reload, |n| tr!("excluir {} do Dropbox", "delete {} from Dropbox", crate::actions::count(n)), move |rec| {
+        let a = dropbox::reach(&server.user)?;
+        let since = undo::now_secs() - SKEW;
+        let results = match paths.as_slice() {
+            [(one, _)] => vec![a.delete(one)],
+            many => a.delete_many(&many.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>())?,
+        };
+        let mut failed = Vec::new();
+        let mut done = 0;
+        for (r, (path, name)) in results.into_iter().zip(&paths) {
+            match r {
+                Ok(e) => {
+                    done += 1;
+                    rec.add([Step::DropboxRestore { server: server.clone(), path: path.clone(), name: name.clone(), rev: (!e.dir).then_some(e.rev), since }]);
+                }
+                Err(e) => failed.push(e),
+            }
+        }
+        if failed.is_empty() {
+            Ok(tr!("Excluído do Dropbox: {}. Dá para desfazer.", "Deleted from Dropbox: {}. It can be undone.", crate::actions::count(done)))
+        } else {
+            Err(failed.join("\n"))
+        }
+    });
+}
+
+/// Whether the item a Dropbox step changes is as it expects.
+pub fn check(step: &Step) -> Result<(), String> {
+    match step {
+        Step::DropboxDelete { server, path, name } => match dropbox::reach(&server.user)?.stat(path)? {
+            Some(_) => Ok(()),
+            None => Err(tr!("“{name}” não está mais no Dropbox.", "“{name}” is no longer on Dropbox.")),
+        },
+        Step::DropboxRestore { server, path, name, .. } => match dropbox::reach(&server.user)?.stat(path)? {
+            Some(_) => Err(tr!("já existe “{name}” no Dropbox, onde ele estava.", "“{name}” already exists on Dropbox, where it was.")),
+            None => Ok(()),
+        },
+        _ => Ok(()),
+    }
+}
+
+/// Makes a Dropbox step's change, giving the step that takes it back.
+pub fn run(step: &Step) -> Result<Step, String> {
+    match step {
+        Step::DropboxDelete { server, path, name } => {
+            let a = dropbox::reach(&server.user)?;
+            let since = undo::now_secs() - SKEW;
+            let e = a.delete(path)?;
+            Ok(Step::DropboxRestore { server: server.clone(), path: path.clone(), name: name.clone(), rev: (!e.dir).then_some(e.rev), since })
+        }
+        Step::DropboxRestore { server, path, name, rev, since } => {
+            let a = dropbox::reach(&server.user)?;
+            match rev {
+                Some(rev) => {
+                    a.restore(path, rev)?;
+                }
+                None => {
+                    a.restore_folder(path, *since)?;
+                }
+            }
+            Ok(Step::DropboxDelete { server: server.clone(), path: path.clone(), name: name.clone() })
+        }
+        other => Ok(other.clone()),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shared links
+
+/// Copiar link, asked before a link is made: the item opens to anyone who has it.
+pub struct MakeLink {
+    pub server: Server,
+    pub path: String,
+    pub item: Entry,
+}
+
+fn one_item(s: &mut State, p: usize) -> Option<(Server, String, Entry)> {
+    let loc = s.panes[p].loc.clone();
+    let items = selected(s, p);
+    let (Some((server, _)), [item]) = (at(&loc), items.as_slice()) else {
+        if items.len() > 1 {
+            s.status = t("Selecione um item só.", "Select just one item.").into();
+        }
+        return None;
+    };
+    let path = path_of(&loc, item)?;
+    Some((server.clone(), path, item.clone()))
+}
+
+/// Copiar link: the item's link to the clipboard; with none yet, asks before making one.
+pub fn copy_link(s: &mut State, p: usize, _: &mut Tx) {
+    let Some((server, path, item)) = one_item(s, p) else { return };
+    s.status = tr!("Buscando o link de \"{}\"…", "Getting the link for \"{}\"…", item.name);
+    let (sv, at_path, it) = (server.clone(), path.clone(), item.clone());
+    task(s, &server, t("copiar o link", "copy the link"), move |a| a.link_of(&path), move |result| Msg::Dropbox(Answer::Link { server: Box::new(sv), path: at_path, item: it, result }));
+}
+
+/// Criar link e copiar, from the question.
+pub fn make_link(s: &mut State) {
+    let Some(Dialog::DropboxLink(m)) = s.dialog.take() else { return };
+    let MakeLink { server, path, item } = *m;
+    s.status = tr!("Criando o link de \"{}\"…", "Making the link for \"{}\"…", item.name);
+    let name = item.name.clone();
+    task(s, &server, t("criar o link", "make the link"), move |a| a.create_link(&path).map(Some), move |result| Msg::Dropbox(Answer::Linked { name, result }));
+}
+
+/// Remover link: whoever has the link can't open the item any more.
+pub fn remove_link(s: &mut State, p: usize, _: &mut Tx) {
+    let Some((server, path, item)) = one_item(s, p) else { return };
+    let name = item.name.clone();
+    task(s, &server, t("remover o link", "remove the link"), move |a| a.remove_link(&path).map(|_| None), move |result| Msg::Dropbox(Answer::Linked { name, result }));
+}
+
+pub fn link_dialog(k: &Kit, m: &MakeLink, layer: &mut Vec<El>) {
+    let note = tr!(
+        "\"{}\" ainda não tem link. Criar um link deixa qualquer pessoa que o tenha ver e baixar o item. Dá para remover depois em Remover link.",
+        "\"{}\" has no link yet. Making one lets anyone who has it see and download the item. You can remove it later with Remove link.",
+        m.item.name
+    );
+    let close = |s: &mut State| s.dialog = None;
+    let body = col()
+        .key("content")
+        .w_full()
+        .px(16.0)
+        .pb(16.0)
+        .gap(12.0)
+        .child(text(note).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
+        .child(
+            row()
+                .key("actions")
+                .w_full()
+                .pt(8.0)
+                .gap(8.0)
+                .justify_end()
+                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k))
+                .child(Button::new(t("Criar link e copiar", "Make link and copy")).variant(ButtonVariant::Submit).on_press(make_link).build(k).default_button()),
+        );
+    Modal::new("dropbox-link", t("Criar link compartilhado?", "Make a shared link?")).open(true).child(body).width(480.0).fit().on_close(close).build(k, layer);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Storage
+
+/// Asks for account `server`'s storage (unless the first answer is still on its way).
+pub fn ask_quota(s: &mut State, server: &Server) {
+    match s.servers.dropbox_quotas.get(&server.id) {
+        Some(None) => return,
+        Some(Some(_)) => {}
+        None => {
+            s.servers.dropbox_quotas.insert(server.id.clone(), None);
+        }
+    }
+    let id = server.id.clone();
+    task(s, server, t("ler a cota", "read the storage quota"), |a| a.quota(), move |result| Msg::Dropbox(Answer::Quota { id, result }));
+}
+
+/// The storage the status bar shows beside a Dropbox location: its words, how full, the tip.
+pub fn quota_status(s: &State, loc: &Location) -> Option<(String, Option<f64>, String)> {
+    let (server, _) = at(loc)?;
+    let q = s.servers.dropbox_quotas.get(&server.id).copied().flatten()?;
+    Some((quota_label(&q), (q.total > 0).then(|| q.used as f64 / q.total as f64), quota_help(q)))
+}
+
+pub fn quota_label(q: &Quota) -> String {
+    tr!("{} livres de {}", "{} free of {}", crate::model::format_size(q.total.saturating_sub(q.used)), crate::ui::whole_size(q.total))
+}
+
+pub fn quota_help(q: Quota) -> String {
+    let used = tr!("Usado: {} de {}", "Used: {} of {}", crate::model::format_size(q.used), crate::ui::whole_size(q.total));
+    if q.team { format!("{used}\n{}", t("Espaço do time", "Team space")) } else { used }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Changes made elsewhere
+
+/// How long each longpoll waits for a change, in seconds (Dropbox takes 30 to 480).
+const WAIT: u64 = 60;
+/// After a failed wait, how long until the next one.
+const RETRY: f64 = 60.0;
+
+/// When each account shown waits for changes next, and whether a wait is out.
+#[derive(Default)]
+pub struct Watch {
+    next: f64,
+    busy: bool,
+}
+
+/// Keeps one longpoll out for each Dropbox account a pane shows (on a thread of its own, it
+/// costs nothing while nothing changes).
+pub fn tick(s: &mut State, now: f64) {
+    if s.servers.dropbox_watch.is_empty() && !s.panes.iter().any(|p| at(&p.loc).is_some()) {
+        return;
+    }
+    let mut shown: Vec<Server> = s.panes.iter().filter_map(|p| at(&p.loc).map(|(sv, _)| sv.clone())).collect();
+    shown.dedup_by(|a, b| a.id == b.id);
+    s.servers.dropbox_watch.retain(|id, _| shown.iter().any(|sv| sv.id == *id));
+    for server in shown {
+        // Only an account already open: opening one is the listing's job.
+        if dropbox::cached(&server.user).is_none() {
+            continue;
+        }
+        let w = s.servers.dropbox_watch.entry(server.id.clone()).or_insert(Watch { next: now, busy: false });
+        if w.busy || now < w.next {
+            continue;
+        }
+        w.busy = true;
+        let id = server.id.clone();
+        task(s, &server, t("esperar mudanças no Dropbox", "wait for changes on Dropbox"), |a| a.watch(WAIT), move |result| Msg::Dropbox(Answer::Changes { id, result }));
+    }
+}
+
+/// When the next wait is due, for the frame loop to wake then.
+pub fn next_ask(s: &State) -> Option<f64> {
+    s.servers.dropbox_watch.values().filter(|w| !w.busy).map(|w| w.next).reduce(f64::min)
+}
+
+fn changes_arrived(s: &mut State, id: String, result: Result<Changes, String>, now: f64) {
+    let Some(w) = s.servers.dropbox_watch.get_mut(&id) else { return };
+    w.busy = false;
+    let changes = match result {
+        Ok(c) => {
+            w.next = now + c.backoff.unwrap_or(0) as f64;
+            c
+        }
+        Err(e) => {
+            w.next = now + RETRY;
+            openexplorer_gdrive::log(&format!("mudanças do Dropbox {id}: {e}"));
+            return;
+        }
+    };
+    if changes.is_empty() {
+        return;
+    }
+    let Some(server) = s.servers.list.iter().find(|sv| sv.id == id).cloned() else { return };
+    let stale = |path: &[String]| changes.touches(&server.path(path));
+    for p in 0..2 {
+        let reload = matches!(&s.panes[p].loc, Location::Server { server: sv, path, find: None } if sv.id == id && stale(path));
+        if reload && !s.panes[p].loading {
+            crate::load(s, p);
+        }
+    }
+    crate::tree::server_folders_changed(s, &id, &stale);
+    ask_quota(s, &server);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accounts_open_at_their_top() {
+        let sv = Server::dropbox("ana@exemplo.com");
+        assert_eq!(top(&sv), folder(&sv, Vec::new()));
+        assert!(at(&top(&sv)).is_some() && at(&Location::home()).is_none());
+    }
+
+    #[test]
+    fn an_account_address_reaches_its_folder_and_a_new_one_opens_the_sign_in() {
+        let sv = Server::dropbox("ana@exemplo.com");
+        let a = crate::servers::parse_address("dropbox://Ana@Exemplo.com/Fotos/Viagem%202024").unwrap();
+        assert_eq!((a.protocol, a.user.as_str(), a.path.as_str()), (openexplorer_remote::Protocol::Dropbox, "ana@exemplo.com", "/Fotos/Viagem 2024"));
+        let at = folder(&sv, vec!["Fotos".into(), "Viagem 2024".into()]);
+        assert_eq!(crate::servers::reach(std::slice::from_ref(&sv), &a).unwrap(), at);
+        assert_eq!(crate::servers::address_text(&at), "dropbox://ana@exemplo.com/Fotos/Viagem 2024");
+        // Not connected: the dialog to add it, on Dropbox's step.
+        assert_eq!(crate::servers::reach(&[], &a), Err(String::new()));
+        assert_eq!(Form::of_address(&a).provider, crate::servers::Provider::Dropbox);
+        // A MEGA address isn't taken for a Dropbox one.
+        let m = crate::servers::parse_address("mega://ana@exemplo.com/Drive na nuvem").unwrap();
+        assert!(crate::servers::reach(std::slice::from_ref(&sv), &m).is_err());
+    }
+
+    #[test]
+    fn the_storage_reads_free_of_total() {
+        let q = Quota { used: 5_368_709_120, total: 2_199_023_255_552, team: false };
+        assert_eq!(quota_label(&q), "2,0 TB livres de 2 TB");
+        assert!(!quota_help(q).contains("time"));
+        assert!(quota_help(Quota { team: true, ..q }).contains("Espaço do time"));
+    }
+
+    #[test]
+    fn changes_name_the_folders_panes_show() {
+        let sv = Server::dropbox("ana@exemplo.com");
+        let c = Changes { folders: ["/fotos/2024".to_string()].into(), all: false, backoff: None };
+        assert!(c.touches(&sv.path(&["Fotos".into(), "2024".into()])));
+        assert!(!c.touches(&sv.path(&["Fotos".into()])));
+    }
+}
