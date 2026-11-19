@@ -45,8 +45,10 @@ fn lists_the_buckets_and_a_bucket_top() {
     for i in top.iter().take(20) {
         println!("  {}{} {:?}", i.name, if i.is_dir { "/" } else { "" }, i.size);
     }
-    // The same folder again within a few minutes: from the cache.
-    assert_eq!(a.list(&format!("/{b}")).unwrap(), top);
+    // Read again: as kept. And what the app's own readings make of it.
+    assert_eq!(a.reread(&format!("/{b}")).unwrap(), openexplorer_b2::Fresh::Same);
+    assert_eq!(a.poll(&format!("/{b}")), openexplorer_b2::Polled::Same);
+    println!("leituras próprias nesta hora e neste dia: {:?}", a.polls_spent());
 }
 
 #[test]
@@ -81,6 +83,12 @@ fn writes_inside_a_folder_of_its_own() {
         a.copy(&format!("{dir}/sub"), &format!("{dir}/sub2"))?;
         let names: Vec<String> = a.list_fresh(&format!("{dir}/sub2"))?.into_iter().map(|i| i.name).collect();
         assert_eq!(names, ["copia.txt"]);
+        // A change made elsewhere (another connection of the same key) shows on the next
+        // reading the app makes on its own.
+        let Some(elsewhere) = account() else { unreachable!() };
+        a.list_fresh(&dir)?;
+        elsewhere.upload(&mut Uploads::default(), &format!("{dir}/de-fora.txt"), &mut &b"x"[..], 1, &mut |_| true)?;
+        assert!(matches!(a.poll(&dir), openexplorer_b2::Polled::Changed(items) if items.iter().any(|i| i.name == "de-fora.txt")));
         // Deleted (hidden), then brought back.
         let since = a.hide(&renamed, false)?;
         assert!(a.stat(&renamed)?.is_none());
@@ -95,6 +103,28 @@ fn writes_inside_a_folder_of_its_own() {
             let mut back = Vec::new();
             a.download(&path, &mut back, &mut |_| true)?;
             assert!(back == big, "the large file came back whole");
+            // One that stops midway shows among the unfinished uploads, and is cancelled.
+            struct Stops<'a>(&'a [u8], usize);
+            impl std::io::Read for Stops<'_> {
+                fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                    if self.1 >= 40 << 20 {
+                        return Err(std::io::Error::other("parou"));
+                    }
+                    let n = buf.len().min(self.0.len() - self.1).min((40 << 20) - self.1);
+                    buf[..n].copy_from_slice(&self.0[self.1..self.1 + n]);
+                    self.1 += n;
+                    Ok(n)
+                }
+            }
+            let stopped = format!("{dir}/parou.bin");
+            assert!(a.upload(&mut up, &stopped, &mut Stops(&big, 0), big.len() as u64, &mut |_| true).is_err());
+            let name = stopped.trim_start_matches(&format!("/{b}/")).to_string();
+            let mine: Vec<_> = a.unfinished_uploads(&b)?.into_iter().filter(|u| u.name == name).collect();
+            println!("inacabado: {mine:?}");
+            assert_eq!(mine.len(), 1);
+            assert!(mine[0].sent > 0 && mine[0].size == Some(big.len() as u64));
+            assert_eq!(a.cancel_unfinished(&[mine[0].id.clone()])?, 1);
+            assert!(a.unfinished_uploads(&b)?.iter().all(|u| u.name != name));
         }
         Ok(())
     };
