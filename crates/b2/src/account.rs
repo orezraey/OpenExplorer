@@ -277,6 +277,9 @@ pub struct Account {
     changes: AtomicU64,
     /// What the app's own readings may still ask (see [`crate::watch`]).
     budget: Mutex<watch::Budget>,
+    /// Each bucket's sums of sizes (see [`crate::sizes`]), and one summing at a time.
+    pub(crate) sizes: Mutex<HashMap<String, crate::sizes::Kept>>,
+    pub(crate) sizing: Mutex<()>,
 }
 
 /// What B2 has at a name: a file, or a folder (names under it).
@@ -315,7 +318,7 @@ impl Account {
         let secret = cache::Secret::of(api.key_id(), api.key());
         let lists = Listings::open(file.map(|f| (f, secret)));
         let buckets = lists.get("", "").map(|l| l.items.iter().filter_map(Bucket::of_item).collect()).unwrap_or_default();
-        Account { key_id: api.key_id().to_string(), api, lists, buckets: Mutex::new(buckets), parallel: crate::upload::PARTS_AT_ONCE, changes: AtomicU64::new(0), budget: Mutex::default() }
+        Account { key_id: api.key_id().to_string(), api, lists, buckets: Mutex::new(buckets), parallel: crate::upload::PARTS_AT_ONCE, changes: AtomicU64::new(0), budget: Mutex::default(), sizes: Mutex::default(), sizing: Mutex::new(()) }
     }
 
     pub fn api(&self) -> &Api {
@@ -711,6 +714,7 @@ impl Account {
     pub(crate) fn changed(&self, s: &Spot, tree: bool) {
         // A listing being read meanwhile may predate the change: it isn't kept.
         self.changes.fetch_add(1, Ordering::SeqCst);
+        self.sizes_changed(&s.bucket);
         let parent = s.parent().0.prefix();
         self.lists.forget(&s.bucket, "");
         for (i, _) in parent.match_indices('/') {

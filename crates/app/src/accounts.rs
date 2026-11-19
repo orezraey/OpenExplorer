@@ -299,7 +299,7 @@ pub fn quota_bar(s: &State, loc: &Location) -> Option<(String, Option<f64>, Stri
         Account::Mega => mega::quota_of(s, loc).map(|q| (mega::quota_label(&q), (q.total > 0).then(|| q.used as f64 / q.total as f64), mega::quota_help(q))),
         Account::Dropbox => dropbox::quota_status(s, loc),
         Account::OneDrive => onedrive::quota_bar(s, loc),
-        Account::B2 => None,
+        Account::B2 => b2::quota_bar(loc),
     }
 }
 

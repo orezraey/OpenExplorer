@@ -749,3 +749,24 @@ fn the_folders_inside_one_shown_are_read_ahead_and_kept() {
     a.prefetch("/");
     assert!(a.cached("/docs").is_some());
 }
+
+#[test]
+fn a_bucket_and_its_folders_are_summed_in_one_listing_and_kept() {
+    let m = mock();
+    let a = m.account();
+    let before = m.calls("b2_list_file_versions");
+    let s = a.sizes("fotos").unwrap();
+    assert_eq!(m.calls("b2_list_file_versions"), before + 1);
+    // praia.jpg 5, ferias/a.jpg 3, leia-me.txt 2.
+    assert_eq!(s.of(""), Some((10, 10)));
+    assert_eq!(s.of("2024/"), Some((8, 8)));
+    assert_eq!(s.of("2024/ferias/"), Some((3, 3)));
+    assert_eq!(s.files, 3);
+    // Kept: no request; after a change of the app's own, summed again.
+    a.sizes("fotos").unwrap();
+    assert_eq!(m.calls("b2_list_file_versions"), before + 1);
+    a.hide("/fotos/leia-me.txt", false).unwrap();
+    assert_eq!(a.kept_sizes("fotos").unwrap().of(""), Some((10, 10)));
+    let s = a.sizes("fotos").unwrap();
+    assert_eq!(s.of(""), Some((8, 10)));
+}

@@ -85,6 +85,87 @@ fn entries(items: Vec<b2::Item>, show_hidden: bool) -> Vec<Entry> {
     items.into_iter().filter(|i| show_hidden || !i.name.starts_with('.')).map(entry).collect()
 }
 
+/// The bucket and the folder prefix (`a/b/`, `""` at the bucket's top) of a B2 path; `None` at
+/// the key's top, the list of buckets.
+fn bucket_of(dir: &str) -> Option<(&str, String)> {
+    let rel = dir.trim_matches('/');
+    match rel.split_once('/') {
+        Some((b, p)) => Some((b, format!("{p}/"))),
+        None if rel.is_empty() => None,
+        None => Some((rel, String::new())),
+    }
+}
+
+/// Gives the folders (or the buckets) among `entries`, listed at `dir`, the size the key summed
+/// for them (see `openexplorer_b2::sizes`): the bytes of the current files under each. Those not
+/// summed yet keep none.
+fn fill(entries: &mut [Entry], account: &b2::Account, dir: &str) {
+    let at = bucket_of(dir);
+    for e in entries.iter_mut().filter(|e| e.is_dir) {
+        let size = match &at {
+            None => account.kept_sizes(&e.name).map(|s| s.current),
+            Some((b, prefix)) => account.kept_sizes(b).and_then(|s| s.of(&format!("{prefix}{}/", e.name))).map(|(current, _)| current),
+        };
+        if size.is_some() {
+            e.size = size;
+        }
+    }
+}
+
+/// Sums the sizes of the buckets `dir` shows or is in (one listing of every version each, kept
+/// a while; see `openexplorer_b2::sizes`), then has the panes on the key show them.
+fn sum_sizes(account: &b2::Account, dir: &str, emit: &dyn Fn(Msg)) {
+    let buckets: Vec<String> = match bucket_of(dir) {
+        Some((b, _)) => vec![b.to_string()],
+        None => account.known_buckets().into_iter().map(|b| b.name).collect(),
+    };
+    let mut any = false;
+    for b in buckets {
+        match catch_panic(t("somar o tamanho do bucket", "add up the bucket's size"), || account.sizes(&b)) {
+            Ok(_) => any = true,
+            Err(e) => openexplorer_gdrive::log(&format!("B2: tamanho de {b}: {e}")),
+        }
+    }
+    if any {
+        emit(Msg::B2(Answer::Sized { key_id: account.key_id.clone() }));
+    }
+}
+
+/// The sums of key `key_id` arrived: its panes' folders show their sizes.
+fn sized(s: &mut State, key_id: &str) {
+    let Some(account) = b2::cached(key_id) else { return };
+    for p in 0..s.panes.len() {
+        let Location::Server { server, path, find: None } = &s.panes[p].loc else { continue };
+        if !server.is_b2() || server.user != key_id || s.panes[p].loading {
+            continue;
+        }
+        let dir = server.path(path);
+        let mut entries = s.panes[p].entries.clone();
+        fill(&mut entries, &account, &dir);
+        if entries != s.panes[p].entries {
+            s.panes[p].set_entries(Ok(entries));
+        }
+    }
+}
+
+/// What the status bar shows inside a B2 bucket: what its current files take, and in the tip
+/// what every version kept takes (what the website shows and Backblaze bills).
+pub fn quota_bar(loc: &Location) -> Option<(String, Option<f64>, String)> {
+    let Location::Server { server, path, .. } = loc else { return None };
+    let dir = server.path(path);
+    let (bucket, _) = bucket_of(&dir)?;
+    let sums = b2::cached(&server.user)?.kept_sizes(bucket)?;
+    let label = tr!("{} no bucket", "{} in the bucket", crate::model::format_size(sums.current));
+    let help = tr!(
+        "{bucket}: {} arquivos, {} nos arquivos atuais; {} guardados contando as versões escondidas (o que a Backblaze cobra).",
+        "{bucket}: {} files, {} in the current files; {} stored counting hidden versions (what Backblaze bills).",
+        openexplorer_i18n::grouped(sums.files),
+        crate::model::format_size(sums.current),
+        crate::model::format_size(sums.stored)
+    );
+    Some((label, None, help))
+}
+
 /// Lists pane `p`'s B2 folder on a thread. A listing kept from before shows at once, and B2 is
 /// always asked again behind it (B2 can't say what changed, and listing is free; see
 /// `openexplorer_b2::watch`): the pane changes only if B2's answer differs, so nothing blinks
@@ -121,24 +202,31 @@ pub fn load(s: &mut State, p: usize, request: u64, _fresh: bool) {
                 Ok(())
             });
         };
+        let sized = |items: Vec<b2::Item>| {
+            let mut e = entries(items, show_hidden);
+            fill(&mut e, &account, &dir);
+            e
+        };
         let Some(kept) = account.cached(&dir) else {
-            let result = catch_panic(t("listar", "list"), || account.list_fresh(&dir).map(|items| entries(items, show_hidden)));
+            let result = catch_panic(t("listar", "list"), || account.list_fresh(&dir).map(sized));
             let ok = result.is_ok();
             emit(listed(Part::WHOLE, result));
             if ok {
                 ahead();
+                sum_sizes(&account, &dir, &emit);
             }
             return;
         };
-        emit(listed(Part::Cached, Ok(entries(kept.items.clone(), show_hidden))));
+        emit(listed(Part::Cached, Ok(sized(kept.items.clone()))));
         drop(kept);
         match catch_panic(t("listar", "list"), || account.reread(&dir).map(Some)) {
-            Ok(Some(b2::Fresh::Changed(items))) => emit(listed(Part::WHOLE, Ok(entries(items, show_hidden)))),
+            Ok(Some(b2::Fresh::Changed(items))) => emit(listed(Part::WHOLE, Ok(sized(items)))),
             Ok(_) => emit(Msg::B2(Answer::Same { pane: p, request })),
             // The kept listing stays on screen; the error is said.
             Err(e) => emit(listed(Part::Page { first: false, more: false }, Err(e))),
         }
         ahead();
+        sum_sizes(&account, &dir, &emit);
     });
 }
 
@@ -339,8 +427,19 @@ fn polled(s: &mut State, pane: usize, request: u64, loc: Location, result: Resul
     }
     // The selection, the cursor and the scroll stay: entries are matched by name.
     let show_hidden = s.settings.show_hidden;
-    s.panes[pane].set_entries(Ok(entries(items, show_hidden)));
+    let mut shown = entries(items, show_hidden);
+    if let (Some(account), Location::Server { server, path, .. }) = (b2::cached(&server_user(&loc)), &loc) {
+        fill(&mut shown, &account, &server.path(path));
+    }
+    s.panes[pane].set_entries(Ok(shown));
     crate::drop_stale_rename(s, pane);
+}
+
+fn server_user(loc: &Location) -> String {
+    match loc {
+        Location::Server { server, .. } => server.user.clone(),
+        _ => String::new(),
+    }
 }
 
 fn loc_text(loc: &Location) -> String {
@@ -365,6 +464,8 @@ pub enum Answer {
     Unfinished { key_id: String, bucket: String, result: Result<Vec<b2::Unfinished>, String> },
     /// Cancelling some of them ended: how many went.
     Cancelled { key_id: String, bucket: String, result: Result<usize, String> },
+    /// Key `key_id` summed the sizes of buckets its panes show.
+    Sized { key_id: String },
 }
 
 pub fn arrived(s: &mut State, a: Answer) {
@@ -374,6 +475,7 @@ pub fn arrived(s: &mut State, a: Answer) {
         Answer::Polled { pane, request, loc, result } => polled(s, pane, request, *loc, result),
         Answer::Unfinished { key_id, bucket, result } => unfinished_listed(s, &key_id, &bucket, result),
         Answer::Cancelled { key_id, bucket, result } => uploads_cancelled(s, &key_id, &bucket, result),
+        Answer::Sized { key_id } => sized(s, &key_id),
     }
 }
 
@@ -967,6 +1069,13 @@ pub fn form(k: &Kit, f: &Form, banner: El, eye: El, scroll: impl FnOnce(El) -> E
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_names_its_bucket_and_folder_prefix() {
+        assert_eq!(bucket_of("/"), None);
+        assert_eq!(bucket_of("/fotos"), Some(("fotos", String::new())));
+        assert_eq!(bucket_of("/fotos/2024/ferias/"), Some(("fotos", "2024/ferias/".to_string())));
+    }
 
     fn at_path(path: &[&str]) -> Location {
         folder(&Server::b2("0051a2b3", "B2 · fotos"), path.iter().map(|s| s.to_string()).collect())

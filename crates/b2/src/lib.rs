@@ -46,6 +46,7 @@ pub mod api;
 pub mod cache;
 pub mod download;
 pub mod notes;
+pub mod sizes;
 pub mod store;
 pub mod upload;
 pub mod watch;
@@ -63,6 +64,7 @@ pub use api::{Allowed, set_log};
 pub use cache::set_dir as set_cache_dir;
 pub use notes::set_file as set_notes_file;
 pub use store::Store;
+pub use sizes::Sizes;
 pub use upload::{Unfinished, Uploads};
 
 /// Errors are shown to the user as they are, so they're plain sentences in the interface's
