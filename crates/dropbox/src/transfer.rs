@@ -3,10 +3,14 @@
 //! - A download names the file's revision once it knows it, so a connection dropped midway is
 //!   asked again with `Range` from the bytes already written, of the same version: two versions
 //!   are never spliced. What arrived is checked against the file's `content_hash`.
-//! - An upload up to 150 MiB goes in one request (`files/upload`), streamed; above, in an upload
-//!   session, block by block (8 MiB, a multiple of the 4 MiB Dropbox asks for), each block sent
-//!   again on a dropped connection, and the offset Dropbox says it holds is believed when the
-//!   two disagree. The `content_hash` Dropbox computes is checked against the one computed here.
+//! - An upload up to 8 MiB goes in one request (`files/upload`), from memory; above, in an
+//!   upload session, block by block (8 MiB, a multiple of the 4 MiB Dropbox asks for). Every
+//!   request is held in memory, so one Dropbox answers with 429 (`too_many_write_operations`,
+//!   frequent with several uploads into one account) is waited out and sent again, as is a block
+//!   whose connection dropped; the offset Dropbox says it holds is believed when the two disagree.
+//!   The `content_hash` Dropbox computes is checked against the one computed here. (Files up to
+//!   150 MiB once went in one streamed request, which a 429 midway lost for good.)
+//! - Many small files go together (see [`crate::batch`]).
 //! - [`Account::same_content`] tells a file already on Dropbox with the same bytes, so it isn't
 //!   sent again.
 
@@ -23,37 +27,13 @@ use crate::content::Hasher;
 use crate::meta::{Change, Entry, api_path, entry, last};
 use crate::{CANCELLED, Result};
 
-/// The largest file sent in one request.
-pub const SIMPLE_MAX: u64 = 150 << 20;
-/// An upload session's block.
+/// An upload session's block, and the largest file sent in one request.
 pub const BLOCK: usize = 8 << 20;
 /// Tries of a download from where it stopped, or of one block.
 const TRIES: u32 = 5;
 
 /// Called with the bytes moved so far; `false` stops the transfer with [`CANCELLED`].
 pub type Progress<'a> = &'a mut dyn FnMut(u64) -> bool;
-
-/// Counts and hashes what's read through it, and stops when told.
-struct Tap<'a> {
-    src: &'a mut dyn Read,
-    done: u64,
-    hash: &'a mut Hasher,
-    progress: &'a mut dyn FnMut(u64) -> bool,
-    stopped: bool,
-}
-
-impl Read for Tap<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.src.read(buf)?;
-        self.hash.update(&buf[..n]);
-        self.done += n as u64;
-        if n > 0 && !(self.progress)(self.done) {
-            self.stopped = true;
-            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, CANCELLED));
-        }
-        Ok(n)
-    }
-}
 
 /// Fills `buf` from `src` as far as it goes: how much it read.
 fn fill(src: &mut dyn Read, buf: &mut [u8]) -> Result<usize> {
@@ -67,6 +47,16 @@ fn fill(src: &mut dyn Read, buf: &mut [u8]) -> Result<usize> {
         }
     }
     Ok(got)
+}
+
+/// The offset an `incorrect_offset` error says Dropbox holds. A struct member of a union sits
+/// beside its tag (`{".tag": "incorrect_offset", "correct_offset": 8}`, Stone's JSON rules); the
+/// nested form is read too.
+pub(crate) fn correct_offset(error: &Value) -> Option<u64> {
+    if error.get(".tag").and_then(Value::as_str) != Some("incorrect_offset") {
+        return None;
+    }
+    error.get("correct_offset").or_else(|| error.pointer("/incorrect_offset/correct_offset")).and_then(Value::as_u64)
 }
 
 impl Account {
@@ -148,11 +138,11 @@ impl Account {
 
     /// Creates or replaces the file at `path` with the `len` bytes of `src`.
     pub fn upload(&self, path: &str, src: &mut dyn Read, len: u64, progress: Progress) -> Result<Entry> {
-        self.upload_limited(path, src, len, SIMPLE_MAX, progress)
+        self.upload_limited(path, src, len, BLOCK as u64, progress)
     }
 
-    /// [`Account::upload`] with files over `simple_max` bytes sent in an upload session (the
-    /// real-account tests send a small file that way).
+    /// [`Account::upload`] with files over `simple_max` bytes (at most [`BLOCK`]) sent in an
+    /// upload session (the real-account tests send a small file that way).
     pub fn upload_limited(&self, path: &str, src: &mut dyn Read, len: u64, simple_max: u64, progress: Progress) -> Result<Entry> {
         let commit = json!({"path": api_path(path), "mode": "overwrite", "autorename": false, "mute": true, "strict_conflict": false});
         let mut hash = Hasher::default();
@@ -168,16 +158,6 @@ impl Account {
             hash.update(&data);
             let mut told = |n: usize| progress(n as u64);
             self.api.upload("files/upload", &commit, &mut Body::Bytes(&data, Some(&mut told))).map_err(named)?
-        } else if len <= simple_max {
-            let mut tap = Tap { src, done: 0, hash: &mut hash, progress: &mut *progress, stopped: false };
-            let sent = self.api.upload("files/upload", &commit, &mut Body::Reader(&mut tap, len));
-            if tap.stopped {
-                return Err(CANCELLED.into());
-            }
-            if tap.done != len {
-                return Err(tr!("O arquivo mudou de tamanho durante o envio ({} de {len} bytes).", "The file changed size while being sent ({} of {len} bytes).", tap.done));
-            }
-            sent.map_err(named)?
         } else {
             self.upload_session(src, len, &commit, &mut hash, progress)?
         };
@@ -220,8 +200,8 @@ impl Account {
                         break;
                     }
                     // Dropbox holds more (or less) of the block than we thought: from there.
-                    Err(Fail::Route { ref error, .. }) if error.pointer("/incorrect_offset/correct_offset").is_some() => {
-                        let correct = error.pointer("/incorrect_offset/correct_offset").and_then(Value::as_u64).unwrap_or(0);
+                    Err(Fail::Route { ref error, .. }) if correct_offset(error).is_some() => {
+                        let correct = correct_offset(error).unwrap_or(0);
                         if correct < offset || correct > offset + n as u64 {
                             return Err(t("O Dropbox perdeu parte do envio; envie de novo.", "Dropbox lost part of the upload; send it again.").into());
                         }
@@ -293,8 +273,7 @@ mod tests {
     fn a_big_file_goes_in_blocks_through_dropped_connections() {
         let fake = Fake::start();
         let a = fake.account();
-        // Past the one-request limit, without sending 150 MiB in a test: the limit is a size,
-        // so the session is checked on its own with a size that needs three blocks.
+        // Three blocks, the session checked on its own.
         let data = bytes(2 * super::BLOCK + 1234);
         fake.drop_next_append();
         let mut hash = crate::content::Hasher::default();
@@ -352,6 +331,24 @@ mod tests {
         let err = a.upload_limited("/d.bin", &mut &big[..], big.len() as u64, 0, &mut |n| n < 1_000_000).unwrap_err();
         assert_eq!(err, crate::CANCELLED);
         assert!(!fake.has("/d.bin"));
+    }
+
+    #[test]
+    fn a_file_over_a_block_survives_a_429_midway() {
+        // Between 8 and 150 MiB: once one streamed request, which a 429 lost for good; now
+        // blocks held in memory, the block Dropbox asked to wait for sent again.
+        let fake = Fake::start();
+        let a = fake.account();
+        let data = bytes(2 * super::BLOCK + 77);
+        fake.throttle_route("files/upload_session/append_v2");
+        let mut last = 0;
+        let e = a.upload("/medio.bin", &mut &data[..], data.len() as u64, &mut |n| {
+            last = n;
+            true
+        }).unwrap();
+        assert_eq!((e.size, last), (data.len() as u64, data.len() as u64));
+        assert_eq!(fake.content("/medio.bin"), data);
+        assert_eq!(fake.throttled(), 1);
     }
 
     #[test]

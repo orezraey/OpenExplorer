@@ -49,11 +49,21 @@ impl Change {
 }
 
 /// Reads a metadata object. `None` for what has no path (an item not mounted in this account).
+///
+/// A route declared to answer `Metadata` tags it (`"file"`, `"folder"`, `"deleted"`); one
+/// declared `FileMetadata` or `FolderMetadata` (upload, restore, a new folder) doesn't, by
+/// Stone's JSON rules, and a batch entry carries its own tag (`"success"`) instead: then what it
+/// is shows in its fields, a file's `rev` and `size`.
 pub fn change(v: &Value) -> Option<Change> {
     let s = |k: &str| v.get(k).and_then(Value::as_str);
     let lower = s("path_lower")?.to_string();
     let name = s("name").map(str::to_string).unwrap_or_else(|| last(&lower).to_string());
-    Some(match s(".tag")? {
+    let tag = match s(".tag") {
+        Some(t @ ("file" | "folder" | "deleted")) => t,
+        _ if v.get("rev").is_some() || v.get("size").is_some() => "file",
+        _ => "folder",
+    };
+    Some(match tag {
         "deleted" => Change::Gone(lower),
         "folder" => Change::Is(Entry { name, lower, dir: true, size: 0, modified: None, rev: String::new(), hash: String::new() }),
         "file" => Change::Is(Entry {
@@ -158,6 +168,13 @@ mod tests {
         assert_eq!(change(&json!({".tag": "deleted", "name": "x", "path_lower": "/a/x"})), Some(Change::Gone("/a/x".into())));
         // Not mounted here: no path.
         assert_eq!(change(&json!({".tag": "folder", "name": "fora"})), None);
+        // Untagged, as upload and restore answer, or tagged as a batch entry.
+        let mut bare = file.clone();
+        bare.as_object_mut().unwrap().remove(".tag");
+        assert_eq!(entry(&bare), Some(e.clone()));
+        bare[".tag"] = json!("success");
+        assert_eq!(entry(&bare), Some(e));
+        assert!(entry(&json!({"name": "math", "path_lower": "/homework/math", "id": "id:x"})).unwrap().dir);
     }
 
     #[test]

@@ -52,6 +52,7 @@ pub enum Dialog {
     /// Copiar link on a MEGA file with no link yet: make one?
     MegaLink(Box<crate::mega::MakeLink>),
     DropboxLink(Box<crate::dropbox::MakeLink>),
+    DropboxDeleted(Box<crate::dropbox::DeletedView>),
     /// Copiar link on a OneDrive item with no link yet: make one?
     OneDriveLink(Box<crate::onedrive::MakeLink>),
     /// Envios inacabados of a B2 bucket.

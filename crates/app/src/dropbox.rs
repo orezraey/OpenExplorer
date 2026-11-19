@@ -3,9 +3,10 @@
 //! account's top, a team space's top for a team member (team folders beside their own).
 //! Listing, copying to and from anywhere, moving, renaming, new folders, searching and dragging
 //! go through the servers' code, with the account as the connection (`openexplorer_remote`'s
-//! `dropbox.rs`). What only Dropbox has lives here: adding an account (OAuth in the browser),
-//! deleting into Dropbox's deleted files and undoing it, shared links, the storage in the status
-//! bar, and folders that refresh when something changes elsewhere (a longpoll per account).
+//! `dropbox.rs`; many items at once in Dropbox's batches). What only Dropbox has lives here:
+//! adding an account (OAuth in the browser), deleting into Dropbox's deleted files and undoing
+//! it, a folder's deleted items and restoring them, shared links, the storage in the status bar,
+//! and folders that refresh when something changes elsewhere (a longpoll per account).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -14,7 +15,7 @@ use openexplorer_dropbox::{self as dropbox, Account, AppConfig, Changes, Quota};
 use openexplorer_i18n::{t, tr};
 use openexplorer_remote::Server;
 use rune::{El, ScrollSpec, Tx, col, el, icon, row, text};
-use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit};
+use rune_kit::{Button, ButtonVariant, Checkbox, Dialog as Modal, Kit};
 
 use crate::actions::{Dialog, selected};
 use crate::model::{Entry, Location};
@@ -80,6 +81,8 @@ pub enum Answer {
     Link { server: Box<Server>, path: String, item: Entry, result: Result<Option<String>, String> },
     /// A link made (`Some`) or taken away (`None`) for the item named `name`.
     Linked { name: String, result: Result<Option<String>, String> },
+    /// What was deleted from the folder at `path` (Itens excluídos).
+    Deleted { path: String, result: Result<Vec<dropbox::Deleted>, String> },
 }
 
 pub fn arrived(s: &mut State, a: Answer, tx: &mut Tx, now: f64) {
@@ -108,6 +111,14 @@ pub fn arrived(s: &mut State, a: Answer, tx: &mut Tx, now: f64) {
             Ok(None) => s.status = tr!("Link removido: \"{name}\" não abre mais pelo link.", "Link removed: \"{name}\" no longer opens from the link."),
             Err(e) => crate::fail(s, e),
         },
+        Answer::Deleted { path, result } => {
+            if let Some(v) = view_mut(s)
+                && v.path == path
+            {
+                v.picked = vec![false; result.as_ref().map_or(0, Vec::len)];
+                v.items = Some(result);
+            }
+        }
     }
 }
 
@@ -353,10 +364,6 @@ pub fn delete_note() -> &'static str {
     )
 }
 
-/// How far before a folder's deletion files deleted from it count as deleted with it: the
-/// computer's clock and Dropbox's may disagree a little.
-const SKEW: i64 = 120;
-
 /// Excluir: the items go to Dropbox's deleted files (several in one batch), and Desfazer brings
 /// them back.
 pub fn delete(s: &mut State, loc: &Location, items: Vec<Entry>) {
@@ -366,18 +373,20 @@ pub fn delete(s: &mut State, loc: &Location, items: Vec<Entry>) {
     let paths: Vec<(String, String)> = items.iter().filter_map(|e| path_of(loc, e).map(|p| (p, e.name.clone()))).collect();
     undo::local_job(s, reload, |n| tr!("excluir {} do Dropbox", "delete {} from Dropbox", crate::actions::count(n)), move |rec| {
         let a = dropbox::reach(&server.user)?;
-        let since = undo::now_secs() - SKEW;
+        // The deletion's window on Dropbox's clock, for Desfazer to bring back what it took.
+        let since = a.api.server_now() - 2;
         let results = match paths.as_slice() {
             [(one, _)] => vec![a.delete(one)],
             many => a.delete_many(&many.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>())?,
         };
+        let until = a.api.server_now() + 1;
         let mut failed = Vec::new();
         let mut done = 0;
         for (r, (path, name)) in results.into_iter().zip(&paths) {
             match r {
                 Ok(e) => {
                     done += 1;
-                    rec.add([Step::DropboxRestore { server: server.clone(), path: path.clone(), name: name.clone(), rev: (!e.dir).then_some(e.rev), since }]);
+                    rec.add([Step::DropboxRestore { server: server.clone(), path: path.clone(), name: name.clone(), rev: (!e.dir).then_some(e.rev), since, until }]);
                 }
                 Err(e) => failed.push(e),
             }
@@ -410,24 +419,173 @@ pub fn run(step: &Step) -> Result<Step, String> {
     match step {
         Step::DropboxDelete { server, path, name } => {
             let a = dropbox::reach(&server.user)?;
-            let since = undo::now_secs() - SKEW;
+            let since = a.api.server_now() - 2;
             let e = a.delete(path)?;
-            Ok(Step::DropboxRestore { server: server.clone(), path: path.clone(), name: name.clone(), rev: (!e.dir).then_some(e.rev), since })
+            let until = a.api.server_now() + 1;
+            Ok(Step::DropboxRestore { server: server.clone(), path: path.clone(), name: name.clone(), rev: (!e.dir).then_some(e.rev), since, until })
         }
-        Step::DropboxRestore { server, path, name, rev, since } => {
+        Step::DropboxRestore { server, path, name, rev, since, until } => {
             let a = dropbox::reach(&server.user)?;
             match rev {
                 Some(rev) => {
                     a.restore(path, rev)?;
                 }
                 None => {
-                    a.restore_folder(path, *since)?;
+                    a.restore_folder(path, Some((*since, *until)))?;
                 }
             }
             Ok(Step::DropboxDelete { server: server.clone(), path: path.clone(), name: name.clone() })
         }
         other => Ok(other.clone()),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A folder's deleted items
+
+/// Itens excluídos: what was deleted from a folder, as the Dropbox website's "deleted files"
+/// shows it, to pick and bring back.
+pub struct DeletedView {
+    pub server: Server,
+    /// The folder's path on the account.
+    pub path: String,
+    /// Its name, for the title.
+    pub place: String,
+    /// What was deleted there: `None` while it's asked.
+    pub items: Option<Result<Vec<dropbox::Deleted>, String>>,
+    /// Which of `items` are ticked.
+    pub picked: Vec<bool>,
+}
+
+fn view_mut(s: &mut State) -> Option<&mut DeletedView> {
+    match &mut s.dialog {
+        Some(Dialog::DropboxDeleted(v)) => Some(v),
+        _ => None,
+    }
+}
+
+/// Whether pane `p` shows a Dropbox folder (not a search), where Itens excluídos applies.
+pub fn shows_folder(s: &State, p: usize) -> bool {
+    matches!(&s.panes[p].loc, Location::Server { server, find: None, .. } if server.is_dropbox())
+}
+
+/// Itens excluídos: the deleted items of the folder pane `p` shows, in a dialog.
+pub fn show_deleted(s: &mut State, p: usize, _: &mut Tx) {
+    if !shows_folder(s, p) {
+        return;
+    }
+    let Some((server, path)) = at(&s.panes[p].loc) else { return };
+    let (server, dir) = (server.clone(), server.path(path));
+    let place = path.last().cloned().unwrap_or_else(|| server.name.clone());
+    s.dialog = Some(Dialog::DropboxDeleted(Box::new(DeletedView { server: server.clone(), path: dir.clone(), place, items: None, picked: Vec::new() })));
+    let at_path = dir.clone();
+    task(s, &server, t("listar os itens excluídos", "list the deleted items"), move |a| a.deleted_in(&at_path), move |result| Msg::Dropbox(Answer::Deleted { path: dir, result }));
+}
+
+/// Restaurar, in the dialog: the items ticked come back (a folder with what its deletion took),
+/// and Desfazer deletes them again.
+pub fn restore_picked(s: &mut State) {
+    let Some(Dialog::DropboxDeleted(v)) = s.dialog.take() else { return };
+    let DeletedView { server, items, picked, .. } = *v;
+    let chosen: Vec<dropbox::Deleted> = items.and_then(Result::ok).unwrap_or_default().into_iter().zip(&picked).filter(|(_, on)| **on).map(|(d, _)| d).collect();
+    if chosen.is_empty() {
+        return;
+    }
+    let reload = panes_on(s, &server.id);
+    s.status = tr!("Restaurando {}…", "Restoring {}…", crate::actions::count(chosen.len()));
+    undo::local_job(s, reload, |n| tr!("restaurar {} no Dropbox", "restore {} on Dropbox", crate::actions::count(n)), move |rec| {
+        let a = dropbox::reach(&server.user)?;
+        let (mut done, mut files, mut failed) = (0, 0, Vec::new());
+        for d in &chosen {
+            match a.restore_deleted(d) {
+                Ok(n) => {
+                    done += 1;
+                    files += n;
+                    rec.add([Step::DropboxDelete { server: server.clone(), path: d.path.clone(), name: d.name.clone() }]);
+                }
+                Err(e) => failed.push(e),
+            }
+        }
+        match failed.first() {
+            None if files == done => Ok(tr!("Restaurado no Dropbox: {}.", "Restored on Dropbox: {}.", crate::actions::count(done))),
+            None => Ok(tr!("Restaurado no Dropbox: {} ({files} arquivos).", "Restored on Dropbox: {} ({files} files).", crate::actions::count(done))),
+            Some(_) if done == 0 => Err(failed.join("\n")),
+            Some(first) => Err(tr!("Restaurado: {}; {} falharam ({first})", "Restored: {}; {} failed ({first})", crate::actions::count(done), failed.len())),
+        }
+    });
+}
+
+/// What a deleted item's line says under its name.
+fn deleted_detail(d: &dropbox::Deleted) -> String {
+    let when = |w: i64| crate::model::format_time(std::time::UNIX_EPOCH + std::time::Duration::from_secs(w.max(0) as u64));
+    match (d.dir, d.size, d.when) {
+        (Some(true), ..) => t("Pasta", "Folder").into(),
+        (Some(false), Some(size), Some(w)) => tr!("{} · excluído em {}", "{} · deleted on {}", crate::model::format_size(size), when(w)),
+        (Some(false), Some(size), None) => crate::model::format_size(size),
+        _ => t("Arquivo ou pasta", "File or folder").into(),
+    }
+}
+
+pub fn deleted_dialog(k: &Kit, v: &DeletedView, layer: &mut Vec<El>) {
+    let close = |s: &mut State| s.dialog = None;
+    let muted = |words: String| text(words).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
+    let mut body = col().key("content").w_full().px(16.0).pb(16.0).gap(10.0).child(muted(
+        t(
+            "Itens excluídos desta pasta que o Dropbox ainda guarda. Marque os que quer de volta: uma pasta volta com o que foi excluído junto com ela.",
+            "Items deleted from this folder that Dropbox still keeps. Tick the ones you want back: a folder comes back with what was deleted along with it.",
+        )
+        .into(),
+    ));
+    let picked = v.picked.iter().filter(|p| **p).count();
+    match &v.items {
+        None => body = body.child(muted(t("Procurando os itens excluídos…", "Looking for the deleted items…").into())),
+        Some(Err(e)) => body = body.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0)),
+        Some(Ok(items)) if items.is_empty() => body = body.child(muted(t("Nada excluído aqui.", "Nothing deleted here.").into())),
+        Some(Ok(items)) => {
+            let all = picked == items.len();
+            body = body.child(
+                Checkbox::new(all)
+                    .label(tr!("Todos ({})", "All ({})", items.len()))
+                    .on_toggle(move |s: &mut State| {
+                        if let Some(v) = view_mut(s) {
+                            v.picked.iter_mut().for_each(|p| *p = !all);
+                        }
+                    })
+                    .build(k)
+                    .key("all"),
+            );
+            let mut list = col().key("deleted").w_full().gap(6.0);
+            for (i, d) in items.iter().enumerate() {
+                let on = v.picked.get(i).copied().unwrap_or(false);
+                list = list.child(
+                    Checkbox::new(on)
+                        .label(d.name.clone())
+                        .description(deleted_detail(d))
+                        .on_toggle(move |s: &mut State| {
+                            if let Some(p) = view_mut(s).and_then(|v| v.picked.get_mut(i)) {
+                                *p = !*p;
+                            }
+                        })
+                        .build(k)
+                        .key(format!("deleted-{i}")),
+                );
+            }
+            body = body.child(col().key("deleted-scroll").w_full().max_h(320.0).min_h(0.0).shrink().child(list.scroll(ScrollSpec { stick_bottom: false })));
+        }
+    }
+    let label = if picked > 0 { tr!("Restaurar ({picked})", "Restore ({picked})") } else { t("Restaurar", "Restore").into() };
+    body = body.child(
+        row()
+            .key("actions")
+            .w_full()
+            .pt(8.0)
+            .gap(8.0)
+            .justify_end()
+            .child(Button::new(t("Fechar", "Close")).variant(ButtonVariant::Neutral).on_press(close).build(k))
+            .child(Button::new(label).variant(ButtonVariant::Submit).disabled(picked == 0).on_press(restore_picked).build(k).default_button()),
+    );
+    let title = tr!("Itens excluídos de “{}”", "Deleted items of “{}”", v.place);
+    Modal::new("dropbox-deleted", title).open(true).child(body).width(520.0).fit().on_close(close).build(k, layer);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -645,10 +803,224 @@ mod tests {
     }
 
     #[test]
+    fn deleted_items_say_what_they_are() {
+        let d = |dir, size, when| dropbox::Deleted { name: "x".into(), path: "/x".into(), dir, rev: None, size, when };
+        assert_eq!(deleted_detail(&d(Some(true), None, None)), "Pasta");
+        assert!(deleted_detail(&d(Some(false), Some(2048), Some(1_700_000_000))).contains("excluído em"));
+        assert_eq!(deleted_detail(&d(None, None, None)), "Arquivo ou pasta");
+    }
+
+    #[test]
     fn changes_name_the_folders_panes_show() {
         let sv = Server::dropbox("ana@exemplo.com");
         let c = Changes { folders: ["/fotos/2024".to_string()].into(), all: false, backoff: None };
         assert!(c.touches(&sv.path(&["Fotos".into(), "2024".into()])));
         assert!(!c.touches(&sv.path(&["Fotos".into()])));
+    }
+}
+
+/// The panes' work on a Dropbox account in batches, as the panes do it (Colar, Recortar, an
+/// upload), against the Dropbox crate's stand-in for the API: the account is the connection,
+/// with its batch methods and `batches()` of (250, 8 MiB).
+#[cfg(test)]
+mod batches {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use openexplorer_dropbox::fake::Fake;
+
+    use super::*;
+    use crate::actions::{self, Clip, ClipMode};
+    use crate::ops::Stage;
+
+    /// Lets background jobs finish: polls until the status says how the last one went.
+    fn settle(s: &mut State) {
+        let start = Instant::now();
+        loop {
+            crate::poll(s, 0.0, &mut rune::Tx::default());
+            let busy = s.panes.iter().any(|p| p.loading) || s.status.is_empty() || s.status.ends_with('…');
+            if !busy {
+                return;
+            }
+            assert!(start.elapsed() < Duration::from_secs(60), "stuck: {}", s.status);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A state whose only server is an account on a new stand-in, open as `tag`'s e-mail.
+    fn on_fake(tag: &str) -> (Fake, Server, State) {
+        let fake = Fake::start();
+        let email = format!("{tag}@lotes.teste");
+        dropbox::account::adopt(&email, Arc::new(fake.account()));
+        let server = Server::dropbox(&email);
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        s.servers.list = vec![server.clone()];
+        // Rows done stay in the queue, to be looked at.
+        s.settings.clear_completed = false;
+        (fake, server, s)
+    }
+
+    fn open(s: &mut State, p: usize, loc: Location) {
+        crate::switch(s, p, loc);
+        s.status = "listado".into();
+        settle(s);
+    }
+
+    /// Picks `names` (all when empty) in pane 0's folder and pastes them into pane 1's, without
+    /// waiting for the job.
+    fn paste_now(s: &mut State, names: &[&str], mode: ClipMode) {
+        let items: Vec<Entry> = s.panes[0].entries.iter().filter(|e| names.is_empty() || names.contains(&e.name.as_str())).cloned().collect();
+        s.status.clear();
+        s.clip = Some(Clip { mode, from: s.panes[0].loc.clone(), items });
+        actions::paste(s, 1);
+    }
+
+    /// The stages of the last `n` rows of the queue, in order.
+    fn stages(s: &State, n: usize) -> Vec<Stage> {
+        s.transfers[s.transfers.len() - n..].iter().map(|t| t.progress.stage()).collect()
+    }
+
+    fn count(stages: &[Stage], stage: Stage) -> usize {
+        stages.iter().filter(|s| **s == stage).count()
+    }
+
+    #[test]
+    fn moves_go_in_batches_of_what_the_account_takes_and_undo_one_by_one() {
+        let (fake, sv, mut s) = on_fake("mover");
+        for i in 0..300 {
+            fake.put_file(&format!("/A/f{i:03}.txt"), b"a");
+        }
+        // Taken where f007 goes: that one fails alone.
+        fake.put_file("/B/f007.txt", b"ja estava");
+        open(&mut s, 0, folder(&sv, vec!["A".into()]));
+        open(&mut s, 1, folder(&sv, vec!["B".into()]));
+        paste_now(&mut s, &[], ClipMode::Cut);
+        settle(&mut s);
+        // 250 a batch, the rest in the next; each row with its own result.
+        assert_eq!(fake.batch_sizes("files/move_batch_v2"), [250, 50]);
+        let st = stages(&s, 300);
+        assert_eq!((count(&st, Stage::Done), count(&st, Stage::Failed)), (299, 1), "{}", s.status);
+        assert_eq!(st[7], Stage::Failed);
+        assert!(s.transfers[s.transfers.len() - 300 + 7].progress.error().contains("Já existe"));
+        assert!(s.status.contains("299") && s.status.contains("com erro: 1"), "{}", s.status);
+        assert!(fake.has("/B/f000.txt") && fake.has("/B/f299.txt") && fake.has("/A/f007.txt"));
+        assert_eq!(fake.content("/B/f007.txt"), b"ja estava");
+
+        // Desfazer: a step per item moved, each back where it was; the one that failed stays.
+        crate::undo::undo(&mut s, false);
+        settle(&mut s);
+        assert!(s.status.starts_with("Desfeito"), "{}", s.status);
+        assert!((0..300).all(|i| fake.has(&format!("/A/f{i:03}.txt"))));
+        assert!((0..300).filter(|i| *i != 7).all(|i| !fake.has(&format!("/B/f{i:03}.txt"))));
+        assert_eq!(fake.content("/B/f007.txt"), b"ja estava");
+    }
+
+    #[test]
+    fn copies_in_one_folder_take_free_names_and_rows_cancelled_meanwhile_stay_out() {
+        let (fake, sv, mut s) = on_fake("copiar");
+        for i in 0..300 {
+            fake.put_file(&format!("/C/f{i:03}.txt"), format!("{i}").as_bytes());
+        }
+        open(&mut s, 0, folder(&sv, vec!["C".into()]));
+        open(&mut s, 1, folder(&sv, vec!["C".into()]));
+        // Each answer late, so the first batch is still out when Cancelar comes.
+        fake.delay(150);
+        paste_now(&mut s, &[], ClipMode::Copy);
+        std::thread::sleep(Duration::from_millis(300));
+        let rows = s.transfers.len() - 300;
+        for t in &s.transfers[rows + 280..rows + 290] {
+            t.progress.cancel();
+        }
+        settle(&mut s);
+        fake.delay(0);
+        assert_eq!(fake.batch_sizes("files/copy_batch_v2"), [250, 40]);
+        let st = stages(&s, 300);
+        assert_eq!((count(&st, Stage::Done), count(&st, Stage::Cancelled)), (290, 10), "{}", s.status);
+        // The names the one-by-one path gives: "nome (2).ext".
+        assert_eq!(fake.content("/C/f000 (2).txt"), b"0");
+        assert_eq!(fake.content("/C/f299 (2).txt"), b"299");
+        assert!(!fake.has("/C/f285 (2).txt"));
+    }
+
+    fn local_tree(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("oe-app-dropbox-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(path: &Path, n: usize, seed: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, (0..n).map(|k| ((k + seed) % 251) as u8).collect::<Vec<u8>>()).unwrap();
+    }
+
+    #[test]
+    fn uploads_go_together_up_to_what_the_account_takes_with_free_names() {
+        let (fake, sv, mut s) = on_fake("enviar");
+        let local = local_tree("enviar");
+        for i in 0..300 {
+            write(&local.join(format!("f{i:03}.bin")), 1000 + i, i);
+        }
+        // Too big for a batch: alone, in its own session.
+        write(&local.join("grande.bin"), (8 << 20) + 10, 1);
+        for i in 0..5 {
+            write(&local.join(format!("Pasta/p{i}.bin")), 500, i);
+        }
+        // Taken on Dropbox already: the upload gets "f000 (2).bin", as one by one.
+        fake.put_file("/U/f000.bin", b"outro");
+        open(&mut s, 0, Location::Local(local.clone()));
+        open(&mut s, 1, folder(&sv, vec!["U".into()]));
+        paste_now(&mut s, &[], ClipMode::Copy);
+        settle(&mut s);
+        let st = stages(&s, 302);
+        assert_eq!(count(&st, Stage::Done), 302, "{}", s.status);
+        let finished = fake.batch_sizes("files/upload_session/finish_batch_v2");
+        assert!(finished.iter().all(|n| *n <= 250), "{finished:?}");
+        // The 300 rows, and the folder's five in a batch of their own; a run a worker was left
+        // with a single row of goes in one request, as one by one.
+        let alone = fake.count_since(&0, "files/upload");
+        assert_eq!(finished.iter().sum::<usize>() + alone, 305, "{finished:?} + {alone}");
+        assert!(finished.len() < 20, "{finished:?}");
+        assert_eq!(fake.content("/U/f000 (2).bin"), std::fs::read(local.join("f000.bin")).unwrap());
+        assert_eq!(fake.content("/U/f000.bin"), b"outro");
+        assert_eq!(fake.content("/U/f299.bin"), std::fs::read(local.join("f299.bin")).unwrap());
+        assert_eq!(fake.content("/U/grande.bin"), std::fs::read(local.join("grande.bin")).unwrap());
+        assert_eq!(fake.content("/U/Pasta/p4.bin"), std::fs::read(local.join("Pasta/p4.bin")).unwrap());
+        // Each row's bar full.
+        for t in &s.transfers[s.transfers.len() - 302..] {
+            assert_eq!(t.progress.bytes.load(std::sync::atomic::Ordering::Relaxed), t.progress.total.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        let _ = std::fs::remove_dir_all(local);
+    }
+
+    #[test]
+    fn a_folder_cancelled_between_its_batches_goes_away_whole() {
+        let (fake, sv, mut s) = on_fake("cancelar");
+        let local = local_tree("cancelar");
+        for i in 0..300 {
+            write(&local.join(format!("Grande/g{i:03}.bin")), 200, i);
+        }
+        open(&mut s, 0, Location::Local(local.clone()));
+        open(&mut s, 1, folder(&sv, vec!["V".into()]));
+        fake.make_dir("/V");
+        fake.delay(150);
+        paste_now(&mut s, &["Grande"], ClipMode::Copy);
+        // The folder made, its first 250 files arrived at Dropbox: Cancelar.
+        let start = Instant::now();
+        while fake.batch_sizes("files/upload_session/append_batch").is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(20));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        s.transfers.last().unwrap().progress.cancel();
+        settle(&mut s);
+        fake.delay(0);
+        assert_eq!(stages(&s, 1), [Stage::Cancelled], "{}", s.status);
+        // The first batch committed, none after it, and what arrived taken away with the folder.
+        assert_eq!(fake.batch_sizes("files/upload_session/append_batch"), [250]);
+        assert_eq!(fake.batch_sizes("files/upload_session/finish_batch_v2"), [250]);
+        assert!(!fake.has("/V/Grande"));
+        let _ = std::fs::remove_dir_all(local);
     }
 }

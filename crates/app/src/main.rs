@@ -1994,6 +1994,22 @@ fn main() {
                 s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
                 s.active = 1;
             }),
+            // A Dropbox folder's deleted items, two ticked.
+            ("dropbox-deleted", |s| {
+                let sv = openexplorer_remote::Server::dropbox("voce@exemplo.com");
+                s.servers.list.push(sv.clone());
+                s.panes[1].go(servers::folder(&sv, vec!["Documentos".into()]));
+                s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
+                s.active = 1;
+                let d = |name: &str, dir, size, when| openexplorer_dropbox::Deleted { name: name.into(), path: format!("/Documentos/{name}"), dir, rev: None, size, when };
+                let items = vec![
+                    d("Relatório final.docx", Some(false), Some(48_213), Some(1_763_560_800)),
+                    d("orçamento 2026.xlsx", Some(false), Some(12_904), Some(1_763_474_400)),
+                    d("Fotos da viagem", Some(true), None, None),
+                    d("rascunho.txt", None, None, None),
+                ];
+                s.dialog = Some(actions::Dialog::DropboxDeleted(Box::new(dropbox::DeletedView { server: sv, path: "/Documentos".into(), place: "Documentos".into(), picked: vec![true, false, true, false], items: Some(Ok(items)) })));
+            }),
             // Adding a Dropbox account before its app is set up.
             ("dropbox-add", |s| {
                 let mut f = servers::Form::for_provider(servers::Provider::Dropbox);

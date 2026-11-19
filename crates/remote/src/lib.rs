@@ -352,6 +352,33 @@ pub trait Conn: Send {
         Ok(false)
     }
 
+    /// [`Conn::rename`] of each `(from, to)`: each one's result, in order, one failing leaving
+    /// the others to go on. A server with a batch command (Dropbox) does them in a few requests
+    /// (see [`Conn::batches`]).
+    fn rename_many(&mut self, moves: &[(String, String)]) -> Vec<Result<()>> {
+        moves.iter().map(|(from, to)| self.rename(from, to)).collect()
+    }
+
+    /// [`Conn::copy`] of each `(from, to)`: each one's result, in order, as `rename_many`.
+    fn copy_many(&mut self, copies: &[(String, String)]) -> Vec<Result<bool>> {
+        copies.iter().map(|(from, to)| self.copy(from, to)).collect()
+    }
+
+    /// [`Conn::upload_file`] of each `(path, local)`: each one's result, in order.
+    /// `progress(i, bytes)` hears file `i`'s bytes so far, never fewer than before; `false`
+    /// stops that file with [`CANCELLED`], and the others go on. A server that takes files in
+    /// batches sends them together (see [`Conn::batches`]).
+    fn upload_files(&mut self, files: &[(String, std::path::PathBuf)], progress: &mut dyn FnMut(usize, u64) -> bool) -> Vec<Result<()>> {
+        files.iter().enumerate().map(|(i, (path, local))| self.upload_file(path, local, &mut |n| progress(i, n))).collect()
+    }
+
+    /// How many items are worth giving [`Conn::rename_many`], [`Conn::copy_many`] and
+    /// [`Conn::upload_files`] at once, and the largest file worth putting in an upload batch:
+    /// `(1, 0)` where they go one by one anyway.
+    fn batches(&self) -> (usize, u64) {
+        (1, 0)
+    }
+
     /// A file, or a folder and all it holds. A link, to a folder or not, goes alone: what it
     /// points to stays.
     fn remove(&mut self, path: &str, is_dir: bool) -> Result<()> {

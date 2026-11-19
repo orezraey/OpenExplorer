@@ -80,6 +80,9 @@ pub struct Account {
     pub(crate) lists: Mutex<Lists>,
     /// One reader of the log at a time.
     log_gate: Mutex<()>,
+    /// One batch job (moves, copies, an upload batch's commit) at a time: Dropbox asks that an
+    /// account's batch commits go one after another, and jobs at once only make it busier.
+    pub(crate) batch_gate: Mutex<()>,
     /// When the log was last read to its end.
     caught_up: Mutex<Option<Instant>>,
     /// The cursor a longpoll is waiting on now, since when and for how long: while it's the
@@ -107,7 +110,7 @@ fn now() -> i64 {
 }
 
 /// The words of a failure about the item at `path`.
-fn about(path: &str, f: Fail) -> String {
+pub(crate) fn about(path: &str, f: Fail) -> String {
     match f {
         Fail::Route { .. } => format!("“{}”: {}", last(&api_path(path)), f.text()),
         f => f.text(),
@@ -159,6 +162,7 @@ impl Account {
             api,
             lists: Mutex::new(lists),
             log_gate: Mutex::new(()),
+            batch_gate: Mutex::new(()),
             caught_up: Mutex::new(None),
             watching: Mutex::new(None),
             pending: Mutex::default(),
@@ -344,7 +348,7 @@ impl Account {
     // -----------------------------------------------------------------------------------------
     // Changes the panes make
 
-    fn metadata_of(v: &Value) -> Result<Entry> {
+    pub(crate) fn metadata_of(v: &Value) -> Result<Entry> {
         entry(v.get("metadata").unwrap_or(v)).ok_or_else(|| t("O Dropbox respondeu sem os dados do item.", "Dropbox answered without the item's details.").into())
     }
 
@@ -394,36 +398,40 @@ impl Account {
     /// Deletes several items in one batch job (`delete_batch`), waiting for it to end: each
     /// item's result, in order.
     pub fn delete_many(&self, paths: &[String]) -> Result<Vec<Result<Entry>>> {
-        if paths.is_empty() {
-            return Ok(Vec::new());
+        let mut results = Vec::with_capacity(paths.len());
+        // Up to 1,000 entries a job.
+        for chunk in paths.chunks(1000) {
+            let entries: Vec<Value> = chunk.iter().map(|p| json!({"path": api_path(p)})).collect();
+            let v = {
+                let _gate = self.batch_gate.lock().unwrap_or_else(|e| e.into_inner());
+                let v = self.api.rpc("files/delete_batch", &json!({"entries": entries})).map_err(String::from)?;
+                self.wait_job("files/delete_batch/check", v)?
+            };
+            let answered: Vec<Value> = v.get("entries").and_then(Value::as_array).cloned().unwrap_or_default();
+            let done: Vec<Result<Entry>> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, p)| match answered.get(i).map(|r| (r.get(".tag").and_then(Value::as_str), r)) {
+                    Some((Some("success"), r)) => Account::metadata_of(r),
+                    Some((_, r)) => {
+                        let summary = r.get("failure").map(failure_summary).unwrap_or_default();
+                        Err(format!("“{}”: {}", last(&api_path(p)), crate::api::route_text(&summary)))
+                    }
+                    None => Err(tr!("“{}”: o Dropbox não disse se excluiu.", "“{}”: Dropbox didn't say whether it was deleted.", last(&api_path(p)))),
+                })
+                .collect();
+            let gone: Vec<Change> = done.iter().filter_map(|r| r.as_ref().ok()).map(|e| Change::Gone(e.lower.clone())).collect();
+            self.note(&gone);
+            results.extend(done);
         }
-        let entries: Vec<Value> = paths.iter().map(|p| json!({"path": api_path(p)})).collect();
-        let v = self.api.rpc("files/delete_batch", &json!({"entries": entries})).map_err(String::from)?;
-        let done = self.wait_job("files/delete_batch/check", v)?;
-        let results: Vec<Result<Entry>> = done
-            .get("entries")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .zip(paths)
-            .map(|(r, p)| match r.get(".tag").and_then(Value::as_str) {
-                Some("success") => Account::metadata_of(r),
-                _ => {
-                    let summary = r.get("failure").map(failure_summary).unwrap_or_default();
-                    Err(format!("“{}”: {}", last(&api_path(p)), crate::api::route_text(&summary)))
-                }
-            })
-            .collect();
-        let gone: Vec<Change> = results.iter().filter_map(|r| r.as_ref().ok()).map(|e| Change::Gone(e.lower.clone())).collect();
-        self.note(&gone);
         Ok(results)
     }
 
     /// Waits for a batch job that answered `first`: `complete` at once, or an `async_job_id`
     /// asked about at `check` until it ends.
-    fn wait_job(&self, check: &str, first: Value) -> Result<Value> {
+    pub(crate) fn wait_job(&self, check: &str, first: Value) -> Result<Value> {
         let mut v = first;
-        let mut pause = Duration::from_millis(200);
+        let mut pause = Duration::from_millis(100);
         let started = Instant::now();
         let mut id = String::new();
         loop {
@@ -448,67 +456,12 @@ impl Account {
     // -----------------------------------------------------------------------------------------
     // What was deleted
 
-    /// The latest revision of the file deleted from `path`, and when it was deleted (seconds),
-    /// `None` when nothing deleted was there (or it's a folder).
-    pub fn deleted_file(&self, path: &str) -> Result<Option<(String, i64)>> {
-        let v = match self.api.rpc("files/list_revisions", &json!({"path": api_path(path), "mode": "path", "limit": 1})) {
-            Ok(v) => v,
-            Err(f) if f.is("not_file") || f.is("not_found") => return Ok(None),
-            Err(f) => return Err(about(path, f)),
-        };
-        if !v.get("is_deleted").and_then(Value::as_bool).unwrap_or(false) {
-            return Ok(None);
-        }
-        let when = v.get("server_deleted").and_then(Value::as_str).and_then(crate::meta::seconds).unwrap_or(0);
-        Ok(v.pointer("/entries/0/rev").and_then(Value::as_str).map(|rev| (rev.to_string(), when)))
-    }
-
     /// Brings back revision `rev` of the file at `path`.
     pub fn restore(&self, path: &str, rev: &str) -> Result<Entry> {
         let v = self.api.rpc("files/restore", &json!({"path": api_path(path), "rev": rev})).map_err(|f| about(path, f))?;
         let e = Account::metadata_of(&v)?;
         self.note(&[Change::Is(e.clone())]);
         Ok(e)
-    }
-
-    /// Brings back the folder deleted from `path` at `since` (seconds) or later, with the files
-    /// deleted from it since then. Dropbox's API restores files only, and lists what was deleted
-    /// only inside a folder that exists: so the folder is made again, what was deleted in it is
-    /// listed, and each file deleted since `since` comes back at its last revision (the folders
-    /// on its way with it; a folder that held no file stays out). How many files came back.
-    pub fn restore_folder(&self, path: &str, since: i64) -> Result<usize> {
-        match self.mkdir(path) {
-            Ok(_) => {}
-            Err(_) if self.stat(path)?.is_some_and(|e| e.dir) => {}
-            Err(e) => return Err(e),
-        }
-        let mut deleted: Vec<String> = Vec::new();
-        let mut page = self.api.rpc("files/list_folder", &json!({"path": api_path(path), "recursive": true, "include_deleted": true, "limit": 2000})).map_err(|f| about(path, f))?;
-        loop {
-            for it in page.get("entries").and_then(Value::as_array).into_iter().flatten() {
-                if it.get(".tag").and_then(Value::as_str) == Some("deleted") {
-                    let shown = it.get("path_display").or(it.get("path_lower")).and_then(Value::as_str).unwrap_or("");
-                    if !shown.is_empty() {
-                        deleted.push(shown.to_string());
-                    }
-                }
-            }
-            if !page.get("has_more").and_then(Value::as_bool).unwrap_or(false) {
-                break;
-            }
-            let cursor = page.get("cursor").and_then(Value::as_str).unwrap_or("").to_string();
-            page = self.api.rpc("files/list_folder/continue", &json!({"cursor": cursor})).map_err(String::from)?;
-        }
-        let mut back = 0;
-        for p in deleted {
-            if let Some((rev, when)) = self.deleted_file(&p)?
-                && when >= since
-            {
-                self.restore(&p, &rev)?;
-                back += 1;
-            }
-        }
-        Ok(back)
     }
 
     // -----------------------------------------------------------------------------------------
@@ -660,7 +613,7 @@ pub fn forget_kept() {
 
 /// The summary of a failure object of a batch (`{".tag": "path_lookup", "path_lookup": {...}}`)
 /// as the API writes `error_summary`: the tags, joined with `/`.
-fn failure_summary(v: &Value) -> String {
+pub(crate) fn failure_summary(v: &Value) -> String {
     let mut out = String::new();
     let mut at = v;
     while let Some(tag) = at.get(".tag").and_then(Value::as_str) {
@@ -706,6 +659,12 @@ pub fn reach(email: &str) -> Result<Arc<Account>> {
     }
     OPEN.lock().unwrap_or_else(|e| e.into_inner()).insert(email, account.clone());
     Ok(account)
+}
+
+/// Makes `account` the one open for `email` (the app's tests, on the stand-in).
+#[cfg(any(test, feature = "fake"))]
+pub fn adopt(email: &str, account: Arc<Account>) {
+    OPEN.lock().unwrap_or_else(|e| e.into_inner()).insert(normal_email(email), account);
 }
 
 /// Opens the account a login just got `tokens` for and keeps its refresh token in the
@@ -838,25 +797,6 @@ mod tests {
         let changes = waiting.join().unwrap();
         assert!(changes.touches("/Docs") && !changes.touches("/Outra"), "{changes:?}");
         assert!(a.list("/Docs").unwrap().iter().any(|e| e.name == "y.txt"));
-    }
-
-    #[test]
-    fn deleted_files_and_folders_come_back() {
-        let fake = Fake::start();
-        fake.put_file("/a.txt", b"um");
-        fake.put_file("/Pasta/b.txt", b"dois");
-        fake.put_file("/Pasta/Sub/c.txt", b"tres");
-        let a = fake.account();
-        let gone = a.delete("/a.txt").unwrap();
-        assert!(a.stat("/a.txt").unwrap().is_none());
-        a.restore("/a.txt", &gone.rev).unwrap();
-        assert_eq!(a.stat("/a.txt").unwrap().unwrap().size, 2);
-        let since = now() - 1;
-        let results = a.delete_many(&["/Pasta".into(), "/nada".into()]).unwrap();
-        assert!(results[0].is_ok() && results[1].as_ref().unwrap_err().contains("Não encontrado"));
-        assert!(a.stat("/Pasta").unwrap().is_none());
-        assert_eq!(a.restore_folder("/Pasta", since).unwrap(), 2);
-        assert_eq!(a.stat("/Pasta/Sub/c.txt").unwrap().unwrap().size, 4);
     }
 
     #[test]

@@ -5,6 +5,10 @@ edition.workspace = true
 
 # Our own blocking client of the Dropbox API v2 over ureq, not the `dropbox-sdk` crate: see the
 # crate docs in `src/lib.rs`. Every version here is one Cargo.lock already had.
+[features]
+# The stand-in for the API (`fake.rs`), for the app's tests of the panes' work on Dropbox.
+fake = []
+
 [dependencies]
 aes-gcm = "0.11"
 base64 = "0.22"
