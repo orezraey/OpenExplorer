@@ -10,10 +10,15 @@
 //!
 //! # How much at once
 //!
-//! Requests that carry file parts (both ways) share one budget per account, [`PARTS_AT_ONCE`]:
-//! a dozen gave ~37 MiB/s on a real account, more got `-429`. Messages are sent one at a time
-//! per account: Telegram paces them anyway, and several at once only collect several waits.
+//! Requests that carry file parts (both ways) share one budget per account, and go over several
+//! connections to the DC, as Telegram's own apps do (TDLib, Android, Desktop: up to 8 per DC):
+//! each connection is a session of its own over the account's key, and a part goes to the one
+//! with the fewest in flight. The extra connections run on copies of the session that save
+//! nothing, made once the account's own connection holds an authorized key for that DC. One that
+//! breaks is dropped, and that DC gets one fewer for a while. Messages are sent one at a time per account:
+//! Telegram paces them anyway, and several at once only collect several waits.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
@@ -25,7 +30,7 @@ use std::time::{Duration, Instant};
 use grammers_client::media::{Downloadable, InputMedia, Media, Uploaded};
 use grammers_client::message::InputMessage;
 use grammers_client::{Client, InvocationError};
-use grammers_mtsender::{ConnectionParams, RetryContext, RetryPolicy, SenderPool};
+use grammers_mtsender::{ConnectionParams, RetryContext, RetryPolicy, SenderPool, SenderPoolHandle};
 use grammers_session::types::PeerRef;
 use grammers_tl_types as tl;
 use openexplorer_i18n::{t, tr};
@@ -41,10 +46,20 @@ use crate::{CANCELLED, Result};
 pub const PART: usize = 512 * 1024;
 /// Above this a file goes in "big file" parts.
 const BIG: u64 = 10 * 1024 * 1024;
-/// File-part requests in flight per account.
-pub const PARTS_AT_ONCE: usize = 12;
+/// Connections per DC that carry file parts, and file-part requests in flight per account, for a
+/// Premium account and a free one. Telegram's own apps open 8 per DC for Premium (TDLib, Android).
+/// On a real Premium account (`tests/real_account.rs`, `speed_by_connections`: 100 MiB down and
+/// 40 MiB up, variants interleaved, median of 4 rounds) one connection with 12 parts in flight did
+/// 16.7 MiB/s down and 8.6 up; 8 with 32 did 40.7 and 33.4, against 24.9 and 25.8 for 4 with 16
+/// and 19.8 and 20.2 for 8 with 16: 8 connections need enough parts in flight. A free account gets
+/// fewer: Telegram caps its speed anyway (FLOOD_PREMIUM_WAIT), and TDLib uses 2 to 4 there.
+pub const PREMIUM: (usize, usize) = (8, 32);
+pub const FREE: (usize, usize) = (4, 16);
 /// Parts of one upload in flight.
 const UPLOAD_AT_ONCE: usize = 4;
+/// How long a DC keeps the fewer connections it was left with when one broke: a short network
+/// drop breaks them all, and the speed should come back after it.
+const CEILING_FOR: Duration = Duration::from_secs(60);
 /// Waits longer than this fail rather than hold a transfer for so long.
 const LONGEST_WAIT: u64 = 15 * 60;
 /// FLOOD_WAITs this short grammers waits out by itself.
@@ -67,29 +82,39 @@ impl RetryPolicy for Policy {
     }
 }
 
+/// How every connection of ours introduces itself and retries.
+fn params() -> ConnectionParams {
+    ConnectionParams { device_model: "Open Explorer".into(), app_version: env!("CARGO_PKG_VERSION").into(), retry_policy: Box::new(Policy), ..Default::default() }
+}
+
 /// A runtime and a client over a session: what a login and an open account both run on.
 pub struct Conn {
     pub rt: tokio::runtime::Runtime,
     pub client: Client,
     pub session: Arc<KeyringSession>,
+    pub api_id: i32,
+    /// The handle of the client's own connections, for file parts to share them out.
+    main: SenderPoolHandle,
 }
 
 impl Conn {
     pub fn start(api_id: i32, session: Arc<KeyringSession>) -> Result<Conn> {
+        // Each connection decrypts on its own task: a thread for each, up to the cores.
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 8));
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(threads)
             .thread_name("telegram")
             .enable_all()
             .build()
             .map_err(|e| tr!("Não consegui iniciar a conexão com o Telegram: {e}", "Couldn't start the connection to Telegram: {e}"))?;
-        let client = {
+        let (client, main) = {
             let _in = rt.enter();
-            let params = ConnectionParams { device_model: "Open Explorer".into(), app_version: env!("CARGO_PKG_VERSION").into(), retry_policy: Box::new(Policy), ..Default::default() };
-            let SenderPool { runner, handle, .. } = SenderPool::with_configuration(session.clone(), api_id, params);
+            let SenderPool { runner, handle, .. } = SenderPool::with_configuration(session.clone(), api_id, params());
             rt.spawn(runner.run());
-            Client::new(handle)
+            let main = handle.thin.clone();
+            (Client::new(handle), main)
         };
-        Ok(Conn { rt, client, session })
+        Ok(Conn { rt, client, session, api_id, main })
     }
 }
 
@@ -127,15 +152,63 @@ struct Shared {
     channel: PeerRef,
     /// Until when (seconds since 1970) each request waiting now waits.
     waits: std::sync::Mutex<Vec<i64>>,
-    parts: Semaphore,
+    /// The budget of file parts in flight; replaced whole when tuned.
+    parts: std::sync::Mutex<Arc<Semaphore>>,
+    parts_at_once: AtomicUsize,
     sends: Semaphore,
     /// The DCs this session was authorized in, besides its own.
     authorized: AsyncMutex<Vec<i32>>,
+    session: Arc<KeyringSession>,
+    api_id: i32,
+    main: SenderPoolHandle,
+    /// Per DC, the connections file parts go over: the account's own first.
+    lanes: std::sync::Mutex<HashMap<i32, Vec<Arc<Lane>>>>,
+    /// Connections per DC wanted, and per DC the most it takes (one fewer each time one broke)
+    /// and since when: it lasts [`CEILING_FOR`].
+    connections: AtomicUsize,
+    ceiling: std::sync::Mutex<HashMap<i32, (usize, Instant)>>,
+}
+
+/// One connection to a DC that file parts go over.
+struct Lane {
+    handle: SenderPoolHandle,
+    busy: AtomicUsize,
+    /// The account's own connection: never dropped.
+    main: bool,
+    /// It answered once: connected. Until then it takes one request at a time (which connects
+    /// it), so parts don't wait behind a connection still being made.
+    ready: AtomicBool,
+}
+
+/// Counts a request as in flight on a lane until dropped, also when its task is aborted.
+struct Busy<'a>(&'a AtomicUsize);
+
+impl<'a> Busy<'a> {
+    fn on(count: &'a AtomicUsize) -> Busy<'a> {
+        count.fetch_add(1, Ordering::SeqCst);
+        Busy(count)
+    }
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// An error after which an extra connection is no use: it ended, or its key isn't known there.
+fn broken(e: &InvocationError) -> bool {
+    matches!(e, InvocationError::Dropped(_) | InvocationError::Transport(_) | InvocationError::Authentication(_) | InvocationError::Deserialize(_))
+        || matches!(e, InvocationError::Rpc(r) if r.name == "AUTH_KEY_UNREGISTERED")
 }
 
 /// How many waits Telegram asked for in this process, and their seconds: for logs and tests.
 pub static WAITS: AtomicUsize = AtomicUsize::new(0);
 pub static WAITED_SECS: AtomicUsize = AtomicUsize::new(0);
+/// Of those, how many were FLOOD_PREMIUM_WAIT: Telegram's cap on a free account's speed.
+pub static PREMIUM_WAITS: AtomicUsize = AtomicUsize::new(0);
+/// The extra connections dropped in this process, and why: for logs and tests.
+pub static DROPPED_LANES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// A flag nothing sets: for requests no one cancels.
 static NEVER: AtomicBool = AtomicBool::new(false);
@@ -152,6 +225,9 @@ impl Shared {
             match call().await {
                 Ok(v) => return Ok(v),
                 Err(InvocationError::Rpc(e)) if e.code == 420 => {
+                    if e.name.starts_with("FLOOD_PREMIUM_WAIT") {
+                        PREMIUM_WAITS.fetch_add(1, Ordering::Relaxed);
+                    }
                     let secs = e.value.unwrap_or(5) as u64;
                     if secs > LONGEST_WAIT {
                         return Err(tr!("O Telegram pediu para esperar {} antes de continuar.", "Telegram asked to wait {} before going on.", span(secs)));
@@ -201,15 +277,104 @@ impl Shared {
         Ok(())
     }
 
+    /// The budget of file parts in flight, as tuned now.
+    fn budget(&self) -> Arc<Semaphore> {
+        self.parts.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The connections to `dc` file parts go over: at least the account's own.
+    fn lanes(&self, dc: i32) -> Vec<Arc<Lane>> {
+        let mut all = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        all.entry(dc).or_insert_with(|| vec![self.main_lane()]).clone()
+    }
+
+    fn main_lane(&self) -> Arc<Lane> {
+        Arc::new(Lane { handle: self.main.clone(), busy: AtomicUsize::new(0), main: true, ready: AtomicBool::new(true) })
+    }
+
+    /// How many connections `dc` should have now.
+    fn wanted(&self, dc: i32) -> usize {
+        let ceiling = self.ceiling.lock().unwrap_or_else(|e| e.into_inner()).get(&dc).filter(|(_, at)| at.elapsed() < CEILING_FOR).map_or(usize::MAX, |(n, _)| *n);
+        self.connections.load(Ordering::SeqCst).min(ceiling).max(1)
+    }
+
+    /// Opens extra connections to `dc` up to the number wanted, once the account's own holds a
+    /// key there that's authorized (its own DC, or one it imported its authorization into): the
+    /// copies then carry that key and need nothing of their own.
+    async fn grow(&self, dc: i32) {
+        if self.lanes(dc).len() >= self.wanted(dc) || !self.session.has_key(dc) || (dc != self.session.home() && !self.authorized.lock().await.contains(&dc)) {
+            return;
+        }
+        // Counted again under the lock: the parts of a transfer all get here at once.
+        let want = self.wanted(dc);
+        let mut all = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        let lanes = all.entry(dc).or_insert_with(|| vec![self.main_lane()]);
+        while lanes.len() < want {
+            let SenderPool { runner, handle, .. } = SenderPool::with_configuration(Arc::new(self.session.unsaved_copy()), self.api_id, params());
+            tokio::spawn(runner.run());
+            lanes.push(Arc::new(Lane { handle: handle.thin.clone(), busy: AtomicUsize::new(0), main: false, ready: AtomicBool::new(false) }));
+        }
+    }
+
+    /// Drops an extra connection that broke; `dc` takes one fewer from now on.
+    fn drop_lane(&self, dc: i32, lane: &Arc<Lane>) {
+        let mut all = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lanes) = all.get_mut(&dc) {
+            let before = lanes.len();
+            lanes.retain(|l| !Arc::ptr_eq(l, lane));
+            if lanes.len() < before {
+                lane.handle.quit();
+                self.ceiling.lock().unwrap_or_else(|e| e.into_inner()).insert(dc, (lanes.len().max(1), Instant::now()));
+            }
+        }
+    }
+
+    /// Sends a file-part request to `dc` over its least busy connection; an extra connection
+    /// that broke is dropped and the request goes over another.
+    async fn call_in<R: tl::RemoteCall>(&self, dc: i32, request: &R) -> std::result::Result<R::Return, InvocationError> {
+        loop {
+            let lane = self
+                .lanes(dc)
+                .into_iter()
+                .filter(|l| l.ready.load(Ordering::SeqCst) || l.busy.load(Ordering::SeqCst) == 0)
+                .min_by_key(|l| l.busy.load(Ordering::SeqCst))
+                .expect("the account's own connection is always ready");
+            let answer = {
+                let _busy = Busy::on(&lane.busy);
+                lane.handle.invoke_in_dc(dc, request).await
+            };
+            if answer.is_ok() {
+                lane.ready.store(true, Ordering::SeqCst);
+                // The account's key answered there: it's authorized, also when that was done in
+                // an earlier run, so the extra connections may go there too.
+                if lane.main && dc != self.session.home() {
+                    let mut done = self.authorized.lock().await;
+                    if !done.contains(&dc) {
+                        done.push(dc);
+                    }
+                }
+            }
+            match &answer {
+                Err(e) if !lane.main && broken(e) => {
+                    DROPPED_LANES.lock().unwrap_or_else(|e| e.into_inner()).push(format!("DC {dc}: {e}"));
+                    self.drop_lane(dc, &lane)
+                }
+                _ => return answer,
+            }
+        }
+    }
+
     /// One part of a file, from wherever Telegram keeps it.
     async fn part(&self, location: &tl::enums::InputFileLocation, dc: &mut i32, offset: i64, cancel: &AtomicBool) -> Result<Vec<u8>> {
+        let budget = self.budget();
         loop {
-            let _slot = self.parts.acquire().await.map_err(|e| e.to_string())?;
+            let _slot = budget.acquire().await.map_err(|e| e.to_string())?;
             let request = tl::functions::upload::GetFile { precise: true, cdn_supported: false, location: location.clone(), offset, limit: PART as i32 };
             let here = *dc;
+            self.grow(here).await;
             let got = self
                 .patient(cancel, || async {
-                    match self.client.invoke_in_dc(here, &request).await {
+                    match self.call_in(here, &request).await {
                         // Moves and missing authorizations come back to be handled below.
                         Err(InvocationError::Rpc(e)) if e.code == 303 || e.name == "AUTH_KEY_UNREGISTERED" => Ok(Err(e)),
                         other => other.map(Ok),
@@ -339,19 +504,33 @@ fn read_full(src: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<usize> {
 impl Real {
     /// The account behind `conn`, storing in `channel`.
     pub fn new(conn: Conn, channel: PeerRef, premium: bool) -> Real {
+        let (connections, parts) = if premium { PREMIUM } else { FREE };
         let shared = Arc::new(Shared {
             client: conn.client.clone(),
             channel,
             waits: std::sync::Mutex::new(Vec::new()),
-            parts: Semaphore::new(PARTS_AT_ONCE),
+            parts: std::sync::Mutex::new(Arc::new(Semaphore::new(parts))),
+            parts_at_once: AtomicUsize::new(parts),
             sends: Semaphore::new(1),
             authorized: AsyncMutex::new(Vec::new()),
+            session: conn.session.clone(),
+            api_id: conn.api_id,
+            main: conn.main.clone(),
+            lanes: std::sync::Mutex::new(HashMap::new()),
+            connections: AtomicUsize::new(connections),
+            ceiling: std::sync::Mutex::new(HashMap::new()),
         });
         Real { conn, shared, premium }
     }
 
     pub fn session(&self) -> &Arc<KeyringSession> {
         &self.conn.session
+    }
+
+    /// Parts of one upload in flight: [`UPLOAD_AT_ONCE`] a connection, within the budget.
+    fn upload_at_once(&self) -> usize {
+        let s = &self.shared;
+        (UPLOAD_AT_ONCE * s.connections.load(Ordering::SeqCst).max(1)).min(s.parts_at_once.load(Ordering::SeqCst)).max(1)
     }
 
     fn block<F: Future>(&self, f: F) -> F::Output {
@@ -401,7 +580,7 @@ impl Real {
             let mut buf = vec![0u8; PART.min((len - part as u64 * PART as u64) as usize)];
             let n = read_full(src, &mut buf).map_err(|e| tr!("Não consegui ler o arquivo: {e}", "Couldn't read the file: {e}"))?;
             buf.truncate(n);
-            while set.len() >= UPLOAD_AT_ONCE {
+            while set.len() >= self.upload_at_once() {
                 match tokio::time::timeout(Duration::from_millis(250), set.join_next()).await {
                     Ok(Some(r)) => done += r.map_err(|e| e.to_string())?? as u64,
                     Ok(None) => {}
@@ -411,15 +590,17 @@ impl Real {
                     return stop(&mut set, &cancel);
                 }
             }
-            let (s, cancel) = (self.shared.clone(), cancel.clone());
+            let (s, cancel, budget) = (self.shared.clone(), cancel.clone(), self.shared.budget());
             set.spawn(async move {
-                let _slot = s.parts.acquire().await.map_err(|e| e.to_string())?;
+                let _slot = budget.acquire().await.map_err(|e| e.to_string())?;
+                let home = s.session.home();
+                s.grow(home).await;
                 let ok = s
                     .patient(&cancel, || async {
                         if big {
-                            s.client.invoke(&tl::functions::upload::SaveBigFilePart { file_id, file_part: part, file_total_parts: parts, bytes: buf.clone() }).await
+                            s.call_in(home, &tl::functions::upload::SaveBigFilePart { file_id, file_part: part, file_total_parts: parts, bytes: buf.clone() }).await
                         } else {
-                            s.client.invoke(&tl::functions::upload::SaveFilePart { file_id, file_part: part, bytes: buf.clone() }).await
+                            s.call_in(home, &tl::functions::upload::SaveFilePart { file_id, file_part: part, bytes: buf.clone() }).await
                         }
                     })
                     .await?;
@@ -643,12 +824,13 @@ impl Backend for Real {
             let count = size.div_ceil(PART as u64) as usize;
             // Each part waits its turn in the account's budget; no more than twice that many
             // parts wait in memory to be written in order.
-            let window = Arc::new(Semaphore::new(PARTS_AT_ONCE * 2));
+            let at_once = self.shared.parts_at_once.load(Ordering::SeqCst);
+            let window = Arc::new(Semaphore::new(at_once * 2));
             let next = Arc::new(AtomicUsize::new(0));
             let cancel = Arc::new(AtomicBool::new(false));
             let (tx, mut rx) = mpsc::unbounded_channel();
             let mut tasks = tokio::task::JoinSet::new();
-            for _ in 0..PARTS_AT_ONCE.min(count.max(1)) {
+            for _ in 0..at_once.min(count.max(1)) {
                 let (s, location, window, next, cancel, tx) = (self.shared.clone(), location.clone(), window.clone(), next.clone(), cancel.clone(), tx.clone());
                 tasks.spawn(async move {
                     let mut dc = dc;
@@ -726,5 +908,28 @@ impl Backend for Real {
 
     fn detach(&self) {
         self.conn.session.detach();
+    }
+
+    fn connections_open(&self) -> Vec<(i32, usize)> {
+        let mut open: Vec<(i32, usize)> = self.shared.lanes.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(dc, l)| (*dc, l.len())).collect();
+        open.sort();
+        open
+    }
+
+    fn tune(&self, connections: usize, parts: usize) {
+        let s = &self.shared;
+        s.connections.store(connections.max(1), Ordering::SeqCst);
+        s.parts_at_once.store(parts.max(1), Ordering::SeqCst);
+        *s.parts.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(Semaphore::new(parts.max(1)));
+        // Fewer connections: the extra ones beyond go now.
+        let mut all = s.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        for lanes in all.values_mut() {
+            while lanes.len() > connections.max(1) {
+                if let Some(lane) = lanes.pop() {
+                    lane.handle.quit();
+                }
+            }
+        }
+        s.ceiling.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }

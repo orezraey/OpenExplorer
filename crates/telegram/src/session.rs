@@ -112,6 +112,25 @@ impl KeyringSession {
         self.save(&data).map_err(|e| e.0)
     }
 
+    /// The same keys in a session that saves nothing: what an extra connection to a DC runs on
+    /// (see `real`), so it never writes over the account's entry, and a key it might make alone
+    /// (a DC this session had none for) stays its own.
+    pub fn unsaved_copy(&self) -> KeyringSession {
+        let data = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let copy = SessionData { home_dc: data.home_dc, dc_options: data.dc_options.clone(), ..SessionData::default() };
+        KeyringSession { data: Mutex::new(copy), name: Mutex::new(None) }
+    }
+
+    /// This session's own DC.
+    pub fn home(&self) -> i32 {
+        self.data.lock().unwrap_or_else(|e| e.into_inner()).home_dc
+    }
+
+    /// Whether this session holds a key for DC `dc`.
+    pub fn has_key(&self, dc: i32) -> bool {
+        self.data.lock().unwrap_or_else(|e| e.into_inner()).dc_options.get(&dc).is_some_and(|o| o.auth_key.is_some())
+    }
+
     /// Saves nothing from now on: a session being ended after its account was removed.
     pub fn detach(&self) {
         *self.name.lock().unwrap_or_else(|e| e.into_inner()) = None;

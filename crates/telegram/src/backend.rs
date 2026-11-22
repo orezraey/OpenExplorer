@@ -73,4 +73,13 @@ pub trait Backend: Send + Sync {
 
     /// Saves the session nowhere from now on (the account is being removed).
     fn detach(&self) {}
+
+    /// How many connections per DC carry file parts, and how many parts may be in flight for the
+    /// account: the tests and benchmarks, to compare.
+    fn tune(&self, _connections: usize, _parts: usize) {}
+
+    /// Per DC, how many connections carry file parts now.
+    fn connections_open(&self) -> Vec<(i32, usize)> {
+        Vec::new()
+    }
 }

@@ -457,3 +457,66 @@ fn download_speed_of_a_big_file() {
         std::panic::resume_unwind(p);
     }
 }
+
+/// Speed by connections per DC, the variants interleaved round after round so the network's
+/// swings fall on all of them alike. `TELEGRAM_ROUNDS` rounds (3 by default).
+#[test]
+#[ignore = "uses a real Telegram account"]
+fn speed_by_connections() {
+    use openexplorer_telegram::real::{PREMIUM_WAITS, WAITS};
+    use std::sync::atomic::Ordering;
+    let Some((api_id, session, peer)) = poc() else { return };
+    let rounds: usize = std::env::var("TELEGRAM_ROUNDS").ok().and_then(|r| r.parse().ok()).unwrap_or(3);
+    // `TELEGRAM_VARIANTS=4x16,8x16`: connections × parts in flight.
+    let variants: Vec<(usize, usize)> = std::env::var("TELEGRAM_VARIANTS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|p| p.split_once('x')).map(|(c, n)| (c.parse().unwrap(), n.parse().unwrap())).collect())
+        .unwrap_or(vec![(1, 12), (2, 12), (4, 16), (8, 32)]);
+    let a = account(api_id, &session, peer);
+    let path = format!("/OE velocidade {}.bin", std::process::id());
+    let big = random(100 * 1024 * 1024);
+    let up = random(40 * 1024 * 1024);
+    a.upload(&path, &mut &big[..], big.len() as u64, None, &mut |_| true).unwrap();
+    let mut down: Vec<Vec<f64>> = vec![Vec::new(); variants.len()];
+    let mut sent: Vec<Vec<f64>> = vec![Vec::new(); variants.len()];
+    let (waits, premium) = (WAITS.load(Ordering::Relaxed), PREMIUM_WAITS.load(Ordering::Relaxed));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for round in 1..=rounds {
+            for (i, &(connections, parts)) in variants.iter().enumerate() {
+                a.tune(connections, parts);
+                let t = Instant::now();
+                let mut out = Vec::with_capacity(big.len());
+                a.download(&path, &mut out, &mut |_| true).unwrap();
+                let speed = big.len() as f64 / 1048576.0 / t.elapsed().as_secs_f64();
+                assert!(out == big);
+                down[i].push(speed);
+                let target = format!("/OE envio {} {connections}.bin", std::process::id());
+                let t = Instant::now();
+                a.upload(&target, &mut &up[..], up.len() as u64, None, &mut |_| true).unwrap();
+                let speed_up = up.len() as f64 / 1048576.0 / t.elapsed().as_secs_f64();
+                a.remove(&target, false).unwrap();
+                sent[i].push(speed_up);
+                println!("rodada {round}, {connections} conexões / {parts} partes: baixar {speed:.1} MiB/s, enviar {speed_up:.1} MiB/s; abertas por DC: {:?}", a.connections_open());
+            }
+        }
+    }));
+    a.remove(&path, false).unwrap();
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        (v[v.len() / 2], v[0], v[v.len() - 1])
+    };
+    println!("\nmediana (mín–máx) em MiB/s, {rounds} rodadas:");
+    for (i, &(connections, parts)) in variants.iter().enumerate() {
+        if down[i].is_empty() {
+            continue;
+        }
+        let (d, dmin, dmax) = median(&mut down[i]);
+        let (u, umin, umax) = median(&mut sent[i]);
+        println!("  {connections} conexões / {parts} partes: baixar {d:.1} ({dmin:.1}–{dmax:.1}), enviar {u:.1} ({umin:.1}–{umax:.1})");
+    }
+    println!("esperas pedidas: {} (FLOOD_PREMIUM_WAIT: {})", WAITS.load(Ordering::Relaxed) - waits, PREMIUM_WAITS.load(Ordering::Relaxed) - premium);
+    println!("conexões extras descartadas: {:?}", openexplorer_telegram::real::DROPPED_LANES.lock().unwrap());
+    if let Err(p) = result {
+        std::panic::resume_unwind(p);
+    }
+}

@@ -580,6 +580,17 @@ impl Account {
         self.backend.sign_out();
     }
 
+    /// Sets how many connections per DC carry file parts and how many parts may be in flight:
+    /// the benchmarks, to compare.
+    pub fn tune(&self, connections: usize, parts: usize) {
+        self.backend.tune(connections, parts);
+    }
+
+    /// Per DC, how many connections carry file parts now.
+    pub fn connections_open(&self) -> Vec<(i32, usize)> {
+        self.backend.connections_open()
+    }
+
     /// Stops saving the session to the credential store: the account is being removed.
     pub fn detach(&self) {
         self.backend.detach();
