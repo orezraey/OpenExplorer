@@ -10,6 +10,7 @@ mod ftp;
 mod mega;
 mod onedrive;
 mod sftp;
+mod telegram;
 pub mod store;
 mod tls;
 
@@ -54,6 +55,8 @@ pub enum Protocol {
     B2,
     /// A OneDrive account (see `onedrive.rs`), kept apart from `servers.json` as MEGA is.
     OneDrive,
+    /// A Telegram account's storage channel (see `telegram.rs`), kept apart as MEGA is.
+    Telegram,
 }
 
 impl Protocol {
@@ -70,6 +73,7 @@ impl Protocol {
             Protocol::Dropbox => "Dropbox",
             Protocol::B2 => "Backblaze B2",
             Protocol::OneDrive => "OneDrive",
+            Protocol::Telegram => "Telegram",
         }
     }
 
@@ -94,6 +98,7 @@ impl Protocol {
             Protocol::Dropbox => "dropbox",
             Protocol::B2 => "b2",
             Protocol::OneDrive => "onedrive",
+            Protocol::Telegram => "telegram",
         }
     }
 
@@ -113,7 +118,7 @@ impl Protocol {
             Protocol::Ftp | Protocol::Ftps => 21,
             Protocol::Sftp => 22,
             Protocol::Dav => 80,
-            Protocol::Davs | Protocol::Mega | Protocol::Dropbox | Protocol::B2 | Protocol::OneDrive => 443,
+            Protocol::Davs | Protocol::Mega | Protocol::Dropbox | Protocol::B2 | Protocol::OneDrive | Protocol::Telegram => 443,
         }
     }
 
@@ -255,6 +260,16 @@ impl Server {
         self.protocol == Protocol::OneDrive
     }
 
+    /// The server a Telegram account shows as: its user id is the user (the account's key in the
+    /// Telegram crate), the person's name on Telegram the name.
+    pub fn telegram(user_id: i64, name: &str) -> Server {
+        Server { id: format!("telegram:{user_id}"), name: name.to_string(), protocol: Protocol::Telegram, host: "telegram.org".into(), user: user_id.to_string(), connections: 6, ..Server::mega("") }
+    }
+
+    pub fn is_telegram(&self) -> bool {
+        self.protocol == Protocol::Telegram
+    }
+
     /// `sftp://ana@host:2222`, the port only when it isn't the usual one. Never the password.
     pub fn address(&self) -> String {
         if self.is_mega() {
@@ -269,6 +284,10 @@ impl Server {
         }
         if self.is_onedrive() {
             return format!("onedrive://{}", self.name);
+        }
+        // The user id: a name on Telegram is neither unique nor fixed.
+        if self.is_telegram() {
+            return format!("telegram://{}", self.user);
         }
         let user = if self.user.is_empty() { String::new() } else { format!("{}@", encode_user(&self.user)) };
         let host = if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() };
@@ -462,6 +481,7 @@ fn open(server: &Server, secret: &str, trust: &tls::Trust) -> Result<Box<dyn Con
         Protocol::Dropbox => Ok(Box::new(dropbox::Dropbox::connect(server)?)),
         Protocol::B2 => Ok(Box::new(b2::B2::connect(server)?)),
         Protocol::OneDrive => Ok(Box::new(onedrive::OneDrive::connect(server)?)),
+        Protocol::Telegram => Ok(Box::new(telegram::Telegram::connect(server)?)),
     }
 }
 

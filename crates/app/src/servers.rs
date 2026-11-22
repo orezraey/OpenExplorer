@@ -44,6 +44,10 @@ pub struct Servers {
     pub b2_watch: crate::b2::Watch,
     /// The OneDrive accounts (see `onedrive.rs`).
     pub onedrive: crate::onedrive::Side,
+    /// The Telegram accounts' own list (see `telegram.rs`).
+    pub telegram: openexplorer_telegram::Store,
+    /// When each Telegram account a pane shows next asks what changed elsewhere.
+    pub telegram_watch: crate::telegram::Watch,
     /// Counts the add dialog's connection checks, to drop a stale answer.
     pub attempts: u64,
 }
@@ -60,7 +64,9 @@ impl Servers {
         list.extend(crate::b2::servers(&b2));
         let onedrive = crate::onedrive::Side::load();
         list.extend(onedrive.servers());
-        Servers { list, pool: Arc::default(), store, mega, mega_quotas: Default::default(), mega_watch: Default::default(), dropbox, dropbox_quotas: Default::default(), dropbox_watch: Default::default(), b2, b2_watch: Default::default(), onedrive, attempts: 0 }
+        let telegram = crate::telegram::store();
+        list.extend(crate::telegram::servers(&telegram));
+        Servers { list, pool: Arc::default(), store, mega, mega_quotas: Default::default(), mega_watch: Default::default(), dropbox, dropbox_quotas: Default::default(), dropbox_watch: Default::default(), b2, b2_watch: Default::default(), onedrive, telegram, telegram_watch: Default::default(), attempts: 0 }
     }
 }
 
@@ -671,6 +677,7 @@ pub enum Provider {
     Dropbox,
     B2,
     OneDrive,
+    Telegram,
     Nextcloud,
     OwnCloud,
     Sftp,
@@ -679,12 +686,13 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub const ALL: [Provider; 10] = [
+    pub const ALL: [Provider; 11] = [
         Provider::GoogleDrive,
         Provider::OneDrive,
         Provider::Dropbox,
         Provider::Mega,
         Provider::B2,
+        Provider::Telegram,
         Provider::Nextcloud,
         Provider::OwnCloud,
         Provider::Sftp,
@@ -699,6 +707,7 @@ impl Provider {
             Provider::Dropbox => "Dropbox",
             Provider::B2 => "Backblaze B2",
             Provider::OneDrive => "OneDrive",
+            Provider::Telegram => "Telegram",
             Provider::Nextcloud => "Nextcloud",
             Provider::OwnCloud => "ownCloud",
             Provider::Sftp => "SFTP",
@@ -714,6 +723,7 @@ impl Provider {
             Provider::Dropbox => t("OAuth no navegador · contas pessoais e de times", "OAuth in the browser · personal and team accounts"),
             Provider::B2 => t("Armazenamento de objetos · chave de aplicação", "Object storage · application key"),
             Provider::OneDrive => t("Pessoal ou corporativo · OAuth no navegador", "Personal or work · OAuth in the browser"),
+            Provider::Telegram => t("Canal privado da sua conta · telefone e código", "Your account's private channel · phone and code"),
             Provider::Nextcloud => t("Nuvem via WebDAV", "Cloud via WebDAV"),
             Provider::OwnCloud => t("Nuvem via WebDAV", "Cloud via WebDAV"),
             Provider::Sftp => t("SSH seguro · porta 22", "Secure SSH · port 22"),
@@ -729,6 +739,7 @@ impl Provider {
             Provider::Dropbox => &crate::icons::PROVIDER_DROPBOX,
             Provider::B2 => &crate::icons::PROVIDER_B2,
             Provider::OneDrive => &crate::icons::PROVIDER_ONEDRIVE,
+            Provider::Telegram => &crate::icons::PROVIDER_TELEGRAM,
             Provider::Nextcloud => &crate::icons::PROVIDER_NEXTCLOUD,
             Provider::OwnCloud => &crate::icons::PROVIDER_OWNCLOUD,
             Provider::Sftp => &crate::icons::PROVIDER_SFTP,
@@ -740,7 +751,7 @@ impl Provider {
     pub fn in_category(self, category: Category) -> bool {
         match category {
             Category::All => true,
-            Category::Cloud => matches!(self, Provider::GoogleDrive | Provider::OneDrive | Provider::Dropbox | Provider::Mega | Provider::B2 | Provider::Nextcloud | Provider::OwnCloud),
+            Category::Cloud => matches!(self, Provider::GoogleDrive | Provider::OneDrive | Provider::Dropbox | Provider::Mega | Provider::B2 | Provider::Telegram | Provider::Nextcloud | Provider::OwnCloud),
             Category::Nas => matches!(self, Provider::Nextcloud | Provider::OwnCloud | Provider::Sftp | Provider::Ftp | Provider::WebDav),
             Category::Protocols => matches!(self, Provider::Sftp | Provider::Ftp | Provider::WebDav),
         }
@@ -757,6 +768,7 @@ impl Provider {
             Provider::Dropbox => "dropbox nuvem cloud oauth time equipe team business",
             Provider::B2 => "backblaze b2 bucket s3 nuvem cloud objetos object storage chave key",
             Provider::OneDrive => "onedrive one drive microsoft office 365 sharepoint nuvem cloud oauth business empresa trabalho escola work school",
+            Provider::Telegram => "telegram canal channel mensagens messages nuvem cloud ilimitado unlimited mtproto",
             Provider::Nextcloud => "nextcloud webdav dav https nas nuvem cloud",
             Provider::OwnCloud => "owncloud webdav dav https nas nuvem cloud",
             Provider::Sftp => "sftp ssh servidor linux nas chave 22 server key secure",
@@ -773,6 +785,7 @@ impl Provider {
             Provider::Dropbox => Protocol::Dropbox,
             Provider::B2 => Protocol::B2,
             Provider::OneDrive => Protocol::OneDrive,
+            Provider::Telegram => Protocol::Telegram,
             Provider::Ftp => Protocol::Ftp,
             Provider::Nextcloud | Provider::OwnCloud | Provider::WebDav => Protocol::Davs,
         }
@@ -797,6 +810,7 @@ impl Provider {
             (_, Protocol::Dropbox) => Provider::Dropbox,
             (_, Protocol::B2) => Provider::B2,
             (_, Protocol::OneDrive) => Provider::OneDrive,
+            (_, Protocol::Telegram) => Provider::Telegram,
         }
     }
 
@@ -809,6 +823,7 @@ impl Provider {
             Protocol::Dropbox => Provider::Dropbox,
             Protocol::B2 => Provider::B2,
             Protocol::OneDrive => Provider::OneDrive,
+            Protocol::Telegram => Provider::Telegram,
         }
     }
 }
@@ -858,6 +873,8 @@ pub struct Form {
     pub error: Option<String>,
     /// The connection check under way, by number.
     pub checking: Option<u64>,
+    /// Telegram: where its login in steps stands.
+    pub telegram: crate::telegram::Stage,
 }
 
 impl Form {
@@ -893,6 +910,7 @@ impl Form {
             untrusted: None,
             error: None,
             checking: None,
+            telegram: Default::default(),
         }
     }
 
@@ -939,6 +957,9 @@ impl Form {
         }
         if provider == Provider::OneDrive {
             return crate::onedrive::prepare(self);
+        }
+        if provider == Provider::Telegram {
+            return crate::telegram::prepare(self);
         }
         if provider == Provider::GoogleDrive {
             let missing = openexplorer_gdrive::ClientConfig::load().is_err();
@@ -1239,6 +1260,10 @@ pub fn ask_edit(s: &mut State, id: &str) {
         s.status = t("Contas MEGA e OneDrive não têm o que editar: para trocar de conta, remova e conecte de novo.", "MEGA and OneDrive accounts have nothing to edit: to switch accounts, remove it and connect again.").into();
         return;
     }
+    if id.starts_with("telegram:") {
+        s.status = t("Contas do Telegram não têm o que editar: para trocar de conta, remova e conecte de novo.", "Telegram accounts have nothing to edit: to switch accounts, remove it and connect again.").into();
+        return;
+    }
     if id.starts_with("dropbox:") {
         s.status = t("Contas Dropbox não têm o que editar: para trocar de conta, remova e conecte de novo.", "Dropbox accounts have nothing to edit: to switch accounts, remove it and connect again.").into();
         return;
@@ -1306,7 +1331,7 @@ pub fn toggle_tls(s: &mut State) {
             Protocol::Ftps => Protocol::Ftp,
             Protocol::Dav => Protocol::Davs,
             Protocol::Davs => Protocol::Dav,
-            p @ (Protocol::Sftp | Protocol::Mega | Protocol::Dropbox | Protocol::B2 | Protocol::OneDrive) => p,
+            p @ (Protocol::Sftp | Protocol::Mega | Protocol::Dropbox | Protocol::B2 | Protocol::OneDrive | Protocol::Telegram) => p,
         };
         let trimmed = f.host.text.trim_start();
         if let Some((scheme, rest)) = trimmed.split_once("://") {
@@ -1609,6 +1634,13 @@ pub fn parse_address(text: &str) -> Option<Address> {
         let path = format!("/{}", decode(path).trim_start_matches('/'));
         return Some(Address { protocol, user: email, password: None, host: host.into(), port: None, path });
     }
+    // A Telegram account's address names its user id (`telegram://123456789/Fotos`).
+    if scheme.eq_ignore_ascii_case("telegram") {
+        let (id, path) = rest.split_once('/').unwrap_or((rest, ""));
+        id.parse::<i64>().ok()?;
+        let path = format!("/{}", decode(path).trim_start_matches('/'));
+        return Some(Address { protocol: Protocol::Telegram, user: id.into(), password: None, host: "telegram.org".into(), port: None, path });
+    }
     if scheme.eq_ignore_ascii_case("onedrive") {
         let (email, path) = crate::onedrive::address(&decode(rest))?;
         return Some(Address { protocol: Protocol::OneDrive, user: email, password: None, host: "graph.microsoft.com".into(), port: None, path });
@@ -1827,6 +1859,14 @@ pub(crate) mod tests {
         let list = [list.to_vec(), vec![mega]].concat();
         assert_eq!(reach(&list, &parse_address(&address_text(&at)).unwrap()), Ok(at));
         assert_eq!(reach(&list, &parse_address("mega://bia@exemplo.com/").unwrap()), Err(String::new()), "an account not connected");
+        // A Telegram account's, by its user id.
+        let tg = Server::telegram(123456789, "Ana Souza");
+        let at = folder(&tg, vec!["Fotos".into(), "Férias 2026".into()]);
+        assert_eq!(address_text(&at), "telegram://123456789/Fotos/Férias 2026");
+        let list = [list.to_vec(), vec![tg]].concat();
+        assert_eq!(reach(&list, &parse_address(&address_text(&at)).unwrap()), Ok(at));
+        assert_eq!(reach(&list, &parse_address("telegram://5").unwrap()), Err(String::new()), "an account not connected");
+        assert!(parse_address("telegram://ana/").is_none());
         assert!(parse_address("mega://semarroba/x").is_none());
     }
 
@@ -1845,9 +1885,9 @@ pub(crate) mod tests {
     fn unified_catalog_filters_and_configures_presets() {
         let mut f = Form::new();
         assert_eq!(f.step, Step::Pick);
-        assert_eq!(f.visible_providers().len(), 10);
+        assert_eq!(f.visible_providers().len(), 11);
         f.category = Category::Cloud;
-        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::OneDrive, Provider::Dropbox, Provider::Mega, Provider::B2, Provider::Nextcloud, Provider::OwnCloud]);
+        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::OneDrive, Provider::Dropbox, Provider::Mega, Provider::B2, Provider::Telegram, Provider::Nextcloud, Provider::OwnCloud]);
         f.category = Category::Protocols;
         assert_eq!(f.visible_providers(), [Provider::Sftp, Provider::Ftp, Provider::WebDav]);
         f.category = Category::All;

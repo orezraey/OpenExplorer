@@ -10,6 +10,7 @@ openexplorer-i18n = { path = "../i18n" }
 openexplorer-dropbox = { path = "../dropbox" }
 openexplorer-mega = { path = "../mega" }
 openexplorer-onedrive = { path = "../onedrive" }
+openexplorer-telegram = { path = "../telegram" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
 quick-xml = "0.38"
@@ -28,3 +29,5 @@ webpki-roots = "1"
 [dev-dependencies]
 # The Dropbox crate's stand-in for the API, for the tests and the benchmark of `dropbox.rs`.
 openexplorer-dropbox = { path = "../dropbox", features = ["fake"] }
+# The Telegram crate's channel in memory, for the tests of `telegram.rs`.
+openexplorer-telegram = { path = "../telegram", features = ["fake"] }

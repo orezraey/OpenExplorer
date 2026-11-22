@@ -856,6 +856,7 @@ fn cache_page(k: &Kit, page: &crate::caches::Page, card: El, head: El) -> El {
         .child(line("cache-dropbox", t("Contas Dropbox", "Dropbox accounts"), openexplorer_dropbox::cache::dir().map_or_else(String::new, |d| d.display().to_string()), usage.map(|u| u.dropbox)))
         .child(line("cache-b2", t("Listagens do Backblaze B2", "Backblaze B2 listings"), openexplorer_b2::cache::dir().map_or_else(String::new, |d| d.display().to_string()), usage.map(|u| u.b2)))
         .child(line("cache-onedrive", t("Contas OneDrive", "OneDrive accounts"), openexplorer_onedrive::cache::dir().map_or_else(String::new, |d| d.display().to_string()), usage.map(|u| u.onedrive)))
+        .child(line("cache-telegram", t("Contas do Telegram", "Telegram accounts"), openexplorer_telegram::cache::dir().map_or_else(String::new, |d| d.display().to_string()), usage.map(|u| u.telegram)))
         .child(divider())
         .child(actions);
 
@@ -979,7 +980,11 @@ fn queue_row(s: &State, k: &Kit, t: &transfers::Transfer) -> El {
     // A folder's row counts its items while running: "Em andamento · 120 de 1.946".
     let items = p.items.load(Relaxed);
     let failed = p.stage() == Stage::Failed;
-    let state = if p.stage() == Stage::Running && items > 1 {
+    // Telegram asked to wait: the row says for how long, rather than look stuck.
+    let waiting = (p.stage() == Stage::Running).then(|| crate::telegram::waiting_note(&t.from.text, &t.to.text)).flatten();
+    let state = if let Some(note) = waiting {
+        note
+    } else if p.stage() == Stage::Running && items > 1 {
         let (done, items) = (ui_count(p.items_done.load(Relaxed) as usize), ui_count(items as usize));
         tr!("{state} · {done} de {items}", "{state} · {done} of {items}")
     } else if failed && !p.reason().is_empty() {
@@ -1652,6 +1657,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         (Provider::Mega, _) => (t("Criptografia de ponta a ponta · os arquivos são decifrados neste computador", "End-to-end encryption · files are decrypted on this computer"), "E2EE"),
         (Provider::Dropbox, _) => (t("Autorização segura OAuth 2.0 (PKCE) pelo navegador padrão", "Secure OAuth 2.0 (PKCE) sign-in through the default browser"), "OAuth 2.0"),
         (Provider::B2, _) => crate::b2::summary(),
+        (Provider::Telegram, _) => crate::telegram::summary(),
         (Provider::Nextcloud, Protocol::Davs) => (t("Servidor Nextcloud · conexão criptografada", "Nextcloud server · encrypted connection"), "HTTPS"),
         (Provider::Nextcloud, _) => (t("Servidor Nextcloud · conexão sem criptografia", "Nextcloud server · unencrypted connection"), "HTTP"),
         (Provider::OwnCloud, Protocol::Davs) => (t("Servidor ownCloud · conexão criptografada", "ownCloud server · encrypted connection"), "HTTPS"),
@@ -1875,6 +1881,16 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         return crate::b2::form(k, f, banner, eye, |inner| account_scroll(k, "b2-scroll", window_h, inner), close, layer);
     }
 
+    // Telegram step: the app's keys and the phone, then the code, then the password if asked.
+    if f.provider == Provider::Telegram {
+        let eye = eye_toggle("pass-eye", f.reveal_password, |s| {
+            if let Some(Dialog::Server(f)) = &mut s.dialog {
+                f.reveal_password = !f.reveal_password;
+            }
+        });
+        return crate::telegram::form(k, f, banner, eye, |inner| account_scroll(k, "telegram-scroll", window_h, inner), layer);
+    }
+
     // MEGA step: e-mail and password, then the two-factor code once the account asks for it.
     if f.provider == Provider::Mega {
         let labeled = |key: &'static str, label: &'static str, input: El| col().key(key).w_full().gap(4.0).child(text(label).font(k.ty.text_small_medium).color(k.c.text_base)).child(input);
@@ -2000,13 +2016,13 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         Provider::OwnCloud => t("owncloud.exemplo.com ou https://owncloud.exemplo.com", "owncloud.example.com or https://owncloud.example.com"),
         Provider::Sftp => t("nas.local, 192.168.0.10 ou sftp://usuario@host", "nas.local, 192.168.0.10 or sftp://user@host"),
         Provider::Ftp => t("ftp.exemplo.com, 192.168.0.10 ou ftp://usuario@host", "ftp.example.com, 192.168.0.10 or ftp://user@host"),
-        Provider::WebDav | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive => t("dav.exemplo.com, 192.168.0.10 ou https://host/dav", "dav.example.com, 192.168.0.10 or https://host/dav"),
+        Provider::WebDav | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive | Provider::Telegram => t("dav.exemplo.com, 192.168.0.10 ou https://host/dav", "dav.example.com, 192.168.0.10 or https://host/dav"),
     };
     let folder_hint = match f.provider {
         Provider::Nextcloud | Provider::OwnCloud => t("/remote.php/webdav (automático, se vazio)", "/remote.php/webdav (automatic if empty)"),
         Provider::WebDav => t("/dav ou /remote.php/dav/files/usuario (raiz /, se vazio)", "/dav or /remote.php/dav/files/user (root / if empty)"),
         Provider::Sftp => t("a pasta pessoal, se vazio", "the home folder if empty"),
-        Provider::Ftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive => t("a pasta do login, se vazio", "the login folder if empty"),
+        Provider::Ftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive | Provider::Telegram => t("a pasta do login, se vazio", "the login folder if empty"),
     };
     let name_hint = match f.provider {
         Provider::Nextcloud => t("Nextcloud (servidor), se vazio", "Nextcloud (server) if empty"),
@@ -2052,7 +2068,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
                     .key("tls-toggle"),
             );
         }
-        Provider::Sftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive => {}
+        Provider::Sftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive | Provider::Telegram => {}
     }
 
     inner = inner.child(field("folder", t("Pasta inicial", "Start folder"), &f.folder, folder_hint, |f| &mut f.folder));
@@ -2719,6 +2735,10 @@ fn toolbar(s: &State, k: &Kit) -> El {
         (None, Some((id, name))) if id.starts_with("mega:") => bar.child(
             tool(k, "remove-server", &icons::SIGN_OUT, t("Remover conta", "Remove account"), true, move |s: &mut State, _| crate::servers::remove(s, &id))
                 .help(tr!("Tira {name} da lista e encerra a sessão do MEGA", "Removes {name} from the list and ends the MEGA session")),
+        ),
+        (None, Some((id, name))) if id.starts_with("telegram:") => bar.child(
+            tool(k, "remove-server", &icons::SIGN_OUT, t("Remover conta", "Remove account"), true, move |s: &mut State, _| crate::servers::remove(s, &id))
+                .help(tr!("Tira {name} da lista e encerra a sessão do Open Explorer no Telegram; o canal e os arquivos continuam lá", "Removes {name} from the list and ends Open Explorer's Telegram session; the channel and its files stay there")),
         ),
         (None, Some((id, name))) if id.starts_with("dropbox:") => bar.child(
             tool(k, "remove-server", &icons::SIGN_OUT, t("Remover conta", "Remove account"), true, move |s: &mut State, _| crate::servers::remove(s, &id))

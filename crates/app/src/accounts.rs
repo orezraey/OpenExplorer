@@ -1,5 +1,5 @@
-//! The cloud accounts that show in the panes as servers: MEGA, Dropbox, Backblaze B2 and
-//! OneDrive. Their servers go through the servers' code (`servers.rs`) like any other, with the
+//! The cloud accounts that show in the panes as servers: MEGA, Dropbox, Backblaze B2,
+//! OneDrive and Telegram. Their servers go through the servers' code (`servers.rs`) like any other, with the
 //! account as the connection; what differs from one to another (where new items can't go, a
 //! bin, how deleting works, the storage, a refresh from the change log, links) is asked here,
 //! and here sent on to the account's own module (`mega.rs`, `dropbox.rs`, `b2.rs`,
@@ -13,7 +13,7 @@ use openexplorer_remote::{Protocol, Server};
 use rune::Tx;
 
 use crate::model::{Entry, Location};
-use crate::{State, b2, dropbox, mega, onedrive};
+use crate::{State, b2, dropbox, mega, onedrive, telegram};
 
 /// The kind of account a server is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +22,7 @@ pub enum Account {
     Dropbox,
     B2,
     OneDrive,
+    Telegram,
 }
 
 /// A context menu item's action, on pane `p`.
@@ -29,7 +30,7 @@ pub type MenuAction = fn(&mut State, usize, &mut Tx);
 
 impl Account {
     /// In the order they're asked each frame (see [`tick`]).
-    pub const ALL: [Account; 4] = [Account::Mega, Account::Dropbox, Account::OneDrive, Account::B2];
+    pub const ALL: [Account; 5] = [Account::Mega, Account::Dropbox, Account::OneDrive, Account::B2, Account::Telegram];
 
     /// The account server `server` is, `None` for a server reached by a protocol of its own
     /// (SFTP, FTP, WebDAV).
@@ -39,6 +40,7 @@ impl Account {
             Protocol::Dropbox => Some(Account::Dropbox),
             Protocol::B2 => Some(Account::B2),
             Protocol::OneDrive => Some(Account::OneDrive),
+            Protocol::Telegram => Some(Account::Telegram),
             Protocol::Ftp | Protocol::Ftps | Protocol::Sftp | Protocol::Dav | Protocol::Davs => None,
         }
     }
@@ -63,6 +65,7 @@ impl Account {
             Account::Dropbox => "dropbox:",
             Account::B2 => "b2:",
             Account::OneDrive => "onedrive:",
+            Account::Telegram => "telegram:",
         }
     }
 }
@@ -88,6 +91,9 @@ pub fn start() {
     // Each OneDrive account's listings and delta position, sealed, so a start reads one page.
     openexplorer_onedrive::set_log(openexplorer_gdrive::log);
     openexplorer_onedrive::set_cache_dir(Some(local.join("onedrive")));
+    // Each Telegram account's tree, sealed, so a start asks the channel only what changed.
+    openexplorer_telegram::cache::set_dir(Some(telegram::cache_dir()));
+    openexplorer_telegram::set_store(telegram::store());
 }
 
 /// As the app closes: what each open account changed since it was last kept goes to disk.
@@ -98,6 +104,7 @@ pub fn save_caches() {
             Account::Dropbox => openexplorer_dropbox::save_caches(),
             Account::OneDrive => openexplorer_onedrive::save_caches(),
             Account::B2 => openexplorer_b2::save_caches(),
+            Account::Telegram => openexplorer_telegram::save_caches(),
         }
     }
 }
@@ -112,7 +119,7 @@ pub fn why_not(loc: &Location) -> Option<String> {
         Account::Mega => mega::why_not(loc),
         Account::B2 => b2::why_not(loc),
         Account::OneDrive => onedrive::why_not(loc),
-        Account::Dropbox => None,
+        Account::Dropbox | Account::Telegram => None,
     }
 }
 
@@ -123,7 +130,7 @@ pub fn items_fixed(loc: &Location) -> bool {
         Some(Account::Mega) => mega::items_fixed(loc),
         Some(Account::B2) => b2::items_fixed(loc),
         Some(Account::OneDrive) => onedrive::items_fixed(loc),
-        Some(Account::Dropbox) | None => false,
+        Some(Account::Dropbox | Account::Telegram) | None => false,
     }
 }
 
@@ -133,7 +140,7 @@ pub fn bin_top(loc: &Location) -> bool {
     match Account::at(loc) {
         Some(Account::Mega) => mega::bin_top(loc),
         Some(Account::OneDrive) => onedrive::bin_top(loc),
-        Some(Account::Dropbox | Account::B2) | None => false,
+        Some(Account::Dropbox | Account::B2 | Account::Telegram) | None => false,
     }
 }
 
@@ -147,7 +154,8 @@ pub fn keeps_deleted(loc: &Location) -> bool {
     match Account::at(loc) {
         Some(Account::Mega) => !mega::deletes_for_good(loc),
         Some(Account::Dropbox | Account::B2 | Account::OneDrive) => true,
-        None => false,
+        // Telegram has no bin: the servers' deleting, after asking.
+        Some(Account::Telegram) | None => false,
     }
 }
 
@@ -159,7 +167,7 @@ pub fn delete(s: &mut State, loc: &Location, items: Vec<Entry>) -> Result<(), Ve
         Some(Account::Dropbox) => dropbox::delete(s, loc, items),
         Some(Account::B2) => b2::hide(s, loc, items),
         Some(Account::OneDrive) => onedrive::trash(s, loc, items),
-        None => return Err(items),
+        Some(Account::Telegram) | None => return Err(items),
     }
     Ok(())
 }
@@ -172,7 +180,7 @@ pub fn purge(s: &mut State, loc: &Location, items: Vec<Entry>) -> Result<(), Vec
         Some(Account::Mega) => mega::purge(s, loc, items),
         Some(Account::B2) => b2::purge(s, loc, items),
         Some(Account::OneDrive) if onedrive::in_bin(loc) => onedrive::purge(s, loc, items),
-        Some(Account::OneDrive | Account::Dropbox) | None => return Err(items),
+        Some(Account::OneDrive | Account::Dropbox | Account::Telegram) | None => return Err(items),
     }
     Ok(())
 }
@@ -186,7 +194,7 @@ pub fn restore(s: &mut State, p: usize) -> bool {
     match Account::at(loc) {
         Some(Account::Mega) => mega::restore(s, p),
         Some(Account::OneDrive) => onedrive::restore(s, p),
-        Some(Account::Dropbox | Account::B2) | None => return false,
+        Some(Account::Dropbox | Account::B2 | Account::Telegram) | None => return false,
     }
     true
 }
@@ -205,7 +213,7 @@ pub fn empty_bin(s: &mut State, id: &str) -> bool {
     match Account::of_id(id) {
         Some(Account::Mega) => mega::empty_bin(s, id),
         Some(Account::OneDrive) => onedrive::empty_bin(s, id),
-        Some(Account::Dropbox | Account::B2) | None => return false,
+        Some(Account::Dropbox | Account::B2 | Account::Telegram) | None => return false,
     }
     true
 }
@@ -217,6 +225,7 @@ pub fn delete_note(s: &State, loc: &Location) -> Option<Cow<'static, str>> {
         Account::Dropbox => Some(dropbox::delete_note().into()),
         Account::B2 => Some(b2::delete_note(loc).into()),
         Account::OneDrive => onedrive::delete_note(s, loc).map(Cow::from),
+        Account::Telegram => Some(telegram::delete_note().into()),
     }
 }
 
@@ -228,6 +237,7 @@ pub fn purge_note(loc: &Location) -> Option<&'static str> {
         Account::B2 => Some(b2::purge_note()),
         Account::OneDrive => onedrive::purge_note(loc),
         Account::Dropbox => None,
+        Account::Telegram => Some(telegram::delete_note()),
     }
 }
 
@@ -241,7 +251,7 @@ pub fn links(loc: &Location) -> Option<(MenuAction, MenuAction)> {
         Account::Mega if !mega::in_bin(loc) => Some((mega::copy_link, mega::remove_link)),
         Account::Dropbox => Some((dropbox::copy_link, dropbox::remove_link)),
         Account::OneDrive if !onedrive::in_bin(loc) => Some((onedrive::copy_link, onedrive::remove_link)),
-        Account::Mega | Account::OneDrive | Account::B2 => None,
+        Account::Mega | Account::OneDrive | Account::B2 | Account::Telegram => None,
     }
 }
 
@@ -257,6 +267,7 @@ pub fn remove(s: &mut State, account: Account, server: &Server) -> bool {
         Account::Dropbox => dropbox::remove(s, server),
         Account::B2 => b2::remove(s, server),
         Account::OneDrive => onedrive::remove(s, server),
+        Account::Telegram => telegram::remove(s, server),
     }
 }
 
@@ -267,6 +278,7 @@ pub fn removed(account: Account, name: &str) -> String {
         Account::Dropbox => tr!("Conta Dropbox removida: {name}", "Dropbox account removed: {name}"),
         Account::B2 => tr!("Conta B2 removida: {name}", "B2 account removed: {name}"),
         Account::OneDrive => tr!("Conta OneDrive removida: {name}", "OneDrive account removed: {name}"),
+        Account::Telegram => tr!("Conta do Telegram removida: {name}. O canal e os arquivos continuam no Telegram.", "Telegram account removed: {name}. The channel and its files stay on Telegram."),
     }
 }
 
@@ -279,7 +291,7 @@ pub fn ask_quota(s: &mut State, server: &Server) {
         Some(Account::Mega) => mega::ask_quota(s, server),
         Some(Account::Dropbox) => dropbox::ask_quota(s, server),
         Some(Account::OneDrive) => onedrive::ask_quota(s, server),
-        Some(Account::B2) | None => {}
+        Some(Account::B2 | Account::Telegram) | None => {}
     }
 }
 
@@ -289,7 +301,7 @@ pub fn quota_unasked(s: &State, server: &Server) -> bool {
         Some(Account::Mega) => !s.servers.mega_quotas.contains_key(&server.id),
         Some(Account::Dropbox) => !s.servers.dropbox_quotas.contains_key(&server.id),
         Some(Account::OneDrive) => !s.servers.onedrive.quotas.contains_key(&server.id),
-        Some(Account::B2) | None => false,
+        Some(Account::B2 | Account::Telegram) | None => false,
     }
 }
 
@@ -300,6 +312,7 @@ pub fn quota_bar(s: &State, loc: &Location) -> Option<(String, Option<f64>, Stri
         Account::Dropbox => dropbox::quota_status(s, loc),
         Account::OneDrive => onedrive::quota_bar(s, loc),
         Account::B2 => b2::quota_bar(loc),
+        Account::Telegram => None,
     }
 }
 
@@ -320,6 +333,7 @@ pub fn kept_folders(server: &Server, path: &[String], show_hidden: bool) -> Opti
         }
         Account::OneDrive => Some(openexplorer_onedrive::cached(&server.user)?.kept_list(&dir)?.into_iter().filter(|i| i.is_dir && shown(&i.name)).map(|i| i.name).collect()),
         Account::Dropbox => Some(openexplorer_dropbox::cached(&server.user)?.kept(&dir)?.into_iter().filter(|e| e.dir && shown(&e.name)).map(|e| e.name).collect()),
+        Account::Telegram => telegram::kept_folders(server, &dir, shown),
     }
 }
 
@@ -329,7 +343,7 @@ pub fn load(s: &mut State, p: usize, request: u64, fresh: bool) -> bool {
     match Account::at(&s.panes[p].loc) {
         Some(Account::B2) => b2::load(s, p, request, fresh),
         Some(Account::OneDrive) => return onedrive::load(s, p, request),
-        Some(Account::Mega | Account::Dropbox) | None => return false,
+        Some(Account::Mega | Account::Dropbox | Account::Telegram) | None => return false,
     }
     true
 }
@@ -342,6 +356,7 @@ pub fn tick(s: &mut State, now: f64) {
             Account::Dropbox => dropbox::tick(s, now),
             Account::OneDrive => onedrive::tick(s, now),
             Account::B2 => b2::tick(s, now),
+            Account::Telegram => telegram::tick(s, now),
         }
     }
 }
@@ -355,8 +370,16 @@ pub fn next_ask(s: &State) -> Option<f64> {
             Account::Dropbox => dropbox::next_ask(s),
             Account::OneDrive => onedrive::next_ask(s),
             Account::B2 => b2::next_ask(s),
+            Account::Telegram => telegram::next_ask(s),
         })
         .reduce(f64::min)
+}
+
+/// The window gained or lost the focus: the accounts that look for changes only while it's in
+/// front (B2, Telegram) stop, or catch up at once.
+pub fn window_focus(s: &mut State, focused: bool, tx: &mut Tx) {
+    b2::window_focus(s, focused, tx);
+    telegram::window_focus(s, focused);
 }
 
 #[cfg(test)]

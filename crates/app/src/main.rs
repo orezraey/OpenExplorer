@@ -36,6 +36,7 @@ mod places;
 mod relay;
 mod servers;
 mod sysicons;
+mod telegram;
 mod transfers;
 mod tree;
 mod undo;
@@ -108,6 +109,8 @@ enum Msg {
     B2(b2::Answer),
     /// Something background work on a OneDrive account brought back.
     OneDrive(onedrive::Answer),
+    /// Something background work on a Telegram account brought back.
+    Telegram(telegram::Answer),
     /// What the caches take, measured or cleared for Opções › Cache.
     Caches(caches::Answer),
     /// Installing the search service ended: search again in the panes `reload` shows.
@@ -559,6 +562,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             Msg::Dropbox(answer) => dropbox::arrived(s, answer, tx, now),
             Msg::B2(answer) => b2::arrived(s, answer),
             Msg::OneDrive(answer) => onedrive::arrived(s, answer, tx, now),
+            Msg::Telegram(answer) => telegram::arrived(s, answer),
             Msg::Caches(answer) => caches::arrived(s, answer),
             Msg::Changes { email, result } => watch::arrived(s, email, result, now),
             Msg::Quota { email, result } => {
@@ -1672,7 +1676,7 @@ fn clash_scene(s: &mut State, all: bool) {
 /// Opções open on Cache, its sizes fixed, then `then` applied to the page.
 fn cache_scene(s: &mut State, then: fn(&mut caches::Page)) {
     let mut v = settings::OptionsView::open(settings::OptionsTab::Cache);
-    v.cache.usage = Some(caches::Usage { drive: 3_565_158, mega: 48_211_968, dropbox: 1_204_224, b2: 1_204_224, onedrive: 1_310_720 });
+    v.cache.usage = Some(caches::Usage { drive: 3_565_158, mega: 48_211_968, dropbox: 1_204_224, b2: 1_204_224, onedrive: 1_310_720, telegram: 524_288 });
     then(&mut v.cache);
     s.dialog = Some(actions::Dialog::Options(Box::new(v)));
 }
@@ -1840,7 +1844,7 @@ fn main() {
             ("options-cache-confirm", |s| cache_scene(s, |p| p.confirming = true)),
             ("options-cache-error", |s| {
                 cache_scene(s, |p| {
-                    p.usage = Some(caches::Usage { drive: 0, mega: 48_211_968, dropbox: 0, b2: 0, onedrive: 0 });
+                    p.usage = Some(caches::Usage { drive: 0, mega: 48_211_968, dropbox: 0, b2: 0, onedrive: 0, telegram: 0 });
                     p.error = Some(tr!(
                         "Não foi possível apagar {}: O arquivo já está sendo usado por outro processo. (os error 32). Feche o que estiver usando o arquivo e tente de novo.",
                         "Couldn't delete {}: The process cannot access the file because it is being used by another process. (os error 32). Close whatever is using the file and try again.",
@@ -2034,6 +2038,35 @@ fn main() {
             }),
             // A B2 bucket's unfinished uploads, without a network.
             ("b2-unfinished", b2::unfinished_scene),
+            // A Telegram account's channel as folders, without a network.
+            ("telegram", |s| {
+                let sv = openexplorer_remote::Server::telegram(123456789, "Você");
+                s.servers.list.push(sv.clone());
+                s.panes[1].go(servers::folder(&sv, vec!["Documentos".into()]));
+                s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
+                s.active = 1;
+            }),
+            // Connecting a Telegram account: its first step, its code, its password.
+            ("telegram-add", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::Telegram);
+                f.client_id = rune::TextEdit::new("1234567");
+                f.client_secret = rune::TextEdit::new("0123456789abcdef0123456789abcdef").secure();
+                f.user = rune::TextEdit::new("+55 11 99999-8888");
+                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+            }),
+            ("telegram-code", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::Telegram);
+                f.user = rune::TextEdit::new("+55 11 99999-8888");
+                f.telegram = telegram::Stage::Code;
+                f.error = Some(openexplorer_i18n::t("O código não confere.", "The code doesn't match.").into());
+                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+            }),
+            ("telegram-password", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::Telegram);
+                f.telegram = telegram::Stage::Password { hint: "gato".into() };
+                f.password = rune::TextEdit::new("segredo").secure();
+                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+            }),
             // A OneDrive account's files with its storage, without a network.
             ("onedrive", |s| {
                 let sv = openexplorer_remote::Server::onedrive("b!exemplo", "voce@exemplo.com");
@@ -2106,8 +2139,9 @@ fn main() {
     })
     .font_smoothing(initial.text_render.smoothing())
     .args(rune_args(std::env::args().skip(1)))
-    // B2 folders on screen are read again only while the window is in front.
-    .on_focus(b2::window_focus)
+    // B2 folders and Telegram accounts on screen look for changes only while the window is in
+    // front.
+    .on_focus(accounts::window_focus)
     // The app ends without returning from `run`: what the cloud accounts changed since their
     // trees and listings were last kept is kept here, so the next start has less to catch up on.
     .on_quit(|_, _| accounts::save_caches())

@@ -1,0 +1,30 @@
+[package]
+name = "openexplorer-telegram"
+version.workspace = true
+edition.workspace = true
+
+# Telegram through its user API (MTProto) with grammers, the one maintained MTProto client in Rust
+# (MIT/Apache-2.0). Unlike the other cloud crates, these versions weren't in Cargo.lock before
+# this crate: grammers came with it, and tokio (already here for SFTP) needs its multi-thread
+# runtime, since grammers is async and the app blocks (see the crate docs).
+[features]
+# The in-memory stand-in for a channel (`fake.rs`), for the app's tests.
+fake = []
+
+[dependencies]
+getrandom = "0.3"
+grammers-client = { version = "0.12.0", default-features = false }
+grammers-mtsender = "0.12.0"
+grammers-session = { version = "0.12.0", default-features = false }
+grammers-tl-types = "0.12.0"
+# The session's keys live in the OS credential store: Credential Manager on Windows.
+keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
+openexplorer-cloud = { path = "../cloud" }
+openexplorer-i18n = { path = "../i18n" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+# The 2FA password and api_hash in `examples/conta.rs`, typed without showing.
+rpassword = "7"

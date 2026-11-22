@@ -5,7 +5,8 @@
 //! (see `openexplorer_mega::cache`), `dropbox\`, each Dropbox account's sealed listings
 //! (see `openexplorer_dropbox::cache`), `b2\`, each B2 key's sealed folder listings
 //! (see `openexplorer_b2::cache`), and `onedrive\`, each OneDrive account's sealed listings
-//! (see `openexplorer_onedrive::cache`). All only spare reading from the network: clearing them
+//! (see `openexplorer_onedrive::cache`), and `telegram\`, each Telegram account's sealed tree
+//! (see `openexplorer_telegram::cache`). All only spare reading from the network: clearing them
 //! leaves accounts, sessions and settings as they are.
 
 use std::path::{Path, PathBuf};
@@ -25,11 +26,13 @@ pub struct Usage {
     pub b2: u64,
     /// `onedrive\`: each OneDrive account's sealed listings (see `openexplorer_onedrive::cache`).
     pub onedrive: u64,
+    /// `telegram\`: each Telegram account's sealed tree (see `openexplorer_telegram::cache`).
+    pub telegram: u64,
 }
 
 impl Usage {
     pub fn total(self) -> u64 {
-        self.drive + self.mega + self.dropbox + self.b2 + self.onedrive
+        self.drive + self.mega + self.dropbox + self.b2 + self.onedrive + self.telegram
     }
 
     /// Measured now. Walks the folders, so it runs off the UI thread.
@@ -40,6 +43,7 @@ impl Usage {
             dropbox: openexplorer_dropbox::cache::dir().map_or(0, |d| dir_size(&d)),
             b2: openexplorer_b2::cache::dir().map_or(0, |d| dir_size(&d)),
             onedrive: openexplorer_onedrive::cache::dir().map_or(0, |d| dir_size(&d)),
+            telegram: openexplorer_telegram::cache::dir().map_or(0, |d| dir_size(&d)),
         }
     }
 }
@@ -114,7 +118,8 @@ pub fn clear(s: &mut State) {
         let dropbox = openexplorer_dropbox::cache::clear_with(clear_dir).unwrap_or(Ok(()));
         let b2 = openexplorer_b2::cache::clear_with(clear_dir).unwrap_or(Ok(()));
         let onedrive = openexplorer_onedrive::cache::clear_with(clear_dir).unwrap_or(Ok(()));
-        let errors: Vec<String> = [drive, mega, dropbox, b2, onedrive].into_iter().filter_map(Result::err).collect();
+        let telegram = openexplorer_telegram::cache::clear_with(clear_dir).unwrap_or(Ok(()));
+        let errors: Vec<String> = [drive, mega, dropbox, b2, onedrive, telegram].into_iter().filter_map(Result::err).collect();
         let result = if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) };
         emit(Msg::Caches(Answer::Cleared { id, result, usage: Usage::now() }));
     });
@@ -238,7 +243,7 @@ mod tests {
         assert_eq!(dir_size(&dir), 1240);
         assert_eq!(dir_size(&dir.join("conta")), 240);
         assert_eq!(dir_size(&dir.join("nada")), 0);
-        assert_eq!(Usage { drive: 1240, mega: 60, dropbox: 700, b2: 7, onedrive: 5 }.total(), 2012);
+        assert_eq!(Usage { drive: 1240, mega: 60, dropbox: 700, b2: 7, onedrive: 5, telegram: 3 }.total(), 2015);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/app", "crates/b2", "crates/cloud", "crates/dropbox", "crates/gdrive", "crates/i18n", "crates/index", "crates/mega", "crates/onedrive", "crates/remote"]
+members = ["crates/app", "crates/b2", "crates/cloud", "crates/dropbox", "crates/gdrive", "crates/i18n", "crates/index", "crates/mega", "crates/onedrive", "crates/remote", "crates/telegram"]
 
 [workspace.package]
 version = "0.3.0"
