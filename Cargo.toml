@@ -21,6 +21,7 @@ parley_engine = { git = "https://github.com/anomalyco/rune", branch = "dev" }
 wgpu-hal = { git = "https://github.com/anomalyco/rune", branch = "dev" }
 accesskit_windows = { git = "https://github.com/anomalyco/rune", branch = "dev" }
 accesskit_macos = { git = "https://github.com/anomalyco/rune", branch = "dev" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", branch = "dev" }
 
 [profile.dev]
 # File and line numbers in backtraces and panics, without full variable debug info: the
