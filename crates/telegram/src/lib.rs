@@ -3,6 +3,9 @@
 //! document; the tree is read from the channel's history (`records` has the format, `tree` the
 //! view), kept on disk sealed, and brought up to date with the channel's change log.
 //!
+//! The account's other chats show beside it, read-only, in a folder of their own (`chats`):
+//! each chat a folder of months, each month the files sent then.
+//!
 //! Everything here blocks, like the other cloud crates: the app runs it on background threads.
 //! grammers is async, so each open account keeps a tokio runtime of its own and blocks on it.
 //!
@@ -19,6 +22,7 @@
 pub mod account;
 pub mod backend;
 pub mod cache;
+pub mod chats;
 pub mod login;
 pub mod open;
 pub mod real;

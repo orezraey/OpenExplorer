@@ -33,9 +33,26 @@ fn poc() -> Option<(i32, Vec<u8>, PeerRef)> {
     Some((api_id, session, peer))
 }
 
+/// `session` with the key of its own DC only, as a new login has: `TELEGRAM_HOME_ONLY=1`.
+fn home_only(session: &[u8]) -> Vec<u8> {
+    const ENTRY: usize = 4 + 4 + 2 + 16 + 2 + 256;
+    let home = i32::from_le_bytes(session[1..5].try_into().unwrap());
+    let n = session[5] as usize;
+    let entries: Vec<&[u8]> = (0..n).map(|i| &session[6 + i * ENTRY..6 + (i + 1) * ENTRY]).filter(|e| i32::from_le_bytes(e[..4].try_into().unwrap()) == home).collect();
+    let mut out = session[..5].to_vec();
+    out.push(entries.len() as u8);
+    for e in entries {
+        out.extend_from_slice(e);
+    }
+    out
+}
+
 fn account(api_id: i32, session: &[u8], peer: PeerRef) -> Account {
-    let conn = Conn::start(api_id, Arc::new(KeyringSession::from_bytes(session).unwrap())).unwrap();
-    Account::open(1, "teste", Box::new(Real::new(conn, peer, false)), None)
+    let session = if std::env::var("TELEGRAM_HOME_ONLY").as_deref() == Ok("1") { home_only(session) } else { session.to_vec() };
+    let conn = Conn::start(api_id, Arc::new(KeyringSession::from_bytes(&session).unwrap())).unwrap();
+    // `TELEGRAM_PREMIUM=1`: tuned as a Premium account is.
+    let premium = std::env::var("TELEGRAM_PREMIUM").as_deref() == Ok("1");
+    Account::open(1, "teste", Box::new(Real::new(conn, peer, premium)), None)
 }
 
 fn random(n: usize) -> Vec<u8> {
@@ -496,7 +513,8 @@ fn speed_by_connections() {
                 let speed_up = up.len() as f64 / 1048576.0 / t.elapsed().as_secs_f64();
                 a.remove(&target, false).unwrap();
                 sent[i].push(speed_up);
-                println!("rodada {round}, {connections} conexões / {parts} partes: baixar {speed:.1} MiB/s, enviar {speed_up:.1} MiB/s; abertas por DC: {:?}", a.connections_open());
+                let dropped = openexplorer_telegram::real::DROPPED_CALLS.load(Ordering::Relaxed);
+                println!("rodada {round}, {connections} conexões / {parts} partes: baixar {speed:.1} MiB/s, enviar {speed_up:.1} MiB/s; abertas por DC: {:?}; esperas até aqui {}, pedidos refeitos {dropped}", a.connections_open(), WAITS.load(Ordering::Relaxed) - waits);
             }
         }
     }));
@@ -518,5 +536,371 @@ fn speed_by_connections() {
     println!("conexões extras descartadas: {:?}", openexplorer_telegram::real::DROPPED_LANES.lock().unwrap());
     if let Err(p) = result {
         std::panic::resume_unwind(p);
+    }
+}
+
+/// The chats, read-only: the first page of them, Saved Messages' months, its newest month and
+/// the smallest file there, downloaded whole. Prints counts and times only, never names.
+/// `TELEGRAM_CHATS_ALL=1` also reads every chat, as the app does over its asks, and times it.
+#[test]
+#[ignore = "uses a real Telegram account"]
+fn the_chats_list_and_a_file_of_saved_messages_downloads() {
+    use openexplorer_telegram::chats::folder_name;
+    let Some((api_id, bytes, peer)) = poc() else { return };
+    let a = account(api_id, &bytes, peer);
+    let top = format!("/{}", folder_name());
+    assert!(names(&a, "/").contains(&folder_name().to_string()));
+
+    let t = Instant::now();
+    let chats = a.list(&top).unwrap();
+    println!("primeira página: {} conversas em {:.2} s", chats.len(), t.elapsed().as_secs_f64());
+    let saved = &chats[0].name;
+
+    let t = Instant::now();
+    let months = names(&a, &format!("{top}/{saved}"));
+    println!("Mensagens Salvas: {} meses em {:.2} s", months.len(), t.elapsed().as_secs_f64());
+    let Some(month) = months.first() else { return };
+    let t = Instant::now();
+    let files = a.list(&format!("{top}/{saved}/{month}")).unwrap();
+    println!("mês mais recente: {} arquivos em {:.2} s", files.len(), t.elapsed().as_secs_f64());
+    if let Some(f) = files.iter().filter(|f| f.size > 0).min_by_key(|f| f.size) {
+        let t = Instant::now();
+        let got = get(&a, &format!("{top}/{saved}/{month}/{}", f.name));
+        assert_eq!(got.len() as u64, f.size, "o arquivo veio inteiro");
+        println!("menor arquivo ({} bytes) baixado em {:.2} s", f.size, t.elapsed().as_secs_f64());
+    }
+    // Read-only.
+    assert!(a.mkdir(&format!("{top}/{saved}/x")).is_err());
+
+    if std::env::var("TELEGRAM_CHATS_ALL").as_deref() == Ok("1") {
+        let t = Instant::now();
+        let mut asks = 0;
+        while t.elapsed().as_secs() < 900 {
+            asks += 1;
+            a.refresh().unwrap();
+            let n = a.kept(&top).map_or(0, |v| v.len());
+            println!("  pedido {asks}: {n} conversas, {:.0} s", t.elapsed().as_secs_f64());
+            if !a.refresh().unwrap() && asks > 1 && a.kept(&top).map_or(0, |v| v.len()) == n {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        println!("todas as conversas: {} em {:.0} s", a.kept(&top).map_or(0, |v| v.len()), t.elapsed().as_secs_f64());
+    }
+}
+
+/// A file from chats other than Saved Messages: the first few chats with files, the smallest of
+/// each one's newest month, downloaded whole (or why not). Prints counts, sizes and times only.
+#[test]
+#[ignore = "uses a real Telegram account"]
+fn files_download_from_other_chats() {
+    use openexplorer_telegram::chats::folder_name;
+    let Some((api_id, bytes, peer)) = poc() else { return };
+    let a = account(api_id, &bytes, peer);
+    let top = format!("/{}", folder_name());
+    let chats = a.list(&top).unwrap();
+    let mut done = 0;
+    for (i, c) in chats.iter().enumerate().skip(1).take(40) {
+        let months = match a.list(&format!("{top}/{}", c.name)) {
+            Ok(m) => m,
+            Err(e) => {
+                println!("conversa {i}: meses: erro: {e}");
+                continue;
+            }
+        };
+        let Some(month) = months.first() else { continue };
+        let files = a.list(&format!("{top}/{}/{}", c.name, month.name)).unwrap();
+        let Some(f) = files.iter().filter(|f| f.size > 0 && f.size < 20 << 20).min_by_key(|f| f.size) else { continue };
+        let t = Instant::now();
+        let mut out = Vec::new();
+        match a.download(&format!("{top}/{}/{}/{}", c.name, month.name, f.name), &mut out, &mut |_| true) {
+            Ok(()) => {
+                assert_eq!(out.len() as u64, f.size);
+                println!("conversa {i}: {} meses, {} arquivos no mais recente, {} bytes em {:.2} s", months.len(), files.len(), f.size, t.elapsed().as_secs_f64());
+            }
+            Err(e) => println!("conversa {i}: download: erro: {e}"),
+        }
+        done += 1;
+        if done == 5 {
+            break;
+        }
+    }
+    assert!(done > 0, "alguma conversa com arquivos");
+}
+
+/// Whether a chat's months each hold files: every month of the first chats with any, listed.
+#[test]
+#[ignore = "uses a real Telegram account"]
+fn months_of_a_chat_hold_files() {
+    use openexplorer_telegram::chats::folder_name;
+    // Some 850 requests over five minutes: only when asked.
+    if std::env::var("TELEGRAM_MONTHS").as_deref() != Ok("1") {
+        eprintln!("TELEGRAM_MONTHS=1 não está definido: nada a fazer.");
+        return;
+    }
+    let Some((api_id, bytes, peer)) = poc() else { return };
+    let a = account(api_id, &bytes, peer);
+    let top = format!("/{}", folder_name());
+    let chats = a.list(&top).unwrap();
+    for (i, c) in chats.iter().enumerate().take(4) {
+        let months = a.list(&format!("{top}/{}", c.name)).unwrap();
+        let mut empty = 0;
+        let mut files = 0;
+        for m in &months {
+            let n = a.list(&format!("{top}/{}/{}", c.name, m.name)).unwrap().len();
+            files += n;
+            if n == 0 {
+                empty += 1;
+            }
+        }
+        println!("conversa {i}: {} meses ({} a {}), {empty} vazios, {files} arquivos", months.len(), months.last().map_or("", |m| m.name.as_str()), months.first().map_or("", |m| m.name.as_str()));
+    }
+}
+
+
+
+/// The main list of chats and the archive, paged as the account pages them: how many each has
+/// and how many of the archive's the main list lacks. Prints counts only.
+#[test]
+#[ignore = "uses a real Telegram account"]
+fn the_archive_adds_the_chats_the_main_list_lacks() {
+    use openexplorer_telegram::backend::{Backend, Paged};
+    use openexplorer_telegram::chats::Cursor;
+    use std::collections::HashSet;
+    let Some((api_id, bytes, peer)) = poc() else { return };
+    let conn = Conn::start(api_id, Arc::new(KeyringSession::from_bytes(&bytes).unwrap())).unwrap();
+    let real = Real::new(conn, peer, false);
+    let all = |start: Option<Cursor>| {
+        let mut seen = HashSet::new();
+        let mut after = start;
+        let mut pages = Vec::new();
+        for _ in 0..100 {
+            match real.chats(after.as_ref(), true).unwrap() {
+                Paged::Page(p) => {
+                    pages.push(p.chats.len());
+                    seen.extend(p.chats.iter().map(|c| (c.at.kind as u8, c.at.id)));
+                    match p.next {
+                        Some(n) => after = Some(n),
+                        None => break,
+                    }
+                }
+                Paged::WaitUntil(_) => unreachable!("patient"),
+            }
+        }
+        (seen, pages)
+    };
+    let (main, mp) = all(None);
+    let (archive, ap) = all(Some(Cursor::archive()));
+    let lacking = archive.iter().filter(|c| !main.contains(*c)).count();
+    println!("principal: {} ({} páginas {:?}); arquivo: {} ({} páginas {:?}); do arquivo fora da principal: {lacking}", main.len(), mp.len(), mp, archive.len(), ap.len(), ap);
+}
+
+/// Files of several chats downloaded at once, as the queue does: four at a time. Prints sizes,
+/// times and errors only. `TELEGRAM_PARALLEL=n` changes how many at once.
+#[test]
+#[ignore = "uses a real Telegram account"]
+fn files_of_several_chats_download_at_once() {
+    use openexplorer_telegram::chats::folder_name;
+    let Some((api_id, bytes, peer)) = poc() else { return };
+    let a = Arc::new(account(api_id, &bytes, peer));
+    let top = format!("/{}", folder_name());
+    let chats = a.list(&top).unwrap();
+    let mut files = Vec::new();
+    for c in chats.iter().take(40) {
+        let Ok(months) = a.list(&format!("{top}/{}", c.name)) else { continue };
+        let Some(m) = months.first() else { continue };
+        let Ok(items) = a.list(&format!("{top}/{}/{}", c.name, m.name)) else { continue };
+        for f in items.iter().filter(|f| f.size > 0 && f.size < std::env::var("TELEGRAM_MAX_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(8) << 20).take(3) {
+            files.push((format!("{top}/{}/{}/{}", c.name, m.name, f.name), f.size));
+        }
+        if files.len() >= 24 {
+            break;
+        }
+    }
+    let at_once: usize = std::env::var("TELEGRAM_PARALLEL").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let queue = Arc::new(std::sync::Mutex::new(files.into_iter().enumerate().collect::<Vec<_>>()));
+    let t = Instant::now();
+    let workers: Vec<_> = (0..at_once)
+        .map(|_| {
+            let (a, queue) = (a.clone(), queue.clone());
+            std::thread::spawn(move || {
+                let mut out = Vec::new();
+                loop {
+                    let Some((i, (path, size))) = queue.lock().unwrap().pop() else { break };
+                    let mut got = Vec::new();
+                    let r = a.download(&path, &mut got, &mut |_| true);
+                    out.push((i, size, r.map(|()| got.len() as u64)));
+                }
+                out
+            })
+        })
+        .collect();
+    let mut results: Vec<_> = workers.into_iter().flat_map(|w| w.join().unwrap()).collect();
+    results.sort_by_key(|r| r.0);
+    let failed = results.iter().filter(|r| r.2.is_err()).count();
+    for (i, size, r) in &results {
+        match r {
+            Ok(n) => println!("arquivo {i}: {size} bytes, {}", if n == size { "inteiro" } else { "INCOMPLETO" }),
+            Err(e) => println!("arquivo {i}: {size} bytes, ERRO {e}"),
+        }
+    }
+    println!("{} arquivos, {failed} com erro, {at_once} de cada vez, {:.1} s", results.len(), t.elapsed().as_secs_f64());
+    assert_eq!(failed, 0);
+}
+
+/// Files of several chats downloaded at once while the account's connections are ended again and
+/// again, as Telegram may end one: every file still comes whole. Prints sizes and counts only.
+#[test]
+#[ignore = "uses a real Telegram account"]
+fn downloads_survive_connections_that_end() {
+    use openexplorer_telegram::chats::folder_name;
+    use openexplorer_telegram::real::DROPPED_CALLS;
+    let Some((api_id, bytes, peer)) = poc() else { return };
+    let conn = Conn::start(api_id, Arc::new(KeyringSession::from_bytes(&bytes).unwrap())).unwrap();
+    let breaker = conn.breaker();
+    let a = Arc::new(Account::open(1, "teste", Box::new(Real::new(conn, peer, true)), None));
+    let top = format!("/{}", folder_name());
+    let chats = a.list(&top).unwrap();
+    let mut files = Vec::new();
+    for c in chats.iter().take(40) {
+        let Ok(months) = a.list(&format!("{top}/{}", c.name)) else { continue };
+        for m in months.iter().take(3) {
+            let Ok(items) = a.list(&format!("{top}/{}/{}", c.name, m.name)) else { continue };
+            for f in items.iter().filter(|f| f.size > 2 << 20 && f.size < 60 << 20).take(2) {
+                files.push((format!("{top}/{}/{}/{}", c.name, m.name, f.name), f.size));
+            }
+        }
+        if files.len() >= 8 {
+            break;
+        }
+    }
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let chaos = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut n = 0;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(std::env::var("TELEGRAM_CHAOS_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000)));
+                for dc in 1..=5 {
+                    breaker(dc);
+                }
+                n += 1;
+            }
+            n
+        })
+    };
+    let t = Instant::now();
+    let workers: Vec<_> = files
+        .into_iter()
+        .map(|(path, size)| {
+            let a = a.clone();
+            std::thread::spawn(move || {
+                let mut got = Vec::new();
+                let r = a.download(&path, &mut got, &mut |_| true);
+                (size, r.map(|()| got.len() as u64))
+            })
+        })
+        .collect();
+    let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let breaks = chaos.join().unwrap();
+    let failed: Vec<String> = results.iter().filter_map(|(s, r)| match r {
+        Ok(n) if n == s => None,
+        Ok(n) => Some(format!("{n} de {s} bytes")),
+        Err(e) => Some(e.clone()),
+    }).collect();
+    println!("{} arquivos, {} MiB, {breaks} quedas forçadas, {} pedidos refeitos, {:.1} s; falhas: {failed:?}", results.len(), results.iter().map(|r| r.0).sum::<u64>() >> 20, DROPPED_CALLS.load(std::sync::atomic::Ordering::Relaxed), t.elapsed().as_secs_f64());
+    assert!(failed.is_empty());
+}
+
+/// How fast one big file of a chat comes down, and over how many connections per DC: the
+/// biggest of the first chats' recent months (up to 400 MiB), into nothing. Prints sizes, speeds
+/// and DCs only. With `TELEGRAM_PREMIUM=1`, tuned as Premium.
+#[test]
+#[ignore = "uses a real Telegram account"]
+fn speed_of_a_big_chat_file() {
+    use openexplorer_telegram::chats::folder_name;
+    let Some((api_id, bytes, peer)) = poc() else { return };
+    let a = account(api_id, &bytes, peer);
+    let top = format!("/{}", folder_name());
+    let chats = a.list(&top).unwrap();
+    let mut best: Option<(String, u64)> = None;
+    for c in chats.iter().take(30) {
+        let Ok(months) = a.list(&format!("{top}/{}", c.name)) else { continue };
+        for m in months.iter().take(4) {
+            let Ok(items) = a.list(&format!("{top}/{}/{}", c.name, m.name)) else { continue };
+            for f in items.iter().filter(|f| f.size < 400 << 20) {
+                if best.as_ref().is_none_or(|b| f.size > b.1) {
+                    best = Some((format!("{top}/{}/{}/{}", c.name, m.name, f.name), f.size));
+                }
+            }
+        }
+    }
+    let (path, size) = best.expect("a file");
+    let _ = std::fs::write(std::env::temp_dir().join("oe-telegram-big-file.txt"), format!("{size}
+{path}"));
+    big_file_rounds(&a, &path, size);
+}
+
+fn big_file_rounds(a: &Account, path: &str, size: u64) {
+    use openexplorer_telegram::real::{DROPPED_LANES, PREMIUM_WAITS, WAITED_SECS, WAITS};
+    use std::sync::atomic::Ordering::Relaxed;
+    for round in 0..2 {
+        let t = Instant::now();
+        let mut sink = std::io::sink();
+        a.download(path, &mut sink, &mut |_| true).unwrap();
+        println!("rodada {round}: {:.1} MiB em {:.1} s = {}; conexões por DC {:?}", size as f64 / 1048576.0, t.elapsed().as_secs_f64(), mib_s(size as usize, t), a.connections_open());
+        println!("  esperas {} ({} s), premium {}, conexões perdidas {:?}", WAITS.load(Relaxed), WAITED_SECS.load(Relaxed), PREMIUM_WAITS.load(Relaxed), DROPPED_LANES.lock().unwrap());
+    }
+}
+
+/// [`speed_of_a_big_chat_file`] again on the file it found, with no search first.
+#[test]
+#[ignore = "uses a real Telegram account"]
+fn speed_of_the_big_chat_file_again() {
+    let Some((api_id, bytes, peer)) = poc() else { return };
+    let Ok(kept) = std::fs::read_to_string(std::env::temp_dir().join("oe-telegram-big-file.txt")) else { return };
+    let (size, path) = kept.split_once('\n').unwrap();
+    let a = account(api_id, &bytes, peer);
+    let top = path.split('/').take(4).collect::<Vec<_>>().join("/");
+    a.list(&top).unwrap();
+    let home = KeyringSession::from_bytes(&bytes).unwrap().home();
+    println!("DC da conta: {home}");
+    // `TELEGRAM_TUNE=8x32`: connections per DC and parts in flight.
+    if let Some((c, p)) = std::env::var("TELEGRAM_TUNE").ok().and_then(|v| v.split_once('x').map(|(c, p)| (c.parse().unwrap(), p.parse().unwrap()))) {
+        a.tune(c, p);
+    }
+    big_file_rounds(&a, path, size.parse().unwrap());
+}
+
+/// The big chat file over 1, 4 and 8 connections, interleaved, three rounds, a pause between:
+/// the median of each. Prints speeds only.
+#[test]
+#[ignore = "uses a real Telegram account"]
+fn speed_of_the_big_chat_file_by_connections() {
+    let Some((api_id, bytes, peer)) = poc() else { return };
+    let Ok(kept) = std::fs::read_to_string(std::env::temp_dir().join("oe-telegram-big-file.txt")) else { return };
+    let (size, path) = kept.split_once('\n').unwrap();
+    let size: u64 = size.parse().unwrap();
+    let variants: Vec<(usize, usize)> = std::env::var("TELEGRAM_VARIANTS").ok().map_or_else(|| vec![(1, 16), (4, 16), (8, 32)], |v| v.split(',').map(|p| { let (c, n) = p.split_once('x').unwrap(); (c.parse().unwrap(), n.parse().unwrap()) }).collect());
+    let mut speeds: Vec<Vec<f64>> = vec![Vec::new(); variants.len()];
+    for round in 0..3 {
+        for (v, &(c, p)) in variants.iter().enumerate() {
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            // A fresh account each time: no connection left over from the variant before.
+            let a = account(api_id, &bytes, peer);
+            a.list(&path.split('/').take(4).collect::<Vec<_>>().join("/")).unwrap();
+            a.tune(c, p);
+            let t = Instant::now();
+            a.download(path, &mut std::io::sink(), &mut |_| true).unwrap();
+            let mibs = size as f64 / 1048576.0 / t.elapsed().as_secs_f64();
+            speeds[v].push(mibs);
+            println!("rodada {round}, {c}x{p}: {mibs:.1} MiB/s, conexões {:?}", a.connections_open());
+        }
+    }
+    for (v, &(c, p)) in variants.iter().enumerate() {
+        let mut s = speeds[v].clone();
+        s.sort_by(f64::total_cmp);
+        println!("{c}x{p}: mediana {:.1} MiB/s ({:?})", s[s.len() / 2], s.iter().map(|x| format!("{x:.1}")).collect::<Vec<_>>());
     }
 }

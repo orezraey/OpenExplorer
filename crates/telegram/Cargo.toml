@@ -12,6 +12,8 @@ edition.workspace = true
 fake = []
 
 [dependencies]
+# The local date and time in the names of photos and voice notes from chats (`chats`).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 getrandom = "0.3"
 grammers-client = { version = "0.12.0", default-features = false }
 grammers-mtsender = "0.12.0"

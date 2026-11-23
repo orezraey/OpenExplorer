@@ -100,8 +100,16 @@ impl Conn for Telegram {
         Ok(false)
     }
 
-    /// On Telegram's side: a document is sent again by reference, a folder item by item.
+    fn passed_over(&mut self, path: &str) -> bool {
+        self.account.passed_over(path)
+    }
+
+    /// On Telegram's side: a document is sent again by reference, a folder item by item. From
+    /// the chats (read-only, not the storage), through the app, as between servers.
     fn copy(&mut self, from: &str, to: &str) -> Result<bool> {
+        if self.account.in_chats(from) {
+            return Ok(false);
+        }
         self.account.copy(from, to).map(|()| true)
     }
 
@@ -182,6 +190,19 @@ mod tests {
         let names: Vec<String> = c.list("/").unwrap().into_iter().map(|i| i.name).collect();
         assert_eq!(names, ["Cópia", "b.txt"]);
         assert_eq!(Server::telegram(9001, "Ana").address(), "telegram://9001");
+    }
+
+    #[test]
+    fn a_walk_from_above_passes_over_the_chats_folder_and_each_chat() {
+        let fake = Arc::new(Fake::new());
+        fake.add_chat(openexplorer_telegram::chats::Kind::User, 20, "Ana");
+        openexplorer_telegram::open::adopt(9003, Arc::new(Account::open(9003, "Ana", Box::new(fake), None)));
+        let mut c = Telegram::connect(&Server::telegram(9003, "Ana")).unwrap();
+        assert!(c.passed_over("/Conversas do Telegram"));
+        assert!(c.passed_over("telegram chats/"));
+        assert!(c.passed_over("/Conversas do Telegram/Ana"));
+        assert!(!c.passed_over("/Conversas do Telegram/Ana/2026-11"));
+        assert!(!c.passed_over("/Fotos"));
     }
 
     #[test]

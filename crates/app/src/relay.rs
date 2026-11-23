@@ -381,7 +381,12 @@ fn up(c: &mut dyn Conn, d: &Drive, path: &str, is_dir: bool, parent: &str, name:
             return Err(tr!("{path}: pastas demais umas dentro das outras (um link que volta para cima?).", "{path}: too many folders inside one another (a link that loops back up?)."));
         }
         let folder = d.create_folder(name, parent)?;
-        let filled = c.list(path).and_then(|items| items.iter().try_for_each(|it| up(c, d, &child(path, &it.name), it.is_dir, &folder.id, &it.name, p, depth + 1)));
+        let filled = c.list(path).and_then(|items| {
+            items.iter().try_for_each(|it| {
+                let at = child(path, &it.name);
+                if it.is_dir && c.passed_over(&at) { Ok(()) } else { up(c, d, &at, it.is_dir, &folder.id, &it.name, p, depth + 1) }
+            })
+        });
         // A copy that stopped leaves no half-filled folder in Drive: it goes to the trash.
         if filled.is_err() && depth == 0 {
             let _ = d.trash(&folder.id);
@@ -588,7 +593,7 @@ fn described(
     }
     let mut inner = HashSet::new();
     for it in c.list(path)? {
-        if it.is_dir && it.link {
+        if it.is_dir && (it.link || c.passed_over(&child(path, &it.name))) {
             continue;
         }
         described(c, &child(path, &it.name), &it.name, it.is_dir, it.size, it.modified, &at, &mut inner, out, stop, depth + 1)?;

@@ -12,7 +12,8 @@
 //! magic "OETGTRE\0" | format (u32 LE) | key id (16) | nonce (12) | AES-256-GCM(JSON body) | tag (16)
 //! ```
 //!
-//! The body is the change log's position and the messages the tree is made of. Names are
+//! The body is the change log's position, the messages the tree is made of, and the chats read
+//! so far (`chats`; files from before they were kept have none, and read them again). Names are
 //! private, so the key is derived from the session's authorization key (in the OS credential
 //! store), salted with the user id: the file alone opens nothing, and a new login can't open an
 //! old file, which is then read from the channel again.
@@ -23,6 +24,7 @@ use std::sync::atomic::AtomicBool;
 use openexplorer_cloud::sealed::{OnClear, Secret, Store};
 use serde::{Deserialize, Serialize};
 
+use crate::chats;
 use crate::tree::Msg;
 
 /// Bumped when the body's shape changes: a file of another format is thrown away.
@@ -36,6 +38,8 @@ static STORE: Store = Store::new(b"OETGTRE\0", FORMAT, "tree", OnClear::Keep);
 struct Body {
     pts: i32,
     msgs: Vec<Msg>,
+    #[serde(default)]
+    chats: chats::Kept,
 }
 
 /// Keeps the files in `dir` from now on (`%LOCALAPPDATA%\OpenExplorer\telegram` in the app).
@@ -59,17 +63,17 @@ pub fn mark() -> u64 {
     STORE.mark()
 }
 
-/// The change log's position and the messages kept in `file`, if it opens.
-pub fn load(file: &Path, secret: &Secret) -> Option<(i32, Vec<Msg>)> {
+/// The change log's position, the messages and the chats kept in `file`, if it opens.
+pub fn load(file: &Path, secret: &Secret) -> Option<(i32, Vec<Msg>, chats::Kept)> {
     let (data, body) = STORE.read(file, secret).ok()?;
     let b: Body = serde_json::from_slice(&data[body]).ok()?;
-    Some((b.pts, b.msgs))
+    Some((b.pts, b.msgs, b.chats))
 }
 
 /// Writes the tree, unless the account was removed meanwhile or the folder was cleared after
 /// `mark`. Whether it wrote.
-pub fn save<'a>(file: &Path, secret: &Secret, pts: i32, msgs: impl Iterator<Item = &'a Msg>, forgotten: &AtomicBool, mark: u64) -> bool {
-    let body = Body { pts, msgs: msgs.cloned().collect() };
+pub fn save<'a>(file: &Path, secret: &Secret, pts: i32, msgs: impl Iterator<Item = &'a Msg>, chats: &chats::Kept, forgotten: &AtomicBool, mark: u64) -> bool {
+    let body = Body { pts, msgs: msgs.cloned().collect(), chats: chats.clone() };
     let Ok(json) = serde_json::to_vec(&body) else { return false };
     let sealed = STORE.seal_copy(secret, &json);
     STORE.write_unless(file, &sealed, forgotten, mark).unwrap_or(false)

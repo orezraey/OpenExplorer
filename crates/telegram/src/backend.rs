@@ -5,6 +5,7 @@
 use std::io::{Read, Write};
 
 use crate::Result;
+use crate::chats::{ChatFile, ChatRef, Cursor, Month, Page};
 use crate::tree::Msg;
 
 /// How a transfer reports the bytes done so far and hears whether to go on: `false` stops it
@@ -30,6 +31,19 @@ pub struct Small {
 
 /// At most this many files go in one message group (Telegram's limit for an album).
 pub const GROUP: usize = 10;
+
+/// A page of the listing of chats, or when Telegram lets it be asked again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Paged {
+    Page(Page),
+    /// Seconds since 1970.
+    WaitUntil(i64),
+}
+
+/// What a backend with no chats answers (`chats`).
+fn no_chats() -> String {
+    openexplorer_i18n::t("Esta conta não lê conversas.", "This account doesn't read chats.").into()
+}
 
 pub trait Backend: Send + Sync {
     /// Every message of the channel and the change log's position, taken before reading, so
@@ -62,6 +76,34 @@ pub trait Backend: Send + Sync {
 
     /// The largest file the account can send.
     fn max_file(&self) -> u64;
+
+    /// Whether the account shows its chats (`chats`): a real account does; the fake, once it has
+    /// some.
+    fn has_chats(&self) -> bool {
+        false
+    }
+
+    /// A page of the account's chats, the most recent first, from `after` (the first page with
+    /// `None`), leaving out the storage channel. `patient`: a FLOOD_WAIT is waited out; else its
+    /// end comes back as [`Paged::WaitUntil`].
+    fn chats(&self, _after: Option<&Cursor>, _patient: bool) -> Result<Paged> {
+        Err(no_chats())
+    }
+
+    /// The months with files in `chat` (see `chats`).
+    fn chat_months(&self, _chat: &ChatRef) -> Result<Vec<Month>> {
+        Err(no_chats())
+    }
+
+    /// The files sent in `chat` in `month`.
+    fn chat_files(&self, _chat: &ChatRef, _month: Month) -> Result<Vec<ChatFile>> {
+        Err(no_chats())
+    }
+
+    /// Writes the file of message `msg` of `chat` to `out`.
+    fn chat_download(&self, _chat: &ChatRef, _msg: i32, _out: &mut dyn Write, _progress: Progress) -> Result<()> {
+        Err(no_chats())
+    }
 
     /// Until when (seconds since 1970) Telegram asked to wait, if it is asking now.
     fn waiting_until(&self) -> Option<i64> {

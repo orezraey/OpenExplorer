@@ -11,6 +11,11 @@
 //! | upload over a file | the new one sent, then the old one deleted |
 //! | upload past Telegram's limit | the file in parts of the limit, each a message (see `records`) |
 //!
+//! The top folder also holds the account's chats, read-only (`chats`): a path under it goes
+//! there, and anything that would change it is refused. An item of the storage named as the
+//! chats' folder (made before it, or by another app) keeps its name; the folder of chats then
+//! shows numbered, as a twin would (`Conversas do Telegram (2)`).
+//!
 //! The tree is brought up to date from the channel's change log before an operation reads it,
 //! at most every few seconds (one small request, made under the tree's lock so two panes don't
 //! ask at once); what this account does itself goes into the tree as soon as Telegram answers.
@@ -27,9 +32,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use openexplorer_cloud::sealed::Secret;
 use openexplorer_i18n::{t, tr};
 
-use crate::backend::{Backend, Changes, GROUP, Progress, Small};
+use crate::backend::{Backend, Changes, GROUP, Paged, Progress, Small};
+use crate::chats::{self, ChatRef, Chats, Need};
 use crate::records;
-use crate::tree::{Found, Item, Msg, Tree};
+use crate::tree::{Found, Item, Msg, Tree, numbered};
 use crate::{Result, cache};
 
 /// How long the tree is trusted without asking the change log.
@@ -58,6 +64,8 @@ pub struct Account {
     pub name: String,
     backend: Box<dyn Backend>,
     state: Mutex<State>,
+    /// The chats, read-only; locked after `state` when both are.
+    chats: Mutex<Chats>,
     /// Held from a new folder's check to its message: Telegram doesn't refuse a second folder of
     /// the same name, as the other services do, so two panes making one must take turns.
     making: Mutex<()>,
@@ -103,11 +111,142 @@ impl Account {
     /// The account over `backend`; the tree is read (from `kept`, else the channel) when first
     /// needed.
     pub fn open(user_id: i64, name: &str, backend: Box<dyn Backend>, kept: Option<Kept>) -> Account {
-        Account { user_id, name: name.into(), backend, state: Mutex::default(), making: Mutex::new(()), part_size: AtomicU64::new(0), kept, mark: cache::mark(), forgotten: AtomicBool::new(false) }
+        Account { user_id, name: name.into(), backend, state: Mutex::default(), chats: Mutex::default(), making: Mutex::new(()), part_size: AtomicU64::new(0), kept, mark: cache::mark(), forgotten: AtomicBool::new(false) }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn chats(&self) -> MutexGuard<'_, Chats> {
+        self.chats.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether `path` is in the folder of chats: read-only, and not kept as the storage is.
+    pub fn in_chats(&self, path: &str) -> bool {
+        self.chat_segs(path).ok().flatten().is_some()
+    }
+
+    /// Whether a walk from above passes over `path`: the folder of chats, or a chat in it (a
+    /// walk from the folder would read the months of thousands of chats). A walk that starts in
+    /// a chat goes into its months.
+    pub fn passed_over(&self, path: &str) -> bool {
+        self.chat_segs(path).ok().flatten().is_some_and(|segs| segs.len() <= 1)
+    }
+
+    /// The name the folder of chats shows as in `tree`'s top folder: its own, unless an item of
+    /// the storage has it, then numbered as a twin.
+    fn chats_name(tree: &mut Tree) -> String {
+        let base = chats::folder_name();
+        let mut taken = |name: &str| matches!(tree.find(&format!("/{name}")), Some(Found::Item(_)));
+        (1..).map(|n| if n == 1 { base.to_string() } else { numbered(base, n, true) }).find(|n| !taken(n)).unwrap_or_default()
+    }
+
+    /// The chats' part of `path` with the storage as `tree` has it: the account shows its chats,
+    /// the first folder is one of their folder's names or the one it shows as, and no item of the
+    /// storage at the top is named so.
+    fn chats_part<'a>(&self, tree: &mut Tree, path: &'a str) -> Option<Vec<&'a str>> {
+        let (first, rest) = chats::split_first(path)?;
+        if !chats::may_name_folder(first) || !self.backend.has_chats() || matches!(tree.find(&format!("/{first}")), Some(Found::Item(_))) {
+            return None;
+        }
+        (chats::is_folder_name(first) || Account::chats_name(tree).to_lowercase() == first.to_lowercase()).then_some(rest)
+    }
+
+    /// The chats' part of `path`, if it's in them (see `chats_part`): a path of the storage is
+    /// told apart by its first folder alone, with no lock.
+    fn chat_segs<'a>(&self, path: &'a str) -> Result<Option<Vec<&'a str>>> {
+        if !chats::split_first(path).is_some_and(|(first, _)| chats::may_name_folder(first)) {
+            return Ok(None);
+        }
+        let mut st = self.current(false)?;
+        Ok(self.chats_part(&mut st.tree, path))
+    }
+
+    /// Refuses a change to `path` when it's in the chats (so no item of the storage takes their
+    /// folder's name).
+    fn writable(&self, path: &str) -> Result<()> {
+        if self.chat_segs(path)?.is_some() { Err(chats::read_only()) } else { Ok(()) }
+    }
+
+    /// The chats kept on disk, looked for once, when first needed (the storage's tree may not
+    /// have been read yet).
+    fn chats_from_disk(&self) {
+        {
+            let mut c = self.chats();
+            if c.disk_tried {
+                return;
+            }
+            c.disk_tried = true;
+        }
+        if let Some(k) = &self.kept
+            && let Some((_, _, kept)) = cache::load(&k.file, &k.secret)
+        {
+            self.chats().adopt(kept);
+        }
+    }
+
+    /// The items of the folder `segs` names under the folder of chats, Telegram asked with no
+    /// lock held. `fresh`: what was read over a minute ago is read again.
+    fn chats_list(&self, segs: &[&str], fresh: bool) -> Result<Vec<Item>> {
+        self.chats_from_disk();
+        for _ in 0..4 {
+            let need = self.chats().plan(segs, fresh);
+            match need {
+                Need::Ready(items) => return Ok(items),
+                Need::Missing => break,
+                Need::NotFolder => return Err(chats::not_folder(segs)),
+                Need::First => match self.backend.chats(None, true)? {
+                    Paged::Page(p) => self.chats().put_first(p),
+                    Paged::WaitUntil(until) => return Err(chats::wait_until(until)),
+                },
+                Need::Months(chat) => {
+                    let m = self.backend.chat_months(&chat)?;
+                    self.chats().put_months(chat, m);
+                }
+                Need::Files(chat, month) => {
+                    let f = self.backend.chat_files(&chat, month)?;
+                    self.chats().put_files(chat, month, f);
+                }
+            }
+        }
+        Err(chats::missing(segs))
+    }
+
+    /// The chat and message of the file `segs` names under the folder of chats.
+    fn chat_file(&self, segs: &[&str]) -> Result<(ChatRef, i32)> {
+        let [chat, month, name] = segs else {
+            return Err(if segs.len() < 3 { chats::is_folder(segs) } else { chats::missing(segs) });
+        };
+        let low = name.to_lowercase();
+        let item = self.chats_list(&[chat, month], false)?.into_iter().find(|i| i.name.to_lowercase() == low).ok_or_else(|| chats::missing(segs))?;
+        let at = self.chats().chat(chat).ok_or_else(|| chats::missing(segs))?;
+        Ok((at, item.msg))
+    }
+
+    /// Reads more of the chats for up to `budget`, never waiting on Telegram: whether anything
+    /// shown changed (see `Chats::wanted_more`).
+    fn more_chats(&self, budget: Duration) -> bool {
+        let start = Instant::now();
+        let mut changed = false;
+        while start.elapsed() < budget {
+            let Some(asked) = self.chats().wanted_more() else { break };
+            let Ok(paged) = self.backend.chats(asked.as_ref(), false) else { break };
+            let (shown, go_on) = self.chats().put_more(asked, paged);
+            changed |= shown;
+            if !go_on {
+                break;
+            }
+        }
+        changed
+    }
+
+    /// Adds the folder of chats to the items of the top folder, `tree`'s.
+    fn with_chats(&self, tree: &mut Tree, path: &str, mut items: Vec<Item>) -> Vec<Item> {
+        if path.trim_matches('/').is_empty() && self.backend.has_chats() {
+            items.insert(0, chats::folder_item(Account::chats_name(tree)));
+        }
+        items
     }
 
     /// The tree, brought up to date unless it was a moment ago (or `force`).
@@ -115,8 +254,12 @@ impl Account {
         let mut st = self.lock();
         if !st.loaded
             && let Some(k) = &self.kept
-            && let Some((pts, msgs)) = cache::load(&k.file, &k.secret)
+            && let Some((pts, msgs, kept)) = cache::load(&k.file, &k.secret)
         {
+            let mut c = self.chats();
+            c.adopt(kept);
+            c.disk_tried = true;
+            drop(c);
             st.tree = Tree::new(msgs);
             st.pts = pts;
             st.loaded = true;
@@ -175,19 +318,27 @@ impl Account {
 
     /// Asks the change log now, whatever the time since last: whether it brought anything (made
     /// elsewhere, or this app's own changes coming back, which change nothing shown).
+    /// Once the chats were opened, it also reads more of them, for a moment and never waiting on
+    /// Telegram (`Chats::more`).
     pub fn refresh(&self) -> Result<bool> {
         let before = self.lock().version;
-        Ok(self.current(true)?.version != before)
+        let changed = self.current(true)?.version != before;
+        let more = self.more_chats(Duration::from_secs(3));
+        Ok(changed || more)
     }
 
     /// The items of folder `path`, folders first.
     pub fn list(&self, path: &str) -> Result<Vec<Item>> {
+        if let Some(segs) = self.chat_segs(path)? {
+            return self.chats_list(&segs, true);
+        }
         let mut st = self.current(false)?;
         match st.tree.find(path) {
             Some(f) => match f.dir() {
                 Some(dir) => {
                     let dir = dir.to_string();
-                    Ok(st.tree.list(&dir))
+                    let items = st.tree.list(&dir);
+                    Ok(self.with_chats(&mut st.tree, path, items))
                 }
                 None => Err(tr!("{} não é uma pasta.", "{} isn't a folder.", shown(path))),
             },
@@ -198,6 +349,9 @@ impl Account {
     /// A path that keeps naming what `path` names while items around it go: a twin (an item
     /// sharing its name, shown as `a (2).txt`) by its message, any other by `path` itself.
     pub fn pin(&self, path: &str) -> Result<String> {
+        if self.in_chats(path) {
+            return Ok(path.to_string());
+        }
         match self.current(false)?.tree.find(path) {
             Some(Found::Item(i)) if i.twin => Ok(crate::tree::pinned(i.msg)),
             Some(_) => Ok(path.to_string()),
@@ -217,17 +371,34 @@ impl Account {
         if !st.loaded {
             return None;
         }
+        if let Some(segs) = self.chats_part(&mut st.tree, path) {
+            drop(st);
+            return match self.chats.try_lock() {
+                Ok(mut c) => c.kept_list(&segs),
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().kept_list(&segs),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            };
+        }
         let dir = st.tree.find(path)?.dir()?.to_string();
-        Some(st.tree.list(&dir))
+        let items = st.tree.list(&dir);
+        Some(self.with_chats(&mut st.tree, path, items))
     }
 
     /// What `path` is, `None` if nothing.
     pub fn stat(&self, path: &str) -> Result<Option<Found>> {
+        if let Some(segs) = self.chat_segs(path)? {
+            let Some((last, parent)) = segs.split_last() else { return Ok(Some(Found::Item(chats::folder_item(Account::chats_name(&mut self.current(false)?.tree))))) };
+            let low = last.to_lowercase();
+            return Ok(self.chats_list(parent, false)?.into_iter().find(|i| i.name.to_lowercase() == low).map(Found::Item));
+        }
         Ok(self.current(false)?.tree.find(path))
     }
 
     /// The folder `path`'s parent is, and the name `path` ends in, checked.
-    fn place(st: &mut State, path: &str) -> Result<(String, String)> {
+    fn place(&self, st: &mut State, path: &str) -> Result<(String, String)> {
+        if self.chats_part(&mut st.tree, path).is_some() {
+            return Err(chats::read_only());
+        }
         let (parent, name) = split(path);
         if !records::valid_name(name) {
             return Err(bad_name(name));
@@ -241,7 +412,7 @@ impl Account {
         let _turn = self.making.lock().unwrap_or_else(|e| e.into_inner());
         let (dir, name) = {
             let mut st = self.current(false)?;
-            let (dir, name) = Account::place(&mut st, path)?;
+            let (dir, name) = self.place(&mut st, path)?;
             if st.tree.find(path).is_some() {
                 return Err(taken(&name));
             }
@@ -255,12 +426,13 @@ impl Account {
     /// Moves or renames `from` to `to`, which mustn't exist (but may differ from `from` in case
     /// only).
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
+        self.writable(from)?;
         let (item, dir, name) = {
             let mut st = self.current(false)?;
             let Some(Found::Item(item)) = st.tree.find(from) else {
                 return Err(if st.tree.find(from).is_some() { t("A pasta do topo não pode ser renomeada.", "The top folder can't be renamed.").into() } else { missing(from) });
             };
-            let (dir, name) = Account::place(&mut st, to)?;
+            let (dir, name) = self.place(&mut st, to)?;
             if let Some(Found::Item(there)) = st.tree.find(to)
                 && there.msg != item.msg
             {
@@ -319,6 +491,7 @@ impl Account {
 
     /// Deletes a file, or a folder: an empty one unless `everything`, else with all it holds.
     pub fn remove(&self, path: &str, everything: bool) -> Result<()> {
+        self.writable(path)?;
         let ids = {
             let mut st = self.current(false)?;
             let Some(Found::Item(item)) = st.tree.find(path) else {
@@ -409,7 +582,7 @@ impl Account {
     /// The folder and name `path` goes to, and the messages of the file it replaces.
     fn upload_place(&self, path: &str) -> Result<(String, String, Vec<i32>)> {
         let mut st = self.current(false)?;
-        let (dir, name) = Account::place(&mut st, path)?;
+        let (dir, name) = self.place(&mut st, path)?;
         let old = match st.tree.find(path) {
             Some(Found::Item(i)) if i.is_dir() => return Err(tr!("Já existe uma pasta chamada \"{name}\" aqui.", "There's already a folder named \"{name}\" here.")),
             Some(Found::Item(i)) => i.messages(),
@@ -485,6 +658,10 @@ impl Account {
 
     /// Writes file `path` to `out`.
     pub fn download(&self, path: &str, out: &mut dyn Write, progress: Progress) -> Result<()> {
+        if let Some(segs) = self.chat_segs(path)? {
+            let (chat, msg) = self.chat_file(&segs)?;
+            return self.backend.chat_download(&chat, msg, out, progress);
+        }
         let parts: Vec<(i32, u64)> = {
             let mut st = self.current(false)?;
             match st.tree.find(path) {
@@ -507,11 +684,14 @@ impl Account {
 
     /// Copies `from` to `to` on Telegram's side (a folder with all it holds); `to` mustn't
     /// exist.
+    /// A file of the chats isn't copied here: the app copies it through its bytes
+    /// ([`Account::in_chats`]).
     pub fn copy(&self, from: &str, to: &str) -> Result<()> {
+        self.writable(from)?;
         let (item, dir, name) = {
             let mut st = self.current(false)?;
             let Some(Found::Item(item)) = st.tree.find(from) else { return Err(missing(from)) };
-            let (dir, name) = Account::place(&mut st, to)?;
+            let (dir, name) = self.place(&mut st, to)?;
             if st.tree.find(to).is_some() {
                 return Err(taken(&name));
             }
@@ -600,11 +780,13 @@ impl Account {
     pub fn save_cache_if_changed(&self) {
         let Some(k) = &self.kept else { return };
         let mut st = self.lock();
-        if !st.dirty || !st.loaded {
+        let mut chats = self.chats();
+        if !(st.dirty || chats.dirty) || !st.loaded {
             return;
         }
-        if cache::save(&k.file, &k.secret, st.pts, st.tree.messages(), &self.forgotten, self.mark) {
+        if cache::save(&k.file, &k.secret, st.pts, st.tree.messages(), chats.kept(), &self.forgotten, self.mark) {
             st.dirty = false;
+            chats.dirty = false;
         }
     }
 }
@@ -926,6 +1108,178 @@ mod tests {
         let a = Account::open(1, "Ana", Box::new(Shared(fake.clone())), Some(Kept { file: dir.join("conta.tree"), secret: cache::secret(1, &[8; 256]) }));
         assert_eq!(names(&a, "/"), ["A", "B"]);
         assert_eq!(fake.histories.load(Ordering::SeqCst), histories + 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The chats
+
+    use crate::chats::{Kind, Month};
+
+    fn with_chats() -> (Account, Arc<Fake>) {
+        let fake = Arc::new(Fake::new());
+        (Account::open(1, "Ana", Box::new(fake.clone()), None), fake)
+    }
+
+    fn day(y: i32, m: u32, d: i64) -> i64 {
+        Month { year: y, month: m }.range().0 + (d - 1) * 86400 + 12 * 3600
+    }
+
+    #[test]
+    fn the_chats_show_as_a_folder_of_months_of_files_beside_the_storage() {
+        let (a, fake) = with_chats();
+        put(&a, "/notas.txt", b"minhas");
+        let saved = fake.add_chat(Kind::Saved, 1, "Ana");
+        let bia = fake.add_chat(Kind::User, 20, "Bia");
+        fake.add_chat_file(saved, "contrato.pdf", b"pdf", day(2026, 11, 3));
+        fake.add_chat_file(saved, "", b"jpg", day(2026, 10, 9));
+        fake.add_chat_file(bia, "contrato.pdf", b"outro", day(2026, 11, 4));
+        fake.add_chat_file(bia, "contrato.pdf", b"mais um", day(2026, 11, 5));
+
+        assert_eq!(names(&a, "/"), ["Conversas do Telegram", "notas.txt"]);
+        assert_eq!(names(&a, "/Conversas do Telegram"), ["Mensagens Salvas", "Bia"]);
+        assert_eq!(names(&a, "/Conversas do Telegram/Mensagens Salvas"), ["2026-11", "2026-10"]);
+        assert_eq!(names(&a, "/Conversas do Telegram/Mensagens Salvas/2026-11"), ["contrato.pdf"]);
+        assert_eq!(names(&a, "/telegram chats/bia/2026-11"), ["contrato.pdf", "contrato (2).pdf"]);
+
+        let mut out = Vec::new();
+        a.download("/Conversas do Telegram/Bia/2026-11/contrato (2).pdf", &mut out, &mut |_| true).unwrap();
+        assert_eq!(out, b"mais um");
+        let found = a.stat("/Conversas do Telegram/Bia/2026-11/contrato.pdf").unwrap();
+        assert!(matches!(found, Some(Found::Item(i)) if i.size == 5 && !i.is_dir()));
+        assert!(matches!(a.stat("/Conversas do Telegram").unwrap(), Some(Found::Item(i)) if i.is_dir()));
+        assert!(a.stat("/Conversas do Telegram/Ninguém").unwrap().is_none());
+        // What was listed shows again with no request.
+        let searches = fake.chat_searches.load(Ordering::SeqCst);
+        assert_eq!(a.kept("/Conversas do Telegram/Bia/2026-11").map(|v| v.len()), Some(2));
+        assert_eq!(a.kept("/Conversas do Telegram/Bia/2026-10"), None);
+        assert_eq!(fake.chat_searches.load(Ordering::SeqCst), searches);
+    }
+
+    #[test]
+    fn nothing_in_the_chats_changes_and_no_storage_item_takes_their_name() {
+        let (a, fake) = with_chats();
+        let bia = fake.add_chat(Kind::User, 20, "Bia");
+        fake.add_chat_file(bia, "a.txt", b"a", day(2026, 11, 1));
+        put(&a, "/b.txt", b"b");
+        let ro = crate::chats::read_only();
+        let file = "/Conversas do Telegram/Bia/2026-11/a.txt";
+        assert_eq!(a.mkdir("/Conversas do Telegram/Bia/nova"), Err(ro.clone()));
+        assert_eq!(a.mkdir("/conversas do telegram"), Err(ro.clone()));
+        assert_eq!(a.remove(file, false), Err(ro.clone()));
+        assert_eq!(a.rename(file, "/a.txt"), Err(ro.clone()));
+        assert_eq!(a.rename("/b.txt", "/Conversas do Telegram/b.txt"), Err(ro.clone()));
+        assert_eq!(a.copy(file, "/a.txt"), Err(ro.clone()));
+        assert_eq!(a.upload("/Conversas do Telegram/Bia/2026-11/c.txt", &mut &b"c"[..], 1, None, &mut |_| true), Err(ro.clone()));
+        assert!(a.in_chats(file) && !a.in_chats("/b.txt"));
+        assert_eq!(names(&a, "/"), ["Conversas do Telegram", "b.txt"]);
+    }
+
+    #[test]
+    fn a_storage_folder_named_as_the_chats_keeps_its_name_and_the_chats_show_numbered() {
+        let (a, fake) = with_chats();
+        // Made before the chats showed (or by another app).
+        a.mkdir("/Conversas do Telegram").unwrap();
+        put(&a, "/Conversas do Telegram/backup.txt", b"meu");
+        let bia = fake.add_chat(Kind::User, 20, "Bia");
+        fake.add_chat_file(bia, "a.txt", b"a", day(2026, 11, 1));
+
+        assert_eq!(names(&a, "/"), ["Conversas do Telegram (2)", "Conversas do Telegram"]);
+        assert_eq!(names(&a, "/Conversas do Telegram"), ["backup.txt"]);
+        assert_eq!(names(&a, "/Conversas do Telegram (2)"), ["Mensagens Salvas", "Bia"]);
+        assert_eq!(names(&a, "/Telegram chats"), ["Mensagens Salvas", "Bia"]);
+        assert!(matches!(a.stat("/Conversas do Telegram (2)").unwrap(), Some(Found::Item(i)) if i.name == "Conversas do Telegram (2)"));
+        let mut out = Vec::new();
+        a.download("/Conversas do Telegram/backup.txt", &mut out, &mut |_| true).unwrap();
+        assert_eq!(out, b"meu");
+        a.download("/Conversas do Telegram (2)/Bia/2026-11/a.txt", &mut out, &mut |_| true).unwrap();
+        assert_eq!(out, b"meua");
+        // The storage's folder is the person's: it changes as any other.
+        put(&a, "/Conversas do Telegram/outro.txt", b"x");
+        a.rename("/Conversas do Telegram/outro.txt", "/Conversas do Telegram/novo.txt").unwrap();
+        a.remove("/Conversas do Telegram/novo.txt", false).unwrap();
+        assert!(a.in_chats("/Conversas do Telegram (2)/Bia") && !a.in_chats("/Conversas do Telegram/backup.txt"));
+        assert!(a.passed_over("/Conversas do Telegram (2)") && !a.passed_over("/Conversas do Telegram"));
+        assert_eq!(a.mkdir("/Conversas do Telegram (2)/nova"), Err(crate::chats::read_only()));
+        assert_eq!(a.mkdir("/telegram chats"), Err(crate::chats::read_only()));
+        // Gone, it gives the chats their name back.
+        a.remove("/Conversas do Telegram", true).unwrap();
+        assert_eq!(names(&a, "/"), ["Conversas do Telegram"]);
+        assert_eq!(names(&a, "/Conversas do Telegram"), ["Mensagens Salvas", "Bia"]);
+        assert!(a.stat("/Conversas do Telegram (2)").unwrap().is_none());
+    }
+
+    #[test]
+    fn the_chats_come_a_page_at_a_time_and_the_rest_while_the_app_asks_what_changed() {
+        let (a, fake) = with_chats();
+        fake.page.store(2, Ordering::SeqCst);
+        for i in 0..5 {
+            fake.add_chat(Kind::Channel, 100 + i, &format!("Canal {i}"));
+        }
+        // Nothing is read before someone opens the chats.
+        a.list("/").unwrap();
+        assert!(!a.refresh().unwrap());
+        assert_eq!(fake.chat_pages.load(Ordering::SeqCst), 0);
+        assert_eq!(names(&a, "/Conversas do Telegram"), ["Mensagens Salvas", "Canal 0", "Canal 1"]);
+        // Telegram asks to wait: the rest waits too, and comes after.
+        fake.chats_wait.store(now() + 3600, Ordering::SeqCst);
+        assert!(!a.refresh().unwrap());
+        assert_eq!(a.kept("/Conversas do Telegram").unwrap().len(), 3);
+        a.chats().not_before = 0;
+        assert!(a.refresh().unwrap());
+        assert_eq!(a.kept("/Conversas do Telegram").unwrap().len(), 6);
+        assert!(!a.refresh().unwrap(), "all read: nothing more until the most recent are read again");
+    }
+
+    #[test]
+    fn a_name_keeps_leading_to_its_chat_when_a_twin_comes_later() {
+        let (a, fake) = with_chats();
+        fake.page.store(2, Ordering::SeqCst);
+        let ana = fake.add_chat(Kind::User, 50, "Ana");
+        fake.add_chat(Kind::User, 60, "Bia");
+        let other = fake.add_chat(Kind::User, 10, "Ana");
+        fake.add_chat_file(ana, "a.txt", b"da primeira", day(2026, 11, 1));
+        fake.add_chat_file(other, "a.txt", b"da outra", day(2026, 11, 1));
+        let path = "/Conversas do Telegram/Ana/2026-11/a.txt";
+        let get = |a: &Account| {
+            let mut out = Vec::new();
+            a.download(path, &mut out, &mut |_| true).unwrap();
+            out
+        };
+        a.list("/").unwrap();
+        assert_eq!(get(&a), b"da primeira");
+        assert!(a.refresh().unwrap(), "the next page came");
+        assert_eq!(names(&a, "/Conversas do Telegram"), ["Mensagens Salvas", "Ana", "Bia", "Ana (2)"]);
+        assert_eq!(get(&a), b"da primeira");
+        let mut out = Vec::new();
+        a.download("/Conversas do Telegram/Ana (2)/2026-11/a.txt", &mut out, &mut |_| true).unwrap();
+        assert_eq!(out, b"da outra");
+    }
+
+    #[test]
+    fn the_chats_come_back_from_disk_before_the_storage_is_read() {
+        let dir = std::env::temp_dir().join(format!("oe-telegram-chats-{}", std::process::id()));
+        let kept = || Kept { file: dir.join("conta.tree"), secret: cache::secret(1, &[9; 256]) };
+        let fake = Arc::new(Fake::new());
+        fake.add_chat(Kind::User, 20, "Bia");
+        fake.add_chat(Kind::Channel, 30, "Canal");
+        let a = Account::open(1, "Ana", Box::new(fake.clone()), Some(kept()));
+        a.list("/").unwrap();
+        assert_eq!(names(&a, "/Conversas do Telegram"), ["Mensagens Salvas", "Bia", "Canal"]);
+        a.save_cache_if_changed();
+        drop(a);
+        let pages = fake.chat_pages.load(Ordering::SeqCst);
+        // A pane left in the chats opens there first, before anything reads the storage.
+        let a = Account::open(1, "Ana", Box::new(fake.clone()), Some(kept()));
+        assert_eq!(names(&a, "/Conversas do Telegram"), ["Mensagens Salvas", "Bia", "Canal"]);
+        assert_eq!(fake.chat_pages.load(Ordering::SeqCst), pages, "no page read: they came from disk");
+        // Kept again unchanged, not emptied.
+        a.list("/").unwrap();
+        a.save_cache_if_changed();
+        drop(a);
+        let a = Account::open(1, "Ana", Box::new(fake.clone()), Some(kept()));
+        assert_eq!(names(&a, "/Conversas do Telegram").len(), 3);
+        assert_eq!(fake.chat_pages.load(Ordering::SeqCst), pages);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

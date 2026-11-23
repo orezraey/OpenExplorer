@@ -117,7 +117,7 @@ pub fn pinned(msg: i32) -> String {
 }
 
 /// `a/b:c` → `a_b_c`; empty → `sem nome`.
-fn shown_name(name: &str) -> String {
+pub(crate) fn shown_name(name: &str) -> String {
     let mut s: String = name.chars().map(|c| if c < ' ' || r#"<>:"/\|?*"#.contains(c) { '_' } else { c }).collect();
     while s.ends_with(' ') || s.ends_with('.') {
         s.pop();
@@ -126,7 +126,7 @@ fn shown_name(name: &str) -> String {
 }
 
 /// `nota.txt`, 2 → `nota (2).txt`; a folder or a name with no extension takes it at the end.
-fn numbered(name: &str, n: usize, is_dir: bool) -> String {
+pub(crate) fn numbered(name: &str, n: usize, is_dir: bool) -> String {
     match name.rfind('.').filter(|&i| i > 0 && !is_dir) {
         Some(i) => format!("{} ({n}){}", &name[..i], &name[i..]),
         None => format!("{name} ({n})"),

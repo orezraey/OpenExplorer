@@ -1,12 +1,14 @@
 //! A channel in memory, for the tests of `account` and the app's: messages with their bytes, a
-//! change log, edits that can be made to expire, and counts of what was asked.
+//! change log, edits that can be made to expire, and counts of what was asked. Also the
+//! account's other chats, with their files, listed a page at a time (`chats`).
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 
-use crate::backend::{Backend, Changes, Progress, Small};
+use crate::backend::{Backend, Changes, Paged, Progress, Small};
+use crate::chats::{Chat, ChatFile, ChatRef, Cursor, Kind, Month, Page};
 use crate::tree::{Doc, Msg};
 use crate::{CANCELLED, Result};
 
@@ -46,6 +48,9 @@ impl Channel {
     }
 }
 
+/// A chat of the fake account and its files, each with its bytes.
+type FakeChat = (Chat, Vec<(ChatFile, Vec<u8>)>);
+
 #[derive(Default)]
 pub struct Fake {
     ch: Mutex<Channel>,
@@ -60,6 +65,14 @@ pub struct Fake {
     pub max: AtomicUsize,
     /// Until when Telegram asks to wait (seconds since 1970); 0 when it doesn't.
     pub waiting: AtomicI64,
+    /// The other chats, each with its files and their bytes, the most recent first.
+    chats: Mutex<Vec<FakeChat>>,
+    /// Chats a page; 0 is Telegram's 100.
+    pub page: AtomicUsize,
+    /// A listing of chats that doesn't wait answers "wait until" this (seconds since 1970), once.
+    pub chats_wait: AtomicI64,
+    pub chat_pages: AtomicUsize,
+    pub chat_searches: AtomicUsize,
 }
 
 impl Fake {
@@ -98,6 +111,23 @@ impl Fake {
 
     pub fn bytes(&self, id: i32) -> Option<Vec<u8>> {
         self.ch.lock().unwrap().msgs.get(&id).map(|(_, b)| b.clone())
+    }
+
+    /// A chat at the end of the list (older than those before it).
+    pub fn add_chat(&self, kind: Kind, id: i64, name: &str) -> ChatRef {
+        let at = ChatRef { kind, id, hash: id * 7 };
+        self.chats.lock().unwrap().push((Chat { at, name: name.into(), date: 0 }, Vec::new()));
+        at
+    }
+
+    /// A file sent in `chat` at `date`; its message id.
+    pub fn add_chat_file(&self, chat: ChatRef, name: &str, bytes: &[u8], date: i64) -> i32 {
+        let mut chats = self.chats.lock().unwrap();
+        let (c, files) = chats.iter_mut().find(|(c, _)| c.at == chat).expect("a chat added");
+        let msg = files.len() as i32 + 1;
+        c.date = c.date.max(date);
+        files.push((ChatFile { msg, name: name.into(), size: bytes.len() as u64, date }, bytes.to_vec()));
+        msg
     }
 }
 
@@ -223,6 +253,61 @@ impl Backend for Fake {
     fn waiting_until(&self) -> Option<i64> {
         Some(self.waiting.load(Ordering::SeqCst)).filter(|t| *t > 0)
     }
+
+    fn has_chats(&self) -> bool {
+        !self.chats.lock().unwrap().is_empty()
+    }
+
+    fn chats(&self, after: Option<&Cursor>, patient: bool) -> Result<Paged> {
+        if !patient {
+            let until = self.chats_wait.swap(0, Ordering::SeqCst);
+            if until > 0 {
+                return Ok(Paged::WaitUntil(until));
+            }
+        }
+        self.chat_pages.fetch_add(1, Ordering::SeqCst);
+        let chats = self.chats.lock().unwrap();
+        let size = match self.page.load(Ordering::SeqCst) {
+            0 => 100,
+            n => n,
+        };
+        // The fake has no archive.
+        if after.is_some_and(|c| c.archived) {
+            return Ok(Paged::Page(Page { chats: Vec::new(), next: None }));
+        }
+        let from = after.map_or(0, |c| c.id as usize);
+        let page: Vec<Chat> = chats.iter().skip(from).take(size).map(|(c, _)| c.clone()).collect();
+        let end = from + page.len();
+        let next = (end < chats.len()).then(|| Cursor { date: 0, id: end as i32, peer: page.last().expect("a page before the end isn't empty").at, archived: false });
+        Ok(Paged::Page(Page { chats: page, next }))
+    }
+
+    fn chat_months(&self, chat: &ChatRef) -> Result<Vec<Month>> {
+        self.chat_searches.fetch_add(1, Ordering::SeqCst);
+        let chats = self.chats.lock().unwrap();
+        let (_, files) = chats.iter().find(|(c, _)| c.at == *chat).ok_or("A conversa não existe.")?;
+        Ok(files.iter().map(|(f, _)| Month::of(f.date)).collect())
+    }
+
+    fn chat_files(&self, chat: &ChatRef, month: Month) -> Result<Vec<ChatFile>> {
+        self.chat_searches.fetch_add(1, Ordering::SeqCst);
+        let chats = self.chats.lock().unwrap();
+        let (_, files) = chats.iter().find(|(c, _)| c.at == *chat).ok_or("A conversa não existe.")?;
+        Ok(files.iter().filter(|(f, _)| Month::of(f.date) == month).map(|(f, _)| f.clone()).collect())
+    }
+
+    fn chat_download(&self, chat: &ChatRef, msg: i32, out: &mut dyn Write, progress: Progress) -> Result<()> {
+        let bytes = {
+            let chats = self.chats.lock().unwrap();
+            let (_, files) = chats.iter().find(|(c, _)| c.at == *chat).ok_or("A conversa não existe.")?;
+            files.iter().find(|(f, _)| f.msg == msg).map(|(_, b)| b.clone()).ok_or("A mensagem não existe mais.")?
+        };
+        out.write_all(&bytes).map_err(|e| e.to_string())?;
+        if !progress(bytes.len() as u64) {
+            return Err(CANCELLED.into());
+        }
+        Ok(())
+    }
 }
 
 /// A channel the test keeps a handle on while an account works over it.
@@ -259,5 +344,20 @@ impl Backend for std::sync::Arc<Fake> {
     }
     fn waiting_until(&self) -> Option<i64> {
         (**self).waiting_until()
+    }
+    fn has_chats(&self) -> bool {
+        (**self).has_chats()
+    }
+    fn chats(&self, after: Option<&Cursor>, patient: bool) -> Result<Paged> {
+        (**self).chats(after, patient)
+    }
+    fn chat_months(&self, chat: &ChatRef) -> Result<Vec<Month>> {
+        (**self).chat_months(chat)
+    }
+    fn chat_files(&self, chat: &ChatRef, month: Month) -> Result<Vec<ChatFile>> {
+        (**self).chat_files(chat, month)
+    }
+    fn chat_download(&self, chat: &ChatRef, msg: i32, out: &mut dyn Write, progress: Progress) -> Result<()> {
+        (**self).chat_download(chat, msg, out, progress)
     }
 }

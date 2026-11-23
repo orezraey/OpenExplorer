@@ -31,19 +31,21 @@ use grammers_client::media::{Downloadable, InputMedia, Media, Uploaded};
 use grammers_client::message::InputMessage;
 use grammers_client::{Client, InvocationError};
 use grammers_mtsender::{ConnectionParams, RetryContext, RetryPolicy, SenderPool, SenderPoolHandle};
-use grammers_session::types::PeerRef;
+use grammers_session::types::{PeerAuth, PeerId, PeerRef};
 use grammers_tl_types as tl;
 use openexplorer_i18n::{t, tr};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc};
 
 use crate::account::now;
-use crate::backend::{Backend, Changes, Progress, Small};
+use crate::backend::{Backend, Changes, Paged, Progress, Small};
+use crate::chats::{self, ChatFile, ChatRef, Cursor, Kind, Month, Page};
 use crate::session::KeyringSession;
 use crate::tree::{Doc, Msg};
 use crate::{CANCELLED, Result};
 
 /// A file part, both ways: Telegram's largest for a download that grammers handles.
 pub const PART: usize = 512 * 1024;
+
 /// Above this a file goes in "big file" parts.
 const BIG: u64 = 10 * 1024 * 1024;
 /// Connections per DC that carry file parts, and file-part requests in flight per account, for a
@@ -51,9 +53,14 @@ const BIG: u64 = 10 * 1024 * 1024;
 /// On a real Premium account (`tests/real_account.rs`, `speed_by_connections`: 100 MiB down and
 /// 40 MiB up, variants interleaved, median of 4 rounds) one connection with 12 parts in flight did
 /// 16.7 MiB/s down and 8.6 up; 8 with 32 did 40.7 and 33.4, against 24.9 and 25.8 for 4 with 16
-/// and 19.8 and 20.2 for 8 with 16: 8 connections need enough parts in flight. A free account gets
-/// fewer: Telegram caps its speed anyway (FLOOD_PREMIUM_WAIT), and TDLib uses 2 to 4 there.
-pub const PREMIUM: (usize, usize) = (8, 32);
+/// and 19.8 and 20.2 for 8 with 16: 8 connections need enough parts in flight. Measured again on
+/// 2026-11-23, 8 with 32 lost: a 374.5 MiB file of a chat (`speed_of_the_big_chat_file_by_connections`,
+/// interleaved, median of 3) came down at 12.9 MiB/s against 28.2 for 4 with 16 and 16.9 for one
+/// connection, Telegram dropping some of the 8; on the storage channel 4 with 16 did 16.9 and 30.7
+/// down and 27.0 and 27.2 up, against 33.6 and 29.5 down and 20.2 and 18.5 up for 8 with 32. Hence
+/// 4 with 16. A free account gets fewer: Telegram caps its speed anyway (FLOOD_PREMIUM_WAIT), and
+/// TDLib uses 2 to 4 there.
+pub const PREMIUM: (usize, usize) = (4, 16);
 pub const FREE: (usize, usize) = (4, 16);
 /// Parts of one upload in flight.
 const UPLOAD_AT_ONCE: usize = 4;
@@ -118,6 +125,17 @@ impl Conn {
     }
 }
 
+impl Conn {
+    /// A handle that ends the account's own connection to a DC, as Telegram may at any moment:
+    /// the live tests, to see the requests on it asked again.
+    pub fn breaker(&self) -> impl Fn(i32) + Send + Sync + 'static {
+        let main = self.main.clone();
+        move |dc| {
+            main.disconnect_from_dc(dc);
+        }
+    }
+}
+
 /// An error of Telegram's in the user's words.
 pub fn said(e: InvocationError) -> String {
     match e {
@@ -136,6 +154,16 @@ pub fn said(e: InvocationError) -> String {
 fn too_many(e: &InvocationError) -> bool {
     e.to_string().contains("negative length -429")
 }
+
+/// A connection that ended with the request on it (Telegram may close one at any moment): asked
+/// again, it goes over a new one.
+fn dropped(e: &InvocationError) -> bool {
+    matches!(e, InvocationError::Dropped(_) | InvocationError::Io(_) | InvocationError::Transport(_))
+}
+
+/// How many times a request whose connection ended is asked again, a pause of 1, 2, then 4
+/// seconds before each: some 30 s in all, for a connection busy with many file parts.
+const DROPS: u32 = 10;
 
 /// `90` → `1 min 30 s`.
 fn span(secs: u64) -> String {
@@ -207,6 +235,8 @@ pub static WAITS: AtomicUsize = AtomicUsize::new(0);
 pub static WAITED_SECS: AtomicUsize = AtomicUsize::new(0);
 /// Of those, how many were FLOOD_PREMIUM_WAIT: Telegram's cap on a free account's speed.
 pub static PREMIUM_WAITS: AtomicUsize = AtomicUsize::new(0);
+/// The requests asked again because their connection ended: for logs and tests.
+pub static DROPPED_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// The extra connections dropped in this process, and why: for logs and tests.
 pub static DROPPED_LANES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -214,13 +244,33 @@ pub static DROPPED_LANES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(
 static NEVER: AtomicBool = AtomicBool::new(false);
 
 impl Shared {
-    /// Runs `call` until it answers, waiting out FLOOD_WAITs and `-429`s; `cancel` stops a wait.
-    async fn patient<T, F, Fut>(&self, cancel: &AtomicBool, mut call: F) -> Result<T>
+    /// Runs `call` until it answers, waiting out FLOOD_WAITs and `-429`s, and asking again (up to
+    /// [`DROPS`] times) when its connection ended; `cancel` stops a wait.
+    async fn patient<T, F, Fut>(&self, cancel: &AtomicBool, call: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = std::result::Result<T, InvocationError>>,
+    {
+        self.patient_with(cancel, DROPS, call).await
+    }
+
+    /// [`Shared::patient`] for a message sent: one whose connection ended may have arrived, and
+    /// sent again would be there twice, so it isn't asked again.
+    async fn patient_send<T, F, Fut>(&self, cancel: &AtomicBool, call: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = std::result::Result<T, InvocationError>>,
+    {
+        self.patient_with(cancel, 0, call).await
+    }
+
+    async fn patient_with<T, F, Fut>(&self, cancel: &AtomicBool, drops: u32, mut call: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = std::result::Result<T, InvocationError>>,
     {
         let mut busy = 0u32;
+        let mut ended = 0u32;
         loop {
             match call().await {
                 Ok(v) => return Ok(v),
@@ -237,6 +287,18 @@ impl Shared {
                 Err(e) if too_many(&e) && busy < 6 => {
                     busy += 1;
                     self.wait(1 << busy.min(4), cancel).await?;
+                }
+                Err(e) if dropped(&e) && ended < drops => {
+                    DROPPED_CALLS.fetch_add(1, Ordering::Relaxed);
+                    // A pause of ours, not a wait Telegram asked for: the queue doesn't show it.
+                    let end = Instant::now() + Duration::from_secs(1 << ended.min(2));
+                    while Instant::now() < end {
+                        if cancel.load(Ordering::SeqCst) {
+                            return Err(CANCELLED.to_string());
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    ended += 1;
                 }
                 Err(e) => return Err(said(e)),
             }
@@ -271,8 +333,13 @@ impl Shared {
         if done.contains(&dc) {
             return Ok(());
         }
-        let tl::enums::auth::ExportedAuthorization::Authorization(a) = self.client.invoke(&tl::functions::auth::ExportAuthorization { dc_id: dc }).await.map_err(said)?;
-        self.client.invoke_in_dc(dc, &tl::functions::auth::ImportAuthorization { id: a.id, bytes: a.bytes }).await.map_err(said)?;
+        // Exported bytes are taken once: a retry exports anew.
+        let export = tl::functions::auth::ExportAuthorization { dc_id: dc };
+        self.patient(&NEVER, || async {
+            let tl::enums::auth::ExportedAuthorization::Authorization(a) = self.client.invoke(&export).await?;
+            self.client.invoke_in_dc(dc, &tl::functions::auth::ImportAuthorization { id: a.id, bytes: a.bytes }).await
+        })
+        .await?;
         done.push(dc);
         Ok(())
     }
@@ -395,6 +462,8 @@ pub struct Real {
     conn: Conn,
     shared: Arc<Shared>,
     premium: bool,
+    /// The account's own user, as Saved Messages' files are fetched by: asked once.
+    me: std::sync::OnceLock<PeerRef>,
 }
 
 /// A message's document, or photo: a photo is read as its largest size, which is what a download
@@ -436,6 +505,80 @@ fn msg_of(raw: &tl::enums::Message) -> Option<Msg> {
     match raw {
         tl::enums::Message::Message(m) => Some(Msg { id: m.id, text: m.message.clone(), date: m.date as i64, doc: doc_of(&m.media) }),
         _ => None,
+    }
+}
+
+/// The kinds of file a chat's folders show, each searched apart: Telegram's search takes one.
+const CHAT_FILTERS: [tl::enums::MessagesFilter; 4] = [
+    tl::enums::MessagesFilter::InputMessagesFilterPhotoVideo,
+    tl::enums::MessagesFilter::InputMessagesFilterDocument,
+    tl::enums::MessagesFilter::InputMessagesFilterMusic,
+    tl::enums::MessagesFilter::InputMessagesFilterRoundVoice,
+];
+
+/// How many pages of 100 one search of a chat reads at most: a month of a busy channel.
+const SEARCH_PAGES: usize = 50;
+
+/// The peer a chat is asked about as: Saved Messages as the session's own user.
+fn chat_peer(at: &ChatRef) -> PeerRef {
+    let id = match at.kind {
+        Kind::Saved => PeerId::self_user(),
+        Kind::User => PeerId::user_unchecked(at.id),
+        Kind::Group => PeerId::chat_unchecked(at.id),
+        Kind::Channel => PeerId::channel_unchecked(at.id),
+    };
+    PeerRef { id, auth: PeerAuth::from_hash(at.hash) }
+}
+
+/// A chat's file, from its message; `None` for a message with none, a sticker or a GIF.
+fn chat_file_of(raw: &tl::enums::Message) -> Option<ChatFile> {
+    let tl::enums::Message::Message(m) = raw else { return None };
+    let date = m.date as i64;
+    match m.media.as_ref()? {
+        tl::enums::MessageMedia::Photo(_) => {
+            let doc = doc_of(&m.media)?;
+            Some(ChatFile { msg: m.id, name: chats::file_name(chats::Media::Photo, "", None, "", date), size: doc.size, date })
+        }
+        tl::enums::MessageMedia::Document(d) => {
+            let Some(tl::enums::Document::Document(doc)) = &d.document else { return None };
+            let (mut given, mut media, mut music) = ("", chats::Media::Document, None);
+            for a in &doc.attributes {
+                match a {
+                    tl::enums::DocumentAttribute::Filename(f) => given = &f.file_name,
+                    tl::enums::DocumentAttribute::Audio(a) if a.voice => media = chats::Media::Voice,
+                    tl::enums::DocumentAttribute::Audio(a) => {
+                        media = chats::Media::Music;
+                        music = Some((a.performer.as_deref().unwrap_or(""), a.title.as_deref().unwrap_or("")));
+                    }
+                    tl::enums::DocumentAttribute::Video(v) if v.round_message => media = chats::Media::Round,
+                    tl::enums::DocumentAttribute::Video(_) if media == chats::Media::Document => media = chats::Media::Video,
+                    tl::enums::DocumentAttribute::Sticker(_) | tl::enums::DocumentAttribute::Animated => return None,
+                    _ => {}
+                }
+            }
+            Some(ChatFile { msg: m.id, name: chats::file_name(media, given, music, &doc.mime_type, date), size: doc.size as u64, date })
+        }
+        _ => None,
+    }
+}
+
+/// A user's name as their chat's folder shows it; empty for a deleted account.
+fn user_name(u: &tl::types::User) -> String {
+    if u.deleted {
+        return String::new();
+    }
+    let name = format!("{} {}", u.first_name.as_deref().unwrap_or(""), u.last_name.as_deref().unwrap_or(""));
+    let name = name.trim();
+    if name.is_empty() { u.username.as_deref().map(|n| format!("@{n}")).unwrap_or_default() } else { name.to_string() }
+}
+
+/// The messages of an answer to a search or a history request.
+fn messages_of(answer: tl::enums::messages::Messages) -> Vec<tl::enums::Message> {
+    match answer {
+        tl::enums::messages::Messages::Messages(m) => m.messages,
+        tl::enums::messages::Messages::Slice(m) => m.messages,
+        tl::enums::messages::Messages::ChannelMessages(m) => m.messages,
+        tl::enums::messages::Messages::NotModified(_) => Vec::new(),
     }
 }
 
@@ -520,7 +663,7 @@ impl Real {
             connections: AtomicUsize::new(connections),
             ceiling: std::sync::Mutex::new(HashMap::new()),
         });
-        Real { conn, shared, premium }
+        Real { conn, shared, premium, me: std::sync::OnceLock::new() }
     }
 
     pub fn session(&self) -> &Arc<KeyringSession> {
@@ -547,11 +690,11 @@ impl Real {
         }
     }
 
-    /// The message `id`, as Telegram has it now (with a fresh file reference).
-    async fn fetch(&self, id: i32) -> Result<grammers_client::message::Message> {
+    /// The message `id` of `peer`, as Telegram has it now (with a fresh file reference).
+    async fn fetch(&self, peer: PeerRef, id: i32) -> Result<grammers_client::message::Message> {
         let s = &self.shared;
         let ids = [id];
-        let got = s.patient(&NEVER, || s.client.get_messages_by_id(s.channel, &ids)).await?;
+        let got = s.patient(&NEVER, || s.client.get_messages_by_id(peer, &ids)).await?;
         got.into_iter()
             .flatten()
             .find(|m| !matches!(m.raw, tl::enums::Message::Empty(_)))
@@ -630,7 +773,7 @@ impl Real {
     async fn send(&self, cancel: &AtomicBool, message: impl Fn() -> InputMessage) -> Result<Msg> {
         let s = &self.shared;
         let _turn = s.sends.acquire().await.map_err(|e| e.to_string())?;
-        let m = s.patient(cancel, || s.client.send_message(s.channel, message())).await?;
+        let m = s.patient_send(cancel, || s.client.send_message(s.channel, message())).await?;
         msg_of(&m.raw).ok_or_else(|| t("O Telegram não devolveu a mensagem enviada.", "Telegram didn't return the message sent.").into())
     }
 }
@@ -729,9 +872,9 @@ impl Backend for Real {
             match answer {
                 Ok(updates) => match sent_in(&updates).into_iter().find(|m| m.id == id) {
                     Some(m) => Ok(Some(m)),
-                    None => Ok(msg_of(&self.fetch(id).await?.raw)),
+                    None => Ok(msg_of(&self.fetch(self.shared.channel, id).await?.raw)),
                 },
-                Err(name) if name == "MESSAGE_NOT_MODIFIED" => Ok(msg_of(&self.fetch(id).await?.raw)),
+                Err(name) if name == "MESSAGE_NOT_MODIFIED" => Ok(msg_of(&self.fetch(self.shared.channel, id).await?.raw)),
                 Err(_) => Ok(None),
             }
         })
@@ -787,7 +930,7 @@ impl Backend for Real {
                 docs.push((f.caption.clone(), tl::enums::InputMedia::from(d.to_raw_input_media())));
             }
             let _turn = s.sends.acquire().await.map_err(|e| e.to_string())?;
-            let sent = s.patient(&NEVER, || s.client.send_album(s.channel, docs.iter().map(|(c, d)| InputMedia::new().caption(c.as_str()).media(d.clone())).collect())).await?;
+            let sent = s.patient_send(&NEVER, || s.client.send_album(s.channel, docs.iter().map(|(c, d)| InputMedia::new().caption(c.as_str()).media(d.clone())).collect())).await?;
             let msgs: Vec<Msg> = sent.into_iter().flatten().filter_map(|m| msg_of(&m.raw)).collect();
             if msgs.len() != files.len() {
                 return Err(tr!("O Telegram devolveu {} de {} arquivos do grupo.", "Telegram returned {} of the group's {} files.", msgs.len(), files.len()));
@@ -798,7 +941,7 @@ impl Backend for Real {
 
     fn copy(&self, id: i32, caption: &str) -> Result<Msg> {
         self.block(async {
-            let m = self.fetch(id).await?;
+            let m = self.fetch(self.shared.channel, id).await?;
             let media = m.media().ok_or_else(|| t("A mensagem não tem arquivo.", "The message has no file.").to_string())?;
             self.send(&NEVER, || InputMessage::new().text(caption).copy_media(&media)).await
         })
@@ -815,8 +958,312 @@ impl Backend for Real {
     }
 
     fn download(&self, id: i32, out: &mut dyn Write, progress: Progress) -> Result<()> {
+        self.download_in(self.shared.channel, id, out, progress)
+    }
+
+    fn has_chats(&self) -> bool {
+        true
+    }
+
+    fn chats(&self, after: Option<&Cursor>, patient: bool) -> Result<Paged> {
+        self.block(self.chats_page(after, patient))
+    }
+
+    fn chat_months(&self, chat: &ChatRef) -> Result<Vec<Month>> {
         self.block(async {
-            let m = self.fetch(id).await?;
+            let s = &self.shared;
+            let peer: tl::enums::InputPeer = chat_peer(chat).into();
+            let request = tl::functions::messages::GetSearchCounters { peer: peer.clone(), saved_peer_id: None, top_msg_id: None, filters: CHAT_FILTERS.to_vec() };
+            let counters = s.patient(&NEVER, || s.client.invoke(&request)).await?;
+            let mut months = Vec::new();
+            for tl::enums::messages::SearchCounter::Counter(c) in counters {
+                if c.count == 0 {
+                    continue;
+                }
+                match self.calendar(&peer, &c.filter).await {
+                    Ok(m) => months.extend(m),
+                    // A kind the calendar doesn't take: its files, read through.
+                    Err(_) => months.extend(self.search(&peer, &c.filter, 0, 0).await?.iter().filter_map(chat_file_of).map(|f| Month::of(f.date))),
+                }
+            }
+            Ok(months)
+        })
+    }
+
+    fn chat_files(&self, chat: &ChatRef, month: Month) -> Result<Vec<ChatFile>> {
+        self.block(async {
+            let peer: tl::enums::InputPeer = chat_peer(chat).into();
+            let (start, end) = month.range();
+            let mut out = Vec::new();
+            for f in &CHAT_FILTERS {
+                let raw = self.search(&peer, f, start, end).await?;
+                out.extend(raw.iter().filter_map(chat_file_of).filter(|f| f.date >= start && f.date < end));
+            }
+            Ok(out)
+        })
+    }
+
+    fn chat_download(&self, chat: &ChatRef, msg: i32, out: &mut dyn Write, progress: Progress) -> Result<()> {
+        // A message is fetched by its chat's own id: Saved Messages by the account's user, not
+        // the stand-in for "myself" the searches take.
+        let peer = match chat.kind {
+            Kind::Saved => match self.me.get() {
+                Some(me) => *me,
+                None => {
+                    let me = self.myself()?;
+                    *self.me.get_or_init(|| me)
+                }
+            },
+            _ => chat_peer(chat),
+        };
+        self.download_in(peer, msg, out, progress)
+    }
+
+    fn max_file(&self) -> u64 {
+        (if self.premium { 8000 } else { 4000 }) * PART as u64
+    }
+
+    fn waiting_until(&self) -> Option<i64> {
+        // The longest of the waits under way: when the account sends freely again.
+        self.shared.waits.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().max().filter(|u| *u > now())
+    }
+
+    fn sign_out(&self) {
+        self.conn.session.detach();
+        let _ = self.block(self.conn.client.sign_out());
+    }
+
+    fn detach(&self) {
+        self.conn.session.detach();
+    }
+
+    fn connections_open(&self) -> Vec<(i32, usize)> {
+        let mut open: Vec<(i32, usize)> = self.shared.lanes.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(dc, l)| (*dc, l.len())).collect();
+        open.sort();
+        open
+    }
+
+    fn tune(&self, connections: usize, parts: usize) {
+        let s = &self.shared;
+        s.connections.store(connections.max(1), Ordering::SeqCst);
+        s.parts_at_once.store(parts.max(1), Ordering::SeqCst);
+        *s.parts.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(Semaphore::new(parts.max(1)));
+        // Fewer connections: the extra ones beyond go now.
+        let mut all = s.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        for lanes in all.values_mut() {
+            while lanes.len() > connections.max(1) {
+                if let Some(lane) = lanes.pop() {
+                    lane.handle.quit();
+                }
+            }
+        }
+        s.ceiling.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
+impl Real {
+    /// The account's own user, asked of Telegram.
+    fn myself(&self) -> Result<PeerRef> {
+        self.block(async {
+            let s = &self.shared;
+            let request = tl::functions::users::GetUsers { id: vec![tl::enums::InputUser::UserSelf] };
+            let users = s.patient(&NEVER, || s.client.invoke(&request)).await?;
+            users
+                .into_iter()
+                .find_map(|u| match u {
+                    tl::enums::User::User(u) => Some(PeerRef { id: PeerId::user_unchecked(u.id), auth: PeerAuth::from_hash(u.access_hash.unwrap_or(0)) }),
+                    _ => None,
+                })
+                .ok_or_else(|| t("O Telegram não disse quem é a conta.", "Telegram didn't say who the account is.").to_string())
+        })
+    }
+
+    /// A page of the account's chats from `after` (see [`Backend::chats`]).
+    async fn chats_page(&self, after: Option<&Cursor>, patient: bool) -> Result<Paged> {
+        let s = &self.shared;
+        // The archive is a list of its own: the main one shows it as one entry ("Arquivadas").
+        let archived = after.is_some_and(|c| c.archived);
+        let from = after.filter(|c| c.id != 0);
+        let request = tl::functions::messages::GetDialogs {
+            exclude_pinned: false,
+            folder_id: archived.then_some(1),
+            offset_date: from.map_or(0, |c| c.date),
+            offset_id: from.map_or(0, |c| c.id),
+            offset_peer: from.map_or(tl::enums::InputPeer::Empty, |c| chat_peer(&c.peer).into()),
+            limit: 100,
+            hash: 0,
+        };
+        let answer = if patient {
+            s.patient(&NEVER, || s.client.invoke(&request)).await?
+        } else {
+            match s.client.invoke(&request).await {
+                Ok(a) => a,
+                Err(InvocationError::Rpc(e)) if e.code == 420 => return Ok(Paged::WaitUntil(now() + e.value.unwrap_or(5) as i64)),
+                Err(e) => return Err(said(e)),
+            }
+        };
+        let (dialogs, messages, chats, users, whole) = match answer {
+            tl::enums::messages::Dialogs::Dialogs(d) => (d.dialogs, d.messages, d.chats, d.users, true),
+            tl::enums::messages::Dialogs::Slice(d) => (d.dialogs, d.messages, d.chats, d.users, false),
+            tl::enums::messages::Dialogs::NotModified(_) => return Ok(Paged::Page(Page { chats: Vec::new(), next: None })),
+        };
+        let full = dialogs.len() >= request.limit as usize;
+        let storage = s.channel.id.bare_id_unchecked();
+        let mut out = Vec::new();
+        let mut last = None;
+        for d in &dialogs {
+            let tl::enums::Dialog::Dialog(d) = d else { continue };
+            let date = messages
+                .iter()
+                .find_map(|m| match m {
+                    tl::enums::Message::Message(m) if m.id == d.top_message && m.peer_id == d.peer => Some(m.date),
+                    tl::enums::Message::Service(m) if m.id == d.top_message && m.peer_id == d.peer => Some(m.date),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            // Where the listing goes on from, and the chat's name if it shows.
+            let (at, shown): (ChatRef, Option<String>) = match &d.peer {
+                tl::enums::Peer::User(p) => match users.iter().find_map(|u| match u {
+                    tl::enums::User::User(u) if u.id == p.user_id => Some(u),
+                    _ => None,
+                }) {
+                    Some(u) => (ChatRef { kind: if u.is_self { Kind::Saved } else { Kind::User }, id: u.id, hash: u.access_hash.unwrap_or(0) }, Some(user_name(u))),
+                    None => (ChatRef { kind: Kind::User, id: p.user_id, hash: 0 }, None),
+                },
+                tl::enums::Peer::Chat(p) => match chats.iter().find(|c| c.id() == p.chat_id) {
+                    // A group that became a supergroup shows as that.
+                    Some(tl::enums::Chat::Chat(c)) if c.migrated_to.is_none() => (ChatRef { kind: Kind::Group, id: c.id, hash: 0 }, Some(c.title.clone())),
+                    _ => (ChatRef { kind: Kind::Group, id: p.chat_id, hash: 0 }, None),
+                },
+                tl::enums::Peer::Channel(p) => match chats.iter().find(|c| c.id() == p.channel_id) {
+                    Some(tl::enums::Chat::Channel(c)) => (ChatRef { kind: Kind::Channel, id: c.id, hash: c.access_hash.unwrap_or(0) }, (c.id != storage).then(|| c.title.clone())),
+                    Some(tl::enums::Chat::ChannelForbidden(c)) => (ChatRef { kind: Kind::Channel, id: c.id, hash: c.access_hash }, None),
+                    _ => (ChatRef { kind: Kind::Channel, id: p.channel_id, hash: 0 }, None),
+                },
+            };
+            last = Some(Cursor { date, id: d.top_message, peer: at, archived });
+            if let Some(name) = shown {
+                out.push(chats::Chat { at, name, date: date as i64 });
+            }
+        }
+        let next = if whole || !full { None } else { last };
+        Ok(Paged::Page(Page { chats: out, next }))
+    }
+
+    /// The months with files of kind `filter` in `peer`, from Telegram's calendar of them: a day
+    /// a period. A day that runs over two of the computer's months (Telegram's days may not be
+    /// its) is placed by the dates of its first and last message.
+    async fn calendar(&self, peer: &tl::enums::InputPeer, filter: &tl::enums::MessagesFilter) -> Result<Vec<Month>> {
+        let s = &self.shared;
+        let mut out = Vec::new();
+        let mut across: Vec<(i32, i32, Month, Month)> = Vec::new();
+        let mut offset_id = 0;
+        for _ in 0..200 {
+            let request = tl::functions::messages::GetSearchResultsCalendar { peer: peer.clone(), saved_peer_id: None, filter: filter.clone(), offset_id, offset_date: 0 };
+            let tl::enums::messages::SearchResultsCalendar::Calendar(c) = s.patient(&NEVER, || s.client.invoke(&request)).await?;
+            let mut lowest = i32::MAX;
+            for tl::enums::SearchResultsCalendarPeriod::Period(p) in &c.periods {
+                let (first, last) = (Month::of(p.date as i64), Month::of(p.date as i64 + 86_399));
+                if first == last {
+                    out.push(first);
+                } else {
+                    across.push((p.min_msg_id, p.max_msg_id, first, last));
+                }
+                lowest = lowest.min(p.min_msg_id);
+            }
+            if c.periods.is_empty() || lowest <= c.min_msg_id || (offset_id != 0 && lowest >= offset_id) {
+                break;
+            }
+            offset_id = lowest;
+        }
+        let ids: Vec<i32> = across.iter().flat_map(|a| [a.0, a.1]).collect();
+        let dates = self.dates_of(peer, &ids).await?;
+        for (min, max, first, last) in across {
+            match (dates.get(&min), dates.get(&max)) {
+                (Some(&a), Some(&b)) => {
+                    out.push(Month::of(a));
+                    out.push(Month::of(b));
+                }
+                _ => out.extend([first, last]),
+            }
+        }
+        Ok(out)
+    }
+
+    /// When each of messages `ids` of `peer` was sent, for those still there.
+    async fn dates_of(&self, peer: &tl::enums::InputPeer, ids: &[i32]) -> Result<HashMap<i32, i64>> {
+        let s = &self.shared;
+        let mut out = HashMap::new();
+        for chunk in ids.chunks(100) {
+            let id: Vec<tl::enums::InputMessage> = chunk.iter().map(|&id| tl::types::InputMessageId { id }.into()).collect();
+            let answer = match peer {
+                tl::enums::InputPeer::Channel(c) => {
+                    let request = tl::functions::channels::GetMessages { channel: tl::types::InputChannel { channel_id: c.channel_id, access_hash: c.access_hash }.into(), id };
+                    s.patient(&NEVER, || s.client.invoke(&request)).await?
+                }
+                _ => {
+                    let request = tl::functions::messages::GetMessages { id };
+                    s.patient(&NEVER, || s.client.invoke(&request)).await?
+                }
+            };
+            for m in messages_of(answer) {
+                match m {
+                    tl::enums::Message::Message(m) => out.insert(m.id, m.date as i64),
+                    tl::enums::Message::Service(m) => out.insert(m.id, m.date as i64),
+                    tl::enums::Message::Empty(_) => None,
+                };
+            }
+        }
+        Ok(out)
+    }
+
+    /// The messages of kind `filter` in `peer` sent from `from` and before `before` (0: no bound),
+    /// newest first, up to [`SEARCH_PAGES`] pages. Telegram's search finds nothing when given
+    /// both its date bounds, so it's given the end only and read back to the start.
+    async fn search(&self, peer: &tl::enums::InputPeer, filter: &tl::enums::MessagesFilter, from: i64, before: i64) -> Result<Vec<tl::enums::Message>> {
+        let s = &self.shared;
+        let mut out = Vec::new();
+        let mut offset_id = 0;
+        for _ in 0..SEARCH_PAGES {
+            let request = tl::functions::messages::Search {
+                peer: peer.clone(),
+                q: String::new(),
+                from_id: None,
+                saved_peer_id: None,
+                saved_reaction: None,
+                top_msg_id: None,
+                filter: filter.clone(),
+                min_date: 0,
+                max_date: before.max(0) as i32,
+                offset_id,
+                add_offset: 0,
+                limit: 100,
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            };
+            let page = messages_of(s.patient(&NEVER, || s.client.invoke(&request)).await?);
+            let n = page.len();
+            let Some(last) = page.last().map(|m| m.id()) else { break };
+            let date = |m: &tl::enums::Message| match m {
+                tl::enums::Message::Message(m) => m.date as i64,
+                tl::enums::Message::Service(m) => m.date as i64,
+                tl::enums::Message::Empty(_) => i64::MAX,
+            };
+            let past = page.iter().any(|m| date(m) < from);
+            out.extend(page.into_iter().filter(|m| date(m) >= from));
+            if n < 100 || last == offset_id || past {
+                break;
+            }
+            offset_id = last;
+        }
+        Ok(out)
+    }
+
+    /// Writes the file of message `id` of `peer` to `out`.
+    fn download_in(&self, peer: PeerRef, id: i32, out: &mut dyn Write, progress: Progress) -> Result<()> {
+        self.block(async {
+            let m = self.fetch(peer, id).await?;
             let media: Media = m.media().ok_or_else(|| t("A mensagem não tem arquivo.", "The message has no file.").to_string())?;
             let location = media.to_raw_input_location().ok_or_else(|| t("O Telegram não deu o local do arquivo.", "Telegram didn't give the file's location.").to_string())?;
             let size = media.size().unwrap_or(0) as u64;
@@ -890,46 +1337,5 @@ impl Backend for Real {
             }
             Ok(())
         })
-    }
-
-    fn max_file(&self) -> u64 {
-        (if self.premium { 8000 } else { 4000 }) * PART as u64
-    }
-
-    fn waiting_until(&self) -> Option<i64> {
-        // The longest of the waits under way: when the account sends freely again.
-        self.shared.waits.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().max().filter(|u| *u > now())
-    }
-
-    fn sign_out(&self) {
-        self.conn.session.detach();
-        let _ = self.block(self.conn.client.sign_out());
-    }
-
-    fn detach(&self) {
-        self.conn.session.detach();
-    }
-
-    fn connections_open(&self) -> Vec<(i32, usize)> {
-        let mut open: Vec<(i32, usize)> = self.shared.lanes.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(dc, l)| (*dc, l.len())).collect();
-        open.sort();
-        open
-    }
-
-    fn tune(&self, connections: usize, parts: usize) {
-        let s = &self.shared;
-        s.connections.store(connections.max(1), Ordering::SeqCst);
-        s.parts_at_once.store(parts.max(1), Ordering::SeqCst);
-        *s.parts.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(Semaphore::new(parts.max(1)));
-        // Fewer connections: the extra ones beyond go now.
-        let mut all = s.lanes.lock().unwrap_or_else(|e| e.into_inner());
-        for lanes in all.values_mut() {
-            while lanes.len() > connections.max(1) {
-                if let Some(lane) = lanes.pop() {
-                    lane.handle.quit();
-                }
-            }
-        }
-        s.ceiling.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }

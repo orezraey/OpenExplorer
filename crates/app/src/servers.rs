@@ -196,8 +196,9 @@ fn search(c: &mut dyn Conn, dir: &str, text: &str, show_hidden: bool, alive: &dy
                 continue;
             }
             let id = if rel.is_empty() { it.name.clone() } else { format!("{rel}/{}", it.name) };
-            // Links aren't followed: one back up would go round forever.
-            if it.is_dir && !it.link {
+            // Links aren't followed: one back up would go round forever. Nor is what a walk
+            // passes over (Telegram's chats).
+            if it.is_dir && !it.link && !c.passed_over(&child(dir, &id)) {
                 todo.push_back(id.clone());
             }
             if crate::finder::matches_in(&words, &it.name, &mut buf) {
@@ -263,7 +264,7 @@ pub(crate) fn measure(c: &mut dyn Conn, path: &str, stop: &dyn Fn() -> bool) -> 
         }
         for it in c.list(&dir).unwrap_or_default() {
             match it.is_dir {
-                true if depth < DEEPEST => todo.push((child(&dir, &it.name), depth + 1)),
+                true if depth < DEEPEST && !c.passed_over(&child(&dir, &it.name)) => todo.push((child(&dir, &it.name), depth + 1)),
                 true => {}
                 false => total += it.size.unwrap_or(0),
             }
@@ -391,6 +392,9 @@ fn fetch(c: &mut dyn Conn, path: &str, is_dir: bool, modified: Option<SystemTime
         }
         std::fs::create_dir(local).map_err(|e| tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", local.display()))?;
         for it in c.list(path)? {
+            if it.is_dir && c.passed_over(&child(path, &it.name)) {
+                continue;
+            }
             let to = ops::unique_in(local, &ops::windows_name(&it.name));
             fetch(c, &child(path, &it.name), it.is_dir, it.modified, &to, p, depth + 1)?;
         }

@@ -389,6 +389,13 @@ pub trait Conn: Send {
     /// Whether `path` is a symbolic link itself.
     fn is_link(&mut self, path: &str) -> Result<bool>;
 
+    /// Whether a walk from above `path` (a search, a size, a whole-folder copy) passes over it:
+    /// a Telegram account's folder of chats and each chat in it, thousands of them read a month
+    /// at a time. A walk that starts in a chat goes into its months.
+    fn passed_over(&mut self, _path: &str) -> bool {
+        false
+    }
+
     /// Copies a file or a whole folder within the server, on the server's side; `false` when
     /// the protocol has no such command (FTP, SFTP), and the bytes have to go through the app.
     /// Fails if `to` exists.

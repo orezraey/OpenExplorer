@@ -3464,6 +3464,7 @@ dependencies = [
 name = "openexplorer-telegram"
 version = "0.3.0"
 dependencies = [
+ "chrono",
  "getrandom 0.3.4",
  "grammers-client",
  "grammers-mtsender",
