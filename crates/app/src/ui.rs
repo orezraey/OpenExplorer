@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
 
-use rune::{Align, Color, Cursor, Cx, Drag, DragOutcome, El, GrowthSpec, Icon, KeyEvent, LiveRegion, Phase, ScrollSpec, Span, Tx, col, el, icon, row, text};
+use rune::{Align, Anim, Color, Cursor, Cx, Drag, DragOutcome, El, GrowthSpec, Icon, KeyEvent, LiveRegion, Phase, ScrollSpec, Span, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, ScrollBar, ScrollBarStyle, Toast, ToastRegion, context_menu};
 
 use crate::model::{Kind, Location, SortCol, Space, crumbs, format_bytes, format_long, format_size, format_time, shown};
@@ -51,7 +51,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(transfers(s, &k))
         .child(menu)
         .child(queue_menu)
-        .child(address_menu);
+        .child(address_menu)
+        // Hover lands and leaves with the pointer, as in the system's file lists: the default
+        // 100 ms fade on leaving left a trail of lit rows behind a fast pointer.
+        .hover_motion_within(Anim::INSTANT, Anim::INSTANT);
     rune_kit::root(body, layer)
 }
 
