@@ -11,14 +11,14 @@ use std::time::Duration;
 
 use grammers_client::{InvocationError, SignInError};
 use grammers_client::client::{LoginToken, PasswordToken};
-use grammers_client::peer::Peer;
+use grammers_client::message::InputMessage;
 use grammers_session::types::PeerRef;
 use grammers_tl_types as tl;
 use openexplorer_i18n::{t, tr};
 
 use crate::Account;
 use crate::real::{Conn, said};
-use crate::records::CHANNEL_MARK;
+use crate::records::{CHANNEL_MARK, CHANNEL_POST_TAG, TAG};
 use crate::session::{self, KeyringSession};
 use crate::store::StoredAccount;
 use crate::{Result, open};
@@ -161,9 +161,12 @@ impl Login {
 /// The channel an Open Explorer made for this account: a broadcast channel the person created
 /// whose description holds the mark (the oldest, if several).
 ///
-/// Looked for among all the account's conversations, 100 a request: Telegram paces that listing
-/// hard, so its waits (up to two minutes each) are waited out. A search by title would be one
-/// request, but Telegram's search doesn't find private channels.
+/// Found by Telegram's search over all the account's messages, a request or two, not by listing
+/// its conversations: that listing goes 100 a request and Telegram paces it hard, so an account
+/// with a few thousand conversations waited minutes. A channel shows up in the search by the
+/// post made when it was created ([`CHANNEL_POST_TAG`]) or by its records ([`TAG`]); one that has
+/// neither (emptied, and its first post deleted) is still found among the 100 most recent
+/// conversations. The search finds hashtags only: `#oe1-canal`, in the description, is not one.
 pub async fn find_channel(conn: &Conn) -> Result<Option<PeerRef>> {
     let mut waits = 0;
     let mut pause = async |e: InvocationError| -> Result<()> {
@@ -178,25 +181,58 @@ pub async fn find_channel(conn: &Conn) -> Result<Option<PeerRef>> {
     };
     let mine = |c: &tl::types::Channel| c.creator && c.broadcast;
 
-    let mut rest: Vec<tl::types::Channel> = Vec::new();
-    let mut dialogs = conn.client.iter_dialogs();
-    loop {
-        let d = match dialogs.next().await {
-            Ok(Some(d)) => d,
-            Ok(None) => break,
-            Err(e) => {
-                pause(e).await?;
-                continue;
+    let mut found: Vec<tl::types::Channel> = Vec::new();
+    let keep = |chats: Vec<tl::enums::Chat>, found: &mut Vec<tl::types::Channel>| {
+        for c in chats {
+            if let tl::enums::Chat::Channel(c) = c
+                && mine(&c)
+                && !found.iter().any(|f| f.id == c.id)
+            {
+                found.push(c);
+            }
+        }
+    };
+    for tag in [CHANNEL_POST_TAG, TAG] {
+        let request = tl::functions::messages::SearchGlobal {
+            broadcasts_only: true,
+            groups_only: false,
+            users_only: false,
+            folder_id: None,
+            community: None,
+            q: tag.into(),
+            filter: tl::enums::MessagesFilter::InputMessagesFilterEmpty,
+            min_date: 0,
+            max_date: 0,
+            offset_rate: 0,
+            offset_peer: tl::enums::InputPeer::Empty,
+            offset_id: 0,
+            limit: 100,
+        };
+        let chats = loop {
+            match conn.client.invoke(&request).await {
+                Ok(tl::enums::messages::Messages::Messages(m)) => break m.chats,
+                Ok(tl::enums::messages::Messages::Slice(m)) => break m.chats,
+                Ok(tl::enums::messages::Messages::ChannelMessages(m)) => break m.chats,
+                Ok(tl::enums::messages::Messages::NotModified(_)) => break Vec::new(),
+                Err(e) => pause(e).await?,
             }
         };
-        if let Peer::Channel(c) = d.peer()
-            && mine(&c.raw)
-        {
-            rest.push(c.raw.clone());
-        }
+        keep(chats, &mut found);
     }
-    rest.sort_by_key(|c| c.id);
-    for c in rest {
+    if found.is_empty() {
+        let request = tl::functions::messages::GetDialogs { exclude_pinned: false, folder_id: None, offset_date: 0, offset_id: 0, offset_peer: tl::enums::InputPeer::Empty, limit: 100, hash: 0 };
+        let chats = loop {
+            match conn.client.invoke(&request).await {
+                Ok(tl::enums::messages::Dialogs::Dialogs(d)) => break d.chats,
+                Ok(tl::enums::messages::Dialogs::Slice(d)) => break d.chats,
+                Ok(tl::enums::messages::Dialogs::NotModified(_)) => break Vec::new(),
+                Err(e) => pause(e).await?,
+            }
+        };
+        keep(chats, &mut found);
+    }
+    found.sort_by_key(|c| c.id);
+    for c in found {
         if let Some(p) = marked(conn, c, &mut pause).await? {
             return Ok(Some(p));
         }
@@ -232,11 +268,16 @@ async fn create_channel(conn: &Conn) -> Result<PeerRef> {
         tl::enums::Updates::Combined(u) => u.chats,
         _ => Vec::new(),
     };
-    chats
+    let channel = chats
         .into_iter()
         .find_map(|c| match c {
             tl::enums::Chat::Channel(c) => Some(PeerRef::from(c)),
             _ => None,
         })
-        .ok_or_else(|| tr!("O Telegram não devolveu o canal criado.", "Telegram didn't return the channel it created."))
+        .ok_or_else(|| tr!("O Telegram não devolveu o canal criado.", "Telegram didn't return the channel it created."))?;
+    // Its first post, for a later login's search to find it by (see `find_channel`).
+    let post = format!("Open Explorer: este canal guarda os seus arquivos. Não apague esta mensagem. / Open Explorer keeps your files here. Don't delete this message.
+{CHANNEL_POST_TAG}");
+    conn.client.send_message(channel, InputMessage::new().text(post)).await.map_err(said)?;
+    Ok(channel)
 }

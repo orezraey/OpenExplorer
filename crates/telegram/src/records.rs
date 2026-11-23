@@ -46,6 +46,9 @@ pub const ROOT: &str = "0";
 const FOLDER_MARK: &str = "📁 ";
 /// What the storage channel's description holds, to find it again from another PC.
 pub const CHANNEL_MARK: &str = "#oe1-canal";
+/// The hashtag of the post a channel gets when created, which Telegram's search finds it by
+/// (`login::find_channel`). Not a record: `parse` takes it for plain text.
+pub const CHANNEL_POST_TAG: &str = "#oecanal";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Record {
@@ -216,6 +219,8 @@ mod tests {
         assert_eq!(parse("olá"), Record::None);
         assert_eq!(parse("#oeste"), Record::None);
         assert_eq!(parse(""), Record::None);
+        assert_eq!(parse(&format!("Open Explorer: este canal guarda os seus arquivos.
+{CHANNEL_POST_TAG}")), Record::None);
     }
 
     #[test]
