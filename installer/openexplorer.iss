@@ -54,6 +54,9 @@ Name: "{autodesktop}\Open Explorer"; Filename: "{app}\openexplorer.exe"; Tasks: 
 [Run]
 ; An update brings the search service, a copy of the app, up to the new version.
 Filename: "{app}\openexplorer.exe"; Parameters: "index install"; Flags: runhidden waituntilterminated; Check: SearchServiceInstalled
+; The GPU pipelines compiled once, for the person installing (Direct3D keeps them per user and
+; per exe path), so the first launch reaches the GPU as later ones do. Shows nothing.
+Filename: "{app}\openexplorer.exe"; Parameters: "--warm-gpu-cache"; Flags: runhidden waituntilterminated runasoriginaluser
 Filename: "{app}\openexplorer.exe"; Description: "{cm:LaunchProgram,Open Explorer}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]

@@ -2079,6 +2079,18 @@ fn main() {
     if args.first().is_some_and(|a| a == openexplorer_index::cli::ARG) {
         std::process::exit(openexplorer_index::cli::run(&args[1..]));
     }
+    // `openexplorer --warm-gpu-cache`: the setup runs it once, hidden, as the person who
+    // installs. Direct3D keeps the compiled pipelines per user and per exe path, so the first
+    // launch reaches the GPU as fast as later ones (Rune: 1 to 2 s sooner). No window.
+    if args.first().is_some_and(|a| a == "--warm-gpu-cache") {
+        std::process::exit(match rune::warm_gpu_cache() {
+            Ok(()) => 0,
+            Err(e) => {
+                openexplorer_gdrive::log(&format!("warm_gpu_cache: {e}"));
+                1
+            }
+        });
+    }
     let initial = settings::Settings::load();
     accounts::start();
     let main_spec = AppSpec::<State> {
