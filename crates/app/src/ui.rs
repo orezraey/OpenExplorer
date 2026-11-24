@@ -1461,11 +1461,7 @@ pub fn account_window_view(s: &State, cx: &mut Cx<State>) -> El {
 
     cx.caption_color(k.c.text_base);
 
-    let win_title = if f.editing.is_some() {
-        t("Editar conta", "Edit account")
-    } else {
-        t("Registrar conta", "Add account")
-    };
+    let win_title = account_window_title(f.editing.is_some());
 
     let title_leading = row()
         .gap(8.0)
@@ -1501,10 +1497,14 @@ pub fn account_window_view(s: &State, cx: &mut Cx<State>) -> El {
     rune_kit::root(root, layer)
 }
 
-fn close_account_win(s: &mut State, tx: &mut Tx) {
+/// The account window's title: Editar conta for an account or server being edited.
+pub fn account_window_title(editing: bool) -> &'static str {
+    if editing { t("Editar conta", "Edit account") } else { t("Registrar conta", "Add account") }
+}
+
+fn close_account_win(s: &mut State, _: &mut Tx) {
     crate::telegram::abort_pending();
     s.close_account_form();
-    tx.close_window();
 }
 
 fn account_part(s: &mut State, pick: fn(&mut crate::servers::Form) -> &mut rune::TextEdit) -> &mut rune::TextEdit {
@@ -1883,7 +1883,7 @@ fn account_pick_body(
                 ),
         );
 
-    let waiting_oauth = s.login.is_some() || s.servers.onedrive.login.is_some();
+    let waiting_oauth = s.login.is_some() || s.servers.onedrive.login.is_some() || s.servers.dropbox_login.is_some();
     let footer: El = if waiting_oauth {
         row()
             .key("picker-footer")

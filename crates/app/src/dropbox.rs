@@ -73,7 +73,7 @@ fn task<T: Send + 'static>(s: &State, server: &Server, doing: &'static str, work
 /// What background work on Dropbox brought back.
 pub enum Answer {
     /// A login in the browser ended: the account it opened.
-    Connected { result: Result<StoredAccount, String> },
+    Connected { attempt: u64, result: Result<StoredAccount, String> },
     Quota { id: String, result: Result<Quota, String> },
     /// What changed in account `id` while its longpoll waited; `wait` is the [`Watch`]'s that
     /// sent it.
@@ -88,7 +88,13 @@ pub enum Answer {
 
 pub fn arrived(s: &mut State, a: Answer, tx: &mut Tx, now: f64) {
     match a {
-        Answer::Connected { result } => connected(s, result),
+        Answer::Connected { attempt, result } => {
+            if s.servers.dropbox_login == Some(attempt) {
+                s.servers.dropbox_login = None;
+                s.notify_account();
+            }
+            connected(s, result)
+        }
         Answer::Quota { id, result } => match result {
             Ok(q) => {
                 s.servers.dropbox_quotas.insert(id, Some(q));
@@ -192,6 +198,7 @@ pub fn submit(s: &mut State, tx: &mut Tx) {
         }
         return;
     }
+    s.servers.dropbox_login = Some(attempt);
     s.close_account_form();
     s.status = t("Entre no Dropbox no navegador que abriu e autorize o Open Explorer. Esperando o Dropbox…", "Sign in to Dropbox in the browser that opened and allow Open Explorer. Waiting for Dropbox…").into();
     s.notify_main();
@@ -201,7 +208,7 @@ pub fn submit(s: &mut State, tx: &mut Tx) {
             let a = dropbox::connect(&cfg, &tokens)?;
             Ok(StoredAccount { email: a.email.clone(), name: a.name.clone(), account_id: a.account_id.clone() })
         });
-        emit(Msg::Dropbox(Answer::Connected { result }));
+        emit(Msg::Dropbox(Answer::Connected { attempt, result }));
     });
 }
 

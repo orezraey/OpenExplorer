@@ -125,10 +125,9 @@ pub fn abort_pending() {
 }
 
 /// Cancelar, or the window closed: the login under way goes too.
-fn cancel(s: &mut State, tx: &mut Tx) {
+fn cancel(s: &mut State, _: &mut Tx) {
     drop_pending();
     s.close_account_form();
-    tx.close_window();
 }
 
 /// Back to the first step, the login dropped.

@@ -247,6 +247,13 @@ struct State {
     account_win: Option<rune::AppHandle<State>>,
     main_win: Option<rune::AppHandle<State>>,
     account_dirty: bool,
+    /// Whether the account window was last asked to show (and not closed since).
+    account_shown: bool,
+    /// Closes asked by [`State::close_account_form`] whose `on_close` hasn't run yet: that
+    /// `on_close` leaves alone a form opened again in between.
+    account_closes: u32,
+    /// Whether the account window's title says Editar conta (`Some(true)`) or Registrar conta.
+    account_titled: Option<bool>,
     main_dirty: bool,
     account_synced_font: Option<settings::TextFont>,
     account_synced_render: Option<settings::TextRender>,
@@ -304,6 +311,7 @@ impl State {
                 dropbox: openexplorer_dropbox::store::Store::at(PathBuf::new()),
                 dropbox_quotas: Default::default(),
                 dropbox_watch: Default::default(),
+                dropbox_login: None,
                 b2: openexplorer_b2::Store::at(PathBuf::new()),
                 b2_watch: Default::default(),
                 onedrive: onedrive::Side {
@@ -347,6 +355,9 @@ impl State {
             account_win: None,
             main_win: None,
             account_dirty: false,
+            account_shown: false,
+            account_closes: 0,
+            account_titled: None,
             main_dirty: false,
             account_synced_font: None,
             account_synced_render: None,
@@ -367,17 +378,36 @@ impl State {
     pub fn show_account_form(&mut self) {
         self.account_dirty = true;
         if let Some(w) = &self.account_win {
+            self.account_shown = true;
             w.open();
             w.wake();
         }
     }
 
+    /// Drops the form and closes the account window. The window's `on_close` runs later, maybe
+    /// after Adicionar conta opened a new form, so it's told this close was already handled.
     pub fn close_account_form(&mut self) {
         self.account_form = None;
         self.account_dirty = true;
-        if let Some(w) = &self.account_win {
+        if let Some(w) = &self.account_win
+            && std::mem::take(&mut self.account_shown)
+        {
+            self.account_closes += 1;
             w.close();
         }
+    }
+
+    /// The account window's `on_close`: a close the window's own button asked for drops the
+    /// form (and a Telegram login waiting on it); one [`State::close_account_form`] asked for
+    /// already did, and a form opened since is kept.
+    fn account_window_closed(&mut self) {
+        if self.account_closes > 0 {
+            self.account_closes -= 1;
+            return;
+        }
+        self.account_shown = false;
+        telegram::abort_pending();
+        self.account_form = None;
     }
 
     pub fn notify_main(&mut self) {
@@ -498,6 +528,9 @@ fn init() -> State {
         account_win: None,
         main_win: None,
         account_dirty: false,
+        account_shown: false,
+        account_closes: 0,
+        account_titled: None,
         main_dirty: false,
         account_synced_font: None,
         account_synced_render: None,
@@ -548,10 +581,16 @@ fn poll_account_window(s: &mut State, _now: f64, tx: &mut Tx) -> bool {
         s.account_synced_render = Some(s.settings.text_render);
         tx.set_font_smoothing(s.settings.text_render.smoothing());
     }
+    // The title the taskbar and Alt+Tab show follows the one drawn in the window.
+    let editing = s.account_form.as_ref().is_some_and(|f| f.editing.is_some());
+    if s.account_titled != Some(editing) {
+        s.account_titled = Some(editing);
+        tx.set_title(ui::account_window_title(editing));
+    }
     std::mem::take(&mut s.account_dirty)
 }
 
-fn account_window_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
+fn account_window_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
     if s.is_placeholder {
         return false;
     }
@@ -568,7 +607,6 @@ fn account_window_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
         }
         telegram::abort_pending();
         s.close_account_form();
-        tx.close_window();
         return true;
     }
     false
@@ -861,6 +899,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                 let current = s.login == Some(attempt);
                 if current {
                     s.login = None;
+                    s.notify_account();
                 } else if result.is_err() {
                     continue;
                 }
@@ -2038,51 +2077,6 @@ fn main() {
             ("server", |s| server_scene(s, None)),
             // The same server searched for "praia".
             ("server-search", |s| server_scene(s, Some("praia"))),
-            // Unified Registrar conta picker, plus provider-specific steps.
-            ("add-account", |s| servers::ask_add(s)),
-            ("add-account-nas", |s| {
-                let mut f = servers::Form::new();
-                f.category = servers::Category::Nas;
-                s.open_account_form(f);
-            }),
-            ("add-gdrive", |s| {
-                let mut f = servers::Form::for_provider(servers::Provider::GoogleDrive);
-                f.custom_oauth = true;
-                s.open_account_form(f);
-            }),
-            ("add-nextcloud", |s| {
-                let mut f = servers::Form::for_provider(servers::Provider::Nextcloud);
-                f.host = rune::TextEdit::new("cloud.exemplo.com");
-                f.user = rune::TextEdit::new("ana");
-                s.open_account_form(f);
-            }),
-            // Adicionar conta, filled in for SFTP; and for plain FTP, with its warning.
-            ("add-server", |s| {
-                let mut f = servers::Form::for_provider(servers::Provider::Sftp);
-                f.host = rune::TextEdit::new("nas.local");
-                f.user = rune::TextEdit::new("ana");
-                f.password = rune::TextEdit::new("segredo").secure();
-                s.open_account_form(f);
-            }),
-            ("add-server-ftp", |s| {
-                let mut f = servers::Form::for_provider(servers::Provider::Ftp);
-                f.protocol = openexplorer_remote::Protocol::Ftp;
-                f.host = rune::TextEdit::new("192.168.0.10");
-                f.error = Some("192.168.0.10 recusou o usuário ou a senha.".into());
-                s.open_account_form(f);
-            }),
-            // A NAS's own certificate, turned down: the dialog shows it and asks to trust it.
-            ("add-server-cert", |s| {
-                let mut f = servers::Form::for_provider(servers::Provider::WebDav);
-                f.protocol = openexplorer_remote::Protocol::Davs;
-                f.host = rune::TextEdit::new("nas.local");
-                f.user = rune::TextEdit::new("ana");
-                f.untrusted = Some(openexplorer_remote::Rejected {
-                    fingerprint: "75:25:66:B8:60:50:B3:6B:5E:1A:58:FE:38:DE:1A:DB:F5:D6:86:41:DC:8C:9F:50:75:A6:E5:33:69:5A:A6:36".into(),
-                    why: "não foi emitido por uma autoridade conhecida (é um certificado próprio)".into(),
-                });
-                s.open_account_form(f);
-            }),
             // Opções open on each sidebar tab.
             ("options", |s| s.dialog = Some(actions::Dialog::Options(Box::new(settings::OptionsView::open(settings::OptionsTab::General))))),
             ("options-transfers", |s| s.dialog = Some(actions::Dialog::Options(Box::new(settings::OptionsView::open(settings::OptionsTab::Transfers))))),
@@ -2254,21 +2248,6 @@ fn main() {
                 ];
                 s.dialog = Some(actions::Dialog::DropboxDeleted(Box::new(dropbox::DeletedView { server: sv, path: "/Documentos".into(), place: "Documentos".into(), picked: vec![true, false, true, false], items: Some(Ok(items)) })));
             }),
-            // Adding a Dropbox account before its app is set up.
-            ("dropbox-add", |s| {
-                let mut f = servers::Form::for_provider(servers::Provider::Dropbox);
-                f.custom_oauth = true;
-                f.error = Some("App do Dropbox não configurado.".into());
-                s.open_account_form(f);
-            }),
-            ("mega-add", |s| {
-                let mut f = servers::Form::for_provider(servers::Provider::Mega);
-                f.user = rune::TextEdit::new("voce@exemplo.com");
-                f.password = rune::TextEdit::new("segredo").secure();
-                f.needs_code = true;
-                f.error = Some(openexplorer_mega::Refused::NeedsCode.text());
-                s.open_account_form(f);
-            }),
             // A B2 key's bucket, without a network.
             ("b2", |s| {
                 let sv = openexplorer_remote::Server::b2("0051a2b3c4d5e6f0000000001", "B2 · fotos-familia");
@@ -2276,14 +2255,6 @@ fn main() {
                 s.panes[1].go(servers::folder(&sv, vec!["fotos-familia".into()]));
                 s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
                 s.active = 1;
-            }),
-            // Adding a B2 key, turned down.
-            ("b2-add", |s| {
-                let mut f = servers::Form::for_provider(servers::Provider::B2);
-                f.user = rune::TextEdit::new("0051a2b3c4d5e6f0000000001");
-                f.password = rune::TextEdit::new("K005abcdefghijklmnopqrstuvwxyz0").secure();
-                f.error = Some(openexplorer_i18n::t("O ID da chave ou a chave de aplicação estão errados (ou a chave foi apagada).", "The key ID or the application key is wrong (or the key was deleted).").into());
-                s.open_account_form(f);
             }),
             // A B2 bucket's unfinished uploads, without a network.
             ("b2-unfinished", b2::unfinished_scene),
@@ -2294,27 +2265,6 @@ fn main() {
                 s.panes[1].go(servers::folder(&sv, vec!["Documentos".into()]));
                 s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
                 s.active = 1;
-            }),
-            // Connecting a Telegram account: its first step, its code, its password.
-            ("telegram-add", |s| {
-                let mut f = servers::Form::for_provider(servers::Provider::Telegram);
-                f.client_id = rune::TextEdit::new("1234567");
-                f.client_secret = rune::TextEdit::new("0123456789abcdef0123456789abcdef").secure();
-                f.user = rune::TextEdit::new("+55 11 99999-8888");
-                s.open_account_form(f);
-            }),
-            ("telegram-code", |s| {
-                let mut f = servers::Form::for_provider(servers::Provider::Telegram);
-                f.user = rune::TextEdit::new("+55 11 99999-8888");
-                f.telegram = telegram::Stage::Code;
-                f.error = Some(openexplorer_i18n::t("O código não confere.", "The code doesn't match.").into());
-                s.open_account_form(f);
-            }),
-            ("telegram-password", |s| {
-                let mut f = servers::Form::for_provider(servers::Provider::Telegram);
-                f.telegram = telegram::Stage::Password { hint: "gato".into() };
-                f.password = rune::TextEdit::new("segredo").secure();
-                s.open_account_form(f);
             }),
             // A OneDrive account's files with its storage, without a network.
             ("onedrive", |s| {
@@ -2329,13 +2279,6 @@ fn main() {
             ("onedrive-bin", |s| onedrive::scene_bin(s, true)),
             // The same Lixeira before SharePoint's permission is granted.
             ("onedrive-bin-consent", |s| onedrive::scene_bin(s, false)),
-            // Adding a OneDrive account before an app registration is set up.
-            ("onedrive-add", |s| {
-                let mut f = servers::Form::for_provider(servers::Provider::OneDrive);
-                f.custom_oauth = true;
-                f.error = Some(t("Cliente OAuth do OneDrive não configurado.", "OneDrive OAuth client not set up.").into());
-                s.open_account_form(f);
-            }),
             // The question Copiar link asks on a OneDrive file with no link.
             ("onedrive-link", |s| {
                 let sv = openexplorer_remote::Server::onedrive("b!exemplo", "voce@exemplo.com");
@@ -2432,6 +2375,77 @@ fn main() {
                 f.password = rune::TextEdit::new("segredo").secure();
                 s.open_account_form(f);
             }),
+            // Plain FTP, with its warning; and a NAS's own certificate, turned down: the form shows it
+            // and asks to trust it.
+            ("add-server-ftp", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::Ftp);
+                f.protocol = openexplorer_remote::Protocol::Ftp;
+                f.host = rune::TextEdit::new("192.168.0.10");
+                f.error = Some("192.168.0.10 recusou o usuário ou a senha.".into());
+                s.open_account_form(f);
+            }),
+            ("add-server-cert", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::WebDav);
+                f.protocol = openexplorer_remote::Protocol::Davs;
+                f.host = rune::TextEdit::new("nas.local");
+                f.user = rune::TextEdit::new("ana");
+                f.untrusted = Some(openexplorer_remote::Rejected {
+                    fingerprint: "75:25:66:B8:60:50:B3:6B:5E:1A:58:FE:38:DE:1A:DB:F5:D6:86:41:DC:8C:9F:50:75:A6:E5:33:69:5A:A6:36".into(),
+                    why: "não foi emitido por uma autoridade conhecida (é um certificado próprio)".into(),
+                });
+                s.open_account_form(f);
+            }),
+            // Adding a Dropbox account before its app is set up.
+            ("dropbox-add", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::Dropbox);
+                f.custom_oauth = true;
+                f.error = Some("App do Dropbox não configurado.".into());
+                s.open_account_form(f);
+            }),
+            ("mega-add", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::Mega);
+                f.user = rune::TextEdit::new("voce@exemplo.com");
+                f.password = rune::TextEdit::new("segredo").secure();
+                f.needs_code = true;
+                f.error = Some(openexplorer_mega::Refused::NeedsCode.text());
+                s.open_account_form(f);
+            }),
+            // Adding a B2 key, turned down.
+            ("b2-add", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::B2);
+                f.user = rune::TextEdit::new("0051a2b3c4d5e6f0000000001");
+                f.password = rune::TextEdit::new("K005abcdefghijklmnopqrstuvwxyz0").secure();
+                f.error = Some(openexplorer_i18n::t("O ID da chave ou a chave de aplicação estão errados (ou a chave foi apagada).", "The key ID or the application key is wrong (or the key was deleted).").into());
+                s.open_account_form(f);
+            }),
+            // Connecting a Telegram account: its first step, its code, its password.
+            ("telegram-add", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::Telegram);
+                f.client_id = rune::TextEdit::new("1234567");
+                f.client_secret = rune::TextEdit::new("0123456789abcdef0123456789abcdef").secure();
+                f.user = rune::TextEdit::new("+55 11 99999-8888");
+                s.open_account_form(f);
+            }),
+            ("telegram-code", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::Telegram);
+                f.user = rune::TextEdit::new("+55 11 99999-8888");
+                f.telegram = telegram::Stage::Code;
+                f.error = Some(openexplorer_i18n::t("O código não confere.", "The code doesn't match.").into());
+                s.open_account_form(f);
+            }),
+            ("telegram-password", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::Telegram);
+                f.telegram = telegram::Stage::Password { hint: "gato".into() };
+                f.password = rune::TextEdit::new("segredo").secure();
+                s.open_account_form(f);
+            }),
+            // Adding a OneDrive account before an app registration is set up.
+            ("onedrive-add", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::OneDrive);
+                f.custom_oauth = true;
+                f.error = Some(t("Cliente OAuth do OneDrive não configurado.", "OneDrive OAuth client not set up.").into());
+                s.open_account_form(f);
+            }),
         ],
         ..AppSpec::new("Registrar conta", (980.0, 640.0), init_account_window, ui::account_window_view)
     })
@@ -2441,8 +2455,7 @@ fn main() {
     .turn_scope(enter_turn, leave_turn)
     .on_close(|s, _| {
         if !s.is_placeholder {
-            telegram::abort_pending();
-            s.account_form = None;
+            s.account_window_closed();
         }
     });
 
@@ -2489,6 +2502,19 @@ fn rune_args(given: impl Iterator<Item = String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A close the app asked for, whose `on_close` comes after Adicionar conta opened a new
+    /// form, keeps that form; the window's own close button drops it.
+    #[test]
+    fn account_close_keeps_a_form_opened_since() {
+        let mut s = init();
+        s.account_closes = 1;
+        s.account_form = Some(Box::new(servers::Form::new()));
+        s.account_window_closed();
+        assert!(s.account_form.is_some() && s.account_closes == 0);
+        s.account_window_closed();
+        assert!(s.account_form.is_none());
+    }
 
     /// What one window turn costs in the move of the shared state: Rune runs a turn for every
     /// event-loop callback of each window (events, wakes, every frame of an animation).

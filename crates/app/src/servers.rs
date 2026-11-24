@@ -38,6 +38,8 @@ pub struct Servers {
     pub dropbox: openexplorer_dropbox::store::Store,
     pub dropbox_quotas: std::collections::HashMap<String, Option<openexplorer_dropbox::Quota>>,
     pub dropbox_watch: std::collections::HashMap<String, crate::dropbox::Watch>,
+    /// The Dropbox login waiting for the browser, by its attempt.
+    pub dropbox_login: Option<u64>,
     /// The B2 keys' own list (see `b2.rs`).
     pub b2: openexplorer_b2::Store,
     /// The panes' B2 folders read again on the app's own (see `b2.rs`).
@@ -66,7 +68,7 @@ impl Servers {
         list.extend(onedrive.servers());
         let telegram = crate::telegram::store();
         list.extend(crate::telegram::servers(&telegram));
-        Servers { list, pool: Arc::default(), store, mega, mega_quotas: Default::default(), mega_watch: Default::default(), dropbox, dropbox_quotas: Default::default(), dropbox_watch: Default::default(), b2, b2_watch: Default::default(), onedrive, telegram, telegram_watch: Default::default(), attempts: 0 }
+        Servers { list, pool: Arc::default(), store, mega, mega_quotas: Default::default(), mega_watch: Default::default(), dropbox, dropbox_quotas: Default::default(), dropbox_watch: Default::default(), dropbox_login: None, b2, b2_watch: Default::default(), onedrive, telegram, telegram_watch: Default::default(), attempts: 0 }
     }
 }
 

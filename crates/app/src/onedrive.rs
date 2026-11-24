@@ -259,7 +259,9 @@ pub fn submit(s: &mut State, tx: &mut Tx) {
     let Some(f) = &mut s.account_form else { return };
     f.error = None;
     let typed = f.client_id.text.trim().to_string();
-    let tenant_override = (!f.custom_oauth).then_some(f.onedrive_tenant).flatten();
+    // Pessoal or For Business picks who signs in, also with a Client ID typed here; a
+    // registration that names its own tenant keeps it.
+    let tenant_override = f.onedrive_tenant;
     let mut cfg = if !typed.is_empty() {
         match od::ClientConfig::parse(&typed).and_then(|c| c.save().map(|_| c)) {
             Ok(c) => c,
@@ -313,6 +315,7 @@ pub fn submit(s: &mut State, tx: &mut Tx) {
 fn connected(s: &mut State, attempt: u64, result: Result<StoredAccount, String>) {
     if s.servers.onedrive.login == Some(attempt) {
         s.servers.onedrive.login = None;
+        s.notify_account();
     }
     let account = match result {
         Ok(a) => a,
