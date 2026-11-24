@@ -463,7 +463,7 @@ pub fn form(k: &Kit, f: &Form, banner: El, eye: El) -> (El, El) {
                         crate::fail(s, tr!("Não consegui abrir o navegador: {e:?}", "Couldn't open the browser: {e:?}"));
                     }
                 })
-                .build(k);
+                .build(k).cursor(rune::Cursor::Pointer);
             let api_id = rune_kit::TextInput::new(&f.client_id)
                 .width(None)
                 .placeholder("1234567")
@@ -561,14 +561,14 @@ pub fn form(k: &Kit, f: &Form, banner: El, eye: El) -> (El, El) {
         inner = inner.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0));
     }
     let go = if checking {
-        Button::new(t("Aguarde…", "Wait…")).variant(ButtonVariant::Submit).disabled(true).build(k)
+        Button::new(t("Aguarde…", "Wait…")).variant(ButtonVariant::Submit).disabled(true).build(k).cursor(rune::Cursor::Pointer)
     } else {
-        Button::new(label).variant(ButtonVariant::Submit).on_press(submit).build(k).default_button()
+        Button::new(label).variant(ButtonVariant::Submit).on_press(submit).build(k).cursor(rune::Cursor::Pointer).default_button()
     };
     let back = if f.telegram == Stage::Start {
-        Button::new(t("Voltar", "Back")).icon(&crate::icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(crate::servers::back_to_pick).build(k)
+        Button::new(t("Voltar", "Back")).icon(&crate::icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(crate::servers::back_to_pick).build(k).cursor(rune::Cursor::Pointer)
     } else {
-        Button::new(t("Recomeçar", "Start over")).icon(&crate::icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(restart).build(k)
+        Button::new(t("Recomeçar", "Start over")).icon(&crate::icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(restart).build(k).cursor(rune::Cursor::Pointer)
     };
     let actions = row()
         .key("actions")
@@ -577,7 +577,7 @@ pub fn form(k: &Kit, f: &Form, banner: El, eye: El) -> (El, El) {
         .center_y()
         .child(back)
         .child(rune::el().grow(1.0))
-        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(cancel).build(k))
+        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(cancel).build(k).cursor(rune::Cursor::Pointer))
         .child(go);
     (inner, actions)
 }

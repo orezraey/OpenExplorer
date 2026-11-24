@@ -9,7 +9,7 @@ use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, ScrollBar,
 
 use crate::model::{Kind, Location, SortCol, Space, crumbs, format_bytes, format_long, format_size, format_time, shown};
 use crate::actions::{self, ClipMode, Dialog};
-use crate::{State, click, disconnect, drag_item, dragged_ids, dropped, go_back, go_forward, go_up, key, load, navigate, open, pane_key, paths_for, refresh, row_key, set_sort};
+use crate::{MainTab, State, click, drag_item, dragged_ids, dropped, go_back, go_forward, go_up, key, load, navigate, open, pane_key, paths_for, refresh, row_key, set_sort};
 use crate::icons;
 use crate::ops::Stage;
 use openexplorer_i18n::{t, tr};
@@ -44,13 +44,17 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         // Not a live region of its own: `notice` has each message said once, at once for errors.
         layer.push(ToastRegion::new().toast(toast.build(&k).live_region(LiveRegion::Off)).build(&k));
     }
+    let main_content = match s.main_tab {
+        MainTab::Explore => panes(s, &k),
+        MainTab::Accounts => accounts_hub(s, &k),
+    };
     let body = col()
         .key("window")
         .w_full()
         .h_full()
         .fill(k.c.page)
         .child(toolbar(s, &k))
-        .child(panes(s, &k))
+        .child(main_content)
         .child(transfers(s, &k))
         .child(menu)
         .child(queue_menu)
@@ -221,7 +225,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
             .variant(ButtonVariant::Neutral)
             .disabled(!modified)
             .on_press_tx(reset_settings)
-            .build(k)
+            .build(k).cursor(Cursor::Pointer)
             .key("reset-options"),
     );
 
@@ -622,7 +626,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                                 opt.refresh_logs();
                             }
                         })
-                        .build(k),
+                        .build(k).cursor(Cursor::Pointer),
                 )
                 .child(
                     Button::new(t("Copiar", "Copy"))
@@ -634,7 +638,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                             tx.copy(opt.filtered_logs().join("\n"));
                             s.status = t("Log copiado para a área de transferência.", "Log copied to the clipboard.").into();
                         })
-                        .build(k),
+                        .build(k).cursor(Cursor::Pointer),
                 )
                 .child(
                     Button::new(t("Abrir pasta", "Open folder"))
@@ -646,7 +650,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                                 crate::fail(s, e);
                             }
                         })
-                        .build(k),
+                        .build(k).cursor(Cursor::Pointer),
                 )
                 .child(
                     Button::new(t("Limpar", "Clear"))
@@ -661,7 +665,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                             }
                             Err(e) => crate::fail(s, e),
                         })
-                        .build(k),
+                        .build(k).cursor(Cursor::Pointer),
                 );
 
             let mut filter_input = rune_kit::TextInput::new(&opt.log_filter)
@@ -773,7 +777,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
         .border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_weak)
         .child(el().size(6.0, 6.0).radius(3.0).fill(k.c.success.fg))
         .child(text(t("Alterações salvas automaticamente", "Changes are saved automatically")).font(k.ty.caption()).color(k.c.text_faint).grow(1.0))
-        .child(Button::new(t("Concluído", "Done")).variant(ButtonVariant::Submit).on_press(close).build(k).default_button());
+        .child(Button::new(t("Concluído", "Done")).variant(ButtonVariant::Submit).on_press(close).build(k).cursor(Cursor::Pointer).default_button());
 
     let right_col = col().key("opt-right").grow(1.0).w(0.0).h_full().min_w(0.0).child(main_scroll).child(footer);
 
@@ -850,7 +854,7 @@ fn cache_page(k: &Kit, page: &crate::caches::Page, card: El, head: El) -> El {
                 .w(0.0)
                 .min_w(0.0),
         )
-        .child(clear.build(k).key("cache-clear"));
+        .child(clear.build(k).cursor(Cursor::Pointer).key("cache-clear"));
 
     let card = card
         .child(total)
@@ -897,8 +901,8 @@ fn cache_page(k: &Kit, page: &crate::caches::Page, card: El, head: El) -> El {
                     .w_full()
                     .gap(8.0)
                     .child(el().grow(1.0))
-                    .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(|s: &mut State| crate::caches::confirm(s, false)).build(k).key("cache-cancel"))
-                    .child(Button::new(t("Limpar cache", "Clear cache")).variant(ButtonVariant::Danger).on_press(crate::caches::clear).build(k).key("cache-clear-yes")),
+                    .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(|s: &mut State| crate::caches::confirm(s, false)).build(k).cursor(Cursor::Pointer).key("cache-cancel"))
+                    .child(Button::new(t("Limpar cache", "Clear cache")).variant(ButtonVariant::Danger).on_press(crate::caches::clear).build(k).cursor(Cursor::Pointer).key("cache-clear-yes")),
             );
         out = out.child(ask);
     }
@@ -1270,8 +1274,8 @@ fn actions_row(k: &Kit, cancel: &str, act: Button) -> El {
         .pt(16.0)
         .gap(8.0)
         .justify_end()
-        .child(Button::new(cancel).variant(ButtonVariant::Neutral).on_press(close).build(k))
-        .child(act.build(k).default_button())
+        .child(Button::new(cancel).variant(ButtonVariant::Neutral).on_press(close).build(k).cursor(Cursor::Pointer))
+        .child(act.build(k).default_button().cursor(Cursor::Pointer))
 }
 
 fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
@@ -1372,6 +1376,26 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 .child(text(note).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
                 .child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Esvaziar lixeira", "Empty trash")).variant(ButtonVariant::Danger).on_press(actions::empty_trash)));
             Modal::new("empty-trash", t("Esvaziar lixeira?", "Empty trash?")).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
+        }
+        Dialog::RemoveAccount { provider, who, .. } => {
+            let title = tr!("Remover conta {provider}?", "Remove {provider} account?");
+            let note = if who.is_empty() {
+                tr!(
+                    "Esta conta ({provider}) será desconectada do Open Explorer neste computador. Seus arquivos na nuvem ou no servidor continuam intactos.",
+                    "This account ({provider}) will be disconnected from Open Explorer on this computer. Your files in the cloud or on the server stay untouched."
+                )
+            } else {
+                tr!(
+                    "A conta {who} ({provider}) será desconectada do Open Explorer neste computador. Seus arquivos na nuvem ou no servidor continuam intactos.",
+                    "The account {who} ({provider}) will be disconnected from Open Explorer on this computer. Your files in the cloud or on the server stay untouched."
+                )
+            };
+            let body = col()
+                .w_full()
+                .gap(12.0)
+                .child(text(note).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
+                .child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Remover conta", "Remove account")).variant(ButtonVariant::Danger).on_press(actions::confirm_remove_account)));
+            Modal::new("remove-account", title).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
         }
         Dialog::NewFolder { error, .. } => {
             // Rune's own field, so it can take the dialog's first focus (`autofocus`); Enter
@@ -1656,9 +1680,9 @@ fn account_pick_body(
             tr!("Nenhuma nuvem encontrada para “{}”.", "No cloud found for “{}”.", f.filter.text.trim())
         };
         let act = if is_url {
-            Button::new(t("Configurar endereço", "Set up address")).variant(ButtonVariant::Submit).on_press(crate::servers::submit_filter).build(k).default_button()
+            Button::new(t("Configurar endereço", "Set up address")).variant(ButtonVariant::Submit).on_press(crate::servers::submit_filter).build(k).cursor(Cursor::Pointer).default_button()
         } else {
-            Button::new(t("Limpar pesquisa", "Clear search")).variant(ButtonVariant::Neutral).on_press(crate::servers::clear_filter).build(k)
+            Button::new(t("Limpar pesquisa", "Clear search")).variant(ButtonVariant::Neutral).on_press(crate::servers::clear_filter).build(k).cursor(Cursor::Pointer)
         };
         scroll_inner = scroll_inner.child(
             col()
@@ -1751,7 +1775,7 @@ fn account_pick_body(
 
                         // Floating dropdown menu anchored beneath the card.
                         layer.push(rune_kit::scrim("group-menu-scrim", crate::servers::close_group));
-                        let mut menu_rows = col().key("group-menu-list").w_full().padding(6.0).gap(2.0);
+                        let mut menu_rows = col().key("group-menu-list").w(316.0).padding(6.0).gap(2.0);
                         for &v in versions {
                             let opt = row()
                                 .key(format!("opt-{}", v.label()))
@@ -1780,7 +1804,6 @@ fn account_pick_body(
                             menu_rows = menu_rows.child(opt);
                         }
                         let surface = menu_rows
-                            .min_w(292.0)
                             .radius(8.0)
                             .fill(dropdown_bg)
                             .border(1.0, dropdown_border)
@@ -2079,7 +2102,7 @@ fn account_configure_body(
                             crate::fail(s, tr!("Não consegui abrir o navegador: {e:?}", "Couldn't open the browser: {e:?}"));
                         }
                     })
-                    .build(k);
+                    .build(k).cursor(Cursor::Pointer);
                 let oauth_box = col()
                     .key("oauth-box")
                     .w_full()
@@ -2131,7 +2154,7 @@ fn account_configure_body(
                                     f.client_id.focused = true;
                                 }
                             })
-                            .build(k),
+                            .build(k).cursor(Cursor::Pointer),
                     );
                 inner = inner.child(ready_row);
             }
@@ -2145,10 +2168,10 @@ fn account_configure_body(
                 .w_full()
                 .gap(8.0)
                 .center_y()
-                .child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).on_press(crate::servers::back_to_pick).build(k))
+                .child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).on_press(crate::servers::back_to_pick).build(k).cursor(Cursor::Pointer))
                 .child(el().grow(1.0))
-                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close_account_win).build(k))
-                .child(Button::new(t("Conectar no navegador", "Connect in browser")).variant(ButtonVariant::Submit).on_press_tx(crate::servers::submit_google).build(k).default_button());
+                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close_account_win).build(k).cursor(Cursor::Pointer))
+                .child(Button::new(t("Conectar no navegador", "Connect in browser")).variant(ButtonVariant::Submit).on_press_tx(crate::servers::submit_google).build(k).cursor(Cursor::Pointer).default_button());
             (inner, actions)
         }
         Provider::Mega => {
@@ -2212,18 +2235,18 @@ fn account_configure_body(
                 inner = inner.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0));
             }
             let connect = if checking {
-                Button::new(t("Conectando…", "Connecting…")).variant(ButtonVariant::Submit).disabled(true).build(k)
+                Button::new(t("Conectando…", "Connecting…")).variant(ButtonVariant::Submit).disabled(true).build(k).cursor(Cursor::Pointer)
             } else {
-                Button::new(t("Conectar", "Connect")).variant(ButtonVariant::Submit).on_press(crate::mega::submit).build(k).default_button()
+                Button::new(t("Conectar", "Connect")).variant(ButtonVariant::Submit).on_press(crate::mega::submit).build(k).cursor(Cursor::Pointer).default_button()
             };
             let actions = row()
                 .key("actions")
                 .w_full()
                 .gap(8.0)
                 .center_y()
-                .child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(crate::servers::back_to_pick).build(k))
+                .child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(crate::servers::back_to_pick).build(k).cursor(Cursor::Pointer))
                 .child(el().grow(1.0))
-                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close_account_win).build(k))
+                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close_account_win).build(k).cursor(Cursor::Pointer))
                 .child(connect);
             (inner, actions)
         }
@@ -2414,17 +2437,17 @@ fn account_configure_body(
             let checking = f.checking.is_some();
             let save_label = if f.editing.is_some() { t("Salvar", "Save") } else { t("Conectar", "Connect") };
             let save_el = match (&f.untrusted, checking) {
-                (_, true) => Button::new(t("Conectando…", "Connecting…")).variant(ButtonVariant::Submit).disabled(true).build(k),
-                (Some(_), false) => Button::new(t("Confiar e salvar", "Trust and save")).variant(ButtonVariant::Danger).on_press(crate::servers::trust).build(k).default_button(),
-                (None, false) => Button::new(save_label).variant(ButtonVariant::Submit).on_press(crate::servers::submit).build(k).default_button(),
+                (_, true) => Button::new(t("Conectando…", "Connecting…")).variant(ButtonVariant::Submit).disabled(true).build(k).cursor(Cursor::Pointer),
+                (Some(_), false) => Button::new(t("Confiar e salvar", "Trust and save")).variant(ButtonVariant::Danger).on_press(crate::servers::trust).build(k).cursor(Cursor::Pointer).default_button(),
+                (None, false) => Button::new(save_label).variant(ButtonVariant::Submit).on_press(crate::servers::submit).build(k).cursor(Cursor::Pointer).default_button(),
             };
             let mut actions = row().key("actions").w_full().gap(8.0).center_y();
             if f.editing.is_none() {
-                actions = actions.child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(crate::servers::back_to_pick).build(k));
+                actions = actions.child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(crate::servers::back_to_pick).build(k).cursor(Cursor::Pointer));
             }
             actions = actions
                 .child(el().grow(1.0))
-                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close_account_win).build(k))
+                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close_account_win).build(k).cursor(Cursor::Pointer))
                 .child(save_el);
             (inner, actions)
         }
@@ -2539,14 +2562,14 @@ fn clash_dialog(s: &State, k: &Kit, ask: &actions::ClashAsk, layer: &mut Vec<El>
     if n > 1 {
         body = body.child(rune_kit::Checkbox::new(ask.all).label(t("Aplicar a todos", "Apply to all")).on_toggle(actions::toggle_clash_all).build(k));
     }
-    let choice = |label: &str, c: crate::uploads::Clash, variant: ButtonVariant| Button::new(label).variant(variant).on_press(move |s: &mut State| actions::answer_clash(s, Some(c))).build(k);
+    let choice = |label: &str, c: crate::uploads::Clash, variant: ButtonVariant| Button::new(label).variant(variant).on_press(move |s: &mut State| actions::answer_clash(s, Some(c))).build(k).cursor(Cursor::Pointer);
     let buttons = row()
         .key("actions")
         .w_full()
         .pt(4.0)
         .gap(8.0)
         .justify_end()
-        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(|s: &mut State| actions::answer_clash(s, None)).build(k))
+        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(|s: &mut State| actions::answer_clash(s, None)).build(k).cursor(Cursor::Pointer))
         .child(el().grow(1.0))
         .child(choice(t("Pular", "Skip"), crate::uploads::Clash::Skip, ButtonVariant::Neutral))
         .child(choice(t("Manter os dois", "Keep both"), crate::uploads::Clash::KeepBoth, ButtonVariant::Neutral))
@@ -2799,7 +2822,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
                         (_, Some(Ok(h))) => mono(h),
                         (_, Some(Err(err))) => text(err.clone()).font(k.ty.text_small).color(k.c.danger.fg),
                         (Some(_), None) if p.md5_running => muted(t("Calculando…", "Calculating…")),
-                        (Some(_), None) => Button::new(t("Calcular", "Calculate")).variant(ButtonVariant::Neutral).on_press(actions::props_md5).build(k).key("md5"),
+                        (Some(_), None) => Button::new(t("Calcular", "Calculate")).variant(ButtonVariant::Neutral).on_press(actions::props_md5).build(k).cursor(Cursor::Pointer).key("md5"),
                         (None, None) => match drive_md5 {
                             Some(h) => mono(h),
                             None if google_format => muted(t("— (formato do Google, sem arquivo binário)", "— (Google format, no binary file)")),
@@ -2849,7 +2872,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
                                                     crate::fail(s, tr!("Não consegui abrir o navegador: {e:?}", "Couldn't open the browser: {e:?}"));
                                                 }
                                             })
-                                            .build(k),
+                                            .build(k).cursor(Cursor::Pointer),
                                     ),
                                 );
                             }
@@ -2915,8 +2938,8 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
         .pt(18.0)
         .gap(8.0)
         .justify_end()
-        .child(Button::new("OK").variant(ButtonVariant::Submit).on_press(actions::props_ok).build(k))
-        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(actions::close_properties).build(k));
+        .child(Button::new("OK").variant(ButtonVariant::Submit).on_press(actions::props_ok).build(k).cursor(Cursor::Pointer))
+        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(actions::close_properties).build(k).cursor(Cursor::Pointer));
     let content = col().key("content").w_full().px(16.0).pb(16.0).child(tabs).child(body).child(buttons);
     Modal::new("props", tr!("Propriedades: {title}", "Properties: {title}")).open(true).child(content).width(520.0).fit().on_close(actions::close_properties).build(k, layer);
 }
@@ -2984,76 +3007,818 @@ fn tool<F: Fn(&mut State, &mut Tx) + 'static>(k: &Kit, key: &str, glyph: &'stati
 }
 
 fn toolbar(s: &State, k: &Kit) -> El {
-    let p = s.active;
-    let account = match &s.panes[p].loc {
-        Location::Drive { email, .. } => Some(email.clone()),
-        _ => None,
+    let sep = || el().w(1.0).h(20.0).mx(6.0).fill(k.c.border_weak);
+    let waiting_oauth = s.login.is_some() || s.servers.onedrive.login.is_some() || s.servers.dropbox_login.is_some();
+    let total_accounts = s.accounts.len() + s.servers.list.len();
+
+    let nav_tab = |key: &'static str, tab: MainTab, glyph: &'static Icon, label: &str, badge: Option<usize>, busy_dot: bool| -> El {
+        let on = s.main_tab == tab;
+        let ink = if on { k.c.text_accent } else { k.c.text_base };
+        let icon_ink = if on { k.c.text_accent } else { k.c.icon_muted };
+        let font = if on { k.ty.text_small_medium } else { k.ty.text_small };
+
+        let mut inner = row()
+            .h(32.0)
+            .px(12.0)
+            .gap(7.0)
+            .center_y()
+            .radius(k.radius.md)
+            .child(icon(glyph, 16.0).color(icon_ink))
+            .child(text(label.to_string()).font(font).color(ink));
+
+        if busy_dot {
+            inner = inner.child(el().size(6.0, 6.0).radius(3.0).fill(k.c.text_accent));
+        } else if let Some(count) = badge.filter(|&n| n > 0) {
+            let pill_bg = if on {
+                k.alpha(k.c.text_accent, if k.dark { 0.22 } else { 0.12 })
+            } else {
+                k.alpha(k.c.text_base, if k.dark { 0.10 } else { 0.065 })
+            };
+            let pill_fg = if on { k.c.text_accent } else { k.c.text_muted };
+            inner = inner.child(
+                row()
+                    .h(17.0)
+                    .px(5.5)
+                    .center()
+                    .radius(8.5)
+                    .fill(pill_bg)
+                    .child(text(count.to_string()).font(k.ty.caption()).color(pill_fg)),
+            );
+        }
+
+        if on {
+            inner = inner.child(
+                row()
+                    .pin(Some(12.0), None, Some(12.0), Some(0.0))
+                    .justify_center()
+                    .child(el().w(22.0).h(2.5).radius(1.5).fill(k.c.text_accent)),
+            );
+        }
+
+        k.interactive(
+            inner
+                .key(key)
+                .role("tab")
+                .label(label.to_string())
+                .checked(on)
+                .focusable(true)
+                .focus_ring(2.0, 1.0, k.c.border_focus)
+                .hover(if on { k.alpha(k.c.text_accent, 0.08) } else { k.c.hover })
+                .press(k.c.pressed)
+                .cursor(Cursor::Pointer),
+        )
+        .on_press(move |s: &mut State| crate::set_main_tab(s, tab))
     };
-    let server = match &s.panes[p].loc {
-        Location::Server { server, .. } => Some((server.id.clone(), server.name.clone())),
-        _ => None,
+
+    let refresh_help = match s.main_tab {
+        MainTab::Explore => t("Recarregar a pasta atual", "Reload the current folder"),
+        MainTab::Accounts => t("Atualizar o espaço utilizado nas contas", "Refresh storage usage across accounts"),
     };
-    let connecting = s.login.is_some();
-    let sep = || el().w(1.0).h(20.0).mx(4.0).fill(k.c.border_weak);
-    let add_label = if connecting { t("Adicionar conta · Conectando…", "Add account · Connecting…") } else { t("Adicionar conta", "Add account") };
-    let bar = row()
+
+    row()
         .key("toolbar")
         .w_full()
-        .h(40.0)
-        .px(6.0)
-        .gap(2.0)
+        .h(42.0)
+        .px(8.0)
+        .gap(3.0)
         .center_y()
         .fill(k.c.bg_base)
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+        .child(nav_tab("tab-explore", MainTab::Explore, &icons::TAB_EXPLORE, t("Explorar", "Explore"), None, false))
+        .child(nav_tab("tab-accounts", MainTab::Accounts, &icons::TAB_ACCOUNTS, t("Contas", "Accounts"), Some(total_accounts), waiting_oauth))
+        .child(sep())
         .child(
-            tool(k, "add-account", &icons::ADD_ACCOUNT, add_label, true, |s: &mut State, _| crate::servers::ask_add(s))
-                .help(t("Conectar Google Drive, MEGA, Nextcloud, ownCloud, SFTP, FTP ou WebDAV", "Connect Google Drive, MEGA, Nextcloud, ownCloud, SFTP, FTP or WebDAV")),
-        );
-    let bar = match (account, server) {
-        (Some(email), _) => {
-            let short: String = if email.chars().count() > 26 {
-                format!("{}…", email.chars().take(25).collect::<String>())
-            } else {
-                email.clone()
-            };
-            let who = email.clone();
-            bar.child(
-                tool(k, "disconnect", &icons::SIGN_OUT, &tr!("Desconectar {short}", "Disconnect {short}"), true, move |s: &mut State, _| disconnect(s, &who))
-                    .help(tr!("Desconectar {email}: remove o acesso e o cache desta conta", "Disconnect {email}: removes this account's access and cache")),
-            )
-        }
-        (None, Some((id, name))) if id.starts_with("mega:") => bar.child(
-            tool(k, "remove-server", &icons::SIGN_OUT, t("Remover conta", "Remove account"), true, move |s: &mut State, _| crate::servers::remove(s, &id))
-                .help(tr!("Tira {name} da lista e encerra a sessão do MEGA", "Removes {name} from the list and ends the MEGA session")),
-        ),
-        (None, Some((id, name))) if id.starts_with("telegram:") => bar.child(
-            tool(k, "remove-server", &icons::SIGN_OUT, t("Remover conta", "Remove account"), true, move |s: &mut State, _| crate::servers::remove(s, &id))
-                .help(tr!("Tira {name} da lista e encerra a sessão do Open Explorer no Telegram; o canal e os arquivos continuam lá", "Removes {name} from the list and ends Open Explorer's Telegram session; the channel and its files stay there")),
-        ),
-        (None, Some((id, name))) if id.starts_with("dropbox:") => bar.child(
-            tool(k, "remove-server", &icons::SIGN_OUT, t("Remover conta", "Remove account"), true, move |s: &mut State, _| crate::servers::remove(s, &id))
-                .help(tr!("Tira {name} da lista e revoga o acesso do Open Explorer ao Dropbox", "Removes {name} from the list and revokes Open Explorer's access to Dropbox")),
-        ),
-        (None, Some((id, name))) => {
-            let edit = id.clone();
-            bar.child(
-                tool(k, "edit-server", &icons::M_RENAME, t("Editar conta", "Edit account"), true, move |s: &mut State, _| crate::servers::ask_edit(s, &edit))
-                    .help(tr!("Muda o endereço, o login ou a pasta de {name}", "Changes the address, login or folder of {name}")),
-            )
-            .child(
-                tool(k, "remove-server", &icons::SIGN_OUT, t("Remover conta", "Remove account"), true, move |s: &mut State, _| crate::servers::remove(s, &id))
-                    .help(tr!("Tira {name} da lista e esquece a senha dele", "Removes {name} from the list and forgets its password")),
-            )
-        }
-        (None, None) => bar,
-    };
-    bar.child(sep())
-        .child(tool(k, "reload-all", &icons::REFRESH, t("Atualizar", "Refresh"), true, |s: &mut State, _| refresh(s, s.active)))
+            tool(k, "reload-all", &icons::REFRESH, t("Atualizar", "Refresh"), true, |s: &mut State, _| match s.main_tab {
+                MainTab::Explore => refresh(s, s.active),
+                MainTab::Accounts => crate::refresh_all_quotas(s),
+            })
+            .help(refresh_help),
+        )
         .child(el().grow(1.0))
         .child(tool(k, "options", &icons::SETTINGS, t("Opções", "Options"), true, |s: &mut State, _| {
             s.dialog = Some(Dialog::Options(Box::new(crate::settings::OptionsView::open(crate::settings::OptionsTab::General))));
         }))
         .child(text("Open Explorer").font(k.ty.text_small_medium).color(k.c.text_faint).mx(8.0))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Central de Contas
+
+pub(crate) enum HubQuota {
+    Known { total: u64, free: u64, used_frac: f32, help: String },
+    UnlimitedUsed { used: u64, help: String },
+    Loading,
+    Info(String),
+}
+
+pub(crate) struct HubCard {
+    pub key: String,
+    pub provider: crate::servers::Provider,
+    pub drive_name: String,
+    pub user_name: Option<String>,
+    pub email_or_addr: String,
+    pub quota: HubQuota,
+    pub open_loc: Location,
+    pub in_left: bool,
+    pub in_right: bool,
+    pub edit_id: Option<String>,
+    pub remove_target: actions::AccountTarget,
+}
+
+impl HubCard {
+    pub(crate) fn matches_search(&self, q: &str) -> bool {
+        let q = q.trim().to_lowercase();
+        if q.is_empty() {
+            return true;
+        }
+        q.split_whitespace().all(|w| {
+            self.drive_name.to_lowercase().contains(w)
+                || self.provider.label().to_lowercase().contains(w)
+                || self.user_name.as_deref().is_some_and(|u| u.to_lowercase().contains(w))
+                || self.email_or_addr.to_lowercase().contains(w)
+        })
+    }
+}
+
+pub(crate) fn hub_cards(s: &State) -> Vec<HubCard> {
+    use crate::servers::Provider;
+    use openexplorer_remote::Protocol;
+
+    let mut out = Vec::with_capacity(s.accounts.len() + s.servers.list.len());
+
+    // 1. Google Drive accounts
+    for a in &s.accounts {
+        let user_name = (!a.name.trim().is_empty() && !a.name.eq_ignore_ascii_case(&a.email)).then(|| a.name.clone());
+        let quota = match s.quotas.get(&a.email) {
+            Some(Some(q)) => match (q.limit.filter(|&l| l > 0), q.free()) {
+                (Some(total), Some(free)) => HubQuota::Known {
+                    total,
+                    free,
+                    used_frac: (q.usage as f64 / total as f64).clamp(0.0, 1.0) as f32,
+                    help: quota_help(*q),
+                },
+                _ => HubQuota::UnlimitedUsed { used: q.usage, help: quota_help(*q) },
+            },
+            Some(None) | None => HubQuota::Loading,
+        };
+        let in_pane = |p: usize| matches!(&s.panes[p].loc, Location::Drive { email, .. } if email == &a.email);
+        out.push(HubCard {
+            key: format!("gdrive:{}", a.email),
+            provider: Provider::GoogleDrive,
+            drive_name: "GoogleDrive".into(),
+            user_name,
+            email_or_addr: a.email.clone(),
+            quota,
+            open_loc: Location::drive(&a.email, Space::MyDrive),
+            in_left: in_pane(0),
+            in_right: in_pane(1),
+            edit_id: None,
+            remove_target: actions::AccountTarget::GoogleDrive(a.email.clone()),
+        });
+    }
+
+    // 2. Cloud accounts & remote servers in `s.servers.list`
+    for sv in &s.servers.list {
+        let provider = Provider::of_server(sv);
+        let in_pane = |p: usize| matches!(&s.panes[p].loc, Location::Server { server, .. } if server.id == sv.id);
+
+        match provider {
+            Provider::OneDrive => {
+                let meta = s.servers.onedrive.accounts.iter().find(|a| a.id == sv.user);
+                let business = meta.is_some_and(|m| m.business);
+                let email = meta.map(|m| m.email.clone()).unwrap_or_else(|| sv.name.clone());
+                let user_name = meta
+                    .map(|m| m.name.trim())
+                    .filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case(&email))
+                    .map(str::to_string);
+                let drive_name = if business { "OneDrive For Business" } else { "OneDrive" }.to_string();
+                let quota = match s.servers.onedrive.quotas.get(&sv.id) {
+                    Some(Some(q)) if q.total > 0 => HubQuota::Known {
+                        total: q.total,
+                        free: q.remaining,
+                        used_frac: (q.used as f64 / q.total as f64).clamp(0.0, 1.0) as f32,
+                        help: tr!("Usado: {} de {}", "Used: {} of {}", format_size(q.used), whole_size(q.total)),
+                    },
+                    Some(Some(q)) => HubQuota::UnlimitedUsed {
+                        used: q.used,
+                        help: tr!("Usado: {}", "Used: {}", format_size(q.used)),
+                    },
+                    Some(None) | None => HubQuota::Loading,
+                };
+                out.push(HubCard {
+                    key: format!("srv:{}", sv.id),
+                    provider,
+                    drive_name,
+                    user_name,
+                    email_or_addr: email,
+                    quota,
+                    open_loc: crate::onedrive::files(sv),
+                    in_left: in_pane(0),
+                    in_right: in_pane(1),
+                    edit_id: None,
+                    remove_target: actions::AccountTarget::Server(sv.id.clone()),
+                });
+            }
+            Provider::Dropbox => {
+                let meta = s.servers.dropbox_accounts.iter().find(|a| a.email.eq_ignore_ascii_case(&sv.user));
+                let user_name = meta
+                    .map(|m| m.name.trim())
+                    .filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case(&sv.user))
+                    .map(str::to_string);
+                let quota = match s.servers.dropbox_quotas.get(&sv.id) {
+                    Some(Some(q)) if q.total > 0 => {
+                        let free = q.total.saturating_sub(q.used);
+                        HubQuota::Known {
+                            total: q.total,
+                            free,
+                            used_frac: (q.used as f64 / q.total as f64).clamp(0.0, 1.0) as f32,
+                            help: tr!("Usado: {} de {}", "Used: {} of {}", format_size(q.used), whole_size(q.total)),
+                        }
+                    }
+                    Some(Some(q)) => HubQuota::UnlimitedUsed {
+                        used: q.used,
+                        help: tr!("Usado: {}", "Used: {}", format_size(q.used)),
+                    },
+                    Some(None) | None => HubQuota::Loading,
+                };
+                out.push(HubCard {
+                    key: format!("srv:{}", sv.id),
+                    provider,
+                    drive_name: "Dropbox".into(),
+                    user_name,
+                    email_or_addr: sv.user.clone(),
+                    quota,
+                    open_loc: crate::dropbox::top(sv),
+                    in_left: in_pane(0),
+                    in_right: in_pane(1),
+                    edit_id: None,
+                    remove_target: actions::AccountTarget::Server(sv.id.clone()),
+                });
+            }
+            Provider::Mega => {
+                let quota = match s.servers.mega_quotas.get(&sv.id) {
+                    Some(Some(q)) if q.total > 0 => {
+                        let free = q.total.saturating_sub(q.used);
+                        HubQuota::Known {
+                            total: q.total,
+                            free,
+                            used_frac: (q.used as f64 / q.total as f64).clamp(0.0, 1.0) as f32,
+                            help: crate::mega::quota_help(*q),
+                        }
+                    }
+                    Some(Some(q)) => HubQuota::UnlimitedUsed {
+                        used: q.used,
+                        help: crate::mega::quota_help(*q),
+                    },
+                    Some(None) | None => HubQuota::Loading,
+                };
+                out.push(HubCard {
+                    key: format!("srv:{}", sv.id),
+                    provider,
+                    drive_name: "Mega".into(),
+                    user_name: None,
+                    email_or_addr: sv.user.clone(),
+                    quota,
+                    open_loc: crate::mega::cloud(sv),
+                    in_left: in_pane(0),
+                    in_right: in_pane(1),
+                    edit_id: None,
+                    remove_target: actions::AccountTarget::Server(sv.id.clone()),
+                });
+            }
+            Provider::B2 => {
+                let user_name = (!sv.name.trim().is_empty() && !sv.name.eq_ignore_ascii_case("Backblaze B2") && sv.name != sv.user).then(|| sv.name.clone());
+                out.push(HubCard {
+                    key: format!("srv:{}", sv.id),
+                    provider,
+                    drive_name: "Backblaze B2".into(),
+                    user_name,
+                    email_or_addr: sv.user.clone(),
+                    quota: HubQuota::Info(t("Armazenamento sob demanda · Buckets B2", "Pay-as-you-go storage · B2 Buckets").into()),
+                    open_loc: crate::b2::top(sv),
+                    in_left: in_pane(0),
+                    in_right: in_pane(1),
+                    edit_id: None,
+                    remove_target: actions::AccountTarget::Server(sv.id.clone()),
+                });
+            }
+            Provider::Telegram => {
+                let user_name = (!sv.name.trim().is_empty() && sv.name != sv.user).then(|| sv.name.clone());
+                out.push(HubCard {
+                    key: format!("srv:{}", sv.id),
+                    provider,
+                    drive_name: "Telegram".into(),
+                    user_name,
+                    email_or_addr: format!("ID {}", sv.user),
+                    quota: HubQuota::Info(t("Armazenamento ilimitado · Canal privado", "Unlimited storage · Private channel").into()),
+                    open_loc: crate::servers::folder(sv, Vec::new()),
+                    in_left: in_pane(0),
+                    in_right: in_pane(1),
+                    edit_id: None,
+                    remove_target: actions::AccountTarget::Server(sv.id.clone()),
+                });
+            }
+            Provider::Nextcloud | Provider::OwnCloud | Provider::Sftp | Provider::Ftp | Provider::WebDav | Provider::GoogleDrive => {
+                let drive_name = match (provider, sv.protocol) {
+                    (Provider::Ftp, Protocol::Ftps) => "FTPS",
+                    (Provider::WebDav, Protocol::Dav) => "WebDAV (HTTP)",
+                    _ => provider.label(),
+                }
+                .to_string();
+                let addr = sv.address();
+                let user_or_addr = if !sv.user.is_empty() {
+                    format!("{}@{}", sv.user, sv.host)
+                } else {
+                    sv.host.clone()
+                };
+                let user_name = (!sv.name.trim().is_empty()
+                    && !sv.name.eq_ignore_ascii_case(&drive_name)
+                    && !sv.name.eq_ignore_ascii_case(&sv.host)
+                    && !sv.name.eq_ignore_ascii_case(&user_or_addr))
+                .then(|| sv.name.clone());
+                out.push(HubCard {
+                    key: format!("srv:{}", sv.id),
+                    provider,
+                    drive_name,
+                    user_name,
+                    email_or_addr: user_or_addr,
+                    quota: HubQuota::Info(addr),
+                    open_loc: crate::servers::folder(sv, Vec::new()),
+                    in_left: in_pane(0),
+                    in_right: in_pane(1),
+                    edit_id: Some(sv.id.clone()),
+                    remove_target: actions::AccountTarget::Server(sv.id.clone()),
+                });
+            }
+        }
+    }
+
+    out
+}
+
+fn accounts_hub(s: &State, k: &Kit) -> El {
+    use crate::servers::Provider;
+
+    let all_cards = hub_cards(s);
+    let active_filter = s.accounts_filter.filter(|&p| all_cards.iter().any(|c| c.provider == p));
+    let search_query = s.accounts_search.text.as_str();
+
+    // Left sidebar: "Todos" + each connected provider type.
+    let sidebar_bg = if k.dark { k.alpha(k.c.white, 0.015) } else { k.alpha(k.c.black, 0.014) };
+    let mut sidebar = col()
+        .key("accounts-sidebar")
+        .w(214.0)
+        .h_full()
+        .pt(14.0)
+        .pb(14.0)
+        .px(10.0)
+        .gap(3.0)
+        .fill(sidebar_bg)
+        .border_sides([0.0, 1.0, 0.0, 0.0], k.c.border_weak);
+
+    let sidebar_row = |key: String, label: &str, glyph: El, count: usize, on: bool, pick: Option<Provider>| -> El {
+        let fill = if on {
+            if k.dark {
+                rune::oklch(0.30, 0.055, 252.0)
+            } else {
+                k.alpha(k.c.text_accent, 0.12)
+            }
+        } else {
+            Color::TRANSPARENT
+        };
+        let text_ink = if on { k.c.text_base } else { k.c.text_muted };
+        let font = if on { k.ty.text_small_medium } else { k.ty.text_small };
+
+        let mut r = row()
+            .key(key)
+            .role("tab")
+            .label(label.to_string())
+            .checked(on)
+            .focusable(true)
+            .focus_ring(2.0, 1.0, k.c.border_focus)
+            .w_full()
+            .h(34.0)
+            .pl(6.0)
+            .pr(10.0)
+            .gap(8.0)
+            .center_y()
+            .radius(6.0)
+            .fill(fill)
+            .hover(if on { fill } else { k.c.hover })
+            .cursor(Cursor::Pointer)
+            .child(el().w(3.0).h(16.0).radius(1.5).fill(if on { k.c.text_accent } else { Color::TRANSPARENT }))
+            .child(glyph)
+            .child(text(label.to_string()).font(font).color(text_ink).truncate().min_w(0.0).grow(1.0));
+
+        if count > 0 {
+            r = r.child(text(count.to_string()).font(k.ty.caption()).color(if on { k.c.text_accent } else { k.c.text_faint }));
+        }
+
+        k.interactive(r).on_press(move |s: &mut State| {
+            s.accounts_filter = pick;
+        })
+    };
+
+    let all_on = active_filter.is_none();
+    let globe_icon = icon(&icons::GLOBE, 16.0).color(if all_on { k.c.text_accent } else { k.c.icon_muted });
+    sidebar = sidebar.child(sidebar_row("hub-filter-all".into(), t("Todos", "All"), globe_icon, all_cards.len(), all_on, None));
+
+    for provider in Provider::ALL {
+        let count = all_cards.iter().filter(|c| c.provider == provider).count();
+        if count == 0 {
+            continue;
+        }
+        let on = active_filter == Some(provider);
+        let label = match provider {
+            Provider::GoogleDrive => "GoogleDrive",
+            _ => provider.label(),
+        };
+        sidebar = sidebar.child(sidebar_row(
+            format!("hub-filter-{provider:?}"),
+            label,
+            icon(provider.icon(), 17.0),
+            count,
+            on,
+            Some(provider),
+        ));
+    }
+
+    // Top bar inside Central de Contas: primary blue "+ Adicionar conta" + "Pesquisar" box.
+    let add_bg = if k.dark { rune::oklch(0.53, 0.16, 253.0) } else { rune::oklch(0.50, 0.165, 252.0) };
+    let add_hover = if k.dark { rune::oklch(0.57, 0.16, 253.0) } else { rune::oklch(0.46, 0.165, 252.0) };
+    let add_press = if k.dark { rune::oklch(0.48, 0.155, 253.0) } else { rune::oklch(0.42, 0.16, 252.0) };
+    let add_btn = k
+        .interactive(
+            row()
+                .key("hub-add-account")
+                .role("button")
+                .label(t("Adicionar conta", "Add account"))
+                .focusable(true)
+                .focus_ring(2.0, 1.0, k.c.border_focus)
+                .h(34.0)
+                .px(14.0)
+                .gap(8.0)
+                .center_y()
+                .radius(6.0)
+                .fill(add_bg)
+                .hover(add_hover)
+                .press(add_press)
+                .cursor(Cursor::Pointer)
+                .child(icon(&icons::PERSON_PLUS, 16.0).color(Color::WHITE))
+                .child(text(t("Adicionar conta", "Add account")).font(k.ty.text_small_medium).color(Color::WHITE)),
+        )
+        .on_press(crate::servers::ask_add);
+
+    let search_trailing: El = if !s.accounts_search.text.is_empty() {
+        row()
+            .key("hub-search-clear")
+            .role("button")
+            .label(t("Limpar pesquisa", "Clear search"))
+            .preserve_focus_on_press(true)
+            .size(20.0, 20.0)
+            .center()
+            .radius(k.radius.sm)
+            .hover(k.c.hover)
+            .cursor(Cursor::Pointer)
+            .on_press(|s: &mut State| {
+                s.accounts_search = rune::TextEdit::new("");
+                s.accounts_search.focused = true;
+            })
+            .child(icon(k.glyph.close, 12.0).color(k.c.icon_muted))
+    } else {
+        icon(&icons::SEARCH, 13.0).color(k.c.icon_muted)
+    };
+
+    let search_box = rune_kit::TextInput::new(&s.accounts_search)
+        .width(Some(248.0))
+        .label(t("Pesquisar contas", "Search accounts"))
+        .placeholder(t("Pesquisar", "Search"))
+        .trailing(search_trailing)
+        .on_edit(|s: &mut State| &mut s.accounts_search)
+        .build(k)
+        .key("hub-search");
+
+    let waiting_oauth = s.login.is_some() || s.servers.onedrive.login.is_some() || s.servers.dropbox_login.is_some();
+    let mut top_bar = row()
+        .key("accounts-topbar")
+        .w_full()
+        .gap(16.0)
+        .center_y()
+        .child(add_btn)
+        .child(search_box);
+
+    if waiting_oauth {
+        top_bar = top_bar.child(
+            row()
+                .key("hub-oauth-waiting")
+                .h(28.0)
+                .px(10.0)
+                .gap(7.0)
+                .center_y()
+                .radius(14.0)
+                .fill(k.alpha(k.c.text_accent, if k.dark { 0.16 } else { 0.09 }))
+                .child(el().size(6.5, 6.5).radius(3.5).fill(k.c.text_accent))
+                .child(text(t("Aguardando autorização no navegador…", "Waiting for authorization in the browser…")).font(k.ty.caption()).color(k.c.text_accent)),
+        );
+    }
+
+    let visible: Vec<&HubCard> = all_cards
+        .iter()
+        .filter(|c| active_filter.is_none_or(|p| c.provider == p) && c.matches_search(search_query))
+        .collect();
+
+    let card_bg = if k.dark { rune::oklch(0.245, 0.0, 0.0) } else { k.c.bg_base };
+    let card_border = if k.dark { k.alpha(k.c.white, 0.085) } else { k.c.border_weak };
+
+    let list_content: El = if all_cards.is_empty() {
+        col()
+            .key("hub-empty")
+            .w_full()
+            .max_w(540.0)
+            .mt(24.0)
+            .padding(28.0)
+            .gap(10.0)
+            .items_start()
+            .radius(10.0)
+            .fill(card_bg)
+            .border(1.0, card_border)
+            .child(icon(&icons::CLOUD, 32.0))
+            .child(text(t("Nenhuma conta conectada ainda", "No accounts connected yet")).font(k.ty.body_medium).color(k.c.text_base))
+            .child(
+                text(t(
+                    "Clique em “Adicionar conta” acima para conectar Google Drive, OneDrive, Dropbox, MEGA, Backblaze B2, Telegram ou um servidor SFTP, FTP ou WebDAV.",
+                    "Click “Add account” above to connect Google Drive, OneDrive, Dropbox, MEGA, Backblaze B2, Telegram or an SFTP, FTP or WebDAV server.",
+                ))
+                .font(k.ty.text_small)
+                .color(k.c.text_muted)
+                .wrap()
+                .w_full()
+                .min_w(0.0),
+            )
+    } else if visible.is_empty() {
+        col()
+            .key("hub-no-match")
+            .w_full()
+            .max_w(520.0)
+            .mt(12.0)
+            .padding(22.0)
+            .gap(10.0)
+            .items_start()
+            .radius(8.0)
+            .fill(card_bg)
+            .border(1.0, card_border)
+            .child(text(t("Nenhuma conta corresponde à pesquisa.", "No accounts match your search.")).font(k.ty.text_small_medium).color(k.c.text_base))
+            .child(
+                Button::new(t("Limpar filtros", "Clear filters"))
+                    .variant(ButtonVariant::Neutral)
+                    .on_press(|s: &mut State| {
+                        s.accounts_filter = None;
+                        s.accounts_search = rune::TextEdit::new("");
+                    })
+                    .build(k).cursor(Cursor::Pointer),
+            )
+    } else {
+        let mut cards = col().key("hub-cards").w_full().gap(10.0);
+        for c in visible {
+            // Identity line: bold Drive name + optional display name + muted email/host.
+            let mut head = row()
+                .w_full()
+                .gap(10.0)
+                .center_y()
+                .min_w(0.0)
+                .child(text(c.drive_name.clone()).font(k.ty.text_small_medium).color(k.c.text_base));
+
+            if let Some(u) = &c.user_name {
+                head = head.child(text(u.clone()).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0));
+            }
+            if !c.email_or_addr.is_empty() {
+                head = head.child(
+                    text(c.email_or_addr.clone())
+                        .font(k.ty.text_small)
+                        .color(k.c.text_muted)
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0)
+                        .help_when_truncated(c.email_or_addr.clone()),
+                );
+            }
+
+            // Storage / quota line: "Tamanho 15 GB  Livre 12,1 GB  [━━━━░░░░]"
+            let track_bg = k.alpha(k.c.text_base, if k.dark { 0.14 } else { 0.10 });
+            let quota_row: El = match &c.quota {
+                HubQuota::Known { total, free, used_frac, help } => {
+                    let bar_w = 132.0;
+                    let fill_w = if *used_frac > 0.0 { (bar_w * *used_frac).max(3.0) } else { 0.0 };
+                    let fill_color = if *used_frac >= 0.90 {
+                        k.c.danger.fg
+                    } else if *used_frac >= 0.78 {
+                        k.c.warning.fg
+                    } else {
+                        k.c.text_accent
+                    };
+                    let bar = row()
+                        .w(bar_w)
+                        .h(5.5)
+                        .radius(3.0)
+                        .fill(track_bg)
+                        .clip_soft(3.0)
+                        .child(el().w(fill_w).h_full().radius(3.0).fill(fill_color));
+                    row()
+                        .gap(8.0)
+                        .center_y()
+                        .help(help.clone())
+                        .child(text(t("Tamanho", "Size")).font(k.ty.text_xsmall).color(k.c.text_muted))
+                        .child(text(whole_size(*total)).font(k.ty.text_xsmall_medium).color(k.c.text_base))
+                        .child(text(t("Livre", "Free")).font(k.ty.text_xsmall).color(k.c.text_muted).ml(4.0))
+                        .child(text(format_size(*free)).font(k.ty.text_xsmall_medium).color(k.c.text_base))
+                        .child(bar.ml(4.0))
+                }
+                HubQuota::UnlimitedUsed { used, help } => row()
+                    .gap(8.0)
+                    .center_y()
+                    .help(help.clone())
+                    .child(text(t("Usado", "Used")).font(k.ty.text_xsmall).color(k.c.text_muted))
+                    .child(text(format_size(*used)).font(k.ty.text_xsmall_medium).color(k.c.text_base))
+                    .child(text("·").font(k.ty.text_xsmall).color(k.c.text_faint))
+                    .child(text(t("Ilimitado", "Unlimited")).font(k.ty.text_xsmall).color(k.c.text_muted)),
+                HubQuota::Loading => row()
+                    .gap(8.0)
+                    .center_y()
+                    .child(text(t("Tamanho", "Size")).font(k.ty.text_xsmall).color(k.c.text_muted))
+                    .child(text("—").font(k.ty.text_xsmall).color(k.c.text_faint))
+                    .child(text(t("Livre", "Free")).font(k.ty.text_xsmall).color(k.c.text_muted).ml(4.0))
+                    .child(row().w(120.0).h(5.0).radius(2.5).fill(track_bg).ml(2.0)),
+                HubQuota::Info(info) => row()
+                    .gap(6.0)
+                    .center_y()
+                    .child(text(info.clone()).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().min_w(0.0)),
+            };
+
+            let pane_btn = |side_key: &str, pane: usize, glyph: &'static Icon, short: &str, help_text: &str, active_here: bool, loc: Location| -> El {
+                let bg = if active_here {
+                    k.alpha(k.c.text_accent, if k.dark { 0.20 } else { 0.10 })
+                } else if k.dark {
+                    k.alpha(k.c.white, 0.045)
+                } else {
+                    k.alpha(k.c.black, 0.03)
+                };
+                let border = if active_here {
+                    k.alpha(k.c.text_accent, 0.45)
+                } else {
+                    k.c.border_weak
+                };
+                let ink = if active_here { k.c.text_accent } else { k.c.text_base };
+                let icon_ink = if active_here { k.c.text_accent } else { k.c.icon_muted };
+
+                k.interactive(
+                    row()
+                        .key(format!("{}-{side_key}", c.key))
+                        .role("button")
+                        .label(help_text.to_string())
+                        .help(help_text.to_string())
+                        .focusable(true)
+                        .focus_ring(2.0, 1.0, k.c.border_focus)
+                        .h(30.0)
+                        .px(9.0)
+                        .gap(5.5)
+                        .center_y()
+                        .radius(k.radius.sm)
+                        .fill(bg)
+                        .border(1.0, border)
+                        .hover(if active_here { k.alpha(k.c.text_accent, if k.dark { 0.28 } else { 0.16 }) } else { k.c.hover })
+                        .press(k.c.pressed)
+                        .cursor(Cursor::Pointer)
+                        .child(icon(glyph, 15.0).color(icon_ink))
+                        .child(text(short.to_string()).font(k.ty.text_xsmall_medium).color(ink)),
+                )
+                .on_press(move |s: &mut State| crate::open_account_in_pane(s, pane, loc.clone()))
+            };
+
+            let mut actions_bar = row()
+                .gap(6.0)
+                .center_y()
+                .child(pane_btn(
+                    "open-left",
+                    0,
+                    &icons::OPEN_LEFT_PANE,
+                    t("Esquerda", "Left"),
+                    t("Abrir este drive no painel esquerdo", "Open this drive in the left pane"),
+                    c.in_left,
+                    c.open_loc.clone(),
+                ))
+                .child(pane_btn(
+                    "open-right",
+                    1,
+                    &icons::OPEN_RIGHT_PANE,
+                    t("Direita", "Right"),
+                    t("Abrir este drive no painel direito", "Open this drive in the right pane"),
+                    c.in_right,
+                    c.open_loc.clone(),
+                ));
+
+            if let Some(edit_id) = &c.edit_id {
+                let id = edit_id.clone();
+                actions_bar = actions_bar.child(
+                    k.interactive(
+                        row()
+                            .key(format!("{}-edit", c.key))
+                            .role("button")
+                            .label(t("Editar conta", "Edit account"))
+                            .help(t("Editar endereço ou credenciais", "Edit address or credentials"))
+                            .focusable(true)
+                            .focus_ring(2.0, 1.0, k.c.border_focus)
+                            .size(30.0, 30.0)
+                            .center()
+                            .radius(k.radius.sm)
+                            .border(1.0, k.c.border_weak)
+                            .hover(k.c.hover)
+                            .press(k.c.pressed)
+                            .cursor(Cursor::Pointer)
+                            .child(icon(&icons::M_RENAME, 14.0).color(k.c.icon_muted)),
+                    )
+                    .on_press(move |s: &mut State| crate::servers::ask_edit(s, &id)),
+                );
+            }
+
+            let target = c.remove_target.clone();
+            let prov_name = c.drive_name.clone();
+            let who = c.email_or_addr.clone();
+            let del_btn = k
+                .interactive(
+                    row()
+                        .key(format!("{}-delete", c.key))
+                        .role("button")
+                        .label(t("Remover conta", "Remove account"))
+                        .help(t("Remover esta conta do Open Explorer", "Remove this account from Open Explorer"))
+                        .focusable(true)
+                        .focus_ring(2.0, 1.0, k.c.border_focus)
+                        .size(30.0, 30.0)
+                        .center()
+                        .radius(k.radius.sm)
+                        .border(1.0, k.c.border_weak)
+                        .hover(k.alpha(k.c.danger.fg, if k.dark { 0.18 } else { 0.10 }))
+                        .press(k.alpha(k.c.danger.fg, if k.dark { 0.26 } else { 0.16 }))
+                        .cursor(Cursor::Pointer)
+                        .child(icon(&icons::M_DELETE, 14.5).color(k.c.danger.fg)),
+                )
+                .on_press(move |s: &mut State| {
+                    s.dialog = Some(Dialog::RemoveAccount {
+                        target: target.clone(),
+                        provider: prov_name.clone(),
+                        who: who.clone(),
+                    });
+                });
+            actions_bar = actions_bar.child(del_btn);
+
+            let card = row()
+                .key(format!("hub-card-{}", c.key))
+                .w_full()
+                .max_w(880.0)
+                .px(16.0)
+                .py(13.0)
+                .gap(14.0)
+                .center_y()
+                .radius(8.0)
+                .fill(card_bg)
+                .border(1.0, card_border)
+                .child(row().size(38.0, 38.0).center().child(icon(c.provider.icon(), 33.0)))
+                .child(col().grow(1.0).w(0.0).min_w(0.0).gap(5.0).child(head).child(quota_row))
+                .child(actions_bar);
+
+            cards = cards.child(card);
+        }
+        cards
+    };
+
+    let bar = bar_style(k);
+    let scroll = col()
+        .key("accounts-scroll")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .scroll(ScrollSpec { stick_bottom: false })
+        .child(col().w_full().pr(bar.strip()).pb(16.0).child(list_content))
+        .scroll_bar_styled(bar);
+
+    let main_col = col()
+        .key("accounts-main")
+        .grow(1.0)
+        .w(0.0)
+        .min_w(0.0)
+        .h_full()
+        .pt(14.0)
+        .px(18.0)
+        .gap(14.0)
+        .child(top_bar)
+        .child(scroll);
+
+    row()
+        .key("accounts-hub")
+        .w_full()
+        .grow(1.0)
+        .min_h(160.0)
+        .child(sidebar)
+        .child(main_col)
 }
 
 // ---------------------------------------------------------------------------------------------

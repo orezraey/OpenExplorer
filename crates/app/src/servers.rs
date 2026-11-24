@@ -36,6 +36,7 @@ pub struct Servers {
     pub mega_watch: std::collections::HashMap<String, crate::mega::Watch>,
     /// The Dropbox accounts' own list, their storage and their longpolls (see `dropbox.rs`).
     pub dropbox: openexplorer_dropbox::store::Store,
+    pub dropbox_accounts: Vec<openexplorer_dropbox::store::StoredAccount>,
     pub dropbox_quotas: std::collections::HashMap<String, Option<openexplorer_dropbox::Quota>>,
     pub dropbox_watch: std::collections::HashMap<String, crate::dropbox::Watch>,
     /// The Dropbox login waiting for the browser, by its attempt.
@@ -61,14 +62,15 @@ impl Servers {
         let mut list = store.servers();
         list.extend(crate::mega::servers(&mega));
         let dropbox = crate::dropbox::store();
-        list.extend(crate::dropbox::servers(&dropbox));
+        let dropbox_accounts = dropbox.accounts();
+        list.extend(dropbox_accounts.iter().map(|a| Server::dropbox(&a.email)));
         let b2 = crate::b2::store();
         list.extend(crate::b2::servers(&b2));
         let onedrive = crate::onedrive::Side::load();
         list.extend(onedrive.servers());
         let telegram = crate::telegram::store();
         list.extend(crate::telegram::servers(&telegram));
-        Servers { list, pool: Arc::default(), store, mega, mega_quotas: Default::default(), mega_watch: Default::default(), dropbox, dropbox_quotas: Default::default(), dropbox_watch: Default::default(), dropbox_login: None, b2, b2_watch: Default::default(), onedrive, telegram, telegram_watch: Default::default(), attempts: 0 }
+        Servers { list, pool: Arc::default(), store, mega, mega_quotas: Default::default(), mega_watch: Default::default(), dropbox, dropbox_accounts, dropbox_quotas: Default::default(), dropbox_watch: Default::default(), dropbox_login: None, b2, b2_watch: Default::default(), onedrive, telegram, telegram_watch: Default::default(), attempts: 0 }
     }
 }
 
@@ -861,8 +863,7 @@ impl ProviderVariant {
 }
 
 impl Provider {
-    /// Every provider; the picker lists variants, so only the tests walk this.
-    #[cfg(test)]
+    /// Every supported provider in canonical display order.
     pub const ALL: [Provider; 11] = [
         Provider::GoogleDrive,
         Provider::OneDrive,

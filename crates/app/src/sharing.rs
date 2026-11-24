@@ -271,7 +271,7 @@ fn person_row(k: &Kit, sh: &Share, p: &openexplorer_gdrive::Permission) -> El {
         let id = p.id.clone();
         line = line.child(roles(k, format!("role-{}", p.id), p.role, enabled, move |s, r| set_role(s, id.clone(), r)));
         let id = p.id.clone();
-        line = line.child(Button::new(t("Remover", "Remove")).variant(ButtonVariant::GhostMuted).disabled(!enabled).on_press(move |s: &mut State| remove(s, id.clone())).build(k).key(format!("remove-{}", p.id)));
+        line = line.child(Button::new(t("Remover", "Remove")).variant(ButtonVariant::GhostMuted).disabled(!enabled).on_press(move |s: &mut State| remove(s, id.clone())).build(k).cursor(rune::Cursor::Pointer).key(format!("remove-{}", p.id)));
     }
     line
 }
@@ -302,7 +302,7 @@ pub fn share_dialog(s: &State, k: &Kit, sh: &Share, layer: &mut Vec<El>) {
         .gap(8.0)
         .center_y()
         .child(input)
-        .child(Button::new(t("Compartilhar", "Share")).variant(ButtonVariant::Submit).disabled(!can).on_press(add_person).build(k).key("share-add"));
+        .child(Button::new(t("Compartilhar", "Share")).variant(ButtonVariant::Submit).disabled(!can).on_press(add_person).build(k).cursor(rune::Cursor::Pointer).key("share-add"));
     let options = row()
         .key("add-options")
         .w_full()
@@ -364,7 +364,7 @@ pub fn share_dialog(s: &State, k: &Kit, sh: &Share, layer: &mut Vec<El>) {
                             tx.copy(url.clone());
                             s.status = t("Link copiado.", "Link copied.").into();
                         })
-                        .build(k)
+                        .build(k).cursor(rune::Cursor::Pointer)
                         .key("copy-link"),
                 );
             }
@@ -383,7 +383,7 @@ pub fn share_dialog(s: &State, k: &Kit, sh: &Share, layer: &mut Vec<El>) {
             .gap(8.0)
             .center_y()
             .child(text(status).font(k.ty.text_small).color(k.c.text_muted).grow(1.0))
-            .child(Button::new(t("Concluído", "Done")).variant(ButtonVariant::Submit).on_press(close).build(k)),
+            .child(Button::new(t("Concluído", "Done")).variant(ButtonVariant::Submit).on_press(close).build(k).cursor(rune::Cursor::Pointer)),
     );
     Modal::new("share", tr!("Compartilhar \"{}\"", "Share \"{}\"", sh.item.name)).open(true).child(body).width(600.0).fit().on_close(close).build(k, layer);
 }
@@ -408,9 +408,9 @@ pub fn public_dialog(k: &Kit, m: &MakePublic, layer: &mut Vec<El>) {
                 .pt(8.0)
                 .gap(8.0)
                 .justify_end()
-                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k))
-                .child(Button::new(t("Copiar sem mudar", "Copy without changing")).variant(ButtonVariant::Neutral).on_press_tx(|s: &mut State, tx: &mut Tx| copy_as_is(s, tx)).build(k))
-                .child(Button::new(t("Permitir e copiar", "Allow and copy")).variant(ButtonVariant::Submit).on_press(make_public).build(k)),
+                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k).cursor(rune::Cursor::Pointer))
+                .child(Button::new(t("Copiar sem mudar", "Copy without changing")).variant(ButtonVariant::Neutral).on_press_tx(|s: &mut State, tx: &mut Tx| copy_as_is(s, tx)).build(k).cursor(rune::Cursor::Pointer))
+                .child(Button::new(t("Permitir e copiar", "Allow and copy")).variant(ButtonVariant::Submit).on_press(make_public).build(k).cursor(rune::Cursor::Pointer)),
         );
     Modal::new("make-public", t("Liberar o link?", "Turn on the link?")).open(true).child(body).width(480.0).fit().on_close(close).build(k, layer);
 }

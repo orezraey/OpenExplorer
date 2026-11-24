@@ -32,6 +32,13 @@ pub struct Clip {
     pub items: Vec<Entry>,
 }
 
+/// Target of a connected account or server removal in the Central de Contas.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AccountTarget {
+    GoogleDrive(String),
+    Server(String),
+}
+
 /// The dialog open over the window, if any.
 pub enum Dialog {
     Delete { pane: usize, items: Vec<Entry> },
@@ -39,6 +46,8 @@ pub enum Dialog {
     Purge { pane: usize, items: Vec<Entry> },
     /// Esvaziar lixeira of an account.
     EmptyTrash { email: String },
+    /// Remover conta / servidor da Central de Contas.
+    RemoveAccount { target: AccountTarget, provider: String, who: String },
     /// The name being typed is `State::name_edit`.
     NewFolder { pane: usize, error: Option<String> },
     Properties(Box<Props>),
@@ -63,6 +72,21 @@ pub enum Dialog {
 pub fn selected(s: &State, p: usize) -> Vec<Entry> {
     let pane = &s.panes[p];
     pane.entries.iter().filter(|e| pane.selected.contains(&e.id)).cloned().collect()
+}
+
+pub fn confirm_remove_account(s: &mut State) {
+    let Some(Dialog::RemoveAccount { target, .. }) = s.dialog.take() else { return };
+    match target {
+        AccountTarget::GoogleDrive(email) => crate::disconnect(s, &email),
+        AccountTarget::Server(id) => crate::servers::remove(s, &id),
+    }
+    // The provider's last account gone, its filter goes too: else it would come back on its
+    // own with the next account of that kind.
+    if let Some(p) = s.accounts_filter
+        && !crate::ui::hub_cards(s).iter().any(|c| c.provider == p)
+    {
+        s.accounts_filter = None;
+    }
 }
 
 /// The folder a Drive location shows, to write into: (account, folder id). `None` for the

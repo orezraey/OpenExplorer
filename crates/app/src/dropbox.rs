@@ -28,11 +28,6 @@ pub fn store() -> dropbox::store::Store {
     dropbox::store::Store::at(openexplorer_gdrive::config_dir().join("dropbox-accounts.json"))
 }
 
-/// The servers the connected accounts show as.
-pub fn servers(store: &dropbox::store::Store) -> Vec<Server> {
-    store.accounts().into_iter().map(|a| Server::dropbox(&a.email)).collect()
-}
-
 /// The Dropbox account a location is in, and the path below its top.
 pub fn at(loc: &Location) -> Option<(&Server, &[String])> {
     match loc {
@@ -221,8 +216,12 @@ fn connected(s: &mut State, result: Result<StoredAccount, String>) {
         }
     };
     let email = account.email.clone();
-    if let Err(e) = s.servers.dropbox.add(account) {
+    if let Err(e) = s.servers.dropbox.add(account.clone()) {
         return crate::fail(s, e);
+    }
+    match s.servers.dropbox_accounts.iter_mut().find(|a| a.email.eq_ignore_ascii_case(&email)) {
+        Some(a) => *a = account,
+        None => s.servers.dropbox_accounts.push(account),
     }
     openexplorer_gdrive::log(&format!("conta Dropbox conectada: {email}"));
     let server = Server::dropbox(&email);
@@ -244,6 +243,7 @@ pub fn remove(s: &mut State, server: &Server) -> bool {
         crate::fail(s, e);
         return false;
     }
+    s.servers.dropbox_accounts.retain(|a| !a.email.eq_ignore_ascii_case(&server.user));
     dropbox::disconnect(&server.user);
     s.servers.dropbox_quotas.remove(&server.id);
     s.servers.dropbox_watch.remove(&server.id);
@@ -295,7 +295,7 @@ pub fn account_step(s: &State, k: &Kit, f: &Form, banner: El, close: fn(&mut Sta
                     crate::fail(s, tr!("Não consegui abrir o navegador: {e:?}", "Couldn't open the browser: {e:?}"));
                 }
             })
-            .build(k);
+            .build(k).cursor(rune::Cursor::Pointer);
         let how = tr!(
             "Crie um app em Create app: Scoped access, Full Dropbox. Em Permissions marque files.metadata.read e .write, files.content.read e .write, sharing.read e .write e account_info.read, e clique em Submit. Em Settings › OAuth 2 › Redirect URIs adicione http://localhost:{port}. Depois cole a App key aqui (não é preciso o App secret).",
             "Create an app with Create app: Scoped access, Full Dropbox. On Permissions tick files.metadata.read and .write, files.content.read and .write, sharing.read and .write and account_info.read, then click Submit. On Settings › OAuth 2 › Redirect URIs add http://localhost:{port}. Then paste the App key here (the App secret isn't needed)."
@@ -336,7 +336,7 @@ pub fn account_step(s: &State, k: &Kit, f: &Form, banner: El, close: fn(&mut Sta
                                 f.client_id.focused = true;
                             }
                         })
-                        .build(k),
+                        .build(k).cursor(rune::Cursor::Pointer),
                 ),
         );
     }
@@ -348,10 +348,10 @@ pub fn account_step(s: &State, k: &Kit, f: &Form, banner: El, close: fn(&mut Sta
         .w_full()
         .gap(8.0)
         .center_y()
-        .child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).on_press(crate::servers::back_to_pick).build(k))
+        .child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).on_press(crate::servers::back_to_pick).build(k).cursor(rune::Cursor::Pointer))
         .child(el().grow(1.0))
-        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close).build(k))
-        .child(Button::new(t("Conectar no navegador", "Connect in browser")).variant(ButtonVariant::Submit).on_press_tx(submit).build(k).default_button());
+        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close).build(k).cursor(rune::Cursor::Pointer))
+        .child(Button::new(t("Conectar no navegador", "Connect in browser")).variant(ButtonVariant::Submit).on_press_tx(submit).build(k).cursor(rune::Cursor::Pointer).default_button());
     (inner, actions)
 }
 
@@ -583,8 +583,8 @@ pub fn deleted_dialog(k: &Kit, v: &DeletedView, layer: &mut Vec<El>) {
             .pt(8.0)
             .gap(8.0)
             .justify_end()
-            .child(Button::new(t("Fechar", "Close")).variant(ButtonVariant::Neutral).on_press(close).build(k))
-            .child(Button::new(label).variant(ButtonVariant::Submit).disabled(picked == 0).on_press(restore_picked).build(k).default_button()),
+            .child(Button::new(t("Fechar", "Close")).variant(ButtonVariant::Neutral).on_press(close).build(k).cursor(rune::Cursor::Pointer))
+            .child(Button::new(label).variant(ButtonVariant::Submit).disabled(picked == 0).on_press(restore_picked).build(k).cursor(rune::Cursor::Pointer).default_button()),
     );
     let title = tr!("Itens excluídos de “{}”", "Deleted items of “{}”", v.place);
     Modal::new("dropbox-deleted", title).open(true).child(body).width(520.0).fit().on_close(close).build(k, layer);
@@ -658,8 +658,8 @@ pub fn link_dialog(k: &Kit, m: &MakeLink, layer: &mut Vec<El>) {
                 .pt(8.0)
                 .gap(8.0)
                 .justify_end()
-                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k))
-                .child(Button::new(t("Criar link e copiar", "Make link and copy")).variant(ButtonVariant::Submit).on_press(make_link).build(k).default_button()),
+                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k).cursor(rune::Cursor::Pointer))
+                .child(Button::new(t("Criar link e copiar", "Make link and copy")).variant(ButtonVariant::Submit).on_press(make_link).build(k).cursor(rune::Cursor::Pointer).default_button()),
         );
     Modal::new("dropbox-link", t("Criar link compartilhado?", "Make a shared link?")).open(true).child(body).width(480.0).fit().on_close(close).build(k, layer);
 }

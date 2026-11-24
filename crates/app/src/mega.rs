@@ -441,8 +441,8 @@ pub fn link_dialog(k: &Kit, m: &MakeLink, layer: &mut Vec<El>) {
                 .pt(8.0)
                 .gap(8.0)
                 .justify_end()
-                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k))
-                .child(Button::new(t("Criar link e copiar", "Make link and copy")).variant(ButtonVariant::Submit).on_press(make_link).build(k).default_button()),
+                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k).cursor(rune::Cursor::Pointer))
+                .child(Button::new(t("Criar link e copiar", "Make link and copy")).variant(ButtonVariant::Submit).on_press(make_link).build(k).cursor(rune::Cursor::Pointer).default_button()),
         );
     Modal::new("mega-link", t("Criar link público?", "Make a public link?")).open(true).child(body).width(480.0).fit().on_close(close).build(k, layer);
 }

@@ -910,9 +910,9 @@ pub fn unfinished_dialog(k: &Kit, d: &Unfinished, layer: &mut Vec<El>) {
                     .center_y()
                     .child(col().grow(1.0).min_w(0.0).gap(2.0).child(text(r.name.clone()).font(k.ty.text_small_medium).color(k.c.text_base).wrap().w_full().min_w(0.0)).child(small(unfinished_detail(r))));
                 if r.local.is_some() && !r.sending {
-                    line = line.child(Button::new(t("Retomar", "Resume")).variant(ButtonVariant::Neutral).disabled(d.busy).on_press(move |s: &mut State| resume_upload(s, &again)).build(k));
+                    line = line.child(Button::new(t("Retomar", "Resume")).variant(ButtonVariant::Neutral).disabled(d.busy).on_press(move |s: &mut State| resume_upload(s, &again)).build(k).cursor(rune::Cursor::Pointer));
                 }
-                line = line.child(Button::new(t("Cancelar envio", "Cancel upload")).variant(ButtonVariant::Neutral).disabled(d.busy || r.sending).on_press(move |s: &mut State| cancel_uploads(s, vec![id.clone()])).build(k));
+                line = line.child(Button::new(t("Cancelar envio", "Cancel upload")).variant(ButtonVariant::Neutral).disabled(d.busy || r.sending).on_press(move |s: &mut State| cancel_uploads(s, vec![id.clone()])).build(k).cursor(rune::Cursor::Pointer));
                 list = list.child(line);
             }
             inner = inner.child(col().key("unfinished-rows").w_full().max_h(320.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(list));
@@ -935,10 +935,10 @@ pub fn unfinished_dialog(k: &Kit, d: &Unfinished, layer: &mut Vec<El>) {
         .pb(16.0)
         .gap(8.0)
         .center_y()
-        .child(Button::new(t("Atualizar", "Refresh")).variant(ButtonVariant::Neutral).disabled(d.busy).on_press(list_unfinished).build(k))
+        .child(Button::new(t("Atualizar", "Refresh")).variant(ButtonVariant::Neutral).disabled(d.busy).on_press(list_unfinished).build(k).cursor(rune::Cursor::Pointer))
         .child(rune::el().grow(1.0))
-        .child(Button::new(all).variant(ButtonVariant::Danger).disabled(d.busy || cancellable == 0).on_press(cancel_all_uploads).build(k))
-        .child(Button::new(t("Fechar", "Close")).variant(ButtonVariant::Neutral).on_press(close).build(k).default_button());
+        .child(Button::new(all).variant(ButtonVariant::Danger).disabled(d.busy || cancellable == 0).on_press(cancel_all_uploads).build(k).cursor(rune::Cursor::Pointer))
+        .child(Button::new(t("Fechar", "Close")).variant(ButtonVariant::Neutral).on_press(close).build(k).cursor(rune::Cursor::Pointer).default_button());
     let title = tr!("Envios inacabados · {}", "Unfinished uploads · {}", d.bucket);
     Modal::new("b2-unfinished", title).open(true).child(col().w_full().child(inner).child(actions)).width(620.0).fit().on_close(close).build(k, layer);
 }
@@ -1046,18 +1046,18 @@ pub fn form(k: &Kit, f: &Form, banner: El, eye: El, close: fn(&mut State, &mut T
         inner = inner.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0));
     }
     let connect = if checking {
-        Button::new(t("Conectando…", "Connecting…")).variant(ButtonVariant::Submit).disabled(true).build(k)
+        Button::new(t("Conectando…", "Connecting…")).variant(ButtonVariant::Submit).disabled(true).build(k).cursor(rune::Cursor::Pointer)
     } else {
-        Button::new(t("Conectar", "Connect")).variant(ButtonVariant::Submit).on_press(submit).build(k).default_button()
+        Button::new(t("Conectar", "Connect")).variant(ButtonVariant::Submit).on_press(submit).build(k).cursor(rune::Cursor::Pointer).default_button()
     };
     let actions = row()
         .key("actions")
         .w_full()
         .gap(8.0)
         .center_y()
-        .child(Button::new(t("Voltar", "Back")).icon(&crate::icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(crate::servers::back_to_pick).build(k))
+        .child(Button::new(t("Voltar", "Back")).icon(&crate::icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(crate::servers::back_to_pick).build(k).cursor(rune::Cursor::Pointer))
         .child(rune::el().grow(1.0))
-        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close).build(k))
+        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close).build(k).cursor(rune::Cursor::Pointer))
         .child(connect);
     (inner, actions)
 }

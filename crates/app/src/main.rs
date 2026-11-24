@@ -134,7 +134,17 @@ impl Part {
     const WHOLE: Part = Part::Page { first: true, more: false };
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MainTab {
+    #[default]
+    Explore,
+    Accounts,
+}
+
 struct State {
+    main_tab: MainTab,
+    accounts_filter: Option<servers::Provider>,
+    accounts_search: rune::TextEdit,
     panes: [Pane; 2],
     /// The context menu: the pane it was opened in and where.
     menu: Option<(usize, rune::PointerPress)>,
@@ -273,6 +283,9 @@ impl State {
         let (outbox, inbox) = channel();
         let loc = Location::Mock(Vec::new());
         State {
+            main_tab: MainTab::Explore,
+            accounts_filter: None,
+            accounts_search: rune::TextEdit::new(""),
             panes: [Pane::new(loc.clone()), Pane::new(loc)],
             menu: None,
             lasso: None,
@@ -309,6 +322,7 @@ impl State {
                 mega_quotas: Default::default(),
                 mega_watch: Default::default(),
                 dropbox: openexplorer_dropbox::store::Store::at(PathBuf::new()),
+                dropbox_accounts: Vec::new(),
                 dropbox_quotas: Default::default(),
                 dropbox_watch: Default::default(),
                 dropbox_login: None,
@@ -469,6 +483,9 @@ fn init() -> State {
     let accounts = store::accounts();
     let tree = tree::Tree::new(accounts.iter().map(|a| a.email.clone()));
     State {
+        main_tab: MainTab::Explore,
+        accounts_filter: None,
+        accounts_search: rune::TextEdit::new(""),
         panes,
         menu: None,
         lasso: None,
@@ -1127,6 +1144,43 @@ fn ask_quota(s: &mut State, email: &str) {
     s.quotas.entry(email.to_string()).or_insert(None);
     let who = email.to_string();
     drive_task(s, email, t("ler a cota", "read the storage quota"), |d| d.quota(), move |result| Msg::Quota { email: who, result });
+}
+
+/// Ensures every connected cloud account has requested its storage quota at least once.
+pub(crate) fn ensure_all_quotas(s: &mut State) {
+    let emails: Vec<String> = s.accounts.iter().filter(|a| !s.quotas.contains_key(&a.email)).map(|a| a.email.clone()).collect();
+    for email in emails {
+        ask_quota(s, &email);
+    }
+    let pending: Vec<openexplorer_remote::Server> = s.servers.list.iter().filter(|sv| accounts::quota_unasked(s, sv)).cloned().collect();
+    for sv in pending {
+        accounts::ask_quota(s, &sv);
+    }
+}
+
+/// Refreshes storage quotas for all connected cloud accounts.
+pub(crate) fn refresh_all_quotas(s: &mut State) {
+    let emails: Vec<String> = s.accounts.iter().map(|a| a.email.clone()).collect();
+    for email in emails {
+        ask_quota(s, &email);
+    }
+    let clouds: Vec<openexplorer_remote::Server> = s.servers.list.iter().filter(|sv| accounts::Account::of(sv).is_some()).cloned().collect();
+    for sv in clouds {
+        accounts::ask_quota(s, &sv);
+    }
+}
+
+pub(crate) fn set_main_tab(s: &mut State, tab: MainTab) {
+    s.main_tab = tab;
+    if tab == MainTab::Accounts {
+        ensure_all_quotas(s);
+    }
+}
+
+/// Opens `loc` in pane `p` (0 = left, 1 = right) and switches to `Explorar`.
+pub(crate) fn open_account_in_pane(s: &mut State, p: usize, loc: Location) {
+    s.main_tab = MainTab::Explore;
+    navigate(s, p, loc);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2326,6 +2380,16 @@ fn main() {
                 let d = |id: &str, name: &str| Entry { id: id.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
                 s.panes[1].set_entries(Ok(vec![d("0AAa", "Equipe de design"), d("0AAb", "Financeiro"), d("0AAc", "Projetos 2026")]));
             }),
+            ("accounts-hub", accounts_hub_scene),
+            ("accounts-hub-empty", |s| {
+                s.accounts.clear();
+                s.servers.list.clear();
+                s.main_tab = MainTab::Accounts;
+            }),
+            ("accounts-hub-light", |s| {
+                accounts_hub_scene(s);
+                s.settings.theme = settings::Theme::Light;
+            }),
         ],
         ..AppSpec::new("Open Explorer", (1280.0, 760.0), init, ui::view)
     };
@@ -2488,6 +2552,58 @@ fn main() {
         .run();
 }
 
+/// Central de Contas with connected cloud accounts and servers, without a network.
+fn accounts_hub_scene(s: &mut State) {
+    s.accounts = vec![
+        StoredAccount { email: "caua@gmail.com".into(), name: "Cauã Silva".into() },
+    ];
+    s.quotas.insert(
+        "caua@gmail.com".into(),
+        Some(Quota { limit: Some(16_106_127_360), usage: 3_113_851_289, in_drive: 2_400_000_000, in_trash: 18_000_000 }),
+    );
+    let od_acc = openexplorer_onedrive::StoredAccount {
+        id: "b!exemplo".into(),
+        email: "caua@outlook.com".into(),
+        name: "Cauã Silva".into(),
+        business: false,
+    };
+    let od_sv = onedrive::server_of(&od_acc);
+    s.servers.onedrive.accounts = vec![od_acc];
+    s.servers.onedrive.quotas.insert(
+        od_sv.id.clone(),
+        Some(openexplorer_onedrive::Quota {
+            total: 1_099_511_627_776,
+            used: 214_748_364_800,
+            remaining: 884_763_262_976,
+            deleted: 1_073_741_824,
+            state: "normal".into(),
+        }),
+    );
+    let mega_sv = openexplorer_remote::Server::mega("caua@mega.nz");
+    s.servers.mega_quotas.insert(
+        mega_sv.id.clone(),
+        Some(openexplorer_mega::Quota { total: 21_474_836_480, used: 5_798_205_849, in_rubbish: 536_870_912 }),
+    );
+    let sftp_sv = openexplorer_remote::Server {
+        id: "nas-home".into(),
+        name: "NAS de Casa".into(),
+        protocol: openexplorer_remote::Protocol::Sftp,
+        brand: None,
+        host: "192.168.0.10".into(),
+        port: 22,
+        user: "caua".into(),
+        root: "/mnt/storage".into(),
+        key: None,
+        host_key: None,
+        cert: None,
+        connections: 4,
+        implicit: false,
+    };
+    s.servers.list = vec![od_sv, mega_sv, sftp_sv];
+    s.panes[1].go(Location::drive("caua@gmail.com", Space::MyDrive));
+    s.main_tab = MainTab::Accounts;
+}
+
 /// Rune's flags: what the command line says, with scroll bars always shown on Windows unless
 /// it says otherwise. Rune reads the "Show scroll bars" preference only on macOS and elsewhere
 /// fades bars out at rest; on Windows, as in Explorer, a list shows where it stands.
@@ -2514,6 +2630,53 @@ mod tests {
         assert!(s.account_form.is_some() && s.account_closes == 0);
         s.account_window_closed();
         assert!(s.account_form.is_none());
+    }
+
+    #[test]
+    fn accounts_hub_lists_filters_opens_panes_and_removes() {
+        let mut s = init();
+        s.accounts = vec![StoredAccount { email: "ana@gmail.com".into(), name: "Ana Souza".into() }];
+        s.quotas.insert(
+            "ana@gmail.com".into(),
+            Some(Quota { limit: Some(15_000_000_000), usage: 5_000_000_000, in_drive: 4_000_000_000, in_trash: 0 }),
+        );
+        let sftp = openexplorer_remote::Server {
+            id: "s1".into(),
+            name: "NAS Escritório".into(),
+            protocol: openexplorer_remote::Protocol::Sftp,
+            brand: None,
+            host: "10.0.0.5".into(),
+            port: 22,
+            user: "ana".into(),
+            root: "/dados".into(),
+            key: None,
+            host_key: None,
+            cert: None,
+            connections: 4,
+            implicit: false,
+        };
+        s.servers.list = vec![sftp];
+        set_main_tab(&mut s, MainTab::Accounts);
+
+        let cards = ui::hub_cards(&s);
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].drive_name, "GoogleDrive");
+        assert_eq!(cards[0].user_name.as_deref(), Some("Ana Souza"));
+        assert_eq!(cards[0].email_or_addr, "ana@gmail.com");
+        assert!(matches!(cards[0].quota, ui::HubQuota::Known { total: 15_000_000_000, free: 10_000_000_000, .. }));
+        assert!(cards[0].matches_search("souza"));
+        assert!(!cards[0].matches_search("10.0.0.5"));
+
+        assert_eq!(cards[1].drive_name, "SFTP");
+        assert_eq!(cards[1].user_name.as_deref(), Some("NAS Escritório"));
+        assert_eq!(cards[1].email_or_addr, "ana@10.0.0.5");
+        assert!(cards[1].edit_id.is_some());
+
+        // Opening in left pane switches back to Explorar and navigates pane 0.
+        open_account_in_pane(&mut s, 0, cards[0].open_loc.clone());
+        assert_eq!(s.main_tab, MainTab::Explore);
+        assert_eq!(s.active, 0);
+        assert_eq!(s.panes[0].loc, Location::drive("ana@gmail.com", Space::MyDrive));
     }
 
     /// What one window turn costs in the move of the shared state: Rune runs a turn for every

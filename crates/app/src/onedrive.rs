@@ -395,7 +395,7 @@ pub fn configure(s: &State, k: &Kit, f: &Form, banner: El, close: fn(&mut State,
                     crate::fail(s, tr!("Não consegui abrir o navegador: {e:?}", "Couldn't open the browser: {e:?}"));
                 }
             })
-            .build(k);
+            .build(k).cursor(rune::Cursor::Pointer);
         inner = inner.child(
             col()
                 .key("onedrive-client")
@@ -418,10 +418,10 @@ pub fn configure(s: &State, k: &Kit, f: &Form, banner: El, close: fn(&mut State,
         .w_full()
         .gap(8.0)
         .center_y()
-        .child(Button::new(t("Voltar", "Back")).icon(&crate::icons::BACK).variant(ButtonVariant::Neutral).on_press(crate::servers::back_to_pick).build(k))
+        .child(Button::new(t("Voltar", "Back")).icon(&crate::icons::BACK).variant(ButtonVariant::Neutral).on_press(crate::servers::back_to_pick).build(k).cursor(rune::Cursor::Pointer))
         .child(rune::el().grow(1.0))
-        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close).build(k))
-        .child(Button::new(t("Conectar no navegador", "Connect in browser")).variant(ButtonVariant::Submit).on_press_tx(submit).build(k).default_button());
+        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close).build(k).cursor(rune::Cursor::Pointer))
+        .child(Button::new(t("Conectar no navegador", "Connect in browser")).variant(ButtonVariant::Submit).on_press_tx(submit).build(k).cursor(rune::Cursor::Pointer).default_button());
     (inner, actions)
 }
 
@@ -578,7 +578,7 @@ pub fn bin_notice(s: &State, k: &Kit, p: usize) -> Option<El> {
             .child(text(t("A Lixeira desta conta precisa de autorização", "This account's recycle bin needs authorization")).font(k.ty.text_small_medium).color(k.c.text_base))
             .child(small(od::bin::consent_help(), k.c.text_muted))
             .children((!why.is_empty()).then(|| small(tr!("A Microsoft disse: {why}", "Microsoft said: {why}"), k.c.text_faint)))
-            .child(row().gap(8.0).child(grant.build(k)).child(portal.build(k))),
+            .child(row().gap(8.0).child(grant.build(k).cursor(rune::Cursor::Pointer)).child(portal.build(k).cursor(rune::Cursor::Pointer))),
     )
 }
 
@@ -687,8 +687,8 @@ pub fn link_dialog(k: &Kit, m: &MakeLink, layer: &mut Vec<El>) {
                 .pt(8.0)
                 .gap(8.0)
                 .justify_end()
-                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k))
-                .child(Button::new(t("Criar link e copiar", "Make link and copy")).variant(ButtonVariant::Submit).on_press(make_link).build(k).default_button()),
+                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k).cursor(rune::Cursor::Pointer))
+                .child(Button::new(t("Criar link e copiar", "Make link and copy")).variant(ButtonVariant::Submit).on_press(make_link).build(k).cursor(rune::Cursor::Pointer).default_button()),
         );
     Modal::new("onedrive-link", t("Criar link de compartilhamento?", "Make a sharing link?")).open(true).child(body).width(480.0).fit().on_close(close).build(k, layer);
 }
