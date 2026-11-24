@@ -247,19 +247,20 @@ pub fn prepare(f: &mut Form) {
 }
 
 fn client_field(s: &mut State) -> &mut TextEdit {
-    match &mut s.dialog {
-        Some(Dialog::Server(f)) => &mut f.client_id,
-        _ => &mut s.name_edit,
+    match &mut s.account_form {
+        Some(f) => &mut f.client_id,
+        None => &mut s.name_edit,
     }
 }
 
 /// Conectar no navegador: the registration typed (kept for next time) or saved, then the
 /// browser opens Microsoft's sign-in and a thread waits for it to come back.
 pub fn submit(s: &mut State, tx: &mut Tx) {
-    let Some(Dialog::Server(f)) = &mut s.dialog else { return };
+    let Some(f) = &mut s.account_form else { return };
     f.error = None;
     let typed = f.client_id.text.trim().to_string();
-    let cfg = if !typed.is_empty() {
+    let tenant_override = (!f.custom_oauth).then_some(f.onedrive_tenant).flatten();
+    let mut cfg = if !typed.is_empty() {
         match od::ClientConfig::parse(&typed).and_then(|c| c.save().map(|_| c)) {
             Ok(c) => c,
             Err(e) => {
@@ -278,6 +279,11 @@ pub fn submit(s: &mut State, tx: &mut Tx) {
             }
         }
     };
+    if let Some(tenant) = tenant_override
+        && cfg.tenant == "common"
+    {
+        cfg.tenant = tenant.into();
+    }
     let pending = match od::oauth::begin(&cfg, &od::graph::Endpoints::default()) {
         Ok(p) => p,
         Err(e) => {
@@ -292,8 +298,9 @@ pub fn submit(s: &mut State, tx: &mut Tx) {
     s.servers.attempts += 1;
     let attempt = s.servers.attempts;
     s.servers.onedrive.login = Some(attempt);
-    s.dialog = None;
+    s.close_account_form();
     s.status = t("Faça o login no navegador que abriu. Esperando a Microsoft…", "Sign in in the browser that opened. Waiting for Microsoft…").into();
+    s.notify_main();
     background(s, move |emit| {
         let result = catch_panic(t("conectar ao OneDrive", "connect to OneDrive"), || {
             let a = od::connect(&pending)?;
@@ -348,17 +355,24 @@ pub fn remove(s: &mut State, server: &Server) -> bool {
     true
 }
 
-/// The OneDrive step of Adicionar conta: what's needed, then the browser.
-pub fn configure(s: &State, k: &Kit, f: &Form, layer: &mut Vec<El>) {
-    let close = |s: &mut State| s.dialog = None;
+/// The OneDrive step of Registrar conta: what's needed, then the browser.
+pub fn configure(s: &State, k: &Kit, f: &Form, banner: El, close: fn(&mut State, &mut Tx)) -> (El, El) {
     let muted = |words: String| text(words).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
-    let mut inner = col().key("onedrive-content").w_full().px(16.0).pb(4.0).gap(12.0).child(muted(
-        t(
+    let intro = match f.onedrive_tenant {
+        Some("consumers") => t(
+            "Ao continuar, o navegador abre a página da Microsoft para entrar com sua conta pessoal e autorizar o acesso aos seus arquivos do OneDrive.",
+            "When you continue, the browser opens Microsoft's page to sign in with your personal account and allow access to your OneDrive files.",
+        ),
+        Some("organizations") => t(
+            "Ao continuar, o navegador abre a página da Microsoft para entrar com sua conta corporativa ou de estudante (OneDrive for Business) e autorizar o acesso.",
+            "When you continue, the browser opens Microsoft's page to sign in with your work or school account (OneDrive for Business) and allow access.",
+        ),
+        _ => t(
             "Ao continuar, o navegador abre a página da Microsoft para você escolher a conta (pessoal, corporativa ou de estudante) e autorizar o acesso aos seus arquivos do OneDrive.",
             "When you continue, the browser opens Microsoft's page so you can pick the account (personal, work or school) and allow access to your OneDrive files.",
-        )
-        .into(),
-    ));
+        ),
+    };
+    let mut inner = col().key("onedrive-content").w_full().gap(12.0).child(banner).child(muted(intro.into()));
     let connected: Vec<&str> = s.servers.onedrive.accounts.iter().map(|a| a.email.as_str()).collect();
     if !connected.is_empty() {
         inner = inner.child(muted(tr!("Já conectadas: {}", "Already connected: {}", connected.join(", "))));
@@ -399,17 +413,13 @@ pub fn configure(s: &State, k: &Kit, f: &Form, layer: &mut Vec<El>) {
     let actions = row()
         .key("actions")
         .w_full()
-        .px(16.0)
-        .pt(12.0)
-        .pb(16.0)
         .gap(8.0)
         .center_y()
         .child(Button::new(t("Voltar", "Back")).icon(&crate::icons::BACK).variant(ButtonVariant::Neutral).on_press(crate::servers::back_to_pick).build(k))
         .child(rune::el().grow(1.0))
-        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k))
+        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close).build(k))
         .child(Button::new(t("Conectar no navegador", "Connect in browser")).variant(ButtonVariant::Submit).on_press_tx(submit).build(k).default_button());
-    let body = col().key("onedrive-dialog").w_full().child(inner).child(actions);
-    Modal::new("server", t("Conectar OneDrive", "Connect OneDrive")).open(true).child(body).width(560.0).fit().on_close(close).build(k, layer);
+    (inner, actions)
 }
 
 // ---------------------------------------------------------------------------------------------

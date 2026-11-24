@@ -533,6 +533,11 @@ pub struct MockDrive {
 }
 
 impl MockDrive {
+    /// No folders: the window stand-in's, which nothing lists.
+    pub fn empty() -> MockDrive {
+        MockDrive { folders: HashMap::new() }
+    }
+
     pub fn new() -> MockDrive {
         let now = SystemTime::now();
         let ago = |days: u64| now - Duration::from_secs(days * 86_400);

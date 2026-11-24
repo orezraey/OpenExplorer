@@ -87,8 +87,8 @@ enum Job {
 pub struct Cache {
     mem: HashMap<Key, Listing>,
     disk: Option<Sender<Job>>,
-    /// Tests keep the cache in memory, away from the real cache folder.
-    #[cfg(test)]
+    /// Tests and the idle-window placeholder keep the cache in memory, away from the real
+    /// cache folder.
     memory_only: bool,
 }
 
@@ -184,13 +184,11 @@ impl Cache {
         self.mem.get(k)
     }
 
-    #[cfg(test)]
     pub fn memory_only() -> Cache {
         Cache { memory_only: true, ..Cache::default() }
     }
 
     fn disk(&mut self, job: Job) {
-        #[cfg(test)]
         if self.memory_only {
             return;
         }
@@ -250,7 +248,6 @@ impl Cache {
     fn clear_in(&mut self, dir: PathBuf) -> Receiver<Result<(), String>> {
         self.mem.clear();
         let (tx, rx) = channel();
-        #[cfg(test)]
         if self.memory_only {
             let _ = tx.send(Ok(()));
             return rx;

@@ -16,7 +16,7 @@ use openexplorer_i18n::{t, tr};
 use rune::{Icon, TextEdit, Tx};
 
 use crate::accounts::Account;
-use crate::actions::{Dialog, Then};
+use crate::actions::Then;
 use crate::model::{Entry, Location};
 use crate::ops::{self, CANCELLED, Progress};
 use crate::transfers::{self, End, Op};
@@ -641,39 +641,39 @@ pub fn name(s: &mut State, loc: &Location, item: Option<Entry>, name: String) {
 // ---------------------------------------------------------------------------------------------
 // Adding, changing and removing accounts and servers
 
-/// Category filter tabs in the unified "Adicionar conta" picker.
+/// Category filter tabs in the "Registrar conta" window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Category {
     #[default]
     All,
-    Cloud,
+    Personal,
+    Business,
     Nas,
-    Protocols,
 }
 
 impl Category {
-    pub const ALL: [Category; 4] = [Category::All, Category::Cloud, Category::Nas, Category::Protocols];
+    pub const ALL: [Category; 4] = [Category::All, Category::Personal, Category::Business, Category::Nas];
 
     pub fn label(self) -> &'static str {
         match self {
             Category::All => t("Todos", "All"),
-            Category::Cloud => t("Nuvem", "Cloud"),
+            Category::Personal => t("Pessoal", "Personal"),
+            Category::Business => t("Empresarial", "Business"),
             Category::Nas => "NAS",
-            Category::Protocols => t("Protocolos", "Protocols"),
         }
     }
 
     pub fn icon(self) -> &'static Icon {
         match self {
             Category::All => &crate::icons::CAT_ALL,
-            Category::Cloud => &crate::icons::CAT_CLOUD,
+            Category::Personal => &crate::icons::CAT_PERSONAL,
+            Category::Business => &crate::icons::CAT_BUSINESS,
             Category::Nas => &crate::icons::CAT_NAS,
-            Category::Protocols => &crate::icons::CAT_PROTO,
         }
     }
 }
 
-/// Every cloud or server provider offered in the unified "Adicionar conta" dialog.
+/// Every cloud or server provider offered in the "Registrar conta" window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
     GoogleDrive,
@@ -689,7 +689,178 @@ pub enum Provider {
     WebDav,
 }
 
+/// A selectable account or protocol entry (including multi-version variants like Custom Client ID
+/// or OneDrive For Business), shown in popular dropdowns and in the A–Z list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderVariant {
+    B2,
+    Dropbox,
+    DropboxCustom,
+    Ftp,
+    Ftps,
+    GoogleDrive,
+    GoogleDriveCustom,
+    Mega,
+    Nextcloud,
+    OneDrive,
+    OneDriveCustom,
+    OneDriveBusiness,
+    OwnCloud,
+    Sftp,
+    Telegram,
+    WebDav,
+    WebDavHttp,
+}
+
+impl ProviderVariant {
+    /// All supported variants sorted alphabetically (A–Z) for "Todas as nuvens".
+    pub const ALL_AZ: [ProviderVariant; 17] = [
+        ProviderVariant::B2,
+        ProviderVariant::Dropbox,
+        ProviderVariant::DropboxCustom,
+        ProviderVariant::Ftp,
+        ProviderVariant::Ftps,
+        ProviderVariant::GoogleDrive,
+        ProviderVariant::GoogleDriveCustom,
+        ProviderVariant::Mega,
+        ProviderVariant::Nextcloud,
+        ProviderVariant::OneDrive,
+        ProviderVariant::OneDriveCustom,
+        ProviderVariant::OneDriveBusiness,
+        ProviderVariant::OwnCloud,
+        ProviderVariant::Sftp,
+        ProviderVariant::Telegram,
+        ProviderVariant::WebDav,
+        ProviderVariant::WebDavHttp,
+    ];
+
+    pub fn provider(self) -> Provider {
+        match self {
+            ProviderVariant::B2 => Provider::B2,
+            ProviderVariant::Dropbox | ProviderVariant::DropboxCustom => Provider::Dropbox,
+            ProviderVariant::Ftp | ProviderVariant::Ftps => Provider::Ftp,
+            ProviderVariant::GoogleDrive | ProviderVariant::GoogleDriveCustom => Provider::GoogleDrive,
+            ProviderVariant::Mega => Provider::Mega,
+            ProviderVariant::Nextcloud => Provider::Nextcloud,
+            ProviderVariant::OneDrive | ProviderVariant::OneDriveBusiness | ProviderVariant::OneDriveCustom => Provider::OneDrive,
+            ProviderVariant::OwnCloud => Provider::OwnCloud,
+            ProviderVariant::Sftp => Provider::Sftp,
+            ProviderVariant::Telegram => Provider::Telegram,
+            ProviderVariant::WebDav | ProviderVariant::WebDavHttp => Provider::WebDav,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ProviderVariant::B2 => "Backblaze B2",
+            ProviderVariant::Dropbox => "Dropbox",
+            ProviderVariant::DropboxCustom => "Dropbox Custom App Key",
+            ProviderVariant::Ftp => "FTP",
+            ProviderVariant::Ftps => "FTPS",
+            ProviderVariant::GoogleDrive => "GoogleDrive",
+            ProviderVariant::GoogleDriveCustom => "GoogleDrive Custom Client Id",
+            ProviderVariant::Mega => "Mega",
+            ProviderVariant::Nextcloud => "Nextcloud",
+            ProviderVariant::OneDrive => "OneDrive",
+            ProviderVariant::OneDriveCustom => "OneDrive Custom Client Id",
+            ProviderVariant::OneDriveBusiness => "OneDrive For Business",
+            ProviderVariant::OwnCloud => "OwnCloud",
+            ProviderVariant::Sftp => "SFTP",
+            ProviderVariant::Telegram => "Telegram",
+            ProviderVariant::WebDav => "WebDav",
+            ProviderVariant::WebDavHttp => "WebDav (HTTP)",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            ProviderVariant::B2 => t("Use o ID da chave e a chave de aplicação", "Use your key ID and application key"),
+            ProviderVariant::Dropbox => t("Faça login com sua conta do Dropbox", "Sign in with your Dropbox account"),
+            ProviderVariant::DropboxCustom => t("Use seu próprio app do Dropbox", "Use your own Dropbox app"),
+            ProviderVariant::Ftp => t("Conexão FTP padrão (porta 21)", "Standard FTP connection (port 21)"),
+            ProviderVariant::Ftps => t("FTP explícito com criptografia SSL/TLS", "Explicit FTP with SSL/TLS encryption"),
+            ProviderVariant::GoogleDrive => t("Faça login com sua conta do Google", "Sign in with your Google account"),
+            ProviderVariant::GoogleDriveCustom => t("Use seu próprio app do Google Cloud", "Use your own Google Cloud app"),
+            ProviderVariant::Mega => t("Faça login com e-mail e senha", "Sign in with e-mail and password"),
+            ProviderVariant::Nextcloud => t("Conecte seu servidor Nextcloud via WebDAV", "Connect your Nextcloud server via WebDAV"),
+            ProviderVariant::OneDrive => t("Faça login com sua conta pessoal da Microsoft", "Sign in with your personal Microsoft account"),
+            ProviderVariant::OneDriveBusiness => t("Faça login com sua conta corporativa ou escolar", "Sign in with your work or school account"),
+            ProviderVariant::OneDriveCustom => t("Use seu próprio app do Microsoft Entra", "Use your own Microsoft Entra app"),
+            ProviderVariant::OwnCloud => t("Conecte seu servidor ownCloud via WebDAV", "Connect your ownCloud server via WebDAV"),
+            ProviderVariant::Sftp => t("Transferência segura sobre SSH (porta 22)", "Secure transfer over SSH (port 22)"),
+            ProviderVariant::Telegram => t("Canal privado de armazenamento na sua conta", "Private storage channel in your account"),
+            ProviderVariant::WebDav => t("Servidor WebDAV seguro via HTTPS", "Secure WebDAV server over HTTPS"),
+            ProviderVariant::WebDavHttp => t("Servidor WebDAV sem criptografia (porta 80)", "Unencrypted WebDAV server (port 80)"),
+        }
+    }
+
+    pub fn icon(self) -> &'static Icon {
+        self.provider().icon()
+    }
+
+    pub fn in_category(self, category: Category) -> bool {
+        match category {
+            Category::All => true,
+            Category::Personal => matches!(
+                self,
+                ProviderVariant::OneDrive
+                    | ProviderVariant::OneDriveCustom
+                    | ProviderVariant::GoogleDrive
+                    | ProviderVariant::GoogleDriveCustom
+                    | ProviderVariant::Dropbox
+                    | ProviderVariant::DropboxCustom
+                    | ProviderVariant::Mega
+                    | ProviderVariant::Telegram
+                    | ProviderVariant::Nextcloud
+                    | ProviderVariant::OwnCloud
+            ),
+            Category::Business => matches!(
+                self,
+                ProviderVariant::OneDriveBusiness
+                    | ProviderVariant::OneDriveCustom
+                    | ProviderVariant::GoogleDrive
+                    | ProviderVariant::GoogleDriveCustom
+                    | ProviderVariant::Dropbox
+                    | ProviderVariant::DropboxCustom
+                    | ProviderVariant::B2
+                    | ProviderVariant::Nextcloud
+                    | ProviderVariant::OwnCloud
+                    | ProviderVariant::Sftp
+                    | ProviderVariant::WebDav
+            ),
+            Category::Nas => matches!(
+                self,
+                ProviderVariant::Nextcloud
+                    | ProviderVariant::OwnCloud
+                    | ProviderVariant::Sftp
+                    | ProviderVariant::Ftp
+                    | ProviderVariant::Ftps
+                    | ProviderVariant::WebDav
+                    | ProviderVariant::WebDavHttp
+            ),
+        }
+    }
+
+    pub fn matches_query(self, query: &str) -> bool {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return true;
+        }
+        let p = self.provider();
+        // A word in another version's name picks that version: "ftps" finds FTPS, not plain FTP
+        // through the provider's keywords.
+        let names_sibling = |w: &str| p.versions().iter().any(|&v| v != self && v.label().to_lowercase().contains(w));
+        q.split_whitespace().all(|w| {
+            self.label().to_lowercase().contains(w)
+                || self.description().to_lowercase().contains(w)
+                || (p.matches_word(w) && !names_sibling(w))
+        })
+    }
+}
+
 impl Provider {
+    /// Every provider; the picker lists variants, so only the tests walk this.
+    #[cfg(test)]
     pub const ALL: [Provider; 11] = [
         Provider::GoogleDrive,
         Provider::OneDrive,
@@ -704,10 +875,22 @@ impl Provider {
         Provider::WebDav,
     ];
 
+    /// Featured 8 providers shown as cards in "Nuvens populares" (2 rows × 4 columns).
+    pub const POPULAR: [Provider; 8] = [
+        Provider::OneDrive,
+        Provider::GoogleDrive,
+        Provider::Dropbox,
+        Provider::B2,
+        Provider::Mega,
+        Provider::Telegram,
+        Provider::Nextcloud,
+        Provider::Sftp,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Provider::GoogleDrive => "Google Drive",
-            Provider::Mega => "MEGA",
+            Provider::Mega => "Mega",
             Provider::Dropbox => "Dropbox",
             Provider::B2 => "Backblaze B2",
             Provider::OneDrive => "OneDrive",
@@ -752,26 +935,33 @@ impl Provider {
         }
     }
 
-    pub fn in_category(self, category: Category) -> bool {
-        match category {
-            Category::All => true,
-            Category::Cloud => matches!(self, Provider::GoogleDrive | Provider::OneDrive | Provider::Dropbox | Provider::Mega | Provider::B2 | Provider::Telegram | Provider::Nextcloud | Provider::OwnCloud),
-            Category::Nas => matches!(self, Provider::Nextcloud | Provider::OwnCloud | Provider::Sftp | Provider::Ftp | Provider::WebDav),
-            Category::Protocols => matches!(self, Provider::Sftp | Provider::Ftp | Provider::WebDav),
+    pub fn versions(self) -> &'static [ProviderVariant] {
+        match self {
+            Provider::OneDrive => &[ProviderVariant::OneDrive, ProviderVariant::OneDriveBusiness, ProviderVariant::OneDriveCustom],
+            Provider::GoogleDrive => &[ProviderVariant::GoogleDrive, ProviderVariant::GoogleDriveCustom],
+            Provider::Dropbox => &[ProviderVariant::Dropbox, ProviderVariant::DropboxCustom],
+            Provider::B2 => &[ProviderVariant::B2],
+            Provider::Mega => &[ProviderVariant::Mega],
+            Provider::Telegram => &[ProviderVariant::Telegram],
+            Provider::Nextcloud => &[ProviderVariant::Nextcloud],
+            Provider::OwnCloud => &[ProviderVariant::OwnCloud],
+            Provider::Sftp => &[ProviderVariant::Sftp],
+            Provider::Ftp => &[ProviderVariant::Ftps, ProviderVariant::Ftp],
+            Provider::WebDav => &[ProviderVariant::WebDav, ProviderVariant::WebDavHttp],
         }
     }
 
-    pub fn matches_query(self, query: &str) -> bool {
-        let q = query.trim().to_lowercase();
-        if q.is_empty() {
-            return true;
-        }
+    pub fn versions_in(self, category: Category, query: &str) -> Vec<ProviderVariant> {
+        self.versions().iter().copied().filter(|v| v.in_category(category) && v.matches_query(query)).collect()
+    }
+
+    pub(crate) fn matches_word(self, w: &str) -> bool {
         let keywords = match self {
-            Provider::GoogleDrive => "google drive gdrive nuvem workspace oauth gmail cloud",
+            Provider::GoogleDrive => "google drive gdrive nuvem workspace oauth gmail cloud custom client id",
             Provider::Mega => "mega mega.nz nuvem cloud criptografia encrypted 2fa",
-            Provider::Dropbox => "dropbox nuvem cloud oauth time equipe team business",
+            Provider::Dropbox => "dropbox nuvem cloud oauth time equipe team business app key",
             Provider::B2 => "backblaze b2 bucket s3 nuvem cloud objetos object storage chave key",
-            Provider::OneDrive => "onedrive one drive microsoft office 365 sharepoint nuvem cloud oauth business empresa trabalho escola work school",
+            Provider::OneDrive => "onedrive one drive microsoft office 365 sharepoint nuvem cloud oauth business empresa empresarial trabalho escola work school pessoal personal entra",
             Provider::Telegram => "telegram canal channel mensagens messages nuvem cloud ilimitado unlimited mtproto",
             Provider::Nextcloud => "nextcloud webdav dav https nas nuvem cloud",
             Provider::OwnCloud => "owncloud webdav dav https nas nuvem cloud",
@@ -779,7 +969,7 @@ impl Provider {
             Provider::Ftp => "ftp ftps tls ssl servidor nas 21 990 server",
             Provider::WebDav => "webdav dav davs http https servidor nas server",
         };
-        q.split_whitespace().all(|w| self.label().to_lowercase().contains(w) || self.subtitle().to_lowercase().contains(w) || keywords.contains(w))
+        self.label().to_lowercase().contains(w) || self.subtitle().to_lowercase().contains(w) || keywords.contains(w)
     }
 
     pub fn default_protocol(self) -> Protocol {
@@ -841,12 +1031,18 @@ pub enum Step {
     Configure,
 }
 
-/// The unified Adicionar conta dialog (or Editar conta/servidor, with `editing`).
+/// The unified "Registrar conta" window state (or Editar conta/servidor, with `editing`).
 pub struct Form {
     pub step: Step,
     pub category: Category,
     pub filter: TextEdit,
+    /// Popular provider card whose multi-version dropdown popover is currently open.
+    pub open_group: Option<Provider>,
     pub provider: Provider,
+    /// Display title of the chosen variant when applicable (e.g. "OneDrive For Business").
+    pub variant_label: Option<&'static str>,
+    /// OneDrive sign-in tenant override ("consumers" for personal, "organizations" for work/school).
+    pub onedrive_tenant: Option<&'static str>,
     /// The id of the server being changed.
     pub editing: Option<String>,
     pub protocol: Protocol,
@@ -863,7 +1059,7 @@ pub struct Form {
     pub key: TextEdit,
     /// Conexões simultâneas; empty for the usual number.
     pub connections: TextEdit,
-    /// Google Drive OAuth client configuration inside the modal.
+    /// Google Drive / OneDrive / Dropbox custom OAuth client configuration.
     pub custom_oauth: bool,
     pub client_id: TextEdit,
     pub client_secret: TextEdit,
@@ -882,7 +1078,7 @@ pub struct Form {
 }
 
 impl Form {
-    /// Starts on the unified provider catalog (`Step::Pick`), with the search bar focused.
+    /// Starts on the unified provider catalog (`Step::Pick`), with the search bar ready.
     pub fn new() -> Form {
         let blank = || TextEdit::new("");
         let mut filter = blank();
@@ -891,7 +1087,10 @@ impl Form {
             step: Step::Pick,
             category: Category::All,
             filter,
+            open_group: None,
             provider: Provider::Sftp,
+            variant_label: None,
+            onedrive_tenant: None,
             editing: None,
             protocol: Protocol::Sftp,
             name: blank(),
@@ -926,10 +1125,74 @@ impl Form {
         f
     }
 
+    /// Opens directly on `variant`'s configuration step.
+    pub fn for_variant(variant: ProviderVariant) -> Form {
+        let mut f = Form::new();
+        f.filter.focused = false;
+        f.apply_variant(variant);
+        f
+    }
+
+    pub fn apply_variant(&mut self, variant: ProviderVariant) {
+        self.open_group = None;
+        self.apply_provider(variant.provider());
+        self.variant_label = Some(variant.label());
+        match variant {
+            ProviderVariant::GoogleDrive => {
+                let missing = openexplorer_gdrive::ClientConfig::load().is_err();
+                self.custom_oauth = missing;
+                self.client_id.focused = missing;
+            }
+            ProviderVariant::GoogleDriveCustom => {
+                self.custom_oauth = true;
+                self.client_id.focused = true;
+            }
+            ProviderVariant::Dropbox => {
+                self.custom_oauth = openexplorer_dropbox::AppConfig::load().is_err();
+                self.client_id.focused = self.custom_oauth;
+            }
+            ProviderVariant::DropboxCustom => {
+                self.custom_oauth = true;
+                self.client_id.focused = true;
+            }
+            ProviderVariant::OneDrive => {
+                self.onedrive_tenant = Some("consumers");
+                self.custom_oauth = openexplorer_onedrive::ClientConfig::load().is_err();
+                self.client_id.focused = self.custom_oauth;
+            }
+            ProviderVariant::OneDriveBusiness => {
+                self.onedrive_tenant = Some("organizations");
+                self.custom_oauth = openexplorer_onedrive::ClientConfig::load().is_err();
+                self.client_id.focused = self.custom_oauth;
+            }
+            ProviderVariant::OneDriveCustom => {
+                self.onedrive_tenant = None;
+                self.custom_oauth = true;
+                self.client_id.focused = true;
+            }
+            ProviderVariant::Ftps => {
+                self.protocol = Protocol::Ftps;
+            }
+            ProviderVariant::Ftp => {
+                self.protocol = Protocol::Ftp;
+            }
+            ProviderVariant::WebDav => {
+                self.protocol = Protocol::Davs;
+            }
+            ProviderVariant::WebDavHttp => {
+                self.protocol = Protocol::Dav;
+            }
+            ProviderVariant::B2 | ProviderVariant::Mega | ProviderVariant::Telegram | ProviderVariant::Nextcloud | ProviderVariant::OwnCloud | ProviderVariant::Sftp => {}
+        }
+    }
+
     pub fn apply_provider(&mut self, provider: Provider) {
         let changed_provider = self.provider != provider;
+        self.open_group = None;
         self.step = Step::Configure;
         self.provider = provider;
+        self.variant_label = None;
+        self.onedrive_tenant = None;
         self.protocol = provider.default_protocol();
         self.error = None;
         self.untrusted = None;
@@ -990,9 +1253,27 @@ impl Form {
         }
     }
 
-    /// Providers matching both the selected category tab and search text.
+    /// Popular cards matching both the selected category tab and search text.
+    pub fn visible_popular(&self) -> Vec<(Provider, Vec<ProviderVariant>)> {
+        Provider::POPULAR
+            .into_iter()
+            .filter_map(|p| {
+                let versions = p.versions_in(self.category, &self.filter.text);
+                (!versions.is_empty()).then_some((p, versions))
+            })
+            .collect()
+    }
+
+    /// Providers matching both the selected category tab and search text (tests only: the
+    /// picker shows `visible_variants`).
+    #[cfg(test)]
     pub fn visible_providers(&self) -> Vec<Provider> {
-        Provider::ALL.into_iter().filter(|p| p.in_category(self.category) && p.matches_query(&self.filter.text)).collect()
+        Provider::ALL.into_iter().filter(|p| !p.versions_in(self.category, &self.filter.text).is_empty()).collect()
+    }
+
+    /// Individual variants matching both the selected category tab and search text, sorted A–Z.
+    pub fn visible_variants(&self) -> Vec<ProviderVariant> {
+        ProviderVariant::ALL_AZ.into_iter().filter(|v| v.in_category(self.category) && v.matches_query(&self.filter.text)).collect()
     }
 
     /// The form filled with `server`, to change it; the password stays as stored unless typed.
@@ -1251,8 +1532,14 @@ fn split_host_port(raw: &str) -> Result<(String, Option<u16>), String> {
     Ok((raw.to_string(), None))
 }
 
+/// Adicionar conta: a new catalog, or the account window already open brought to the front with
+/// what it holds.
 pub fn ask_add(s: &mut State) {
-    s.dialog = Some(Dialog::Server(Box::new(Form::new())));
+    if s.account_form.is_some() {
+        s.show_account_form();
+    } else {
+        s.open_account_form(Form::new());
+    }
 }
 
 pub fn ask_edit(s: &mut State, id: &str) {
@@ -1272,23 +1559,49 @@ pub fn ask_edit(s: &mut State, id: &str) {
         s.status = t("Contas Dropbox não têm o que editar: para trocar de conta, remova e conecte de novo.", "Dropbox accounts have nothing to edit: to switch accounts, remove it and connect again.").into();
         return;
     }
-    if let Some(server) = s.servers.list.iter().find(|sv| sv.id == id) {
-        s.dialog = Some(Dialog::Server(Box::new(Form::of(server))));
+    if let Some(server) = s.servers.list.iter().find(|sv| sv.id == id).cloned() {
+        s.open_account_form(Form::of(&server));
     }
 }
 
-pub fn pick_provider(s: &mut State, provider: Provider) {
-    if let Some(Dialog::Server(f)) = &mut s.dialog {
-        f.apply_provider(provider);
+pub fn toggle_group(s: &mut State, provider: Provider) {
+    if let Some(f) = &mut s.account_form {
+        let versions = provider.versions_in(f.category, &f.filter.text);
+        if versions.len() <= 1 {
+            if let Some(&v) = versions.first() {
+                f.apply_variant(v);
+            } else {
+                f.apply_provider(provider);
+            }
+        } else if f.open_group == Some(provider) {
+            f.open_group = None;
+        } else {
+            f.open_group = Some(provider);
+        }
+    }
+}
+
+pub fn close_group(s: &mut State) {
+    if let Some(f) = &mut s.account_form {
+        f.open_group = None;
+    }
+}
+
+pub fn pick_variant(s: &mut State, variant: ProviderVariant) {
+    if let Some(f) = &mut s.account_form {
+        f.apply_variant(variant);
     }
 }
 
 pub fn back_to_pick(s: &mut State) {
-    if let Some(Dialog::Server(f)) = &mut s.dialog
+    if let Some(f) = &mut s.account_form
         && f.editing.is_none()
         && f.checking.is_none()
     {
         f.step = Step::Pick;
+        f.open_group = None;
+        f.variant_label = None;
+        f.onedrive_tenant = None;
         f.error = None;
         f.untrusted = None;
         f.trusted = None;
@@ -1298,22 +1611,24 @@ pub fn back_to_pick(s: &mut State) {
 }
 
 pub fn set_category(s: &mut State, category: Category) {
-    if let Some(Dialog::Server(f)) = &mut s.dialog {
+    if let Some(f) = &mut s.account_form {
         f.category = category;
+        f.open_group = None;
     }
 }
 
 pub fn clear_filter(s: &mut State) {
-    if let Some(Dialog::Server(f)) = &mut s.dialog {
+    if let Some(f) = &mut s.account_form {
         f.filter = TextEdit::new("");
         f.filter.focused = true;
+        f.open_group = None;
     }
 }
 
 /// Pressing Enter in the search box of Step 1: opens a pasted `scheme://…` address at once,
-/// or picks the first matching provider.
+/// or picks the first matching variant.
 pub fn submit_filter(s: &mut State) {
-    let Some(Dialog::Server(f)) = &mut s.dialog else { return };
+    let Some(f) = &mut s.account_form else { return };
     let typed = f.filter.text.trim().trim_matches('"').to_string();
     if !typed.is_empty()
         && let Some(a) = parse_address(&typed)
@@ -1321,15 +1636,15 @@ pub fn submit_filter(s: &mut State) {
         **f = Form::of_address(&a);
         return;
     }
-    if let Some(&first) = f.visible_providers().first() {
-        f.apply_provider(first);
+    if let Some(&first) = f.visible_variants().first() {
+        f.apply_variant(first);
     }
 }
 
 /// Toggles SSL/TLS on FTP (`Ftp` ↔ `Ftps`) or WebDAV (`Dav` ↔ `Davs`), keeping any explicit URL
 /// scheme in `Servidor` in sync so `submit` never silently reverts to plaintext.
 pub fn toggle_tls(s: &mut State) {
-    if let Some(Dialog::Server(f)) = &mut s.dialog {
+    if let Some(f) = &mut s.account_form {
         f.protocol = match f.effective_protocol() {
             Protocol::Ftp => Protocol::Ftps,
             Protocol::Ftps => Protocol::Ftp,
@@ -1357,11 +1672,11 @@ pub fn toggle_tls(s: &mut State) {
     }
 }
 
-/// Connects a Google Drive account from the unified modal, saving custom OAuth credentials
+/// Connects a Google Drive account from the account window, saving custom OAuth credentials
 /// first if typed or pasted.
 pub fn submit_google(s: &mut State, tx: &mut Tx) {
     let cfg = {
-        let Some(Dialog::Server(f)) = &mut s.dialog else { return };
+        let Some(f) = &mut s.account_form else { return };
         f.error = None;
         let id = f.client_id.text.trim().trim_start_matches('\u{feff}');
         let secret = f.client_secret.text.trim().trim_start_matches('\u{feff}');
@@ -1399,25 +1714,28 @@ pub fn submit_google(s: &mut State, tx: &mut Tx) {
         }
     };
     match crate::connect_with(s, s.active, cfg, tx) {
-        Ok(()) => s.dialog = None,
+        Ok(()) => {
+            s.close_account_form();
+            s.notify_main();
+        }
         Err(e) => {
-            if let Some(Dialog::Server(f)) = &mut s.dialog {
+            if let Some(f) = &mut s.account_form {
                 f.error = Some(e);
             }
         }
     }
 }
 
-/// Conectar / Salvar in the dialog: checks the login on a thread; the server is kept once it worked.
+/// Conectar / Salvar in the account window: checks the login on a thread; the server is kept once it worked.
 pub fn submit(s: &mut State) {
-    let Some(Dialog::Server(form)) = &s.dialog else { return };
+    let Some(form) = &s.account_form else { return };
     if form.checking.is_some() {
         return;
     }
     let (server, pasted) = match form.server(s) {
         Ok(found) => found,
         Err(e) => {
-            if let Some(Dialog::Server(f)) = &mut s.dialog {
+            if let Some(f) = &mut s.account_form {
                 f.error = Some(e);
             }
             return;
@@ -1433,7 +1751,7 @@ pub fn submit(s: &mut State) {
     let keep = if form.editing.is_some() && typed.is_empty() { None } else { Some(typed) };
     s.servers.attempts += 1;
     let attempt = s.servers.attempts;
-    if let Some(Dialog::Server(f)) = &mut s.dialog {
+    if let Some(f) = &mut s.account_form {
         f.checking = Some(attempt);
         f.error = None;
         f.untrusted = None;
@@ -1451,7 +1769,7 @@ pub fn submit(s: &mut State) {
 /// Confiar e salvar: trusts the certificate the check turned down, by its fingerprint, and
 /// checks again.
 pub fn trust(s: &mut State) {
-    let Some(Dialog::Server(f)) = &mut s.dialog else { return };
+    let Some(f) = &mut s.account_form else { return };
     if f.checking.is_some() {
         return;
     }
@@ -1461,10 +1779,10 @@ pub fn trust(s: &mut State) {
     submit(s);
 }
 
-/// The add dialog's connection check ended: the server is saved and opens in the active pane,
-/// or the dialog says what went wrong.
+/// The add window's connection check ended: the server is saved and opens in the active pane,
+/// or the window says what went wrong.
 pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, secret: Option<String>) {
-    let Some(Dialog::Server(form)) = &mut s.dialog else { return };
+    let Some(form) = &mut s.account_form else { return };
     if form.checking != Some(attempt) {
         return;
     }
@@ -1474,21 +1792,33 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
         // The dialog shows the certificate and asks whether to trust it.
         Err(Refusal::Untrusted(r)) => {
             form.untrusted = Some(r);
+            s.notify_account();
             return;
         }
         Err(Refusal::Failed(e)) => {
             openexplorer_gdrive::log(&format!("falha ao conectar servidor: {e}"));
             form.error = Some(e);
+            s.notify_account();
             return;
         }
     };
+    // The main window stays usable beside the account window: a server removed there while
+    // being edited here isn't brought back by Salvar.
+    if let Some(id) = &form.editing
+        && !s.servers.list.iter().any(|sv| &sv.id == id)
+    {
+        form.error = Some(t("Esse servidor foi removido enquanto era editado.", "This server was removed while it was being edited.").into());
+        s.notify_account();
+        return;
+    }
     if let Err(e) = s.servers.store.save(server.clone(), secret.as_deref()) {
         form.error = Some(e);
+        s.notify_account();
         return;
     }
     openexplorer_gdrive::log(&format!("servidor salvo: {} ({})", server.name, server.address()));
     let edited = form.editing.is_some();
-    s.dialog = None;
+    s.close_account_form();
     s.servers.pool.forget(&server.id);
     let old_root = s.servers.list.iter().find(|sv| sv.id == server.id).map(|sv| sv.root.clone());
     match s.servers.list.iter_mut().find(|sv| sv.id == server.id) {
@@ -1539,6 +1869,7 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
         let p = s.active;
         crate::navigate(s, p, folder(&server, Vec::new()));
     }
+    s.notify_main();
 }
 
 /// Forgets a server and its password, or a cloud account and its secrets; panes on it go home.
@@ -1887,16 +2218,27 @@ pub(crate) mod tests {
 
     #[test]
     fn unified_catalog_filters_and_configures_presets() {
+        // Verify ALL_AZ is strictly sorted alphabetically (case-insensitive).
+        let az_labels: Vec<String> = ProviderVariant::ALL_AZ.iter().map(|v| v.label().to_lowercase()).collect();
+        let mut sorted = az_labels.clone();
+        sorted.sort();
+        assert_eq!(az_labels, sorted);
+
         let mut f = Form::new();
         assert_eq!(f.step, Step::Pick);
         assert_eq!(f.visible_providers().len(), 11);
-        f.category = Category::Cloud;
-        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::OneDrive, Provider::Dropbox, Provider::Mega, Provider::B2, Provider::Telegram, Provider::Nextcloud, Provider::OwnCloud]);
-        f.category = Category::Protocols;
-        assert_eq!(f.visible_providers(), [Provider::Sftp, Provider::Ftp, Provider::WebDav]);
+        assert_eq!(f.visible_variants().len(), 17);
+        assert_eq!(f.visible_popular().len(), 8);
+        f.category = Category::Personal;
+        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::OneDrive, Provider::Dropbox, Provider::Mega, Provider::Telegram, Provider::Nextcloud, Provider::OwnCloud]);
+        f.category = Category::Business;
+        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::OneDrive, Provider::Dropbox, Provider::B2, Provider::Nextcloud, Provider::OwnCloud, Provider::Sftp, Provider::WebDav]);
+        f.category = Category::Nas;
+        assert_eq!(f.visible_providers(), [Provider::Nextcloud, Provider::OwnCloud, Provider::Sftp, Provider::Ftp, Provider::WebDav]);
         f.category = Category::All;
         f.filter = TextEdit::new("ftps");
         assert_eq!(f.visible_providers(), [Provider::Ftp]);
+        assert_eq!(f.visible_variants(), [ProviderVariant::Ftps]);
 
         let s = crate::init();
         let mut nc = Form::for_provider(Provider::Nextcloud);
@@ -1941,13 +2283,25 @@ pub(crate) mod tests {
         assert_eq!(edited.active_trusted(), None);
         assert_eq!(edited.server(&s).unwrap().0.cert, None);
 
-        // Toggling SSL/TLS rewrites an explicit `ftp://` scheme in `Servidor` so submit keeps FTPS.
+        // Multi-version dropdown toggle and variant selection.
         let mut s2 = s;
+        ask_add(&mut s2);
+        toggle_group(&mut s2, Provider::GoogleDrive);
+        assert_eq!(s2.account_form.as_ref().and_then(|f| f.open_group), Some(Provider::GoogleDrive));
+        pick_variant(&mut s2, ProviderVariant::GoogleDriveCustom);
+        let f_gd = s2.account_form.as_ref().unwrap();
+        assert_eq!((f_gd.step, f_gd.provider, f_gd.custom_oauth, f_gd.open_group), (Step::Configure, Provider::GoogleDrive, true, None));
+        back_to_pick(&mut s2);
+        pick_variant(&mut s2, ProviderVariant::OneDriveBusiness);
+        let f_od = s2.account_form.as_ref().unwrap();
+        assert_eq!((f_od.provider, f_od.onedrive_tenant), (Provider::OneDrive, Some("organizations")));
+
+        // Toggling SSL/TLS rewrites an explicit `ftp://` scheme in `Servidor` so submit keeps FTPS.
         let mut ftp_form = Form::for_provider(Provider::Ftp);
         ftp_form.host = TextEdit::new("ftp://192.168.0.10");
-        s2.dialog = Some(Dialog::Server(Box::new(ftp_form)));
+        s2.open_account_form(ftp_form);
         toggle_tls(&mut s2);
-        let Some(Dialog::Server(f2)) = &s2.dialog else { panic!() };
+        let Some(f2) = &s2.account_form else { panic!() };
         assert_eq!((f2.protocol, f2.host.text.as_str()), (Protocol::Ftps, "ftps://192.168.0.10"));
         assert_eq!(f2.server(&s2).unwrap().0.protocol, Protocol::Ftps);
     }
@@ -1958,7 +2312,7 @@ pub(crate) mod tests {
 #[cfg(test)]
 mod real {
     use super::*;
-    use crate::actions::{self, Clip, ClipMode};
+    use crate::actions::{self, Clip, ClipMode, Dialog};
     use std::time::{Duration, Instant};
 
     struct Served(std::process::Child, PathBuf);
@@ -2128,7 +2482,7 @@ mod real {
         let wait = |s: &mut State| {
             let start = Instant::now();
             loop {
-                let checking = matches!(&s.dialog, Some(Dialog::Server(f)) if f.checking.is_some());
+                let checking = s.account_form.as_ref().is_some_and(|f| f.checking.is_some());
                 if !checking && !s.panes[0].loading {
                     return;
                 }
@@ -2140,22 +2494,19 @@ mod real {
 
         // A wrong password keeps the dialog open, saying so; nothing is kept.
         ask_add(&mut s);
-        let Some(Dialog::Server(f)) = &mut s.dialog else { panic!() };
+        let Some(f) = &mut s.account_form else { panic!() };
         f.host = TextEdit::new("sftp://ana:errada@127.0.0.1:28098");
         submit(&mut s);
         wait(&mut s);
-        let Some(Dialog::Server(f)) = &mut s.dialog else { panic!("the dialog closed") };
+        let Some(f) = &mut s.account_form else { panic!("the dialog closed") };
         assert!(f.error.as_deref().is_some_and(|e| e.contains("recusou")), "{:?}", f.error);
         assert!(s.servers.store.servers().is_empty());
 
         f.password = TextEdit::new("s3nh@ forte").secure();
         submit(&mut s);
         wait(&mut s);
-        let left = match &s.dialog {
-            Some(Dialog::Server(f)) => f.error.clone(),
-            _ => None,
-        };
-        assert!(s.dialog.is_none(), "{left:?}");
+        let left = s.account_form.as_ref().and_then(|f| f.error.clone());
+        assert!(s.account_form.is_none(), "{left:?}");
         let saved = s.servers.store.servers();
         assert_eq!(saved.len(), 1);
         let sv = saved[0].clone();
@@ -2167,11 +2518,11 @@ mod real {
 
         // Changed (a new name) without typing the password: the stored one and the key stay.
         ask_edit(&mut s, &sv.id);
-        let Some(Dialog::Server(f)) = &mut s.dialog else { panic!() };
+        let Some(f) = &mut s.account_form else { panic!() };
         f.name = TextEdit::new("Meu NAS");
         submit(&mut s);
         wait(&mut s);
-        assert!(s.dialog.is_none());
+        assert!(s.account_form.is_none());
         let after = s.servers.store.servers()[0].clone();
         assert_eq!((after.name.as_str(), &after.host_key), ("Meu NAS", &sv.host_key));
         assert_eq!(remote::store::secret(&sv.id).as_deref(), Some("s3nh@ forte"));
@@ -2224,7 +2575,7 @@ mod real {
         let wait = |s: &mut State| {
             let start = Instant::now();
             loop {
-                let checking = matches!(&s.dialog, Some(Dialog::Server(f)) if f.checking.is_some());
+                let checking = s.account_form.as_ref().is_some_and(|f| f.checking.is_some());
                 if !checking && !s.panes[0].loading {
                     return;
                 }
@@ -2234,16 +2585,16 @@ mod real {
             }
         };
         ask_add(&mut s);
-        let Some(Dialog::Server(f)) = &mut s.dialog else { panic!() };
+        let Some(f) = &mut s.account_form else { panic!() };
         f.host = TextEdit::new("https://127.0.0.1:28443");
         submit(&mut s);
         wait(&mut s);
-        let Some(Dialog::Server(f)) = &s.dialog else { panic!("saved with an untrusted certificate") };
+        let Some(f) = &s.account_form else { panic!("saved with an untrusted certificate") };
         let fp = f.untrusted.as_ref().map(|r| r.fingerprint.clone()).expect("the dialog asks about the certificate");
         assert!(f.error.is_none() && s.servers.store.servers().is_empty());
         trust(&mut s);
         wait(&mut s);
-        assert!(s.dialog.is_none());
+        assert!(s.account_form.is_none());
         let saved = s.servers.store.servers();
         assert_eq!(saved[0].cert.as_deref(), Some(fp.as_str()));
         assert_eq!(names(&s, 0), ["Fotos"], "{:?}", s.panes[0].error);

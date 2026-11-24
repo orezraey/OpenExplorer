@@ -15,9 +15,8 @@ use openexplorer_i18n::{t, tr};
 use openexplorer_remote::Server;
 use openexplorer_telegram as telegram;
 use rune::{El, TextEdit, Tx, col, row, text};
-use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit};
+use rune_kit::{Button, ButtonVariant, Kit};
 
-use crate::actions::Dialog;
 use crate::model::Location;
 use crate::servers::{Form, folder};
 use crate::{Msg, State, background, catch_panic};
@@ -120,15 +119,21 @@ pub fn prepare(f: &mut Form) {
     drop_pending();
 }
 
-/// Cancelar, or the dialog closed: the login under way goes too.
-fn cancel(s: &mut State) {
-    s.dialog = None;
+/// Drops any Telegram login waiting for a code or password when the account window closes.
+pub fn abort_pending() {
     drop_pending();
+}
+
+/// Cancelar, or the window closed: the login under way goes too.
+fn cancel(s: &mut State, tx: &mut Tx) {
+    drop_pending();
+    s.close_account_form();
+    tx.close_window();
 }
 
 /// Back to the first step, the login dropped.
 fn restart(s: &mut State) {
-    if let Some(Dialog::Server(f)) = &mut s.dialog {
+    if let Some(f) = &mut s.account_form {
         f.telegram = Stage::Start;
         f.checking = None;
         f.error = None;
@@ -136,9 +141,9 @@ fn restart(s: &mut State) {
     drop_pending();
 }
 
-/// Conectar (or Entrar) in the dialog: the step the login is at, on a thread.
+/// Conectar (or Entrar) in the window: the step the login is at, on a thread.
 pub fn submit(s: &mut State) {
-    let Some(Dialog::Server(f)) = &mut s.dialog else { return };
+    let Some(f) = &mut s.account_form else { return };
     if f.checking.is_some() {
         return;
     }
@@ -206,12 +211,12 @@ fn step(generation: u64, run: impl FnOnce(&mut telegram::Login) -> Result<telegr
 }
 
 fn stepped(s: &mut State, attempt: u64, result: Result<Outcome, String>) {
-    // Signed in: the account is kept even if the dialog closed meanwhile, or it would be
+    // Signed in: the account is kept even if the window closed meanwhile, or it would be
     // connected with nothing in the app to remove it by.
     if let Ok(Outcome::Done(stored)) = result {
         return connected(s, stored);
     }
-    let Some(Dialog::Server(f)) = &mut s.dialog else { return };
+    let Some(f) = &mut s.account_form else { return };
     if f.checking != Some(attempt) {
         return;
     }
@@ -235,6 +240,7 @@ fn stepped(s: &mut State, attempt: u64, result: Result<Outcome, String>) {
         }
         Ok(Outcome::Done(_)) => unreachable!("handled above"),
     }
+    s.notify_account();
 }
 
 fn connected(s: &mut State, stored: telegram::StoredAccount) {
@@ -244,8 +250,8 @@ fn connected(s: &mut State, stored: telegram::StoredAccount) {
         return;
     }
     openexplorer_gdrive::log(&format!("telegram: conta conectada: {name}"));
-    if matches!(&s.dialog, Some(Dialog::Server(f)) if f.provider == crate::servers::Provider::Telegram) {
-        s.dialog = None;
+    if s.account_form.as_ref().is_some_and(|f| f.provider == crate::servers::Provider::Telegram) {
+        s.close_account_form();
     }
     let server = Server::telegram(stored.user_id, &name);
     s.servers.list.retain(|sv| sv.id != server.id);
@@ -436,18 +442,18 @@ pub fn summary() -> (&'static str, &'static str) {
     (t("Canal privado na sua conta · api_id seu, de my.telegram.org", "A private channel in your account · your own api_id from my.telegram.org"), "MTProto")
 }
 
-/// The step of the login the dialog is at: its fields, what to do, and the button.
-pub fn form(k: &Kit, f: &Form, banner: El, eye: El, scroll: impl FnOnce(El) -> El, layer: &mut Vec<El>) {
+/// The step of the login the window is at: its fields, what to do, and the button.
+pub fn form(k: &Kit, f: &Form, banner: El, eye: El) -> (El, El) {
     fn part(s: &mut State, pick: fn(&mut Form) -> &mut TextEdit) -> &mut TextEdit {
-        match &mut s.dialog {
-            Some(Dialog::Server(f)) => pick(f),
-            _ => &mut s.name_edit,
+        match &mut s.account_form {
+            Some(f) => pick(f),
+            None => &mut s.name_edit,
         }
     }
     let labeled = |key: &'static str, label: &'static str, input: El| col().key(key).w_full().gap(4.0).child(text(label).font(k.ty.text_small_medium).color(k.c.text_base)).child(input);
     let note = |words: String| text(words).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
     let checking = f.checking.is_some();
-    let mut inner = col().w_full().px(16.0).pb(4.0).gap(12.0).child(banner);
+    let mut inner = col().w_full().gap(12.0).child(banner);
     let label = match &f.telegram {
         Stage::Start => {
             let site = Button::new(t("Abrir my.telegram.org", "Open my.telegram.org"))
@@ -568,17 +574,13 @@ pub fn form(k: &Kit, f: &Form, banner: El, eye: El, scroll: impl FnOnce(El) -> E
     let actions = row()
         .key("actions")
         .w_full()
-        .px(16.0)
-        .pt(12.0)
-        .pb(16.0)
         .gap(8.0)
         .center_y()
         .child(back)
         .child(rune::el().grow(1.0))
-        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(cancel).build(k))
+        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(cancel).build(k))
         .child(go);
-    let body = col().key("telegram-content").w_full().child(scroll(inner)).child(actions);
-    Modal::new("server", t("Conectar Telegram", "Connect Telegram")).open(true).child(body).width(560.0).fit().on_close(cancel).build(k, layer);
+    (inner, actions)
 }
 
 #[cfg(test)]
@@ -739,13 +741,13 @@ mod tests {
         let (_, _, mut s) = on_fake(7002);
         let mut f = crate::servers::Form::for_provider(crate::servers::Provider::Telegram);
         f.checking = Some(5);
-        s.dialog = Some(Dialog::Server(Box::new(f)));
-        let stage = |s: &State| match &s.dialog {
-            Some(Dialog::Server(f)) => (f.telegram.clone(), f.checking, f.error.clone()),
-            _ => panic!("the dialog closed"),
+        s.open_account_form(f);
+        let stage = |s: &State| match &s.account_form {
+            Some(f) => (f.telegram.clone(), f.checking, f.error.clone()),
+            None => panic!("the dialog closed"),
         };
         let wait = |s: &mut State, n: u64| {
-            if let Some(Dialog::Server(f)) = &mut s.dialog {
+            if let Some(f) = &mut s.account_form {
                 f.checking = Some(n);
             }
         };
@@ -761,7 +763,7 @@ mod tests {
         stepped(&mut s, 7, Ok(Outcome::Password("gato".into())));
         assert_eq!(stage(&s).0, Stage::Password { hint: "gato".into() });
         // Signed in with the dialog closed meanwhile: the account is still kept.
-        s.dialog = None;
+        s.close_account_form();
         let dir = std::env::temp_dir().join(format!("oe-app-telegram-login-{}", std::process::id()));
         s.servers.telegram = telegram::Store::at(dir.join("telegram-accounts.json"));
         let stored = telegram::StoredAccount { user_id: 7002, name: "Ana".into(), channel_id: 1, channel_hash: 2, premium: false };

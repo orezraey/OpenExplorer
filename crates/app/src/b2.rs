@@ -492,7 +492,7 @@ fn missing(allowed: &b2::Allowed) -> Vec<&'static str> {
 
 /// Conectar in the Adicionar conta dialog with B2 picked: authorizes the key on a thread.
 pub fn submit(s: &mut State) {
-    let Some(Dialog::Server(f)) = &mut s.dialog else { return };
+    let Some(f) = &mut s.account_form else { return };
     if f.checking.is_some() {
         return;
     }
@@ -521,7 +521,7 @@ pub fn submit(s: &mut State) {
 }
 
 fn connected(s: &mut State, attempt: u64, result: Result<(String, String, Vec<&'static str>), String>) {
-    let Some(Dialog::Server(f)) = &mut s.dialog else { return };
+    let Some(f) = &mut s.account_form else { return };
     if f.checking != Some(attempt) {
         return;
     }
@@ -531,15 +531,17 @@ fn connected(s: &mut State, attempt: u64, result: Result<(String, String, Vec<&'
         Err(e) => {
             openexplorer_gdrive::log(&format!("falha ao conectar B2: {e}"));
             f.error = Some(e);
+            s.notify_account();
             return;
         }
     };
     if let Err(e) = s.servers.b2.add(&key_id, &name) {
         f.error = Some(e);
+        s.notify_account();
         return;
     }
     openexplorer_gdrive::log(&format!("chave B2 conectada: {name}"));
-    s.dialog = None;
+    s.close_account_form();
     let server = Server::b2(&key_id, &name);
     s.servers.list.retain(|sv| sv.id != server.id);
     s.servers.list.push(server.clone());
@@ -1001,11 +1003,11 @@ pub fn summary() -> (&'static str, &'static str) {
 }
 
 /// The key ID and application key fields, what the key needs, and Conectar.
-pub fn form(k: &Kit, f: &Form, banner: El, eye: El, scroll: impl FnOnce(El) -> El, close: fn(&mut State), layer: &mut Vec<El>) {
+pub fn form(k: &Kit, f: &Form, banner: El, eye: El, close: fn(&mut State, &mut Tx)) -> (El, El) {
     fn part(s: &mut State, pick: fn(&mut Form) -> &mut rune::TextEdit) -> &mut rune::TextEdit {
-        match &mut s.dialog {
-            Some(Dialog::Server(f)) => pick(f),
-            _ => &mut s.name_edit,
+        match &mut s.account_form {
+            Some(f) => pick(f),
+            None => &mut s.name_edit,
         }
     }
     let labeled = |key: &'static str, label: &'static str, input: El| col().key(key).w_full().gap(4.0).child(text(label).font(k.ty.text_small_medium).color(k.c.text_base)).child(input);
@@ -1027,8 +1029,6 @@ pub fn form(k: &Kit, f: &Form, banner: El, eye: El, scroll: impl FnOnce(El) -> E
     let note = |s: &'static str| text(s).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
     let mut inner = col()
         .w_full()
-        .px(16.0)
-        .pb(4.0)
         .gap(12.0)
         .child(banner)
         .child(note(t(
@@ -1053,17 +1053,13 @@ pub fn form(k: &Kit, f: &Form, banner: El, eye: El, scroll: impl FnOnce(El) -> E
     let actions = row()
         .key("actions")
         .w_full()
-        .px(16.0)
-        .pt(12.0)
-        .pb(16.0)
         .gap(8.0)
         .center_y()
         .child(Button::new(t("Voltar", "Back")).icon(&crate::icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(crate::servers::back_to_pick).build(k))
         .child(rune::el().grow(1.0))
-        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k))
+        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close).build(k))
         .child(connect);
-    let body = col().key("b2-content").w_full().child(scroll(inner)).child(actions);
-    Modal::new("server", t("Conectar Backblaze B2", "Connect Backblaze B2")).open(true).child(body).width(540.0).fit().on_close(close).build(k, layer);
+    (inner, actions)
 }
 
 #[cfg(test)]

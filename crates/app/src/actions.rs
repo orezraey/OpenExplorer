@@ -58,8 +58,6 @@ pub enum Dialog {
     OneDriveLink(Box<crate::onedrive::MakeLink>),
     /// Envios inacabados of a B2 bucket.
     B2Unfinished(Box<crate::b2::Unfinished>),
-    /// Adicionar servidor, or Editar servidor.
-    Server(Box<crate::servers::Form>),
 }
 
 pub fn selected(s: &State, p: usize) -> Vec<Entry> {
@@ -360,7 +358,7 @@ pub fn go_to_address(s: &mut State, p: usize, typed: &str) -> bool {
                 crate::navigate(s, p, loc);
             }
             Err(e) if e.is_empty() => {
-                s.dialog = Some(Dialog::Server(Box::new(crate::servers::Form::of_address(&a))));
+                s.open_account_form(crate::servers::Form::of_address(&a));
                 s.status = t("Esse servidor ainda não foi adicionado: confira os dados e clique em Salvar.", "This server hasn't been added yet: check the details and click Save.").into();
             }
             // The field stays, to fix what was typed.

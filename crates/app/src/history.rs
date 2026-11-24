@@ -79,6 +79,7 @@ impl Recall {
     }
 }
 
+#[derive(Default)]
 pub struct History {
     pub saved: Saved,
     /// Where it's saved; `None` (tests) saves nothing.

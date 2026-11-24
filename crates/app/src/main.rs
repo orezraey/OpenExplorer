@@ -242,6 +242,182 @@ struct State {
     icons: sysicons::SysIcons,
     /// The listing version each pane's icons were last asked for.
     icons_for: [u64; 2],
+    /// State of the independent "Registrar conta" window when open.
+    account_form: Option<Box<servers::Form>>,
+    account_win: Option<rune::AppHandle<State>>,
+    main_win: Option<rune::AppHandle<State>>,
+    account_dirty: bool,
+    main_dirty: bool,
+    account_synced_font: Option<settings::TextFont>,
+    account_synced_render: Option<settings::TextRender>,
+    is_placeholder: bool,
+}
+
+static ACCOUNT_WAKER: std::sync::LazyLock<std::sync::Mutex<Option<Waker>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+thread_local! {
+    static SHARED_STATE: std::cell::RefCell<Option<State>> = const { std::cell::RefCell::new(None) };
+    static PENDING_MAIN_FOCUS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+impl State {
+    /// Zero-IO stand-in swapped into the idle window host between turns (`App::turn_scope`).
+    fn placeholder() -> State {
+        let (outbox, inbox) = channel();
+        let loc = Location::Mock(Vec::new());
+        State {
+            panes: [Pane::new(loc.clone()), Pane::new(loc)],
+            menu: None,
+            lasso: None,
+            views: Default::default(),
+            dialog: None,
+            clash_waiting: Default::default(),
+            name_edit: rune::TextEdit::new(""),
+            renaming: None,
+            search: [rune::TextEdit::new(""), rune::TextEdit::new("")],
+            address: Default::default(),
+            history: Default::default(),
+            address_menu: None,
+            typed: Default::default(),
+            searched: Default::default(),
+            found: Default::default(),
+            installing_finder: false,
+            found_again: [0.0; 2],
+            props_seq: 0,
+            clip: None,
+            undo: Default::default(),
+            local_drives: Vec::new(),
+            places: Default::default(),
+            tree: tree::Tree::new(std::iter::empty()),
+            layout: Default::default(),
+            live: Default::default(),
+            cache: cache::Cache::memory_only(),
+            mock: MockDrive::empty(),
+            accounts: Vec::new(),
+            servers: servers::Servers {
+                list: Vec::new(),
+                pool: Arc::default(),
+                store: openexplorer_remote::Store::at(PathBuf::new()),
+                mega: openexplorer_mega::Store::at(PathBuf::new()),
+                mega_quotas: Default::default(),
+                mega_watch: Default::default(),
+                dropbox: openexplorer_dropbox::store::Store::at(PathBuf::new()),
+                dropbox_quotas: Default::default(),
+                dropbox_watch: Default::default(),
+                b2: openexplorer_b2::Store::at(PathBuf::new()),
+                b2_watch: Default::default(),
+                onedrive: onedrive::Side {
+                    store: openexplorer_onedrive::Store::at(PathBuf::new()),
+                    accounts: Vec::new(),
+                    quotas: HashMap::new(),
+                    watch: HashMap::new(),
+                    login: None,
+                },
+                telegram: openexplorer_telegram::Store::at(PathBuf::new()),
+                telegram_watch: Default::default(),
+                attempts: 0,
+            },
+            drives: HashMap::new(),
+            quotas: HashMap::new(),
+            watch: HashMap::new(),
+            login: None,
+            logins: 0,
+            active: 0,
+            typeahead: Default::default(),
+            page_rows: [0; 2],
+            last_drag: None,
+            autoscroll: None,
+            edges: Default::default(),
+            status: String::new(),
+            status_seen: String::new(),
+            status_until: 0.0,
+            status_alert: String::new(),
+            now: 0.0,
+            temp: PathBuf::new(),
+            inbox,
+            outbox,
+            waker: None,
+            settings: Default::default(),
+            transfers: Vec::new(),
+            transfer_menu: None,
+            transfers_live: 0,
+            icons: Default::default(),
+            icons_for: [u64::MAX; 2],
+            account_form: None,
+            account_win: None,
+            main_win: None,
+            account_dirty: false,
+            main_dirty: false,
+            account_synced_font: None,
+            account_synced_render: None,
+            is_placeholder: true,
+        }
+    }
+
+    /// Shows `form` in the account window, unless a login or check is under way there: its answer
+    /// is matched to that form, so the window only comes to the front.
+    pub fn open_account_form(&mut self, form: servers::Form) {
+        if !self.account_form.as_ref().is_some_and(|f| f.checking.is_some()) {
+            self.account_form = Some(Box::new(form));
+        }
+        self.show_account_form();
+    }
+
+    /// Brings the account window to the front with the form it holds.
+    pub fn show_account_form(&mut self) {
+        self.account_dirty = true;
+        if let Some(w) = &self.account_win {
+            w.open();
+            w.wake();
+        }
+    }
+
+    pub fn close_account_form(&mut self) {
+        self.account_form = None;
+        self.account_dirty = true;
+        if let Some(w) = &self.account_win {
+            w.close();
+        }
+    }
+
+    pub fn notify_main(&mut self) {
+        self.main_dirty = true;
+        if let Some(w) = &self.main_win {
+            w.wake();
+        }
+    }
+
+    pub fn notify_account(&mut self) {
+        self.account_dirty = true;
+        if let Some(w) = &self.account_win {
+            w.wake();
+        }
+    }
+}
+
+thread_local! {
+    /// The stand-in the window whose turn it is gave up, handed to the next `leave_turn`. Rune
+    /// runs a turn for every event-loop callback of each window, so building a fresh stand-in
+    /// each time cost more than a frame.
+    static SPARE_PLACEHOLDER: std::cell::RefCell<Option<State>> = const { std::cell::RefCell::new(None) };
+}
+
+fn enter_turn(s: &mut State) {
+    SHARED_STATE.with(|cell| {
+        if let Some(shared) = cell.borrow_mut().take() {
+            let stand_in = std::mem::replace(s, shared);
+            SPARE_PLACEHOLDER.with(|spare| *spare.borrow_mut() = Some(stand_in));
+        }
+    });
+}
+
+fn leave_turn(s: &mut State) {
+    if !s.is_placeholder {
+        let stand_in = SPARE_PLACEHOLDER.with(|spare| spare.borrow_mut().take()).unwrap_or_else(State::placeholder);
+        SHARED_STATE.with(|cell| {
+            *cell.borrow_mut() = Some(std::mem::replace(s, stand_in));
+        });
+    }
 }
 
 fn init() -> State {
@@ -318,17 +494,84 @@ fn init() -> State {
         transfers_live: 0,
         icons: Default::default(),
         icons_for: [u64::MAX; 2],
+        account_form: None,
+        account_win: None,
+        main_win: None,
+        account_dirty: false,
+        main_dirty: false,
+        account_synced_font: None,
+        account_synced_render: None,
+        is_placeholder: false,
     }
 }
 
 fn setup(s: &mut State, waker: Waker) {
     let fixed = tree::fixed_icons(&s.places, &s.local_drives).into_iter().chain(sysicons::home_key());
     s.icons.start(rune::ImageCache::new(waker.clone()), s.outbox.clone(), waker.clone(), fixed);
-    s.waker = Some(waker);
+    let combined: Waker = Arc::new(move || {
+        waker();
+        if let Some(aw) = ACCOUNT_WAKER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            aw();
+        }
+    });
+    s.waker = Some(combined);
     // Each tree opens down to the folder its pane starts in.
     for p in 0..2 {
         tree::follow(s, p);
     }
+}
+
+fn init_account_window() -> State {
+    if rune::is_headless() {
+        let mut s = init();
+        servers::ask_add(&mut s);
+        s
+    } else {
+        State::placeholder()
+    }
+}
+
+fn setup_account_window(_: &mut State, waker: Waker) {
+    *ACCOUNT_WAKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker);
+}
+
+fn poll_account_window(s: &mut State, _now: f64, tx: &mut Tx) -> bool {
+    if s.is_placeholder {
+        return false;
+    }
+    if s.account_synced_font != Some(s.settings.font) {
+        s.account_synced_font = Some(s.settings.font);
+        let (sans, mono) = s.settings.font.families();
+        tx.set_font_families(sans, mono);
+    }
+    if s.account_synced_render != Some(s.settings.text_render) {
+        s.account_synced_render = Some(s.settings.text_render);
+        tx.set_font_smoothing(s.settings.text_render.smoothing());
+    }
+    std::mem::take(&mut s.account_dirty)
+}
+
+fn account_window_key(s: &mut State, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if s.is_placeholder {
+        return false;
+    }
+    if ev.key == Key::Escape && ev.mods == Mods::default() {
+        if let Some(f) = &mut s.account_form {
+            if f.open_group.is_some() {
+                f.open_group = None;
+                return true;
+            }
+            if f.step == servers::Step::Configure && f.editing.is_none() && f.checking.is_none() {
+                servers::back_to_pick(s);
+                return true;
+            }
+        }
+        telegram::abort_pending();
+        s.close_account_form();
+        tx.close_window();
+        return true;
+    }
+    false
 }
 
 /// Runs `f`, turning a panic into an error that names it (and logging it), so background work
@@ -403,6 +646,12 @@ const TYPING_PAUSE: f64 = 0.12;
 const FOUND_AGAIN: f64 = 1.5;
 
 fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
+    if s.is_placeholder {
+        return false;
+    }
+    if let Some(focused) = PENDING_MAIN_FOCUS.with(|c| c.take()) {
+        accounts::window_focus(s, focused, tx);
+    }
     // Each listing's file types get their icons asked for once.
     let versions = s.panes.each_ref().map(|p| p.version);
     if s.icons_for != versions {
@@ -415,7 +664,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             tree::learn(s, p);
         }
     }
-    let mut changed = s.icons.settle();
+    let mut changed = std::mem::take(&mut s.main_dirty) | s.icons.settle();
     changed |= notice(s, now, &mut |text, how| tx.announce(text, how));
     // A rectangle selection held past the list's edge scrolls it.
     changed |= lasso::step(s, now, tx);
@@ -1739,7 +1988,7 @@ fn main() {
     }
     let initial = settings::Settings::load();
     accounts::start();
-    rune::App::new(AppSpec::<State> {
+    let main_spec = AppSpec::<State> {
         min_size: Some((900.0, 420.0)),
         families: initial.font.families(),
         setup: Some(setup),
@@ -1789,23 +2038,23 @@ fn main() {
             ("server", |s| server_scene(s, None)),
             // The same server searched for "praia".
             ("server-search", |s| server_scene(s, Some("praia"))),
-            // Unified Adicionar conta picker, plus provider-specific steps.
+            // Unified Registrar conta picker, plus provider-specific steps.
             ("add-account", |s| servers::ask_add(s)),
             ("add-account-nas", |s| {
                 let mut f = servers::Form::new();
                 f.category = servers::Category::Nas;
-                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+                s.open_account_form(f);
             }),
             ("add-gdrive", |s| {
                 let mut f = servers::Form::for_provider(servers::Provider::GoogleDrive);
                 f.custom_oauth = true;
-                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+                s.open_account_form(f);
             }),
             ("add-nextcloud", |s| {
                 let mut f = servers::Form::for_provider(servers::Provider::Nextcloud);
                 f.host = rune::TextEdit::new("cloud.exemplo.com");
                 f.user = rune::TextEdit::new("ana");
-                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+                s.open_account_form(f);
             }),
             // Adicionar conta, filled in for SFTP; and for plain FTP, with its warning.
             ("add-server", |s| {
@@ -1813,14 +2062,14 @@ fn main() {
                 f.host = rune::TextEdit::new("nas.local");
                 f.user = rune::TextEdit::new("ana");
                 f.password = rune::TextEdit::new("segredo").secure();
-                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+                s.open_account_form(f);
             }),
             ("add-server-ftp", |s| {
                 let mut f = servers::Form::for_provider(servers::Provider::Ftp);
                 f.protocol = openexplorer_remote::Protocol::Ftp;
                 f.host = rune::TextEdit::new("192.168.0.10");
                 f.error = Some("192.168.0.10 recusou o usuário ou a senha.".into());
-                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+                s.open_account_form(f);
             }),
             // A NAS's own certificate, turned down: the dialog shows it and asks to trust it.
             ("add-server-cert", |s| {
@@ -1832,7 +2081,7 @@ fn main() {
                     fingerprint: "75:25:66:B8:60:50:B3:6B:5E:1A:58:FE:38:DE:1A:DB:F5:D6:86:41:DC:8C:9F:50:75:A6:E5:33:69:5A:A6:36".into(),
                     why: "não foi emitido por uma autoridade conhecida (é um certificado próprio)".into(),
                 });
-                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+                s.open_account_form(f);
             }),
             // Opções open on each sidebar tab.
             ("options", |s| s.dialog = Some(actions::Dialog::Options(Box::new(settings::OptionsView::open(settings::OptionsTab::General))))),
@@ -2010,7 +2259,7 @@ fn main() {
                 let mut f = servers::Form::for_provider(servers::Provider::Dropbox);
                 f.custom_oauth = true;
                 f.error = Some("App do Dropbox não configurado.".into());
-                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+                s.open_account_form(f);
             }),
             ("mega-add", |s| {
                 let mut f = servers::Form::for_provider(servers::Provider::Mega);
@@ -2018,7 +2267,7 @@ fn main() {
                 f.password = rune::TextEdit::new("segredo").secure();
                 f.needs_code = true;
                 f.error = Some(openexplorer_mega::Refused::NeedsCode.text());
-                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+                s.open_account_form(f);
             }),
             // A B2 key's bucket, without a network.
             ("b2", |s| {
@@ -2034,7 +2283,7 @@ fn main() {
                 f.user = rune::TextEdit::new("0051a2b3c4d5e6f0000000001");
                 f.password = rune::TextEdit::new("K005abcdefghijklmnopqrstuvwxyz0").secure();
                 f.error = Some(openexplorer_i18n::t("O ID da chave ou a chave de aplicação estão errados (ou a chave foi apagada).", "The key ID or the application key is wrong (or the key was deleted).").into());
-                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+                s.open_account_form(f);
             }),
             // A B2 bucket's unfinished uploads, without a network.
             ("b2-unfinished", b2::unfinished_scene),
@@ -2052,20 +2301,20 @@ fn main() {
                 f.client_id = rune::TextEdit::new("1234567");
                 f.client_secret = rune::TextEdit::new("0123456789abcdef0123456789abcdef").secure();
                 f.user = rune::TextEdit::new("+55 11 99999-8888");
-                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+                s.open_account_form(f);
             }),
             ("telegram-code", |s| {
                 let mut f = servers::Form::for_provider(servers::Provider::Telegram);
                 f.user = rune::TextEdit::new("+55 11 99999-8888");
                 f.telegram = telegram::Stage::Code;
                 f.error = Some(openexplorer_i18n::t("O código não confere.", "The code doesn't match.").into());
-                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+                s.open_account_form(f);
             }),
             ("telegram-password", |s| {
                 let mut f = servers::Form::for_provider(servers::Provider::Telegram);
                 f.telegram = telegram::Stage::Password { hint: "gato".into() };
                 f.password = rune::TextEdit::new("segredo").secure();
-                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+                s.open_account_form(f);
             }),
             // A OneDrive account's files with its storage, without a network.
             ("onedrive", |s| {
@@ -2085,7 +2334,7 @@ fn main() {
                 let mut f = servers::Form::for_provider(servers::Provider::OneDrive);
                 f.custom_oauth = true;
                 f.error = Some(t("Cliente OAuth do OneDrive não configurado.", "OneDrive OAuth client not set up.").into());
-                s.dialog = Some(actions::Dialog::Server(Box::new(f)));
+                s.open_account_form(f);
             }),
             // The question Copiar link asks on a OneDrive file with no link.
             ("onedrive-link", |s| {
@@ -2136,16 +2385,94 @@ fn main() {
             }),
         ],
         ..AppSpec::new("Open Explorer", (1280.0, 760.0), init, ui::view)
+    };
+    let account_app = rune::App::new(AppSpec::<State> {
+        min_size: Some((680.0, 440.0)),
+        families: initial.font.families(),
+        setup: Some(setup_account_window),
+        poll: Some(poll_account_window),
+        on_key: Some(account_window_key),
+        scenes: &[
+            ("add-account", |s| servers::ask_add(s)),
+            ("gdrive-menu", |s| {
+                let mut f = servers::Form::new();
+                f.open_group = Some(servers::Provider::GoogleDrive);
+                s.open_account_form(f);
+            }),
+            ("onedrive-menu", |s| {
+                let mut f = servers::Form::new();
+                f.open_group = Some(servers::Provider::OneDrive);
+                s.open_account_form(f);
+            }),
+            ("add-account-nas", |s| {
+                let mut f = servers::Form::new();
+                f.category = servers::Category::Nas;
+                s.open_account_form(f);
+            }),
+            ("add-account-search", |s| {
+                let mut f = servers::Form::new();
+                f.filter = rune::TextEdit::new("drive");
+                s.open_account_form(f);
+            }),
+            ("add-gdrive", |s| {
+                let mut f = servers::Form::for_variant(servers::ProviderVariant::GoogleDriveCustom);
+                f.custom_oauth = true;
+                s.open_account_form(f);
+            }),
+            ("add-nextcloud", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::Nextcloud);
+                f.host = rune::TextEdit::new("cloud.exemplo.com");
+                f.user = rune::TextEdit::new("ana");
+                s.open_account_form(f);
+            }),
+            ("add-server", |s| {
+                let mut f = servers::Form::for_provider(servers::Provider::Sftp);
+                f.host = rune::TextEdit::new("nas.local");
+                f.user = rune::TextEdit::new("ana");
+                f.password = rune::TextEdit::new("segredo").secure();
+                s.open_account_form(f);
+            }),
+        ],
+        ..AppSpec::new("Registrar conta", (980.0, 640.0), init_account_window, ui::account_window_view)
     })
+    .windowless()
+    .titlebar(rune::Titlebar::new(36.0))
     .font_smoothing(initial.text_render.smoothing())
-    .args(rune_args(std::env::args().skip(1)))
-    // B2 folders and Telegram accounts on screen look for changes only while the window is in
-    // front.
-    .on_focus(accounts::window_focus)
-    // The app ends without returning from `run`: what the cloud accounts changed since their
-    // trees and listings were last kept is kept here, so the next start has less to catch up on.
-    .on_quit(|_, _| accounts::save_caches())
-    .run();
+    .turn_scope(enter_turn, leave_turn)
+    .on_close(|s, _| {
+        if !s.is_placeholder {
+            telegram::abort_pending();
+            s.account_form = None;
+        }
+    });
+
+    let mut main_app = rune::App::new(main_spec)
+        .font_smoothing(initial.text_render.smoothing())
+        .args(rune_args(std::env::args().skip(1)))
+        .turn_scope(enter_turn, leave_turn)
+        // B2 folders and Telegram accounts on screen look for changes only while the window is in
+        // front.
+        .on_focus(|s, focused, tx| {
+            if s.is_placeholder {
+                PENDING_MAIN_FOCUS.with(|c| c.set(Some(focused)));
+            } else {
+                accounts::window_focus(s, focused, tx);
+            }
+        })
+        // The app ends without returning from `run`: what the cloud accounts changed since their
+        // trees and listings were last kept is kept here, so the next start has less to catch up on.
+        .on_quit(|_, _| accounts::save_caches());
+
+    let (account_handle, _) = main_app.window(rune::windows::WindowSpec::from_app("add-account", account_app));
+    let main_handle = main_app.handle();
+    main_app
+        .init(move || {
+            let mut s = init();
+            s.account_win = Some(account_handle);
+            s.main_win = Some(main_handle);
+            s
+        })
+        .run();
 }
 
 /// Rune's flags: what the command line says, with scroll bars always shown on Windows unless
@@ -2162,6 +2489,25 @@ fn rune_args(given: impl Iterator<Item = String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What one window turn costs in the move of the shared state: Rune runs a turn for every
+    /// event-loop callback of each window (events, wakes, every frame of an animation).
+    #[test]
+    #[ignore = "benchmark: cargo test --release -p openexplorer turn_swap_cost -- --ignored --nocapture"]
+    fn turn_swap_cost() {
+        let (mut main_win, mut account_win) = (init(), State::placeholder());
+        let rounds = 500;
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            leave_turn(&mut main_win);
+            enter_turn(&mut account_win);
+            leave_turn(&mut account_win);
+            enter_turn(&mut main_win);
+        }
+        let per_turn = started.elapsed().as_secs_f64() * 1e6 / f64::from(2 * rounds);
+        println!("one turn (enter + leave): {per_turn:.2} µs");
+        assert!(!main_win.is_placeholder && account_win.is_placeholder);
+    }
 
     /// F2, then a click on another row: the rename ends (the name kept as it was) and the click
     /// selects, so the keys aren't left with a field no one is typing in. Before, the rename

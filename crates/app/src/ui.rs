@@ -20,6 +20,9 @@ use crate::layout::{self, clamp_col, clamp_tree};
 const ROW_H: f32 = crate::ROW_H;
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
+    if s.is_placeholder {
+        return el();
+    }
     let k = Kit::neutral(s.settings.theme.dark(cx.system_dark()));
     // Menus and dialogs draw in a layer above everything.
     let mut layer = Vec::new();
@@ -1413,7 +1416,6 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
         Dialog::DropboxDeleted(v) => crate::dropbox::deleted_dialog(k, v, layer),
         Dialog::OneDriveLink(m) => crate::onedrive::link_dialog(k, m, layer),
         Dialog::B2Unfinished(d) => crate::b2::unfinished_dialog(k, d, layer),
-        Dialog::Server(f) => account_dialog(s, k, f, window_h, layer),
     }
 }
 
@@ -1433,226 +1435,504 @@ fn connected_count(s: &State, provider: crate::servers::Provider) -> usize {
     }
 }
 
-/// Scrollable body region inside `account_dialog`, capped to `window_h` so the dialog header
-/// and action buttons remain visible even at the minimum window height (420px) or when long
-/// certificate/error messages appear.
-fn account_scroll(k: &Kit, key: &'static str, window_h: Option<f32>, content: El) -> El {
-    let max_h = window_h.map_or(620.0, |h| (h - 2.0 * 16.0 - 48.0 - 62.0).max(120.0));
-    let bar = bar_style(k);
-    col()
+/// Independent "Registrar conta" / "Editar conta" native window:
+/// - Custom sleek titlebar with leading icon + title and native minimize/maximize/close caption controls.
+/// - `Step::Pick`: category pill tabs (`Todos`, `Pessoal`, `Empresarial`, `NAS`), top-right search bar
+///   (`Pesquisar nuvens`), recessed scrollable container with `"Nuvens populares"` (multi-version
+///   popover dropdowns on cards with >1 version) and `"Todas as nuvens A-Z · N"`, plus footer hint.
+/// - `Step::Configure`: full-window configuration / OAuth / credentials form with `← Voltar`.
+pub fn account_window_view(s: &State, cx: &mut Cx<State>) -> El {
+    if s.is_placeholder {
+        return el();
+    }
+    let k = Kit::neutral(s.settings.theme.dark(cx.system_dark()));
+    let default_form;
+    let f = match &s.account_form {
+        Some(f) => f.as_ref(),
+        None => {
+            default_form = crate::servers::Form::new();
+            &default_form
+        }
+    };
+
+    let window_bg = if k.dark { rune::oklch(0.24, 0.0, 0.0) } else { k.c.page };
+    let panel_bg = if k.dark { rune::oklch(0.198, 0.0, 0.0) } else { k.c.bg_base };
+    let panel_border = if k.dark { rune::oklch(0.285, 0.0, 0.0) } else { k.c.border_weak };
+
+    cx.caption_color(k.c.text_base);
+
+    let win_title = if f.editing.is_some() {
+        t("Editar conta", "Edit account")
+    } else {
+        t("Registrar conta", "Add account")
+    };
+
+    let title_leading = row()
+        .gap(8.0)
+        .center_y()
+        .child(icon(&icons::TITLE_REGISTER, 15.0).color(k.c.text_base))
+        .child(text(win_title).font(k.ty.text_small).color(k.c.text_base));
+
+    let titlebar = rune_kit::WindowTitlebar::from_insets(cx.chrome_insets())
+        .key("account-titlebar")
+        .leading_padding(14.0)
+        .fill(window_bg)
+        .leading(title_leading)
+        .build(&k);
+
+    let win_w = cx.layout_with("account-window", |r| r[2]).unwrap_or(980.0);
+    let mut layer = Vec::new();
+
+    let content = if f.step == crate::servers::Step::Pick {
+        account_pick_body(s, &k, f, win_w, panel_bg, panel_border, &mut layer)
+    } else {
+        account_configure_body(s, &k, f, panel_bg, panel_border)
+    };
+
+    let root = col()
+        .key("account-window")
         .w_full()
-        .max_h(max_h)
-        .min_h(0.0)
-        .shrink()
-        .child(
-            col()
-                .key(key)
-                .w_full()
-                .shrink()
-                .min_h(0.0)
-                .scroll(ScrollSpec { stick_bottom: false })
-                .child(content)
-                .scroll_bar_styled(bar),
-        )
+        .h_full()
+        .fill(window_bg)
+        .child(titlebar)
+        .child(content)
+        .hover_motion_within(Anim::INSTANT, Anim::INSTANT);
+
+    rune_kit::root(root, layer)
 }
 
-/// Unified Adicionar conta / Editar conta dialog:
-/// - `Step::Pick`: modern categorized provider grid with instant search and URL detection.
-/// - `Step::Configure`: tailored OAuth or server credentials screen with `← Voltar`.
-fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option<f32>, layer: &mut Vec<El>) {
-    use crate::servers::{Category, Form, Provider, Step};
-    use openexplorer_remote::Protocol;
+fn close_account_win(s: &mut State, tx: &mut Tx) {
+    crate::telegram::abort_pending();
+    s.close_account_form();
+    tx.close_window();
+}
 
-    fn part(s: &mut State, pick: fn(&mut Form) -> &mut rune::TextEdit) -> &mut rune::TextEdit {
-        match &mut s.dialog {
-            Some(Dialog::Server(f)) => pick(f),
-            _ => &mut s.name_edit,
+fn account_part(s: &mut State, pick: fn(&mut crate::servers::Form) -> &mut rune::TextEdit) -> &mut rune::TextEdit {
+    match &mut s.account_form {
+        Some(f) => pick(f),
+        None => &mut s.name_edit,
+    }
+}
+
+fn account_pick_body(
+    s: &State,
+    k: &Kit,
+    f: &crate::servers::Form,
+    win_w: f32,
+    panel_bg: Color,
+    panel_border: Color,
+    layer: &mut Vec<El>,
+) -> El {
+    use crate::servers::Category;
+
+    // Top bar: category tabs on the left + "Pesquisar nuvens" search input on the top right.
+    let tab_active_bg = if k.dark { rune::oklch(0.31, 0.06, 252.0) } else { k.alpha(k.c.text_accent, 0.13) };
+    let tab_hover_bg = if k.dark { rune::oklch(0.285, 0.0, 0.0) } else { k.alpha(k.c.text_base, 0.05) };
+
+    let mut tabs = row().key("cat-tabs").gap(4.0).center_y();
+    for cat in Category::ALL {
+        let on = f.category == cat;
+        let fill = if on { tab_active_bg } else { Color::TRANSPARENT };
+        let icon_ink = if on {
+            if k.dark { Color::WHITE } else { k.c.text_accent }
+        } else {
+            k.c.icon_muted
+        };
+        let text_ink = if on {
+            if k.dark { Color::WHITE } else { k.c.text_base }
+        } else {
+            if k.dark { rune::oklch(0.84, 0.0, 0.0) } else { k.c.text_muted }
+        };
+        let mut pill = row()
+            .key(format!("cat-{cat:?}"))
+            .role("tab")
+            .label(cat.label())
+            .checked(on)
+            .focusable(true)
+            .focus_ring(2.0, 1.0, k.c.border_focus)
+            .h(32.0)
+            .px(12.0)
+            .gap(7.0)
+            .center_y()
+            .radius(6.0)
+            .fill(fill)
+            .cursor(Cursor::Pointer)
+            .on_press(move |s: &mut State| crate::servers::set_category(s, cat))
+            .child(icon(cat.icon(), 14.0).color(icon_ink))
+            .child(text(cat.label()).font(if on { k.ty.text_small_medium } else { k.ty.text_small }).color(text_ink));
+        if !on {
+            pill = pill.hover(tab_hover_bg);
         }
+        tabs = tabs.child(pill);
     }
 
-    if f.step == Step::Pick {
-        let mut search = rune_kit::TextInput::new(&f.filter)
-            .width(None)
-            .large()
-            .label(t("Buscar provedor", "Search providers"))
-            .leading_icon(&icons::SEARCH)
-            .placeholder(t("Buscar provedor ou colar endereço (ex.: Google Drive, FTP, sftp://nas)…", "Search providers or paste an address (e.g. Google Drive, FTP, sftp://nas)…"))
-            .on_edit(|s: &mut State| part(s, |f| &mut f.filter))
-            .on_submit(|s: &mut State, _: &mut Tx| crate::servers::submit_filter(s));
-        if !f.filter.text.is_empty() {
-            search = search.clear_button().on_action(|s: &mut State, _: &mut Tx| crate::servers::clear_filter(s));
-        }
+    // Trailing magnifier (or clear button + magnifier when text is typed), matching the reference's top-right search bar.
+    let search_trailing = if f.filter.text.is_empty() {
+        row()
+            .size(22.0, 22.0)
+            .center()
+            .child(icon(&icons::SEARCH, 13.5).color(k.c.icon_muted))
+    } else {
+        row()
+            .gap(2.0)
+            .center_y()
+            .child(
+                row()
+                    .key("clear-search")
+                    .role("button")
+                    .label(t("Limpar pesquisa", "Clear search"))
+                    .size(20.0, 20.0)
+                    .center()
+                    .radius(4.0)
+                    .hover(k.c.hover)
+                    .cursor(Cursor::Pointer)
+                    .on_press(crate::servers::clear_filter)
+                    .child(icon(k.glyph.close, 12.0).color(k.c.icon_muted)),
+            )
+            .child(row().size(20.0, 20.0).center().child(icon(&icons::SEARCH, 13.5).color(k.c.icon_muted)))
+    };
 
-        // Category filter tabs with icons (inspired by Air Explorer, modernized as pill tabs).
-        let mut tabs = row().key("cat-tabs").w_full().gap(6.0).center_y();
-        for cat in Category::ALL {
-            let on = f.category == cat;
-            let count = Provider::ALL.into_iter().filter(|p| p.in_category(cat)).count();
-            let fill = if on { k.alpha(k.c.text_accent, if k.dark { 0.20 } else { 0.11 }) } else { k.c.bg_base };
-            let border = if on { k.alpha(k.c.text_accent, 0.50) } else { k.c.border_weak };
-            let icon_ink = if on { k.c.text_accent } else { k.c.icon_muted };
-            let text_ink = if on { k.c.text_base } else { k.c.text_muted };
-            let pill = k
-                .interactive(
-                    row()
-                        .key(format!("cat-{cat:?}"))
-                        .role("tab")
-                        .label(cat.label())
-                        .checked(on)
-                        .focusable(true)
-                        .focus_ring(2.0, 1.0, k.c.border_focus)
-                        .h(30.0)
-                        .px(11.0)
-                        .gap(6.0)
-                        .center_y()
-                        .radius(k.radius.md)
-                        .fill(fill)
-                        .border(1.0, border)
-                        .cursor(Cursor::Pointer),
-                )
-                .on_press(move |s: &mut State| crate::servers::set_category(s, cat))
-                .child(icon(cat.icon(), 14.0).color(icon_ink))
-                .child(text(cat.label()).font(if on { k.ty.text_small_medium } else { k.ty.text_small }).color(text_ink))
-                .child(
-                    row()
-                        .h(16.0)
-                        .px(5.0)
-                        .center()
-                        .radius(8.0)
-                        .fill(if on { k.alpha(k.c.text_accent, 0.20) } else { k.alpha(k.c.text_base, 0.06) })
-                        .child(text(count.to_string()).font(k.ty.caption()).color(if on { k.c.text_accent } else { k.c.text_faint })),
-                );
-            tabs = tabs.child(pill);
-        }
+    let search_w = if win_w < 760.0 { 200.0 } else { 256.0 };
+    let search_box = rune_kit::TextInput::new(&f.filter)
+        .width(Some(search_w))
+        .label(t("Pesquisar nuvens", "Search clouds"))
+        .placeholder(t("Pesquisar nuvens", "Search clouds"))
+        .trailing(search_trailing)
+        .on_edit(|s: &mut State| account_part(s, |f| &mut f.filter))
+        .on_change(|s: &mut State, _: &mut Tx| crate::servers::close_group(s))
+        .on_submit(|s: &mut State, _: &mut Tx| crate::servers::submit_filter(s))
+        .build(k)
+        .key("cloud-search");
 
-        // 3-column provider grid.
-        let visible = f.visible_providers();
-        let grid: El = if visible.is_empty() {
-            let trimmed = f.filter.text.trim().trim_matches('"');
-            let is_url = crate::servers::parse_address(trimmed).is_some();
-            let msg = if is_url {
-                tr!("Endereço “{trimmed}” reconhecido. Clique abaixo ou pressione Enter para configurar.", "Address “{trimmed}” recognized. Click below or press Enter to set it up.")
-            } else {
-                tr!("Nenhum provedor encontrado para “{}”.", "No provider found for “{}”.", f.filter.text.trim())
-            };
-            let act = if is_url {
-                Button::new(t("Configurar endereço", "Set up address")).variant(ButtonVariant::Submit).on_press(crate::servers::submit_filter).build(k).default_button()
-            } else {
-                Button::new(t("Limpar busca", "Clear search")).variant(ButtonVariant::Neutral).on_press(crate::servers::clear_filter).build(k)
-            };
+    let top_bar = row()
+        .key("picker-topbar")
+        .w_full()
+        .px(18.0)
+        .pt(4.0)
+        .pb(10.0)
+        .gap(12.0)
+        .center_y()
+        .child(tabs)
+        .child(el().grow(1.0))
+        .child(search_box);
+
+    // Responsive column counts as the independent window is resized.
+    let pop_cols = if win_w >= 860.0 {
+        4
+    } else if win_w >= 640.0 {
+        3
+    } else {
+        2
+    };
+    let all_cols = if win_w >= 920.0 {
+        5
+    } else if win_w >= 760.0 {
+        4
+    } else {
+        3
+    };
+
+    let popular = f.visible_popular();
+    let variants = f.visible_variants();
+
+    let card_bg = if k.dark { rune::oklch(0.285, 0.0, 0.0) } else { k.alpha(k.c.black, 0.025) };
+    let card_border = if k.dark { rune::oklch(0.34, 0.0, 0.0) } else { k.c.border_weak };
+    let card_hover = if k.dark { rune::oklch(0.32, 0.0, 0.0) } else { k.alpha(k.c.black, 0.05) };
+    let card_active_bg = if k.dark { rune::oklch(0.315, 0.048, 250.0) } else { k.alpha(k.c.text_accent, 0.12) };
+    let card_active_border = if k.dark { rune::oklch(0.43, 0.065, 250.0) } else { k.alpha(k.c.text_accent, 0.45) };
+    let accent_pill = if k.dark { rune::oklch(0.76, 0.135, 240.0) } else { k.c.text_accent };
+    let dropdown_bg = if k.dark { rune::oklch(0.275, 0.0, 0.0) } else { k.c.surface_raised };
+    let dropdown_border = if k.dark { rune::oklch(0.38, 0.0, 0.0) } else { k.c.border_base };
+    let dropdown_hover = if k.dark { rune::oklch(0.33, 0.0, 0.0) } else { k.c.hover };
+
+    let mut scroll_inner = col().key("catalog-sections").w_full().px(22.0).py(18.0).gap(22.0);
+
+    if variants.is_empty() {
+        let trimmed = f.filter.text.trim().trim_matches('"');
+        let is_url = crate::servers::parse_address(trimmed).is_some();
+        let msg = if is_url {
+            tr!("Endereço “{trimmed}” reconhecido. Clique abaixo ou pressione Enter para configurar.", "Address “{trimmed}” recognized. Click below or press Enter to set it up.")
+        } else {
+            tr!("Nenhuma nuvem encontrada para “{}”.", "No cloud found for “{}”.", f.filter.text.trim())
+        };
+        let act = if is_url {
+            Button::new(t("Configurar endereço", "Set up address")).variant(ButtonVariant::Submit).on_press(crate::servers::submit_filter).build(k).default_button()
+        } else {
+            Button::new(t("Limpar pesquisa", "Clear search")).variant(ButtonVariant::Neutral).on_press(crate::servers::clear_filter).build(k)
+        };
+        scroll_inner = scroll_inner.child(
             col()
                 .key("empty-grid")
                 .w_full()
-                .min_h(210.0)
-                .padding(20.0)
+                .min_h(240.0)
+                .padding(24.0)
                 .gap(12.0)
                 .center()
-                .radius(k.radius.lg)
-                .fill(k.c.bg_base)
-                .border(1.0, k.c.border_weak)
                 .child(text(msg).font(k.ty.text_small).color(k.c.text_muted).align(Align::Center).wrap().w_full())
-                .child(act)
-        } else {
-            let mut rows = col().key("provider-grid").w_full().gap(10.0);
-            for (r_idx, chunk) in visible.chunks(3).enumerate() {
-                let mut line = row().key(format!("p-row-{r_idx}")).w_full().gap(10.0);
-                for &provider in chunk {
+                .child(act),
+        );
+    } else {
+        // Section 1: "Nuvens populares"
+        if !popular.is_empty() {
+            let mut pop_grid = col().key("popular-grid").w_full().gap(10.0);
+            for (r_idx, chunk) in popular.chunks(pop_cols).enumerate() {
+                let mut line = row().key(format!("pop-row-{r_idx}")).w_full().gap(10.0);
+                for (provider, versions) in chunk {
+                    let provider = *provider;
+                    let multi = versions.len() > 1;
+                    let is_open = multi && f.open_group == Some(provider);
+                    let anchor_key = format!("pop-card-{}", provider.label());
                     let connected = connected_count(s, provider);
-                    let pedestal_bg = if k.dark { k.alpha(k.c.white, 0.055) } else { k.alpha(k.c.black, 0.035) };
-                    let mut card = k
-                        .interactive(
-                            col()
-                                .key(format!("provider-{}", provider.label()))
-                                .role("button")
-                                .label(format!("{} — {}", provider.label(), provider.subtitle()))
-                                .focusable(true)
-                                .focus_ring(2.0, 1.0, k.c.border_focus)
-                                .grow(1.0)
-                                .w(0.0)
-                                .h(118.0)
-                                .padding(12.0)
-                                .gap(6.0)
-                                .items_center()
-                                .justify_center()
-                                .radius(k.radius.lg)
-                                .fill(k.c.bg_base)
-                                .border(1.0, k.c.border_weak)
-                                .cursor(Cursor::Pointer),
-                        )
-                        .on_press(move |s: &mut State| crate::servers::pick_provider(s, provider))
-                        .child(row().size(48.0, 48.0).center().radius(12.0).fill(pedestal_bg).child(icon(provider.icon(), 34.0)))
-                        .child(text(provider.label()).font(k.ty.text_small_medium).color(k.c.text_base).align(Align::Center))
-                        .child(text(provider.subtitle()).font(k.ty.caption()).color(k.c.text_muted).align(Align::Center).truncate().w_full());
-                    if connected > 0 {
-                        let badge_label = if connected == 1 { t("1 ativa", "1 active").to_string() } else { tr!("{connected} ativas", "{connected} active") };
+
+                    let labels_col = if multi {
+                        let ver_txt = tr!("{} versões", "{} versions", versions.len());
+                        col()
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .gap(1.0)
+                            .child(text(provider.label()).font(k.ty.text_small_medium).color(k.c.text_base).truncate().min_w(0.0))
+                            .child(text(ver_txt).font(k.ty.caption()).color(k.c.text_muted).truncate().min_w(0.0))
+                    } else {
+                        col()
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .child(text(provider.label()).font(k.ty.text_small_medium).color(k.c.text_base).truncate().min_w(0.0))
+                    };
+
+                    let mut card = row()
+                        .key(anchor_key.clone())
+                        .role("button")
+                        .label(provider.label())
+                        .expanded(is_open)
+                        .focusable(true)
+                        .focus_ring(2.0, 1.0, k.c.border_focus)
+                        .grow(1.0)
+                        .w(0.0)
+                        .h(58.0)
+                        .pl(16.0)
+                        .pr(14.0)
+                        .gap(12.0)
+                        .center_y()
+                        .radius(6.0)
+                        .fill(if is_open { card_active_bg } else { card_bg })
+                        .border(1.0, if is_open { card_active_border } else { card_border })
+                        .cursor(Cursor::Pointer)
+                        .on_press(move |s: &mut State| crate::servers::toggle_group(s, provider))
+                        .child(icon(provider.icon(), 26.0))
+                        .child(labels_col);
+
+                    if !is_open {
+                        card = card.hover(card_hover);
+                    }
+
+                    if connected > 0 && !multi {
                         card = card.child(
-                            row()
-                                .pin(None, Some(8.0), Some(8.0), None)
-                                .h(16.0)
-                                .px(5.0)
-                                .gap(3.0)
-                                .center_y()
-                                .radius(8.0)
-                                .fill(k.alpha(k.c.success.fg, if k.dark { 0.18 } else { 0.12 }))
-                                .child(el().size(5.0, 5.0).radius(2.5).fill(k.c.success.fg))
-                                .child(text(badge_label).font(k.ty.caption()).color(k.c.success.fg)),
+                            el()
+                                .size(6.0, 6.0)
+                                .radius(3.0)
+                                .fill(k.c.success.fg),
                         );
                     }
+
+                    if multi {
+                        card = card.child(icon(&icons::CHEVRON_DOWN, 13.0).color(if is_open { k.c.text_base } else { k.c.icon_muted }));
+                    }
+
+                    // Active left vertical accent indicator pill (matching the reference's expanded card).
+                    if is_open {
+                        card = card.child(
+                            el()
+                                .key("active-bar")
+                                .pin(Some(0.0), Some(20.0), None, None)
+                                .size(3.0, 18.0)
+                                .radius(1.5)
+                                .fill(accent_pill),
+                        );
+
+                        // Floating dropdown menu anchored beneath the card.
+                        layer.push(rune_kit::scrim("group-menu-scrim", crate::servers::close_group));
+                        let mut menu_rows = col().key("group-menu-list").w_full().padding(6.0).gap(2.0);
+                        for &v in versions {
+                            let opt = row()
+                                .key(format!("opt-{}", v.label()))
+                                .role("menuitem")
+                                .label(format!("{} — {}", v.label(), v.description()))
+                                .focusable(true)
+                                .focus_ring(2.0, 1.0, k.c.border_focus)
+                                .w_full()
+                                .px(12.0)
+                                .py(9.0)
+                                .gap(12.0)
+                                .center_y()
+                                .radius(6.0)
+                                .hover(dropdown_hover)
+                                .cursor(Cursor::Pointer)
+                                .on_press(move |s: &mut State| crate::servers::pick_variant(s, v))
+                                .child(icon(v.icon(), 25.0))
+                                .child(
+                                    col()
+                                        .grow(1.0)
+                                        .min_w(0.0)
+                                        .gap(2.0)
+                                        .child(text(v.label()).font(k.ty.text_small).color(k.c.text_base).truncate().min_w(0.0))
+                                        .child(text(v.description()).font(k.ty.caption()).color(k.c.text_muted).truncate().min_w(0.0)),
+                                );
+                            menu_rows = menu_rows.child(opt);
+                        }
+                        let surface = menu_rows
+                            .min_w(292.0)
+                            .radius(8.0)
+                            .fill(dropdown_bg)
+                            .border(1.0, dropdown_border)
+                            .box_shadow(rune::Shadow { y: 8.0, blur: 24.0, color: k.dark_a(0.45), ..Default::default() });
+                        layer.push(rune_kit::popover::anchored(k, surface, &anchor_key, rune_kit::Placement::BottomStart, 4.0));
+                    }
+
                     line = line.child(card);
                 }
-                // Keep partial rows aligned to a 3-column grid.
-                for filler in chunk.len()..3 {
-                    line = line.child(el().key(format!("filler-{r_idx}-{filler}")).grow(1.0).w(0.0));
+                for filler in chunk.len()..pop_cols {
+                    line = line.child(el().key(format!("pop-filler-{r_idx}-{filler}")).grow(1.0).w(0.0));
                 }
-                rows = rows.child(line);
+                pop_grid = pop_grid.child(line);
             }
-            rows
-        };
 
-        let footer_note: El = if s.login.is_some() {
-            row()
-                .gap(6.0)
-                .center_y()
-                .grow(1.0)
-                .min_w(0.0)
-                .child(el().size(7.0, 7.0).radius(3.5).fill(k.c.text_accent))
-                .child(text(t("Aguardando autorização do Google no navegador…", "Waiting for Google's authorization in the browser…")).font(k.ty.text_xsmall).color(k.c.text_accent).truncate().min_w(0.0))
-        } else {
-            row()
-                .gap(5.0)
-                .center_y()
-                .grow(1.0)
-                .min_w(0.0)
-                .child(icon(k.glyph.lock, 13.0).color(k.c.icon_faint))
-                .child(text(t("Senhas e tokens ficam protegidos no Cofre do sistema.", "Passwords and tokens are kept safe in the system's Credential Manager.")).font(k.ty.caption()).color(k.c.text_faint).truncate().min_w(0.0))
-        };
+            scroll_inner = scroll_inner.child(
+                col()
+                    .key("sec-popular")
+                    .w_full()
+                    .gap(11.0)
+                    .child(text(t("Nuvens populares", "Popular clouds")).font(k.ty.text_small_medium).color(k.c.text_base))
+                    .child(pop_grid),
+            );
+        }
 
-        let picker_inner = col()
-            .w_full()
-            .px(16.0)
-            .pb(4.0)
-            .gap(12.0)
-            .child(text(t("Escolha uma nuvem, NAS ou protocolo remoto para conectar ao Open Explorer.", "Choose a cloud, NAS or remote protocol to connect to Open Explorer.")).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
-            .child(search.build(k))
-            .child(tabs)
-            .child(grid);
+        // Section 2: "Todas as nuvens A-Z · N"
+        let all_hover = if k.dark { rune::oklch(0.255, 0.0, 0.0) } else { k.alpha(k.c.black, 0.045) };
+        let mut az_grid = col().key("az-grid").w_full().gap(4.0);
+        for (r_idx, chunk) in variants.chunks(all_cols).enumerate() {
+            let mut line = row().key(format!("az-row-{r_idx}")).w_full().gap(8.0);
+            for &variant in chunk {
+                let item = row()
+                    .key(format!("az-{}", variant.label()))
+                    .role("button")
+                    .label(format!("{} — {}", variant.label(), variant.description()))
+                    .focusable(true)
+                    .focus_ring(2.0, 1.0, k.c.border_focus)
+                    .grow(1.0)
+                    .w(0.0)
+                    .h(38.0)
+                    .px(8.0)
+                    .gap(10.0)
+                    .center_y()
+                    .radius(6.0)
+                    .hover(all_hover)
+                    .cursor(Cursor::Pointer)
+                    .on_press(move |s: &mut State| crate::servers::pick_variant(s, variant))
+                    .child(icon(variant.icon(), 21.0))
+                    .child(text(variant.label()).font(k.ty.text_small).color(k.c.text_base).truncate().min_w(0.0).grow(1.0));
+                line = line.child(item);
+            }
+            for filler in chunk.len()..all_cols {
+                line = line.child(el().key(format!("az-filler-{r_idx}-{filler}")).grow(1.0).w(0.0));
+            }
+            az_grid = az_grid.child(line);
+        }
 
-        let body = col()
-            .key("picker-content")
-            .w_full()
-            .child(account_scroll(k, "picker-scroll", window_h, picker_inner))
-            .child(row().key("picker-footer").w_full().px(16.0).pt(12.0).pb(16.0).gap(8.0).center_y().child(footer_note).child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k)));
+        let az_head = row()
+            .gap(6.0)
+            .center_y()
+            .child(text(t("Todas as nuvens", "All clouds")).font(k.ty.text_small_medium).color(k.c.text_base))
+            .child(text(format!("A-Z · {}", variants.len())).font(k.ty.text_small).color(k.c.text_muted));
 
-        Modal::new("server", t("Registrar conta", "Add account")).open(true).child(body).width(600.0).fit().on_close(close).build(k, layer);
-        return;
+        scroll_inner = scroll_inner.child(
+            col()
+                .key("sec-all")
+                .w_full()
+                .gap(10.0)
+                .child(az_head)
+                .child(az_grid),
+        );
     }
 
-    // -----------------------------------------------------------------------------------------
-    // Step 2: Provider-specific configuration (Google Drive OAuth or server credentials)
+    let bar = bar_style(k);
+    let scroll_panel = col()
+        .key("picker-panel-wrap")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .px(12.0)
+        .child(
+            col()
+                .key("picker-panel")
+                .w_full()
+                .h_full()
+                .min_h(0.0)
+                .radius(8.0)
+                .fill(panel_bg)
+                .border(1.0, panel_border)
+                .clip_rounded(8.0)
+                .child(
+                    col()
+                        .key("picker-scroll")
+                        .w_full()
+                        .h_full()
+                        .min_h(0.0)
+                        .scroll(ScrollSpec { stick_bottom: false })
+                        .child(scroll_inner)
+                        .scroll_bar_styled(bar),
+                ),
+        );
 
-    if f.provider == Provider::OneDrive {
-        return crate::onedrive::configure(s, k, f, layer);
-    }
+    let waiting_oauth = s.login.is_some() || s.servers.onedrive.login.is_some();
+    let footer: El = if waiting_oauth {
+        row()
+            .key("picker-footer")
+            .w_full()
+            .h(34.0)
+            .px(18.0)
+            .gap(7.0)
+            .center_y()
+            .child(el().size(7.0, 7.0).radius(3.5).fill(k.c.text_accent))
+            .child(text(t("Aguardando autorização no navegador…", "Waiting for authorization in the browser…")).font(k.ty.caption()).color(k.c.text_accent).truncate().min_w(0.0))
+    } else {
+        row()
+            .key("picker-footer")
+            .w_full()
+            .h(34.0)
+            .px(18.0)
+            .center_y()
+            .child(
+                text(t(
+                    "Não está na lista? Muitas nuvens funcionam via WebDAV, SFTP ou FTP.",
+                    "Not on the list? Many clouds work via WebDAV, SFTP or FTP.",
+                ))
+                .font(k.ty.caption())
+                .color(k.c.text_muted)
+                .truncate()
+                .min_w(0.0),
+            )
+    };
+
+    col()
+        .key("picker-body")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(top_bar)
+        .child(scroll_panel)
+        .child(footer)
+}
+
+fn account_configure_body(
+    s: &State,
+    k: &Kit,
+    f: &crate::servers::Form,
+    panel_bg: Color,
+    panel_border: Color,
+) -> El {
+    use crate::servers::{Form, Provider};
+    use openexplorer_remote::Protocol;
+
     let proto = f.effective_protocol();
     let (summary, badge_text) = match (f.provider, proto) {
         (Provider::GoogleDrive, _) => (t("Autorização segura OAuth 2.0 pelo navegador padrão", "Secure OAuth 2.0 sign-in through the default browser"), "OAuth 2.0"),
@@ -1678,12 +1958,13 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
         rune_kit::BadgeVariant::Subtle
     };
 
+    let banner_title = f.variant_label.unwrap_or_else(|| f.provider.label());
     let banner = row()
         .key("provider-banner")
         .w_full()
-        .px(12.0)
-        .py(9.0)
-        .gap(10.0)
+        .px(14.0)
+        .py(11.0)
+        .gap(12.0)
         .center_y()
         .radius(k.radius.md)
         .fill(k.c.bg_base)
@@ -1694,7 +1975,7 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
                 .grow(1.0)
                 .min_w(0.0)
                 .gap(1.0)
-                .child(text(f.provider.label()).font(k.ty.text_small_medium).color(k.c.text_base))
+                .child(text(banner_title).font(k.ty.text_small_medium).color(k.c.text_base))
                 .child(text(summary).font(k.ty.caption()).color(k.c.text_muted).truncate().min_w(0.0)),
         )
         .child(rune_kit::Badge::new(badge_text).variant(badge_variant).standard().build(k));
@@ -1716,485 +1997,491 @@ fn account_dialog(s: &State, k: &Kit, f: &crate::servers::Form, window_h: Option
             .child(icon(if revealed { k.glyph.eye_off } else { k.glyph.eye }, 15.0).color(k.c.icon_muted))
     };
 
-    // Google Drive step.
-    if f.provider == Provider::GoogleDrive {
-        // Whether a client is configured was read once, on picking Google Drive (`custom_oauth`),
-        // not on every frame.
-        let show_oauth_form = f.custom_oauth;
-        let mut inner = col()
-            .w_full()
-            .px(16.0)
-            .pb(4.0)
-            .gap(12.0)
-            .child(banner)
-            .child(
-                text(t(
-                    "Ao continuar, o navegador abrirá a página do Google para você escolher a conta e autorizar o acesso ao Meu Drive e aos Drives compartilhados.",
-                    "When you continue, the browser opens Google's page so you can pick the account and allow access to My Drive and Shared drives.",
-                ))
+    let (inner, actions) = match f.provider {
+        Provider::OneDrive => crate::onedrive::configure(s, k, f, banner, close_account_win),
+        Provider::Dropbox => crate::dropbox::account_step(s, k, f, banner, close_account_win),
+        Provider::B2 => {
+            let eye = eye_toggle("pass-eye", f.reveal_password, |s| {
+                if let Some(f) = &mut s.account_form {
+                    f.reveal_password = !f.reveal_password;
+                }
+            });
+            crate::b2::form(k, f, banner, eye, close_account_win)
+        }
+        Provider::Telegram => {
+            let eye = eye_toggle("pass-eye", f.reveal_password, |s| {
+                if let Some(f) = &mut s.account_form {
+                    f.reveal_password = !f.reveal_password;
+                }
+            });
+            crate::telegram::form(k, f, banner, eye)
+        }
+        Provider::GoogleDrive => {
+            let show_oauth_form = f.custom_oauth;
+            let mut inner = col()
+                .w_full()
+                .gap(12.0)
+                .child(banner)
+                .child(
+                    text(t(
+                        "Ao continuar, o navegador abrirá a página do Google para você escolher a conta e autorizar o acesso ao Meu Drive e aos Drives compartilhados.",
+                        "When you continue, the browser opens Google's page so you can pick the account and allow access to My Drive and Shared drives.",
+                    ))
                     .font(k.ty.text_small)
                     .color(k.c.text_muted)
                     .wrap()
                     .w_full()
                     .min_w(0.0),
-            );
+                );
 
-        if !s.accounts.is_empty() {
-            let emails = s.accounts.iter().map(|a| a.email.as_str()).collect::<Vec<_>>().join(", ");
-            inner = inner.child(
-                row()
-                    .key("connected-drives")
-                    .w_full()
-                    .px(10.0)
-                    .py(7.0)
-                    .gap(6.0)
-                    .center_y()
-                    .radius(k.radius.sm)
-                    .fill(k.alpha(k.c.text_accent, if k.dark { 0.10 } else { 0.06 }))
-                    .child(el().size(6.0, 6.0).radius(3.0).fill(k.c.success.fg))
-                    .child(text(tr!("Já conectadas: {emails}", "Already connected: {emails}")).font(k.ty.text_xsmall).color(k.c.text_base).truncate().min_w(0.0).grow(1.0)),
-            );
-        }
-
-        if show_oauth_form {
-            let id_input = rune_kit::TextInput::new(&f.client_id)
-                .width(None)
-                .label(t("Client ID (ou JSON completo)", "Client ID (or the full JSON)"))
-                .placeholder(t("123456-abc.apps.googleusercontent.com ou cole o JSON inteiro", "123456-abc.apps.googleusercontent.com or paste the whole JSON"))
-                .on_edit(|s: &mut State| part(s, |f| &mut f.client_id))
-                .on_submit(|s: &mut State, tx: &mut Tx| crate::servers::submit_google(s, tx));
-            let secret_eye = eye_toggle("secret-eye", f.reveal_secret, |s| {
-                if let Some(Dialog::Server(f)) = &mut s.dialog {
-                    f.reveal_secret = !f.reveal_secret;
-                }
-            });
-            let secret_input = rune_kit::TextInput::new(&f.client_secret)
-                .width(None)
-                .label("Client Secret")
-                .placeholder(t("GOCSPX-… (dispensável se colar o JSON acima)", "GOCSPX-… (not needed if you paste the JSON above)"))
-                .revealed(f.reveal_secret)
-                .trailing(secret_eye)
-                .on_edit(|s: &mut State| part(s, |f| &mut f.client_secret))
-                .on_submit(|s: &mut State, tx: &mut Tx| crate::servers::submit_google(s, tx));
-            let console_btn = Button::new(t("Abrir Google Cloud Console", "Open Google Cloud Console"))
-                .icon(&icons::EXTERNAL_LINK)
-                .variant(ButtonVariant::Neutral)
-                .on_press_tx(|s: &mut State, tx: &mut Tx| {
-                    if let Err(e) = tx.open_url("https://console.cloud.google.com/apis/credentials") {
-                        crate::fail(s, tr!("Não consegui abrir o navegador: {e:?}", "Couldn't open the browser: {e:?}"));
-                    }
-                })
-                .build(k);
-            let oauth_box = col()
-                .key("oauth-box")
-                .w_full()
-                .padding(12.0)
-                .gap(8.0)
-                .radius(k.radius.md)
-                .fill(k.c.bg_base)
-                .border(1.0, k.c.border_weak)
-                .child(
+            if !s.accounts.is_empty() {
+                let emails = s.accounts.iter().map(|a| a.email.as_str()).collect::<Vec<_>>().join(", ");
+                inner = inner.child(
                     row()
+                        .key("connected-drives")
                         .w_full()
+                        .px(10.0)
+                        .py(7.0)
+                        .gap(6.0)
                         .center_y()
-                        .child(text(t("Cliente OAuth (App para computador)", "OAuth client (Desktop app)")).font(k.ty.text_small_medium).color(k.c.text_base).grow(1.0))
-                        .child(console_btn),
-                )
-                .child(
-                    text(t(
-                        "Crie uma credencial OAuth do tipo “App para computador” no Google Cloud Console, ou cole o arquivo google-client.json diretamente abaixo:",
-                        "Create an OAuth credential of type “Desktop app” in the Google Cloud Console, or paste the google-client.json file right below:",
-                    ))
+                        .radius(k.radius.sm)
+                        .fill(k.alpha(k.c.text_accent, if k.dark { 0.10 } else { 0.06 }))
+                        .child(el().size(6.0, 6.0).radius(3.0).fill(k.c.success.fg))
+                        .child(text(tr!("Já conectadas: {emails}", "Already connected: {emails}")).font(k.ty.text_xsmall).color(k.c.text_base).truncate().min_w(0.0).grow(1.0)),
+                );
+            }
+
+            if show_oauth_form {
+                let id_input = rune_kit::TextInput::new(&f.client_id)
+                    .width(None)
+                    .label(t("Client ID (ou JSON completo)", "Client ID (or the full JSON)"))
+                    .placeholder(t("123456-abc.apps.googleusercontent.com ou cole o JSON inteiro", "123456-abc.apps.googleusercontent.com or paste the whole JSON"))
+                    .on_edit(|s: &mut State| account_part(s, |f| &mut f.client_id))
+                    .on_submit(|s: &mut State, tx: &mut Tx| crate::servers::submit_google(s, tx));
+                let secret_eye = eye_toggle("secret-eye", f.reveal_secret, |s| {
+                    if let Some(f) = &mut s.account_form {
+                        f.reveal_secret = !f.reveal_secret;
+                    }
+                });
+                let secret_input = rune_kit::TextInput::new(&f.client_secret)
+                    .width(None)
+                    .label("Client Secret")
+                    .placeholder(t("GOCSPX-… (dispensável se colar o JSON acima)", "GOCSPX-… (not needed if you paste the JSON above)"))
+                    .revealed(f.reveal_secret)
+                    .trailing(secret_eye)
+                    .on_edit(|s: &mut State| account_part(s, |f| &mut f.client_secret))
+                    .on_submit(|s: &mut State, tx: &mut Tx| crate::servers::submit_google(s, tx));
+                let console_btn = Button::new(t("Abrir Google Cloud Console", "Open Google Cloud Console"))
+                    .icon(&icons::EXTERNAL_LINK)
+                    .variant(ButtonVariant::Neutral)
+                    .on_press_tx(|s: &mut State, tx: &mut Tx| {
+                        if let Err(e) = tx.open_url("https://console.cloud.google.com/apis/credentials") {
+                            crate::fail(s, tr!("Não consegui abrir o navegador: {e:?}", "Couldn't open the browser: {e:?}"));
+                        }
+                    })
+                    .build(k);
+                let oauth_box = col()
+                    .key("oauth-box")
+                    .w_full()
+                    .padding(12.0)
+                    .gap(8.0)
+                    .radius(k.radius.md)
+                    .fill(k.c.bg_base)
+                    .border(1.0, k.c.border_weak)
+                    .child(
+                        row()
+                            .w_full()
+                            .center_y()
+                            .child(text(t("Cliente OAuth (App para computador)", "OAuth client (Desktop app)")).font(k.ty.text_small_medium).color(k.c.text_base).grow(1.0))
+                            .child(console_btn),
+                    )
+                    .child(
+                        text(t(
+                            "Crie uma credencial OAuth do tipo “App para computador” no Google Cloud Console, ou cole o arquivo google-client.json diretamente abaixo:",
+                            "Create an OAuth credential of type “Desktop app” in the Google Cloud Console, or paste the google-client.json file right below:",
+                        ))
                         .font(k.ty.caption())
                         .color(k.c.text_muted)
                         .wrap()
                         .w_full()
                         .min_w(0.0),
-                )
-                .child(col().w_full().gap(4.0).child(text(t("Client ID ou JSON", "Client ID or JSON")).font(k.ty.text_xsmall_medium).color(k.c.text_base)).child(id_input.build(k)))
-                .child(col().w_full().gap(4.0).child(text("Client Secret").font(k.ty.text_xsmall_medium).color(k.c.text_base)).child(secret_input.build(k)));
-            inner = inner.child(oauth_box);
-        } else {
-            let ready_row = row()
-                .key("oauth-ready")
+                    )
+                    .child(col().w_full().gap(4.0).child(text(t("Client ID ou JSON", "Client ID or JSON")).font(k.ty.text_xsmall_medium).color(k.c.text_base)).child(id_input.build(k)))
+                    .child(col().w_full().gap(4.0).child(text("Client Secret").font(k.ty.text_xsmall_medium).color(k.c.text_base)).child(secret_input.build(k)));
+                inner = inner.child(oauth_box);
+            } else {
+                let ready_row = row()
+                    .key("oauth-ready")
+                    .w_full()
+                    .px(12.0)
+                    .py(8.0)
+                    .gap(8.0)
+                    .center_y()
+                    .radius(k.radius.md)
+                    .fill(k.c.bg_base)
+                    .border(1.0, k.c.border_weak)
+                    .child(icon(k.glyph.lock, 15.0).color(k.c.success.fg))
+                    .child(text(t("Cliente OAuth configurado e pronto para conectar.", "OAuth client set up and ready to connect.")).font(k.ty.text_xsmall).color(k.c.text_muted).grow(1.0).min_w(0.0))
+                    .child(
+                        Button::new(t("Alterar Client ID", "Change Client ID"))
+                            .variant(ButtonVariant::GhostMuted)
+                            .on_press(|s: &mut State| {
+                                if let Some(f) = &mut s.account_form {
+                                    f.custom_oauth = true;
+                                    f.client_id.focused = true;
+                                }
+                            })
+                            .build(k),
+                    );
+                inner = inner.child(ready_row);
+            }
+
+            if let Some(e) = &f.error {
+                inner = inner.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0));
+            }
+
+            let actions = row()
+                .key("actions")
                 .w_full()
-                .px(12.0)
-                .py(8.0)
                 .gap(8.0)
                 .center_y()
-                .radius(k.radius.md)
-                .fill(k.c.bg_base)
-                .border(1.0, k.c.border_weak)
-                .child(icon(k.glyph.lock, 15.0).color(k.c.success.fg))
-                .child(text(t("Cliente OAuth configurado e pronto para conectar.", "OAuth client set up and ready to connect.")).font(k.ty.text_xsmall).color(k.c.text_muted).grow(1.0).min_w(0.0))
-                .child(
-                    Button::new(t("Alterar Client ID", "Change Client ID"))
-                        .variant(ButtonVariant::GhostMuted)
-                        .on_press(|s: &mut State| {
-                            if let Some(Dialog::Server(f)) = &mut s.dialog {
-                                f.custom_oauth = true;
-                                f.client_id.focused = true;
-                            }
-                        })
-                        .build(k),
-                );
-            inner = inner.child(ready_row);
+                .child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).on_press(crate::servers::back_to_pick).build(k))
+                .child(el().grow(1.0))
+                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close_account_win).build(k))
+                .child(Button::new(t("Conectar no navegador", "Connect in browser")).variant(ButtonVariant::Submit).on_press_tx(crate::servers::submit_google).build(k).default_button());
+            (inner, actions)
         }
-
-        if let Some(e) = &f.error {
-            inner = inner.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0));
-        }
-
-        let actions = row()
-            .key("actions")
-            .w_full()
-            .px(16.0)
-            .pt(12.0)
-            .pb(16.0)
-            .gap(8.0)
-            .center_y()
-            .child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).on_press(crate::servers::back_to_pick).build(k))
-            .child(el().grow(1.0))
-            .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k))
-            .child(Button::new(t("Conectar no navegador", "Connect in browser")).variant(ButtonVariant::Submit).on_press_tx(crate::servers::submit_google).build(k).default_button());
-
-        let body = col()
-            .key("gdrive-content")
-            .w_full()
-            .child(account_scroll(k, "gdrive-scroll", window_h, inner))
-            .child(actions);
-
-        Modal::new("server", t("Conectar Google Drive", "Connect Google Drive")).open(true).child(body).width(560.0).fit().on_close(close).build(k, layer);
-        return;
-    }
-
-    // Dropbox step: the app's key when none is set, then the browser (see `dropbox.rs`).
-    if f.provider == Provider::Dropbox {
-        crate::dropbox::account_step(s, k, f, banner, window_h, layer);
-        return;
-    }
-
-    // B2 step: the key ID and the application key.
-    if f.provider == Provider::B2 {
-        let eye = eye_toggle("pass-eye", f.reveal_password, |s| {
-            if let Some(Dialog::Server(f)) = &mut s.dialog {
-                f.reveal_password = !f.reveal_password;
-            }
-        });
-        return crate::b2::form(k, f, banner, eye, |inner| account_scroll(k, "b2-scroll", window_h, inner), close, layer);
-    }
-
-    // Telegram step: the app's keys and the phone, then the code, then the password if asked.
-    if f.provider == Provider::Telegram {
-        let eye = eye_toggle("pass-eye", f.reveal_password, |s| {
-            if let Some(Dialog::Server(f)) = &mut s.dialog {
-                f.reveal_password = !f.reveal_password;
-            }
-        });
-        return crate::telegram::form(k, f, banner, eye, |inner| account_scroll(k, "telegram-scroll", window_h, inner), layer);
-    }
-
-    // MEGA step: e-mail and password, then the two-factor code once the account asks for it.
-    if f.provider == Provider::Mega {
-        let labeled = |key: &'static str, label: &'static str, input: El| col().key(key).w_full().gap(4.0).child(text(label).font(k.ty.text_small_medium).color(k.c.text_base)).child(input);
-        let email_input = rune_kit::TextInput::new(&f.user)
-            .width(None)
-            .label(t("E-mail", "E-mail"))
-            .placeholder(t("voce@exemplo.com", "you@example.com"))
-            .on_edit(|s: &mut State| part(s, |f| &mut f.user))
-            .on_submit(|s: &mut State, _: &mut Tx| crate::mega::submit(s))
-            .build(k);
-        let pass_eye = eye_toggle("pass-eye", f.reveal_password, |s| {
-            if let Some(Dialog::Server(f)) = &mut s.dialog {
-                f.reveal_password = !f.reveal_password;
-            }
-        });
-        let pass_input = rune_kit::TextInput::new(&f.password)
-            .width(None)
-            .label(t("Senha", "Password"))
-            .revealed(f.reveal_password)
-            .trailing(pass_eye)
-            .on_edit(|s: &mut State| part(s, |f| &mut f.password))
-            .on_submit(|s: &mut State, _: &mut Tx| crate::mega::submit(s))
-            .build(k);
-        let mut inner = col()
-            .w_full()
-            .px(16.0)
-            .pb(4.0)
-            .gap(12.0)
-            .child(banner)
-            .child(
-                text(t(
-                    "O Open Explorer guarda só a sessão, no cofre de credenciais do sistema; a senha não fica salva em lugar nenhum.",
-                    "Open Explorer keeps only the session, in the system's credential store; the password isn't saved anywhere.",
-                ))
-                .font(k.ty.text_small)
-                .color(k.c.text_muted)
-                .wrap()
-                .w_full()
-                .min_w(0.0),
-            )
-            .child(labeled("mega-email", t("E-mail", "E-mail"), email_input))
-            .child(labeled("mega-password", t("Senha", "Password"), pass_input));
-        if f.needs_code {
-            let code_input = rune_kit::TextInput::new(&f.code)
+        Provider::Mega => {
+            let labeled = |key: &'static str, label: &'static str, input: El| col().key(key).w_full().gap(4.0).child(text(label).font(k.ty.text_small_medium).color(k.c.text_base)).child(input);
+            let email_input = rune_kit::TextInput::new(&f.user)
                 .width(None)
-                .label(t("Código de verificação", "Verification code"))
-                .placeholder("123456")
-                .on_edit(|s: &mut State| part(s, |f| &mut f.code))
+                .label(t("E-mail", "E-mail"))
+                .placeholder(t("voce@exemplo.com", "you@example.com"))
+                .on_edit(|s: &mut State| account_part(s, |f| &mut f.user))
                 .on_submit(|s: &mut State, _: &mut Tx| crate::mega::submit(s))
                 .build(k);
-            inner = inner.child(labeled("mega-code", t("Código de verificação (app autenticador)", "Verification code (authenticator app)"), code_input));
-        }
-        let checking = f.checking.is_some();
-        if checking {
-            let wait = t(
-                "Conectando… o MEGA pede uma verificação de segurança e a conta é lida inteira, o que leva alguns segundos.",
-                "Connecting… MEGA asks for a security check and the whole account is read, which takes a few seconds.",
-            );
-            inner = inner.child(text(wait).key("mega-wait").font(k.ty.text_xsmall).color(k.c.text_muted).wrap().w_full().min_w(0.0));
-        }
-        if let Some(e) = &f.error {
-            inner = inner.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0));
-        }
-        let connect = if checking {
-            Button::new(t("Conectando…", "Connecting…")).variant(ButtonVariant::Submit).disabled(true).build(k)
-        } else {
-            Button::new(t("Conectar", "Connect")).variant(ButtonVariant::Submit).on_press(crate::mega::submit).build(k).default_button()
-        };
-        let actions = row()
-            .key("actions")
-            .w_full()
-            .px(16.0)
-            .pt(12.0)
-            .pb(16.0)
-            .gap(8.0)
-            .center_y()
-            .child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(crate::servers::back_to_pick).build(k))
-            .child(el().grow(1.0))
-            .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k))
-            .child(connect);
-        let body = col().key("mega-content").w_full().child(account_scroll(k, "mega-scroll", window_h, inner)).child(actions);
-        Modal::new("server", t("Conectar MEGA", "Connect MEGA")).open(true).child(body).width(520.0).fit().on_close(close).build(k, layer);
-        return;
-    }
-
-    // Server credentials step (FTP, SFTP, WebDAV, Nextcloud, ownCloud).
-    let field = |key: &'static str, label: &str, edit: &rune::TextEdit, placeholder: &str, pick: fn(&mut Form) -> &mut rune::TextEdit| {
-        let input = rune_kit::TextInput::new(edit).width(None).label(label).placeholder(placeholder).on_edit(move |s: &mut State| part(s, pick)).on_submit(|s: &mut State, _: &mut Tx| crate::servers::submit(s));
-        col().key(key).w_full().gap(4.0).child(text(label.to_string()).font(k.ty.text_small_medium).color(k.c.text_base)).child(input.build(k))
-    };
-
-    let pass_eye = eye_toggle("pass-eye", f.reveal_password, |s| {
-        if let Some(Dialog::Server(f)) = &mut s.dialog {
-            f.reveal_password = !f.reveal_password;
-        }
-    });
-    let password_label = match (f.editing.is_some(), f.provider) {
-        (true, _) => t("Senha (vazio: manter a salva)", "Password (empty: keep the saved one)"),
-        (false, Provider::Nextcloud | Provider::OwnCloud) => t("Senha ou senha de app", "Password or app password"),
-        (false, _) => t("Senha", "Password"),
-    };
-    let password_field = col()
-        .key("password")
-        .w_full()
-        .gap(4.0)
-        .child(text(password_label).font(k.ty.text_small_medium).color(k.c.text_base))
-        .child(
-            rune_kit::TextInput::new(&f.password)
+            let pass_eye = eye_toggle("pass-eye", f.reveal_password, |s| {
+                if let Some(f) = &mut s.account_form {
+                    f.reveal_password = !f.reveal_password;
+                }
+            });
+            let pass_input = rune_kit::TextInput::new(&f.password)
                 .width(None)
-                .label(password_label)
+                .label(t("Senha", "Password"))
                 .revealed(f.reveal_password)
                 .trailing(pass_eye)
-                .on_edit(|s: &mut State| part(s, |f| &mut f.password))
-                .on_submit(|s: &mut State, _: &mut Tx| crate::servers::submit(s))
-                .build(k),
-        );
+                .on_edit(|s: &mut State| account_part(s, |f| &mut f.password))
+                .on_submit(|s: &mut State, _: &mut Tx| crate::mega::submit(s))
+                .build(k);
+            let mut inner = col()
+                .w_full()
+                .gap(12.0)
+                .child(banner)
+                .child(
+                    text(t(
+                        "O Open Explorer guarda só a sessão, no cofre de credenciais do sistema; a senha não fica salva em lugar nenhum.",
+                        "Open Explorer keeps only the session, in the system's credential store; the password isn't saved anywhere.",
+                    ))
+                    .font(k.ty.text_small)
+                    .color(k.c.text_muted)
+                    .wrap()
+                    .w_full()
+                    .min_w(0.0),
+                )
+                .child(labeled("mega-email", t("E-mail", "E-mail"), email_input))
+                .child(labeled("mega-password", t("Senha", "Password"), pass_input));
+            if f.needs_code {
+                let code_input = rune_kit::TextInput::new(&f.code)
+                    .width(None)
+                    .label(t("Código de verificação", "Verification code"))
+                    .placeholder("123456")
+                    .on_edit(|s: &mut State| account_part(s, |f| &mut f.code))
+                    .on_submit(|s: &mut State, _: &mut Tx| crate::mega::submit(s))
+                    .build(k);
+                inner = inner.child(labeled("mega-code", t("Código de verificação (app autenticador)", "Verification code (authenticator app)"), code_input));
+            }
+            let checking = f.checking.is_some();
+            if checking {
+                let wait = t(
+                    "Conectando… o MEGA pede uma verificação de segurança e a conta é lida inteira, o que leva alguns segundos.",
+                    "Connecting… MEGA asks for a security check and the whole account is read, which takes a few seconds.",
+                );
+                inner = inner.child(text(wait).key("mega-wait").font(k.ty.text_xsmall).color(k.c.text_muted).wrap().w_full().min_w(0.0));
+            }
+            if let Some(e) = &f.error {
+                inner = inner.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0));
+            }
+            let connect = if checking {
+                Button::new(t("Conectando…", "Connecting…")).variant(ButtonVariant::Submit).disabled(true).build(k)
+            } else {
+                Button::new(t("Conectar", "Connect")).variant(ButtonVariant::Submit).on_press(crate::mega::submit).build(k).default_button()
+            };
+            let actions = row()
+                .key("actions")
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(crate::servers::back_to_pick).build(k))
+                .child(el().grow(1.0))
+                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close_account_win).build(k))
+                .child(connect);
+            (inner, actions)
+        }
+        Provider::Sftp | Provider::Ftp | Provider::WebDav | Provider::Nextcloud | Provider::OwnCloud => {
+            let field = |key: &'static str, label: &str, edit: &rune::TextEdit, placeholder: &str, pick: fn(&mut Form) -> &mut rune::TextEdit| {
+                let input = rune_kit::TextInput::new(edit).width(None).label(label).placeholder(placeholder).on_edit(move |s: &mut State| account_part(s, pick)).on_submit(|s: &mut State, _: &mut Tx| crate::servers::submit(s));
+                col().key(key).w_full().gap(4.0).child(text(label.to_string()).font(k.ty.text_small_medium).color(k.c.text_base)).child(input.build(k))
+            };
 
-    let muted = |t: String| text(t).font(k.ty.text_xsmall).color(k.c.text_muted).wrap().w_full().min_w(0.0);
-    let port_hint = proto.default_port().to_string();
-    let half = |a: El, b: El| row().w_full().gap(10.0).child(a.grow(1.0).w(0.0)).child(b.grow(1.0).w(0.0));
-    let host_hint = match f.provider {
-        Provider::Nextcloud => t("cloud.exemplo.com ou https://cloud.exemplo.com", "cloud.example.com or https://cloud.example.com"),
-        Provider::OwnCloud => t("owncloud.exemplo.com ou https://owncloud.exemplo.com", "owncloud.example.com or https://owncloud.example.com"),
-        Provider::Sftp => t("nas.local, 192.168.0.10 ou sftp://usuario@host", "nas.local, 192.168.0.10 or sftp://user@host"),
-        Provider::Ftp => t("ftp.exemplo.com, 192.168.0.10 ou ftp://usuario@host", "ftp.example.com, 192.168.0.10 or ftp://user@host"),
-        Provider::WebDav | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive | Provider::Telegram => t("dav.exemplo.com, 192.168.0.10 ou https://host/dav", "dav.example.com, 192.168.0.10 or https://host/dav"),
-    };
-    let folder_hint = match f.provider {
-        Provider::Nextcloud | Provider::OwnCloud => t("/remote.php/webdav (automático, se vazio)", "/remote.php/webdav (automatic if empty)"),
-        Provider::WebDav => t("/dav ou /remote.php/dav/files/usuario (raiz /, se vazio)", "/dav or /remote.php/dav/files/user (root / if empty)"),
-        Provider::Sftp => t("a pasta pessoal, se vazio", "the home folder if empty"),
-        Provider::Ftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive | Provider::Telegram => t("a pasta do login, se vazio", "the login folder if empty"),
-    };
-    let name_hint = match f.provider {
-        Provider::Nextcloud => t("Nextcloud (servidor), se vazio", "Nextcloud (server) if empty"),
-        Provider::OwnCloud => t("ownCloud (servidor), se vazio", "ownCloud (server) if empty"),
-        _ => t("o endereço do servidor, se vazio", "the server's address if empty"),
-    };
-    let user_hint = if matches!(proto, Protocol::Ftp | Protocol::Ftps) { t("anonymous, se vazio", "anonymous if empty") } else { "" };
+            let pass_eye = eye_toggle("pass-eye", f.reveal_password, |s| {
+                if let Some(f) = &mut s.account_form {
+                    f.reveal_password = !f.reveal_password;
+                }
+            });
+            let password_label = match (f.editing.is_some(), f.provider) {
+                (true, _) => t("Senha (vazio: manter a salva)", "Password (empty: keep the saved one)"),
+                (false, Provider::Nextcloud | Provider::OwnCloud) => t("Senha ou senha de app", "Password or app password"),
+                (false, _) => t("Senha", "Password"),
+            };
+            let password_field = col()
+                .key("password")
+                .w_full()
+                .gap(4.0)
+                .child(text(password_label).font(k.ty.text_small_medium).color(k.c.text_base))
+                .child(
+                    rune_kit::TextInput::new(&f.password)
+                        .width(None)
+                        .label(password_label)
+                        .revealed(f.reveal_password)
+                        .trailing(pass_eye)
+                        .on_edit(|s: &mut State| account_part(s, |f| &mut f.password))
+                        .on_submit(|s: &mut State, _: &mut Tx| crate::servers::submit(s))
+                        .build(k),
+                );
 
-    let mut inner = col()
-        .w_full()
-        .px(16.0)
-        .pb(4.0)
-        .gap(10.0)
-        .child(banner)
-        .child(
-            row()
+            let muted = |t: String| text(t).font(k.ty.text_xsmall).color(k.c.text_muted).wrap().w_full().min_w(0.0);
+            let port_hint = proto.default_port().to_string();
+            let half = |a: El, b: El| row().w_full().gap(10.0).child(a.grow(1.0).w(0.0)).child(b.grow(1.0).w(0.0));
+            let host_hint = match f.provider {
+                Provider::Nextcloud => t("cloud.exemplo.com ou https://cloud.exemplo.com", "cloud.example.com or https://cloud.example.com"),
+                Provider::OwnCloud => t("owncloud.exemplo.com ou https://owncloud.exemplo.com", "owncloud.example.com or https://owncloud.example.com"),
+                Provider::Sftp => t("nas.local, 192.168.0.10 ou sftp://usuario@host", "nas.local, 192.168.0.10 or sftp://user@host"),
+                Provider::Ftp => t("ftp.exemplo.com, 192.168.0.10 ou ftp://usuario@host", "ftp.example.com, 192.168.0.10 or ftp://user@host"),
+                Provider::WebDav | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive | Provider::Telegram => t("dav.exemplo.com, 192.168.0.10 ou https://host/dav", "dav.example.com, 192.168.0.10 or https://host/dav"),
+            };
+            let folder_hint = match f.provider {
+                Provider::Nextcloud | Provider::OwnCloud => t("/remote.php/webdav (automático, se vazio)", "/remote.php/webdav (automatic if empty)"),
+                Provider::WebDav => t("/dav ou /remote.php/dav/files/usuario (raiz /, se vazio)", "/dav or /remote.php/dav/files/user (root / if empty)"),
+                Provider::Sftp => t("a pasta pessoal, se vazio", "the home folder if empty"),
+                Provider::Ftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive | Provider::Telegram => t("a pasta do login, se vazio", "the login folder if empty"),
+            };
+            let name_hint = match f.provider {
+                Provider::Nextcloud => t("Nextcloud (servidor), se vazio", "Nextcloud (server) if empty"),
+                Provider::OwnCloud => t("ownCloud (servidor), se vazio", "ownCloud (server) if empty"),
+                _ => t("o endereço do servidor, se vazio", "the server's address if empty"),
+            };
+            let user_hint = if matches!(proto, Protocol::Ftp | Protocol::Ftps) { t("anonymous, se vazio", "anonymous if empty") } else { "" };
+
+            let mut inner = col()
                 .w_full()
                 .gap(10.0)
-                .child(field("host", t("Servidor", "Server"), &f.host, host_hint, |f| &mut f.host).grow(3.0).w(0.0))
-                .child(field("port", t("Porta", "Port"), &f.port, &port_hint, |f| &mut f.port).grow(1.0).w(0.0)),
-        )
-        .child(half(field("user", t("Usuário", "User name"), &f.user, user_hint, |f| &mut f.user), password_field));
-
-    // Security toggle checkbox (inspired by the reference's "Usar SSL/TLS").
-    match f.provider {
-        Provider::Ftp => {
-            inner = inner.child(
-                rune_kit::Checkbox::new(proto == Protocol::Ftps)
-                    .label(t("Usar SSL/TLS (FTPS)", "Use SSL/TLS (FTPS)"))
-                    .description(t("Criptografa login e arquivos via TLS (porta 21 ou 990).", "Encrypts the login and files with TLS (port 21 or 990)."))
-                    .on_toggle(crate::servers::toggle_tls)
-                    .build(k)
-                    .key("tls-toggle"),
-            );
-        }
-        Provider::WebDav | Provider::Nextcloud | Provider::OwnCloud => {
-            inner = inner.child(
-                rune_kit::Checkbox::new(proto == Protocol::Davs)
-                    .label(t("Usar conexão segura SSL/TLS (HTTPS)", "Use a secure SSL/TLS connection (HTTPS)"))
-                    .description(t("Mantém senha e arquivos criptografados na rede.", "Keeps the password and files encrypted on the network."))
-                    .on_toggle(crate::servers::toggle_tls)
-                    .build(k)
-                    .key("tls-toggle"),
-            );
-        }
-        Provider::Sftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive | Provider::Telegram => {}
-    }
-
-    inner = inner.child(field("folder", t("Pasta inicial", "Start folder"), &f.folder, folder_hint, |f| &mut f.folder));
-
-    if proto == Protocol::Sftp {
-        inner = inner.child(field(
-            "key",
-            t("Chave SSH (opcional)", "SSH key (optional)"),
-            &f.key,
-            t("C:\\Users\\voce\\.ssh\\id_ed25519 (a senha vira a da chave)", "C:\\Users\\you\\.ssh\\id_ed25519 (the password becomes the key's)"),
-            |f| &mut f.key,
-        ));
-        inner = inner.child(muted(
-            t(
-                "Sem senha nem chave, as chaves de ~/.ssh são tentadas. Na primeira conexão a chave do servidor é guardada.",
-                "With no password or key, the keys in ~/.ssh are tried. On the first connection the server's key is saved.",
-            )
-            .into(),
-        ));
-    } else if matches!(f.provider, Provider::Nextcloud | Provider::OwnCloud) {
-        inner = inner.child(muted(
-            t(
-                "Dica: se a sua conta usa verificação em duas etapas (2FA), gere uma senha de aplicativo nas configurações de segurança do servidor.",
-                "Tip: if your account uses two-step verification (2FA), create an app password in the server's security settings.",
-            )
-            .into(),
-        ));
-    }
-
-    let connections_hint = tr!("{} (de 1 a {})", "{} (1 to {})", openexplorer_remote::USUAL_CONNECTIONS, openexplorer_remote::MOST_CONNECTIONS);
-    inner = inner.child(half(
-        field("name", t("Nome na árvore (opcional)", "Name in the tree (optional)"), &f.name, name_hint, |f| &mut f.name),
-        field("connections", t("Conexões simultâneas", "Simultaneous connections"), &f.connections, &connections_hint, |f| &mut f.connections),
-    ));
-
-    let active_fp = f.active_trusted();
-    if let (Some(fp), None) = (active_fp, &f.untrusted) {
-        inner = inner.child(muted(tr!("Certificado confiado (SHA-256): {}", "Trusted certificate (SHA-256): {}", fingerprint_lines(fp))));
-    }
-    if proto.plain() {
-        let secure_alt = if proto == Protocol::Ftp { t("Usar SSL/TLS (FTPS) ou SFTP", "SSL/TLS (FTPS) or SFTP") } else { "HTTPS (SSL/TLS)" };
-        inner = inner.child(
-            row()
-                .key("plain-warn")
-                .w_full()
-                .px(10.0)
-                .py(7.0)
-                .radius(k.radius.sm)
-                .fill(k.alpha(k.c.warning.fg, if k.dark { 0.12 } else { 0.08 }))
-                .border(1.0, k.alpha(k.c.warning.fg, 0.38))
+                .child(banner)
                 .child(
-                    text(tr!(
-                        "{} não usa criptografia: senha e arquivos passam abertos pela rede. Prefira {secure_alt} se o servidor aceitar.",
-                        "{} isn't encrypted: the password and files travel in the clear over the network. Prefer {secure_alt} if the server supports it.",
-                        proto.label()
-                    ))
-                        .font(k.ty.text_xsmall)
-                        .color(k.c.text_base)
-                        .wrap()
+                    row()
                         .w_full()
-                        .min_w(0.0),
-                ),
-        );
-    }
-    if let Some(e) = &f.error {
-        inner = inner.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0));
-    }
-    // A certificate the usual authorities don't vouch for: shown, and trusted only on a click.
-    if let Some(r) = &f.untrusted {
-        let changed = active_fp.is_some_and(|old| old != r.fingerprint);
-        let lead = if changed {
-            tr!(
-                "O certificado do servidor mudou desde que você confiou nele: o novo {}. Se você não trocou o certificado do servidor, alguém pode estar se passando por ele.",
-                "The server's certificate has changed since you trusted it: the new one {}. If you didn't change the server's certificate, someone may be impersonating it.",
-                r.why
-            )
-        } else {
-            tr!(
-                "O certificado do servidor {}. Isso é comum num NAS ou servidor de casa; confira a impressão digital com a que o servidor mostra antes de confiar.",
-                "The server's certificate {}. This is common on a NAS or home server; check the fingerprint against the one the server shows before trusting it.",
-                r.why
-            )
-        };
-        let warn = col()
-            .key("untrusted")
-            .w_full()
-            .gap(6.0)
-            .padding(10.0)
-            .radius(k.radius.sm)
-            .border(1.0, k.c.warning.fg)
-            .child(text(lead).font(k.ty.text_small).color(k.c.text_base).wrap().w_full().min_w(0.0))
-            .child(text(format!("SHA-256: {}", fingerprint_lines(&r.fingerprint))).font(k.ty.text_xsmall).color(k.c.text_muted).wrap().w_full().min_w(0.0));
-        inner = inner.child(warn);
-    }
+                        .gap(10.0)
+                        .child(field("host", t("Servidor", "Server"), &f.host, host_hint, |f| &mut f.host).grow(3.0).w(0.0))
+                        .child(field("port", t("Porta", "Port"), &f.port, &port_hint, |f| &mut f.port).grow(1.0).w(0.0)),
+                )
+                .child(half(field("user", t("Usuário", "User name"), &f.user, user_hint, |f| &mut f.user), password_field));
 
-    let checking = f.checking.is_some();
-    let save_label = if f.editing.is_some() { t("Salvar", "Save") } else { t("Conectar", "Connect") };
-    let save_el = match (&f.untrusted, checking) {
-        (_, true) => Button::new(t("Conectando…", "Connecting…")).variant(ButtonVariant::Submit).disabled(true).build(k),
-        (Some(_), false) => Button::new(t("Confiar e salvar", "Trust and save")).variant(ButtonVariant::Danger).on_press(crate::servers::trust).build(k).default_button(),
-        (None, false) => Button::new(save_label).variant(ButtonVariant::Submit).on_press(crate::servers::submit).build(k).default_button(),
+            match f.provider {
+                Provider::Ftp => {
+                    inner = inner.child(
+                        rune_kit::Checkbox::new(proto == Protocol::Ftps)
+                            .label(t("Usar SSL/TLS (FTPS)", "Use SSL/TLS (FTPS)"))
+                            .description(t("Criptografa login e arquivos via TLS (porta 21 ou 990).", "Encrypts the login and files with TLS (port 21 or 990)."))
+                            .on_toggle(crate::servers::toggle_tls)
+                            .build(k)
+                            .key("tls-toggle"),
+                    );
+                }
+                Provider::WebDav | Provider::Nextcloud | Provider::OwnCloud => {
+                    inner = inner.child(
+                        rune_kit::Checkbox::new(proto == Protocol::Davs)
+                            .label(t("Usar conexão segura SSL/TLS (HTTPS)", "Use a secure SSL/TLS connection (HTTPS)"))
+                            .description(t("Mantém senha e arquivos criptografados na rede.", "Keeps the password and files encrypted on the network."))
+                            .on_toggle(crate::servers::toggle_tls)
+                            .build(k)
+                            .key("tls-toggle"),
+                    );
+                }
+                Provider::Sftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive | Provider::Telegram => {}
+            }
+
+            inner = inner.child(field("folder", t("Pasta inicial", "Start folder"), &f.folder, folder_hint, |f| &mut f.folder));
+
+            if proto == Protocol::Sftp {
+                inner = inner.child(field(
+                    "key",
+                    t("Chave SSH (opcional)", "SSH key (optional)"),
+                    &f.key,
+                    t("C:\\Users\\voce\\.ssh\\id_ed25519 (a senha vira a da chave)", "C:\\Users\\you\\.ssh\\id_ed25519 (the password becomes the key's)"),
+                    |f| &mut f.key,
+                ));
+                inner = inner.child(muted(
+                    t(
+                        "Sem senha nem chave, as chaves de ~/.ssh são tentadas. Na primeira conexão a chave do servidor é guardada.",
+                        "With no password or key, the keys in ~/.ssh are tried. On the first connection the server's key is saved.",
+                    )
+                    .into(),
+                ));
+            } else if matches!(f.provider, Provider::Nextcloud | Provider::OwnCloud) {
+                inner = inner.child(muted(
+                    t(
+                        "Dica: se a sua conta usa verificação em duas etapas (2FA), gere uma senha de aplicativo nas configurações de segurança do servidor.",
+                        "Tip: if your account uses two-step verification (2FA), create an app password in the server's security settings.",
+                    )
+                    .into(),
+                ));
+            }
+
+            let connections_hint = tr!("{} (de 1 a {})", "{} (1 to {})", openexplorer_remote::USUAL_CONNECTIONS, openexplorer_remote::MOST_CONNECTIONS);
+            inner = inner.child(half(
+                field("name", t("Nome na árvore (opcional)", "Name in the tree (optional)"), &f.name, name_hint, |f| &mut f.name),
+                field("connections", t("Conexões simultâneas", "Simultaneous connections"), &f.connections, &connections_hint, |f| &mut f.connections),
+            ));
+
+            let active_fp = f.active_trusted();
+            if let (Some(fp), None) = (active_fp, &f.untrusted) {
+                inner = inner.child(muted(tr!("Certificado confiado (SHA-256): {}", "Trusted certificate (SHA-256): {}", fingerprint_lines(fp))));
+            }
+            if proto.plain() {
+                let secure_alt = if proto == Protocol::Ftp { t("Usar SSL/TLS (FTPS) ou SFTP", "SSL/TLS (FTPS) or SFTP") } else { "HTTPS (SSL/TLS)" };
+                inner = inner.child(
+                    row()
+                        .key("plain-warn")
+                        .w_full()
+                        .px(10.0)
+                        .py(7.0)
+                        .radius(k.radius.sm)
+                        .fill(k.alpha(k.c.warning.fg, if k.dark { 0.12 } else { 0.08 }))
+                        .border(1.0, k.alpha(k.c.warning.fg, 0.38))
+                        .child(
+                            text(tr!(
+                                "{} não usa criptografia: senha e arquivos passam abertos pela rede. Prefira {secure_alt} se o servidor aceitar.",
+                                "{} isn't encrypted: the password and files travel in the clear over the network. Prefer {secure_alt} if the server supports it.",
+                                proto.label()
+                            ))
+                            .font(k.ty.text_xsmall)
+                            .color(k.c.text_base)
+                            .wrap()
+                            .w_full()
+                            .min_w(0.0),
+                        ),
+                );
+            }
+            if let Some(e) = &f.error {
+                inner = inner.child(text(e.clone()).key("error").font(k.ty.text_small).color(k.c.danger.fg).wrap().w_full().min_w(0.0));
+            }
+            if let Some(r) = &f.untrusted {
+                let changed = active_fp.is_some_and(|old| old != r.fingerprint);
+                let lead = if changed {
+                    tr!(
+                        "O certificado do servidor mudou desde que você confiou nele: o novo {}. Se você não trocou o certificado do servidor, alguém pode estar se passando por ele.",
+                        "The server's certificate has changed since you trusted it: the new one {}. If you didn't change the server's certificate, someone may be impersonating it.",
+                        r.why
+                    )
+                } else {
+                    tr!(
+                        "O certificado do servidor {}. Isso é comum num NAS ou servidor de casa; confira a impressão digital com a que o servidor mostra antes de confiar.",
+                        "The server's certificate {}. This is common on a NAS or home server; check the fingerprint against the one the server shows before trusting it.",
+                        r.why
+                    )
+                };
+                let warn = col()
+                    .key("untrusted")
+                    .w_full()
+                    .gap(6.0)
+                    .padding(10.0)
+                    .radius(k.radius.sm)
+                    .border(1.0, k.c.warning.fg)
+                    .child(text(lead).font(k.ty.text_small).color(k.c.text_base).wrap().w_full().min_w(0.0))
+                    .child(text(format!("SHA-256: {}", fingerprint_lines(&r.fingerprint))).font(k.ty.text_xsmall).color(k.c.text_muted).wrap().w_full().min_w(0.0));
+                inner = inner.child(warn);
+            }
+
+            let checking = f.checking.is_some();
+            let save_label = if f.editing.is_some() { t("Salvar", "Save") } else { t("Conectar", "Connect") };
+            let save_el = match (&f.untrusted, checking) {
+                (_, true) => Button::new(t("Conectando…", "Connecting…")).variant(ButtonVariant::Submit).disabled(true).build(k),
+                (Some(_), false) => Button::new(t("Confiar e salvar", "Trust and save")).variant(ButtonVariant::Danger).on_press(crate::servers::trust).build(k).default_button(),
+                (None, false) => Button::new(save_label).variant(ButtonVariant::Submit).on_press(crate::servers::submit).build(k).default_button(),
+            };
+            let mut actions = row().key("actions").w_full().gap(8.0).center_y();
+            if f.editing.is_none() {
+                actions = actions.child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(crate::servers::back_to_pick).build(k));
+            }
+            actions = actions
+                .child(el().grow(1.0))
+                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close_account_win).build(k))
+                .child(save_el);
+            (inner, actions)
+        }
     };
-    let mut actions = row().key("actions").w_full().px(16.0).pt(12.0).pb(16.0).gap(8.0).center_y();
-    if f.editing.is_none() {
-        actions = actions.child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).disabled(checking).on_press(crate::servers::back_to_pick).build(k));
-    }
-    actions = actions
-        .child(el().grow(1.0))
-        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k))
-        .child(save_el);
 
-    let body = col()
-        .key("content")
+    let bar = bar_style(k);
+    let centered_inner = row()
         .w_full()
-        .child(account_scroll(k, "server-scroll", window_h, inner))
-        .child(actions);
+        .justify_center()
+        .px(24.0)
+        .py(22.0)
+        .child(col().w_full().max_w(600.0).child(inner));
 
-    let title = if f.editing.is_some() {
-        tr!("Editar {}", "Edit {}", f.provider.label())
-    } else {
-        tr!("Credenciais {}", "{} sign-in", f.provider.label())
-    };
-    Modal::new("server", title).open(true).child(body).width(560.0).fit().on_close(close).build(k, layer);
+    let centered_footer = row()
+        .key("configure-footer")
+        .w_full()
+        .justify_center()
+        .px(24.0)
+        .py(12.0)
+        .child(col().w_full().max_w(600.0).child(actions));
+
+    col()
+        .key("configure-body")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .pt(6.0)
+        .child(
+            col()
+                .key("configure-panel-wrap")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .px(12.0)
+                .child(
+                    col()
+                        .key("configure-panel")
+                        .w_full()
+                        .h_full()
+                        .min_h(0.0)
+                        .radius(8.0)
+                        .fill(panel_bg)
+                        .border(1.0, panel_border)
+                        .clip_rounded(8.0)
+                        .child(
+                            col()
+                                .key("configure-scroll")
+                                .w_full()
+                                .h_full()
+                                .min_h(0.0)
+                                .scroll(ScrollSpec { stick_bottom: false })
+                                .child(centered_inner)
+                                .scroll_bar_styled(bar),
+                        ),
+                ),
+        )
+        .child(centered_footer)
 }
 
 /// Names an upload would repeat in its Drive folder, as Air Explorer asks: all at once with

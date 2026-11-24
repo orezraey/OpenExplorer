@@ -163,7 +163,7 @@ fn app_of(f: &mut Form) -> Option<AppConfig> {
 /// Conectar no navegador with Dropbox picked: opens Dropbox's authorization page and waits for
 /// it on a thread; the dialog closes, as Google Drive's does.
 pub fn submit(s: &mut State, tx: &mut Tx) {
-    let Some(Dialog::Server(f)) = &mut s.dialog else { return };
+    let Some(f) = &mut s.account_form else { return };
     f.error = None;
     let Some(cfg) = app_of(f) else { return };
     // An older login still waiting holds the port: it's stopped, and gives the port back
@@ -180,20 +180,21 @@ pub fn submit(s: &mut State, tx: &mut Tx) {
     let pending = match begun {
         Ok(p) => p,
         Err(e) => {
-            if let Some(Dialog::Server(f)) = &mut s.dialog {
+            if let Some(f) = &mut s.account_form {
                 f.error = Some(e);
             }
             return;
         }
     };
     if let Err(e) = tx.open_url(&pending.url) {
-        if let Some(Dialog::Server(f)) = &mut s.dialog {
+        if let Some(f) = &mut s.account_form {
             f.error = Some(tr!("Não consegui abrir o navegador: {e:?}", "Couldn't open the browser: {e:?}"));
         }
         return;
     }
-    s.dialog = None;
+    s.close_account_form();
     s.status = t("Entre no Dropbox no navegador que abriu e autorize o Open Explorer. Esperando o Dropbox…", "Sign in to Dropbox in the browser that opened and allow Open Explorer. Waiting for Dropbox…").into();
+    s.notify_main();
     background(s, move |emit| {
         let result = catch_panic(t("conectar ao Dropbox", "connect to Dropbox"), || {
             let tokens = pending.finish_until(&cfg, &dropbox::api::Hosts::default().api, &|| LOGIN.load(Ordering::SeqCst) != attempt)?;
@@ -242,17 +243,16 @@ pub fn remove(s: &mut State, server: &Server) -> bool {
     true
 }
 
-/// The Dropbox step of Adicionar conta: the App key when none is set, then the browser.
-pub fn account_step(s: &State, k: &Kit, f: &Form, banner: El, window_h: Option<f32>, layer: &mut Vec<El>) {
+/// The Dropbox step of Registrar conta: the App key when none is set, then the browser.
+pub fn account_step(s: &State, k: &Kit, f: &Form, banner: El, close: fn(&mut State, &mut Tx)) -> (El, El) {
     fn key_edit(s: &mut State) -> &mut rune::TextEdit {
-        match &mut s.dialog {
-            Some(Dialog::Server(f)) => &mut f.client_id,
-            _ => &mut s.name_edit,
+        match &mut s.account_form {
+            Some(f) => &mut f.client_id,
+            None => &mut s.name_edit,
         }
     }
-    let close = |s: &mut State| s.dialog = None;
     let note = |words: &str| text(words.to_string()).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
-    let mut inner = col().w_full().px(16.0).pb(4.0).gap(12.0).child(banner).child(note(t(
+    let mut inner = col().w_full().gap(12.0).child(banner).child(note(t(
         "Ao continuar, o navegador abre a página do Dropbox para você entrar e autorizar o Open Explorer. Contas de um time veem também as pastas da equipe.",
         "When you continue, the browser opens Dropbox's page so you can sign in and allow Open Explorer. Team accounts also see the team's folders.",
     )));
@@ -324,7 +324,7 @@ pub fn account_step(s: &State, k: &Kit, f: &Form, banner: El, window_h: Option<f
                     Button::new(t("Alterar App key", "Change App key"))
                         .variant(ButtonVariant::GhostMuted)
                         .on_press(|s: &mut State| {
-                            if let Some(Dialog::Server(f)) = &mut s.dialog {
+                            if let Some(f) = &mut s.account_form {
                                 f.custom_oauth = true;
                                 f.client_id.focused = true;
                             }
@@ -339,19 +339,13 @@ pub fn account_step(s: &State, k: &Kit, f: &Form, banner: El, window_h: Option<f
     let actions = row()
         .key("actions")
         .w_full()
-        .px(16.0)
-        .pt(12.0)
-        .pb(16.0)
         .gap(8.0)
         .center_y()
         .child(Button::new(t("Voltar", "Back")).icon(&icons::BACK).variant(ButtonVariant::Neutral).on_press(crate::servers::back_to_pick).build(k))
         .child(el().grow(1.0))
-        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close).build(k))
+        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press_tx(close).build(k))
         .child(Button::new(t("Conectar no navegador", "Connect in browser")).variant(ButtonVariant::Submit).on_press_tx(submit).build(k).default_button());
-    let max_h = window_h.map_or(620.0, |h| (h - 2.0 * 16.0 - 48.0 - 62.0).max(120.0));
-    let scroll = col().w_full().max_h(max_h).min_h(0.0).shrink().child(col().key("dropbox-scroll").w_full().shrink().min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(inner));
-    let body = col().key("dropbox-content").w_full().child(scroll).child(actions);
-    Modal::new("server", t("Conectar Dropbox", "Connect Dropbox")).open(true).child(body).width(560.0).fit().on_close(close).build(k, layer);
+    (inner, actions)
 }
 
 // ---------------------------------------------------------------------------------------------

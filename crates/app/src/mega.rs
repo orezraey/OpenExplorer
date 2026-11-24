@@ -179,7 +179,7 @@ fn folder_link_note() -> &'static str {
 
 /// Conectar in the Adicionar conta dialog with MEGA picked: logs in on a thread.
 pub fn submit(s: &mut State) {
-    let Some(Dialog::Server(f)) = &mut s.dialog else { return };
+    let Some(f) = &mut s.account_form else { return };
     if f.checking.is_some() {
         return;
     }
@@ -211,7 +211,7 @@ pub fn submit(s: &mut State) {
 }
 
 fn connected(s: &mut State, attempt: u64, result: Result<String, Refused>) {
-    let Some(Dialog::Server(f)) = &mut s.dialog else { return };
+    let Some(f) = &mut s.account_form else { return };
     if f.checking != Some(attempt) {
         return;
     }
@@ -223,6 +223,7 @@ fn connected(s: &mut State, attempt: u64, result: Result<String, Refused>) {
             f.code = rune::TextEdit::new("");
             f.code.focused = true;
             f.error = Some(Refused::NeedsCode.text());
+            s.notify_account();
             return;
         }
         Err(r) => {
@@ -232,15 +233,17 @@ fn connected(s: &mut State, attempt: u64, result: Result<String, Refused>) {
                 f.code.focused = true;
             }
             f.error = Some(r.text());
+            s.notify_account();
             return;
         }
     };
     if let Err(e) = s.servers.mega.add(&email) {
         f.error = Some(e);
+        s.notify_account();
         return;
     }
     openexplorer_gdrive::log(&format!("conta MEGA conectada: {email}"));
-    s.dialog = None;
+    s.close_account_form();
     let server = Server::mega(&email);
     if !s.servers.list.iter().any(|sv| sv.id == server.id) {
         s.servers.list.push(server.clone());
