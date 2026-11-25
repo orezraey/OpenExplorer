@@ -37,6 +37,25 @@ using System.Runtime.InteropServices;
 public static class Win {
     [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr pid);
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    // Brings window h to the front even when Windows would refuse this process (it isn't the
+    // one in front): input joined with the front window's thread for the call. Whether h is in
+    // front after.
+    public static bool Front(IntPtr h) {
+        ShowWindow(h, 9);
+        IntPtr fg = GetForegroundWindow();
+        if (fg == h) return true;
+        uint me = GetCurrentThreadId(), them = GetWindowThreadProcessId(fg, IntPtr.Zero);
+        bool joined = them != 0 && them != me && AttachThreadInput(me, them, true);
+        BringWindowToTop(h);
+        SetForegroundWindow(h);
+        if (joined) AttachThreadInput(me, them, false);
+        return GetForegroundWindow() == h;
+    }
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
@@ -146,9 +165,19 @@ $Downloads = [ordered]@{
 }
 # Each download goes to a folder of its own under this one, never emptied while an app may
 # still write there (a download still running would fail with "file not found"); they go at
-# the end, with the apps closed.
+# the end, with the apps closed. They're all made before each app starts: Air Explorer doesn't
+# see a folder made after it listed the one holding it.
 $DownloadRoot = 'C:\OEBench'
 $DownloadTo = $null
+$Fresh = New-Object System.Collections.Generic.Queue[string]
+function Make-DownloadFolders([int] $n) {
+    $Fresh.Clear()
+    for ($k = 0; $k -lt $n; $k++) {
+        $dir = Join-Path $DownloadRoot ('dl-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Force $dir | Out-Null
+        $Fresh.Enqueue($dir)
+    }
+}
 
 # ------------------------------------------------------------------------------------------------
 # What differs between the apps: how to find their window, a pane's address bar, and the number
@@ -284,8 +313,16 @@ $Adapters = @{
             throw "Air Explorer: no tab in the right pane whose address starts with '$prefix'"
         }
         Ready = { param($win, $i) }
-        # Its address bar stays on the old folder until the new one is open: nothing to wait for.
-        Where = { param($win, $i) $null }
+        # The last step of pane `i`'s breadcrumb: the texts drawn inside its half of the window
+        # (each pane is a tab control), the rightmost.
+        Where = {
+            param($win, $i)
+            $half = & $Adapters.airexplorer.Half $win $i
+            if (-not $half) { return '' }
+            $r = $half.Current.BoundingRectangle
+            $crumbs = $half.FindAll($Scope::Descendants, (Prop $A::ClassNameProperty 'TextBlock')) | Where-Object { -not $_.Current.IsOffscreen -and $_.Current.BoundingRectangle.Top -lt $r.Top + 120 }
+            ($crumbs | Sort-Object { $_.Current.BoundingRectangle.X } | Select-Object -Last 1).Current.Name
+        }
         # A list view takes no focus through UI Automation: a click on its first row (on an
         # empty list, its middle) does.
         Focus = {
@@ -309,20 +346,47 @@ $Adapters = @{
         # The pane's file list: a SysListView32, left to right.
         Lists = {
             param($win)
+            # Only the panes' (inside a pane's half): the transfer queue below them is one too.
+            $halves = @($win.FindAll($Scope::Descendants, (Prop $A::ClassNameProperty 'WindowsForms10.SysTabControl32.app.0.25bb5ff_r6_ad1')) | ForEach-Object { $_.Current.BoundingRectangle })
             $lists = $win.FindAll($Scope::Descendants, (Prop $A::ClassNameProperty 'WindowsForms10.SysListView32.app.0.25bb5ff_r6_ad1'))
-            @($lists | Where-Object { -not $_.Current.IsOffscreen } | Sort-Object { $_.Current.BoundingRectangle.X })
+            @($lists | Where-Object {
+                $r = $_.Current.BoundingRectangle
+                $x = $r.X + $r.Width / 2; $y = $r.Y + $r.Height / 2
+                -not $_.Current.IsOffscreen -and ($halves | Where-Object { $x -gt $_.Left -and $x -lt $_.Right -and $y -gt $_.Top -and $y -lt $_.Bottom })
+            } | Sort-Object { $_.Current.BoundingRectangle.X })
         }
         # The address box shows only while editing: a click on the bar's free end (the bar is
         # drawn as a ProgressBar, `progress`) opens it.
         Address = {
             param($win, $i)
-            $x = ((& $Adapters.airexplorer.Lists $win)[$i]).Current.BoundingRectangle.X
-            $near = { param($id) $win.FindAll($Scope::Descendants, (Prop $A::AutomationIdProperty $id)) | Sort-Object { [math]::Abs($_.Current.BoundingRectangle.Right - $x - 400) } | Select-Object -First 1 }
-            $bar = & $near 'progress'
+            $half = (& $Adapters.airexplorer.Half $win $i).Current.BoundingRectangle
+            # The one inside pane `i`'s half of the window.
+            $inside = {
+                param($id)
+                $win.FindAll($Scope::Descendants, (Prop $A::AutomationIdProperty $id)) | Where-Object {
+                    $r = $_.Current.BoundingRectangle
+                    $mid = $r.X + $r.Width / 2
+                    $mid -gt $half.Left -and $mid -lt $half.Right
+                } | Select-Object -First 1
+            }
+            $bar = & $inside 'progress'
+            if (-not $bar) { return $null }
             $r = $bar.Current.BoundingRectangle
-            [Win]::Click([int]($r.Right - 30), [int]($r.Top + $r.Height / 2))
-            Start-Sleep -Milliseconds 200
-            & $near 'PART_EditableTextBox'
+            # The box shows once the click opened it: typed into while hidden, Enter does nothing.
+            for ($try = 0; $try -lt 4; $try++) {
+                [Win]::Click([int]($r.Right - 30), [int]($r.Top + $r.Height / 2))
+                for ($k = 0; $k -lt 20; $k++) {
+                    Start-Sleep -Milliseconds 50
+                    $box = & $inside 'PART_EditableTextBox'
+                    if ($box -and -not $box.Current.IsOffscreen) { return $box }
+                }
+            }
+            $null
+        }
+        # Pane `i`'s half of the window: a tab control of its own, left to right.
+        Half = {
+            param($win, $i)
+            @($win.FindAll($Scope::Descendants, (Prop $A::ClassNameProperty 'WindowsForms10.SysTabControl32.app.0.25bb5ff_r6_ad1')) | Sort-Object { $_.Current.BoundingRectangle.X })[$i]
         }
         Count = {
             param($win, $i)
@@ -375,11 +439,15 @@ function Close-Popups($ad, $win) {
     }
 }
 
+# Brings the app's window to the front, where the keys typed go; fails rather than type into
+# another window.
 function Focus-Window($win) {
     $h = [IntPtr]$win.Current.NativeWindowHandle
-    [void][Win]::ShowWindow($h, 9)
-    [void][Win]::SetForegroundWindow($h)
-    Start-Sleep -Milliseconds 200
+    for ($try = 0; -not [Win]::Front($h); $try++) {
+        if ($try -ge 20) { throw "couldn't bring '$($win.Current.Name)' to the front" }
+        Start-Sleep -Milliseconds 100
+    }
+    Start-Sleep -Milliseconds 100
 }
 
 # Types `path` into pane `i`'s address bar, ready for Enter.
@@ -431,12 +499,20 @@ function Open-Folder($ad, $win, [int] $i, [string] $path, [int] $expected, [int]
     Go-To $ad $win $i $path
     $sw = [Diagnostics.Stopwatch]::StartNew()
     [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-    # Learning a count: not the old folder's, while the new one is still being found.
+    # Learning a count: not the old folder's, while the new one is still being found. An
+    # address the app didn't take (Air Explorer, now and then) is typed again.
     if ($expected -eq 0) {
         $leaf = ($path -split '[\\/]' | Where-Object { $_ } | Select-Object -Last 1)
+        $typed = $sw.Elapsed.TotalSeconds
         while ($sw.Elapsed.TotalSeconds -lt $Timeout) {
-            $at = & $ad.Where $win $i
+            $at = try { & $ad.Where $win $i } catch { '' }
             if ($null -eq $at -or $at -eq $leaf) { break }
+            if ($sw.Elapsed.TotalSeconds - $typed -gt 15) {
+                Write-Host "      (still at '$at'; typing $path again)"
+                Go-To $ad $win $i $path
+                [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+                $typed = $sw.Elapsed.TotalSeconds
+            }
             Start-Sleep -Milliseconds 15
         }
     }
@@ -491,15 +567,19 @@ function Tree-Of([string] $dir) {
 }
 
 function Download($ad, $win, $d) {
-    $script:DownloadTo = Join-Path $DownloadRoot ('dl-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
-    New-Item -ItemType Directory -Force $DownloadTo | Out-Null
+    $script:DownloadTo = $Fresh.Dequeue()
+    Write-Host "      -> $DownloadTo"
     & $ad.Ready $win 1
-    Open-Folder $ad $win 0 $DownloadTo 0 | Out-Null
+    # Through the folder above and a double click: Air Explorer's address bar doesn't take a
+    # folder made since it listed the one holding it.
+    Open-Folder $ad $win 0 $DownloadRoot 0 -least 1 | Out-Null
+    Open-Row $ad $win 0 (Split-Path $DownloadTo -Leaf) 0 | Out-Null
     # The folder above through the address bar, the folder itself by a double click (Air
     # Explorer's address bar stalls on a folder it hasn't listed yet).
     $up = Split-Path $d.Drive -Parent
     Open-Folder $ad $win 1 (& $ad.CloudPath $win 'drive' ($up -replace '\\', '/')) 0 -least 1 | Out-Null
     Open-Row $ad $win 1 (Split-Path $d.Drive -Leaf) 0 -least 1 | Out-Null
+    Write-Host "      in $($d.Drive), copying"
     Focus-Window $win
     & $ad.Focus $win 1
     Start-Sleep -Milliseconds 200
@@ -569,6 +649,11 @@ foreach ($key in $AppList) {
     $ad = $Adapters[$key]
     # The other app closed: its window over this one's would take the clicks, and its keys.
     foreach ($other in $Adapters.Keys) { if ($other -ne $key) { Close-App $Adapters[$other] } }
+    $dlCount = @($Downloads.Keys | Where-Object { Want $_ }).Count
+    if ($dlCount) {
+        Close-App $ad
+        Make-DownloadFolders ($dlCount * ($Runs + 1) + 2)
+    }
     $exe = Get-Item $ad.Exe
     $version = $exe.VersionInfo.ProductVersion
     if (-not $version -and $key -eq 'openexplorer') {
