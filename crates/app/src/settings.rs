@@ -208,8 +208,11 @@ pub struct Settings {
     pub uploads: u8,
     /// Files fetched from the cloud or server at the same time.
     pub downloads: u8,
-    /// Fetch a big file (64 MB or more) in several parallel pieces: measured, 37 MB/s in one
-    /// stream against 58 MB/s in four.
+    /// Fetch a big file (64 MB or more) in parallel pieces: measured on a 500 MiB file, 10.4 s
+    /// in one stream against 5.8 s in eight. On by default; kept under a name of its own since
+    /// it started off, so everyone's old `segmented_downloads: false`, left from before downloads
+    /// existed, doesn't keep it off.
+    #[serde(rename = "big_files_in_segments")]
     pub segmented_downloads: bool,
     /// Show hidden files and `.` dotfiles in local folders, servers and the navigation tree.
     pub show_hidden: bool,
@@ -239,7 +242,7 @@ impl Default for Settings {
             text_render: TextRender::Smooth,
             uploads: 4,
             downloads: 4,
-            segmented_downloads: false,
+            segmented_downloads: true,
             show_hidden: false,
             clear_completed: true,
             skip_recycle_bin: false,
@@ -387,6 +390,11 @@ mod tests {
         assert!(Theme::Auto.dark(true) && !Theme::Light.dark(true) && Theme::Dark.dark(false));
         assert_eq!(Settings::default().font, TextFont::System);
         assert_eq!(Settings::default().text_render, TextRender::Smooth);
+        // Big files come in segments, even for settings that kept the old switch off.
+        let s: Settings = serde_json::from_str(r#"{"segmented_downloads":false}"#).unwrap();
+        assert!(s.segmented_downloads);
+        let off: Settings = serde_json::from_str(r#"{"big_files_in_segments":false}"#).unwrap();
+        assert!(!off.segmented_downloads);
     }
 
     #[test]
