@@ -4141,21 +4141,93 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
             crate::autoscroll::moved(&mut s.autoscroll, p, (at.window_x, at.window_y), tx.clock(), tx)
         })
         .child(navbar(s, k, p))
+        .child(pane_actions(s, k, p))
         .child(search_bar(s, k, p))
-        .child(
-            row()
-                .key("body")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .child(tree(s, k, p))
-                .child(
-                    splitter(k, "tree-split", 5.0, Split::Right, move |s: &mut State| &mut s.layout.tree[p], layout::TREE_W, clamp_tree)
-                    .child(el().w(1.0).h_full().fill(k.c.border_weak)),
-                )
-                .child(list(s, k, p)),
-        )
+        .child({
+            let mut body = row().key("body").instant_changes().w_full().grow(1.0).min_h(0.0);
+            if s.show_tree[p] {
+                body = body
+                    .child(tree(s, k, p))
+                    .child(
+                        splitter(k, "tree-split", 5.0, Split::Right, move |s: &mut State| &mut s.layout.tree[p], layout::TREE_W, clamp_tree)
+                            .child(el().w(1.0).h_full().fill(k.c.border_weak)),
+                    );
+            }
+            body.child(list(s, k, p))
+        })
         .child(statusbar(s, k, p))
+}
+
+/// Action strip directly beneath the navigation bar: toggle folder tree visibility and create
+/// a new folder in pane `p`.
+fn pane_actions(s: &State, k: &Kit, p: usize) -> El {
+    let tree_on = s.show_tree[p];
+    let tree_help = if tree_on {
+        t("Ocultar árvore", "Hide tree")
+    } else {
+        t("Exibir árvore", "Show tree")
+    };
+    let tree_bg = if tree_on {
+        k.alpha(k.c.text_accent, if k.dark { 0.22 } else { 0.14 })
+    } else {
+        Color::TRANSPARENT
+    };
+    let tree_hover = if tree_on {
+        k.alpha(k.c.text_accent, if k.dark { 0.30 } else { 0.20 })
+    } else {
+        k.c.hover
+    };
+    let tree_btn = row()
+        .key(format!("toggle-tree-{p}"))
+        .role("button")
+        .label(tree_help.to_string())
+        .help(tree_help.to_string())
+        .checked(tree_on)
+        .size(28.0, 24.0)
+        .center()
+        .radius(k.radius.sm)
+        .fill(tree_bg)
+        .hover(tree_hover)
+        .press(k.c.pressed)
+        .cursor(Cursor::Pointer)
+        .on_press(move |s: &mut State| {
+            s.active = p;
+            s.show_tree[p] = !s.show_tree[p];
+        })
+        .child(icon(&icons::TOGGLE_TREE, 15.0).color(if tree_on { k.c.text_base } else { k.c.icon_muted }));
+
+    let can_new = actions::editable(&s.panes[p].loc);
+    let new_help = t("Nova pasta (Ctrl+Shift+N)", "New folder (Ctrl+Shift+N)");
+    let mut new_btn = row()
+        .key(format!("pane-new-folder-{p}"))
+        .role("button")
+        .label(new_help.to_string())
+        .help(new_help.to_string())
+        .size(28.0, 24.0)
+        .center()
+        .radius(k.radius.sm)
+        .child(icon(&icons::M_NEW_FOLDER, 15.0).color(if can_new { k.c.icon_base } else { k.c.icon_faint }));
+    if can_new {
+        new_btn = new_btn
+            .hover(k.c.hover)
+            .press(k.c.pressed)
+            .cursor(Cursor::Pointer)
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                s.active = p;
+                actions::ask_new_folder(s, p, tx);
+            });
+    }
+
+    row()
+        .key(format!("pane-actions-{p}"))
+        .w_full()
+        .h(30.0)
+        .px(8.0)
+        .gap(6.0)
+        .center_y()
+        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+        .child(tree_btn)
+        .child(new_btn)
 }
 
 /// A square icon button for the navigation bar.

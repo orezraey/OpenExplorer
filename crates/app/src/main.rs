@@ -147,6 +147,8 @@ struct State {
     accounts_filter: Option<servers::Provider>,
     accounts_search: rune::TextEdit,
     panes: [Pane; 2],
+    /// Whether each pane's left folder tree is shown.
+    show_tree: [bool; 2],
     /// The context menu: the pane it was opened in and where.
     menu: Option<(usize, rune::PointerPress)>,
     /// The tree's right-click menu: pane, node, whether it's open, whether it's empty, and where.
@@ -298,6 +300,7 @@ impl State {
             accounts_filter: None,
             accounts_search: rune::TextEdit::new(""),
             panes: [Pane::new(loc.clone()), Pane::new(loc)],
+            show_tree: [true, true],
             menu: None,
             tree_menu: None,
             lasso: None,
@@ -502,6 +505,7 @@ fn init() -> State {
         accounts_filter: None,
         accounts_search: rune::TextEdit::new(""),
         panes,
+        show_tree: [true, true],
         menu: None,
         tree_menu: None,
         lasso: None,
