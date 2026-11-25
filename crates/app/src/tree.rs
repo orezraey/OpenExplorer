@@ -138,9 +138,11 @@ impl Line {
 }
 
 impl Tree {
-    /// The nodes open from the start: Área de Trabalho, Este Computador and each account.
+    /// The nodes open from the start: Este Computador (once Área de Trabalho is expanded) and
+    /// each account. Área de Trabalho itself starts collapsed so each pane expands it
+    /// independently on demand.
     pub fn new(accounts: impl IntoIterator<Item = String>) -> Tree {
-        let open: HashSet<NodeId> = [NodeId::Desktop, NodeId::Computer].into_iter().chain(accounts.into_iter().map(NodeId::Account)).collect();
+        let open: HashSet<NodeId> = [NodeId::Computer].into_iter().chain(accounts.into_iter().map(NodeId::Account)).collect();
         Tree { open: [open.clone(), open], ..Tree::default() }
     }
 
@@ -1215,7 +1217,7 @@ mod tests {
         s.tree.kids.insert(home.id.clone(), Kids::Ready(vec![downloads.clone(), local_node(&s.places, root.join("Home/Notas"))]));
         s.tree.kids.insert(downloads.id.clone(), Kids::Loading);
         s.tree.kids.insert(NodeId::Local(root.join("Home/Notas")), Kids::Loading);
-        for id in [home.id.clone(), downloads.id.clone(), NodeId::Local(root.join("Home/Notas"))] {
+        for id in [NodeId::Desktop, home.id.clone(), downloads.id.clone(), NodeId::Local(root.join("Home/Notas"))] {
             s.tree.open[0].insert(id);
         }
         let keys: Vec<String> = lines(&s, 0).iter().map(Line::key).collect();
@@ -1282,8 +1284,20 @@ mod tests {
         s.servers.list.clear();
         let kids = desktop_kids(&s.places, true);
         s.tree.kids.insert(NodeId::Desktop, Kids::Ready(kids));
+        s.tree.open[0].insert(NodeId::Desktop);
         s.panes[0].go(Location::Mock(Vec::new()));
         s
+    }
+
+    #[test]
+    fn desktop_starts_collapsed_and_expands_independently_per_pane() {
+        let (mut s, _) = scene("desktop-independent");
+        assert!(!s.tree.open[0].contains(&NodeId::Desktop));
+        assert!(!s.tree.open[1].contains(&NodeId::Desktop));
+        let desktop = desktop_node(&s.places).unwrap();
+        toggle(&mut s, 0, &desktop);
+        assert!(s.tree.open[0].contains(&NodeId::Desktop));
+        assert!(!s.tree.open[1].contains(&NodeId::Desktop));
     }
 
     /// The label of the row the keyboard is on.
