@@ -1903,10 +1903,11 @@ pub fn remove(s: &mut State, id: &str) {
     for p in 0..2 {
         s.panes[p].back.retain(|l| !on(l));
         s.panes[p].forward.retain(|l| !on(l));
-        if on(&s.panes[p].loc) {
+        if !s.tabs[p].is_picker() && on(&s.panes[p].loc) {
             crate::switch(s, p, Location::home());
         }
     }
+    crate::tabs::purge_locations(s, on, &Location::home());
     s.status = match account {
         Some((account, _)) => crate::accounts::removed(account, name),
         None => tr!("Servidor removido: {name}", "Server removed: {name}"),

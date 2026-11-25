@@ -92,6 +92,7 @@ icon!(UP, "up", r#"<path d="M8 13V3.5M4 7.5L8 3.5L12 7.5" stroke="currentColor" 
 icon!(REFRESH, "refresh", r#"<path d="M13 8A5 5 0 1 1 11.5 4.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/><path d="M11.8 1.8V4.8H8.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
 icon!(CHEVRON_DOWN, "chevron-down", r#"<path d="M4 6L8 10L12 6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
 icon!(CHEVRON, "chevron", r#"<path d="M6 4L10 8L6 12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
+icon!(PLUS, "plus", r#"<path d="M8 3.2V12.8M3.2 8H12.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>"#);
 icon!(TOGGLE_TREE, "toggle-tree", r#"<rect x="2" y="3" width="12" height="10" rx="1.8" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M6.2 3V13" stroke="currentColor" stroke-width="1.25"/>"#);
 icon!(EXTERNAL_LINK, "external-link", r#"<path d="M9.5 2.5H13.5V6.5M13.2 2.8L7.5 8.5M6.5 4H3.5C2.95 4 2.5 4.45 2.5 5V12.5C2.5 13.05 2.95 13.5 3.5 13.5H11C11.55 13.5 12 13.05 12 12.5V9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
 

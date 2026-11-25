@@ -1089,6 +1089,8 @@ mod tests {
         s.places = Places {
             desktop: Some((root.join("Desk"), "Área de Trabalho".into())),
             desktop_also: Vec::new(),
+            documents: None,
+            pictures: None,
             user: vec![(root.join("Home/Downloads"), "Downloads".into()), (root.join("Home"), "Pessoal".into())],
             wsl: vec!["Ubuntu".into()],
         };

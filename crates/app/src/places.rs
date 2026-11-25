@@ -12,6 +12,10 @@ pub struct Places {
     pub desktop: Option<(PathBuf, String)>,
     /// Other folders whose folders show on the desktop: the shared Public Desktop.
     pub desktop_also: Vec<PathBuf>,
+    /// The user's Documents folder and its display name, for quick access.
+    pub documents: Option<(PathBuf, String)>,
+    /// The user's Pictures folder and its display name, for quick access.
+    pub pictures: Option<(PathBuf, String)>,
     /// The user's folders and the home folder, each with its name.
     pub user: Vec<(PathBuf, String)>,
     /// WSL's Linux distributions, by name (see [`crate::network::distros`]).
@@ -38,9 +42,13 @@ pub fn places() -> Places {
         .filter(|p| p.is_dir())
         .map(named)
         .collect();
+    let documents = known_folder(&FOLDERID_Documents).filter(|p| p.is_dir()).map(&named);
+    let pictures = known_folder(&FOLDERID_Pictures).filter(|p| p.is_dir()).map(&named);
     Places {
         desktop: known_folder(&FOLDERID_Desktop).filter(|p| p.is_dir()).map(named),
         desktop_also: known_folder(&FOLDERID_PublicDesktop).filter(|p| p.is_dir()).into_iter().collect(),
+        documents,
+        pictures,
         user,
         wsl: crate::network::distros(),
     }
@@ -85,5 +93,7 @@ pub fn places() -> Places {
         (p, name)
     };
     let user = ["Documents", "Downloads", "Pictures", "Music", "Videos"].iter().map(|n| home.join(n)).chain([home.clone()]).filter(|p| p.is_dir()).map(named).collect();
-    Places { desktop: Some(home.join("Desktop")).filter(|p| p.is_dir()).map(named), desktop_also: Vec::new(), user, wsl: Vec::new() }
+    let documents = Some(home.join("Documents")).filter(|p| p.is_dir()).map(&named);
+    let pictures = Some(home.join("Pictures")).filter(|p| p.is_dir()).map(&named);
+    Places { desktop: Some(home.join("Desktop")).filter(|p| p.is_dir()).map(named), desktop_also: Vec::new(), documents, pictures, user, wsl: Vec::new() }
 }

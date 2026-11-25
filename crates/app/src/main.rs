@@ -36,6 +36,7 @@ mod places;
 mod relay;
 mod servers;
 mod sysicons;
+mod tabs;
 mod telegram;
 mod transfers;
 mod tree;
@@ -147,6 +148,7 @@ struct State {
     accounts_filter: Option<servers::Provider>,
     accounts_search: rune::TextEdit,
     panes: [Pane; 2],
+    tabs: [tabs::PaneTabs; 2],
     /// Whether each pane's left folder tree is shown.
     show_tree: [bool; 2],
     /// The context menu: the pane it was opened in and where.
@@ -300,6 +302,7 @@ impl State {
             accounts_filter: None,
             accounts_search: rune::TextEdit::new(""),
             panes: [Pane::new(loc.clone()), Pane::new(loc)],
+            tabs: [tabs::PaneTabs::initial(), tabs::PaneTabs::initial()],
             show_tree: [true, true],
             menu: None,
             tree_menu: None,
@@ -505,6 +508,7 @@ fn init() -> State {
         accounts_filter: None,
         accounts_search: rune::TextEdit::new(""),
         panes,
+        tabs: [tabs::PaneTabs::initial(), tabs::PaneTabs::initial()],
         show_tree: [true, true],
         menu: None,
         tree_menu: None,
@@ -1157,10 +1161,11 @@ fn disconnect(s: &mut State, email: &str) {
         let gone = |l: &Location| matches!(l, Location::Drive { email: e, .. } if e == email);
         s.panes[p].back.retain(|l| !gone(l));
         s.panes[p].forward.retain(|l| !gone(l));
-        if matches!(&s.panes[p].loc, Location::Drive { email: e, .. } if e == email) {
+        if !s.tabs[p].is_picker() && matches!(&s.panes[p].loc, Location::Drive { email: e, .. } if e == email) {
             switch(s, p, Location::Mock(Vec::new()));
         }
     }
+    tabs::purge_locations(s, |l| matches!(l, Location::Drive { email: e, .. } if e == email), &Location::Mock(Vec::new()));
     s.status = tr!("Conta desconectada: {email}", "Account disconnected: {email}");
 }
 
@@ -1209,7 +1214,11 @@ pub(crate) fn set_main_tab(s: &mut State, tab: MainTab) {
 /// Opens `loc` in pane `p` (0 = left, 1 = right) and switches to `Explorar`.
 pub(crate) fn open_account_in_pane(s: &mut State, p: usize, loc: Location) {
     s.main_tab = MainTab::Explore;
-    navigate(s, p, loc);
+    if s.tabs[p].is_picker() {
+        tabs::open_new_tab(s, p, loc);
+    } else {
+        navigate(s, p, loc);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1488,6 +1497,10 @@ fn go_forward(s: &mut State, p: usize) {
 /// The mouse's side buttons over pane `p`: Voltar and Avançar, as in Explorer. Other extra
 /// buttons (the wheel's press) are left to the system.
 fn side_button(s: &mut State, p: usize, button: rune::PointerButton) -> bool {
+    let side = matches!(button, rune::PointerButton::Back | rune::PointerButton::Forward);
+    if s.tabs[p].is_picker() {
+        return side;
+    }
     match button {
         rune::PointerButton::Back => go_back(s, p),
         rune::PointerButton::Forward => go_forward(s, p),
@@ -1602,6 +1615,25 @@ fn click(s: &mut State, p: usize, id: &str, mods: Mods) {
 }
 
 fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if ev.is_command('t') {
+        tabs::open_picker(s, p);
+        return true;
+    }
+    if ev.is_command('w') && !s.tabs[p].is_picker() {
+        tabs::close_active_tab(s, p);
+        return true;
+    }
+    if s.tabs[p].is_picker() {
+        if matches!(ev.key, Key::Escape) {
+            if s.tabs[p].picker.filter_open {
+                s.tabs[p].picker.filter_open = false;
+            } else {
+                tabs::cancel_picker(s, p);
+            }
+            return true;
+        }
+        return false;
+    }
     // Keys belong to the name field while renaming. Once the focus left it (a click in a row,
     // in the other pane), the rename ends as leaving the field does, and the key goes on: else
     // both panes' keys would stay with a field no one is typing in.
