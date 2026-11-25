@@ -13,10 +13,14 @@ Each measurement runs once untimed, then `-Runs` times (5 by default); the media
 |---|---|---|
 | `start` | the app is launched | its left pane shows its first folder whole |
 | `system32`, `winsxs` | Enter in the left pane's address bar, after `C:\Windows\System32` (5,040 items) or `C:\Windows\WinSxS` (28,491) | the pane shows every item |
-| `drive-1000-folders`, `drive-5000-files` | Enter in the Google Drive pane's address bar, after `Open Explorer benchmark/1000 folders` (or `5000 files`) | the pane shows every item |
+| `<cloud>-1000-folders`, `<cloud>-5000-files` | Enter in the cloud pane's address bar, after `Open Explorer benchmark/1000 folders` (or `5000 files`), a folder the app opened before in this session | the pane shows every item |
+| `<cloud>-1000-folders-uncached`, `<cloud>-5000-files-uncached` | a double click on the folder in `Open Explorer benchmark`, right after the app started with no listing kept from before | the pane shows every item |
 | `download-large` | the arrow between the panes that copies the Drive pane's selection (all of `transfer/large`: one 500 MiB file) into the other pane's empty local folder | the file is on disk whole and no program still writes it |
 | `download-100-folders` | the same, for `100 folders` (100 empty folders) | all 100 folders are on disk |
 | `memory` | 10 s idle after a start, then after opening the Drive folder | private bytes and working set of the app's processes |
+
+`<cloud>` is `drive` (Google Drive), `onedrive`, `dropbox` or `mega`: each cloud whose account
+Open Explorer has connected.
 
 Between runs a pane goes back to another folder (`C:\Windows\Web`, or the benchmark's top folder
 in Drive), so each run opens its folder again. "Shows every item" is read from each app's own
@@ -28,20 +32,32 @@ shows what it kept without checking.
 ## Running it
 
 1. Build Open Explorer: `cargo build --release -p openexplorer`.
-2. Connect the same Google account in both apps. In Air Explorer, keep This PC in the left pane and
-   the Google Drive account in the right one (each of its tabs belongs to one account).
-3. Make the Drive test data, once: `cargo run -p openexplorer-gdrive --release --example bench_data -- <e-mail>`
-   (it needs about 400 MB free in the account; run again, it adds only what's missing). In an
-   account with no room left, `--shortcuts` fills `5000 files` with shortcuts, which take no
-   storage, and moves a leftover `openexplorer-speed-500.bin` into `transfer/large`.
+2. Connect the same cloud accounts in both apps, one per cloud (Air Explorer's free version takes
+   no more). In Air Explorer, keep This PC in the left pane and open a tab for each account in the
+   right one (each of its tabs belongs to one account); the script brings each forward.
+3. Make the test data, once per cloud (run again, each adds only what's missing):
+   - Google Drive: `cargo run -p openexplorer-gdrive --release --example bench_data -- <e-mail>`
+     (it needs about 600 MB free in the account). In an account with no room left, `--shortcuts`
+     fills `5000 files` with shortcuts, which take no storage, and moves a leftover
+     `openexplorer-speed-500.bin` into `transfer/large`.
+   - OneDrive: `cargo run -p openexplorer-onedrive --release --example onedrive_bench -- <drive id>`
+     (the id is in `onedrive-accounts.json`, in Open Explorer's settings folder).
+   - Dropbox: `cargo run -p openexplorer-dropbox --release --example dropbox_bench -- <e-mail>`.
+   - MEGA: `cargo run -p openexplorer-mega --release --example mega_bench -- <e-mail>`.
 4. Run, and leave the mouse and keyboard alone while both apps open and close:
 
    ```
-   powershell -NoProfile -ExecutionPolicy Bypass -File bench\compare.ps1 -Email <e-mail> -AirAccount "<name>"
+   powershell -NoProfile -ExecutionPolicy Bypass -File bench\compare.ps1
    ```
 
-   `<name>` is what Air Explorer's address bar shows in "Meu Drive [<name>]". `-Only start,winsxs`
-   runs some measurements; `-Apps airexplorer` one app. Results go to `bench\results\`.
+   The accounts are read from Open Explorer's settings folder (`-Email` picks the Google one when
+   there are several). `-Only start,winsxs` runs some measurements; `-Apps airexplorer` one app.
+   Results go to `bench\results\`.
+
+The `-uncached` measurements close the app before each run and delete the listings Open Explorer
+keeps on disk (`%LOCALAPPDATA%\OpenExplorer`: `cache` for Google Drive, and a folder per cloud);
+Air Explorer keeps none. They open the folder with a double click, as a person would: through its
+address bar Air Explorer took about 40 s for a OneDrive folder it hadn't listed yet.
 
 Air Explorer keeps unfinished transfers and resumes them at its next start: if a run is cut short
 while it copies, cancel what's left in its queue (select the rows, Shift+End, right click,

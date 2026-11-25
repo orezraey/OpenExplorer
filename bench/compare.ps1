@@ -9,10 +9,10 @@
 # reopened along the way.
 
 param(
-    # The Google account connected in both apps, as Open Explorer's address bar names it.
-    [string] $Email = 'eliatan1122@gmail.com',
-    # The same account's name in Air Explorer's address bar ("Meu Drive [<name>]").
-    [string] $AirAccount = 'oreZ raeY',
+    # The cloud accounts are the ones connected in Open Explorer (its settings folder says which);
+    # Air Explorer must have the same ones, one per cloud, each open in a tab of its right pane.
+    # The Google account, when Open Explorer has more than one.
+    [string] $Email = '',
     [string] $OpenExplorer = (Join-Path $PSScriptRoot '..\target\release\openexplorer.exe'),
     [string] $AirExplorer = 'C:\Program Files\AirExplorer\AirExplorer.exe',
     # Timed runs of each measurement, after one run that isn't counted.
@@ -21,7 +21,7 @@ param(
     [int] $Timeout = 180,
     # Comma-separated (powershell -File passes a list as one word): openexplorer,airexplorer.
     [string] $Apps = 'openexplorer,airexplorer',
-    # Only these measurements, comma-separated: system32,winsxs,drive-1000-folders,start,memory...
+    # Only these measurements, comma-separated: system32,winsxs,drive-1000-folders,onedrive-5000-files,start,memory...
     [string] $Only = '',
     [string] $Out = (Join-Path $PSScriptRoot ("results\" + (Get-Date -Format 'yyyy-MM-dd_HHmm') + '.json'))
 )
@@ -44,6 +44,49 @@ public static class Win {
     public static int ListCount(IntPtr h) { return (int)SendMessage(h, 0x1004, IntPtr.Zero, IntPtr.Zero); }
     // A left click at screen pixel (x, y).
     public static void Click(int x, int y) { SetCursorPos(x, y); mouse_event(2, 0, 0, 0, IntPtr.Zero); mouse_event(4, 0, 0, 0, IntPtr.Zero); }
+    public static void DoubleClick(int x, int y) { Click(x, y); Click(x, y); }
+
+    // A row of another process's list view (Air Explorer's is virtual: its rows aren't in the UI
+    // Automation tree), read through a buffer in that process.
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h, ref POINT p);
+    [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll")] static extern IntPtr VirtualAllocEx(IntPtr p, IntPtr at, IntPtr size, uint type, uint protect);
+    [DllImport("kernel32.dll")] static extern bool VirtualFreeEx(IntPtr p, IntPtr at, IntPtr size, uint type);
+    [DllImport("kernel32.dll")] static extern bool WriteProcessMemory(IntPtr p, IntPtr at, byte[] buf, IntPtr size, out IntPtr done);
+    [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr p, IntPtr at, byte[] buf, IntPtr size, out IntPtr done);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    struct POINT { public int X, Y; }
+    // The screen point at the middle of the first row of list h whose first column is name,
+    // or null. LVM_GETITEMTEXTW and LVM_GETITEMRECT (64-bit LVITEMW: pszText at 24, cchTextMax
+    // at 32).
+    public static int[] RowPoint(IntPtr h, string name) {
+        uint pid; GetWindowThreadProcessId(h, out pid);
+        IntPtr proc = OpenProcess(0x38, false, pid);
+        IntPtr mem = VirtualAllocEx(proc, IntPtr.Zero, (IntPtr)4096, 0x3000, 4);
+        try {
+            int n = ListCount(h);
+            IntPtr done;
+            for (int i = 0; i < n; i++) {
+                byte[] item = new byte[88];
+                BitConverter.GetBytes((long)mem + 512).CopyTo(item, 24);
+                BitConverter.GetBytes(260).CopyTo(item, 32);
+                WriteProcessMemory(proc, mem, item, (IntPtr)88, out done);
+                int len = (int)SendMessage(h, 0x1073, (IntPtr)i, mem);
+                byte[] text = new byte[len * 2];
+                ReadProcessMemory(proc, mem + 512, text, (IntPtr)text.Length, out done);
+                if (System.Text.Encoding.Unicode.GetString(text) != name) continue;
+                byte[] rect = new byte[16];
+                WriteProcessMemory(proc, mem, rect, (IntPtr)16, out done);
+                SendMessage(h, 0x100E, (IntPtr)i, mem);
+                ReadProcessMemory(proc, mem, rect, (IntPtr)16, out done);
+                POINT p; p.X = BitConverter.ToInt32(rect, 0) + 40; p.Y = (BitConverter.ToInt32(rect, 4) + BitConverter.ToInt32(rect, 12)) / 2;
+                ClientToScreen(h, ref p);
+                return new int[] { p.X, p.Y };
+            }
+            return null;
+        } finally { VirtualFreeEx(proc, mem, IntPtr.Zero, 0x8000); CloseHandle(proc); }
+    }
 }
 "@
 # UI Automation reports physical pixels; so must the clicks be.
@@ -55,14 +98,40 @@ function Prop($p, $v) { New-Object System.Windows.Automation.PropertyCondition($
 function All { New-Object System.Windows.Automation.AndCondition(, [System.Windows.Automation.Condition[]]$args) }
 
 # ------------------------------------------------------------------------------------------------
-# Measurements: each opens a folder in the left pane; `Kind` is local or drive.
+# The clouds, and the accounts Open Explorer has connected in each (from its settings folder).
 
+$Config = Join-Path $env:APPDATA 'OpenExplorer'
+function Accounts-In([string] $file) {
+    $path = Join-Path $Config $file
+    if (Test-Path $path) { @(Get-Content -Raw -Encoding UTF8 $path | ConvertFrom-Json) } else { @() }
+}
+$Google = Accounts-In 'accounts.json' | Where-Object { -not $Email -or $_.email -eq $Email } | Select-Object -First 1
+$OneDrive = Accounts-In 'onedrive-accounts.json' | Select-Object -First 1
+$Dropbox = Accounts-In 'dropbox-accounts.json' | Select-Object -First 1
+$Mega = Accounts-In 'mega-accounts.json' | Select-Object -First 1
+
+# Each cloud's test data (made by the examples in bench\README.md) sits in "Open Explorer
+# benchmark". `Oe` is where that folder's parent is in Open Explorer's address bar; `Air` is how
+# Air Explorer's address bar starts for the account ("Dropbox [Ana]"), whose own folder it shows
+# at the top.
 $Gd = "Open Explorer benchmark"
+$Clouds = [ordered]@{}
+if ($Google) { $Clouds['drive'] = @{ Oe = "$($Google.email)/Meu Drive"; Air = 'Meu Drive [' } }
+if ($OneDrive) { $Clouds['onedrive'] = @{ Oe = "onedrive://$($OneDrive.email)/Meus arquivos"; Air = 'OneDrive [' } }
+if ($Dropbox) { $Clouds['dropbox'] = @{ Oe = "dropbox://$($Dropbox.email)"; Air = 'Dropbox [' } }
+if ($Mega) { $Clouds['mega'] = @{ Oe = "mega://$($Mega.email)/Drive na nuvem"; Air = 'Mega [' } }
+
+# ------------------------------------------------------------------------------------------------
+# Measurements: each opens a folder, a local one in the left pane or a cloud's in the app's
+# cloud pane.
+
 $Folders = [ordered]@{
     'system32' = @{ Local = 'C:\Windows\System32' }
     'winsxs'   = @{ Local = 'C:\Windows\WinSxS' }
-    'drive-5000-files'   = @{ Drive = "$Gd/5000 files" }
-    'drive-1000-folders' = @{ Drive = "$Gd/1000 folders" }
+}
+foreach ($c in $Clouds.Keys) {
+    $Folders["$c-5000-files"] = @{ Cloud = $c; Path = "$Gd/5000 files" }
+    $Folders["$c-1000-folders"] = @{ Cloud = $c; Path = "$Gd/1000 folders" }
 }
 # Where a pane goes between runs, so each run opens its folder anew.
 $Rest = 'C:\Windows\Web'
@@ -84,9 +153,21 @@ $DownloadTo = 'C:\OEBench\dl'
 $Adapters = @{
     openexplorer = @{
         Name = 'Open Explorer'; Exe = $OpenExplorer; Process = 'openexplorer'
-        DrivePath = { param($p) "$Email/Meu Drive/$p" }
+        CloudPath = { param($win, $c, $p) "$($Clouds[$c].Oe)/$p" }
+        # Deletes the folder listings it keeps on disk between runs (Google Drive's and each
+        # cloud's), with the app closed. A process started from a packaged app (the Claude app)
+        # may see its own copy of the folder, so both copies go.
+        Forget = {
+            $roots = @("$env:LOCALAPPDATA\OpenExplorer")
+            $roots += Get-ChildItem "$env:LOCALAPPDATA\Packages\*\LocalCache\Local\OpenExplorer" -Directory -ErrorAction SilentlyContinue | ForEach-Object FullName
+            foreach ($root in $roots) {
+                foreach ($d in 'cache', 'onedrive', 'dropbox', 'mega', 'b2') {
+                    if (Test-Path "$root\$d") { Remove-Item -LiteralPath "$root\$d" -Recurse -Force }
+                }
+            }
+        }
         # Any pane opens any place.
-        DrivePane = 0
+        CloudPane = 0
         # Makes pane `i` a folder view: a pane on the "+" picker opens This PC in a new tab.
         Ready = {
             param($win, $i)
@@ -102,6 +183,13 @@ $Adapters = @{
             $b.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
         }
         Pane = { param($win, $i) $win.FindFirst($Scope::Descendants, (Prop $A::AutomationIdProperty "pane-$i")) }
+        # The screen point of the row `name` in pane `i`'s list.
+        Row = {
+            param($win, $i, $name)
+            $cond = All (Prop $A::ControlTypeProperty ([System.Windows.Automation.ControlType]::DataItem)) (Prop $A::NameProperty $name)
+            $row = (& $Adapters.openexplorer.Pane $win $i).FindFirst($Scope::Descendants, $cond)
+            if ($row) { $r = $row.Current.BoundingRectangle; @([int]($r.X + 40), [int]($r.Y + $r.Height / 2)) }
+        }
         Address = {
             param($win, $i)
             $pane = & $Adapters.openexplorer.Pane $win $i
@@ -123,17 +211,66 @@ $Adapters = @{
             # Right after a start the window is there before its panes.
             if (-not $pane) { return -1 }
             foreach ($t in $pane.FindAll($Scope::Children, (Prop $A::ControlTypeProperty ([System.Windows.Automation.ControlType]::Text)))) {
-                if ($t.Current.Name -match '^([\d\.,]+) ite(m|ns)(\s|$)') { return [int]($Matches[1] -replace '[\.,]', '') }
+                if ($t.Current.Name -match '^([\d\.,]+) ite(m|ns)(\s|$)') {
+                    $n = [int]($Matches[1] -replace '[\.,]', '')
+                    # "0 itens · carregando…" is a folder still on its way, not an empty one.
+                    if ($n -eq 0 -and $t.Current.Name -match 'carregando') { return -1 }
+                    return $n
+                }
             }
             -1
         }
     }
     airexplorer = @{
         Name = 'Air Explorer'; Exe = $AirExplorer; Process = 'AirExplorer'
-        DrivePath = { param($p) "Meu Drive [$AirAccount]/$p" }
-        # Each tab belongs to one account: the left pane's is This PC, the right pane's the Google
-        # account (set up so before running).
-        DrivePane = 1
+        # Each tab belongs to one account: the left pane's is This PC, and the right pane has a
+        # tab for each cloud account (opened before running). This brings the cloud's tab
+        # forward and starts the path with the account's name as its address bar shows it.
+        CloudPath = {
+            param($win, $c, $p)
+            "$(& $Adapters.airexplorer.Tab $win $Clouds[$c].Air)/$p"
+        }
+        CloudPane = 1
+        # It keeps no folder listings on disk (only its settings, in %APPDATA%\AirExplorer).
+        Forget = { }
+        # The right pane's tabs are a Windows tab control, and only the tab in front is in the
+        # UI Automation tree: each tab in turn comes forward (TCM_SETCURFOCUS, which selects as
+        # a click does) until one's address bar starts with `prefix`; its whole name is returned.
+        Tab = {
+            param($win, $prefix)
+            $cond = Prop $A::ClassNameProperty 'WindowsForms10.SysTabControl32.app.0.25bb5ff_r6_ad1'
+            $strip = $win.FindAll($Scope::Descendants, $cond) | Sort-Object { $_.Current.BoundingRectangle.X } | Select-Object -Last 1
+            $h = [IntPtr]$strip.Current.NativeWindowHandle
+            $text = Prop $A::ControlTypeProperty ([System.Windows.Automation.ControlType]::Text)
+            $any = [System.Windows.Automation.Condition]::TrueCondition
+            # The account's name in the tab in front, if its address starts with `prefix`.
+            $front = {
+                $page = $strip.FindFirst($Scope::Children, $any)
+                $root = $page.FindAll($Scope::Descendants, $text) | Where-Object { $_.Current.Name.StartsWith($prefix) } | Select-Object -First 1
+                if ($root) { $root.Current.Name }
+            }
+            # Right after a start a tab may still be connecting, with no address yet: a few rounds.
+            for ($round = 0; $round -lt 30; $round++) {
+            $name = & $front
+            if ($name) { return $name }
+            # The last tab is the "+" that adds one.
+            $n = [int][Win]::SendMessage($h, 0x1304, [IntPtr]::Zero, [IntPtr]::Zero) - 1
+            $cur = [int][Win]::SendMessage($h, 0x130B, [IntPtr]::Zero, [IntPtr]::Zero)
+            for ($k = 0; $k -lt $n; $k++) {
+                if ($k -eq $cur) { continue }
+                $was = $strip.FindFirst($Scope::Children, $any).Current.NativeWindowHandle
+                [void][Win]::SendMessage($h, 0x1330, [IntPtr]$k, [IntPtr]::Zero)
+                # Until the tree shows the new tab's page.
+                for ($try = 0; $try -lt 50 -and $strip.FindFirst($Scope::Children, $any).Current.NativeWindowHandle -eq $was; $try++) { Start-Sleep -Milliseconds 50 }
+                Start-Sleep -Milliseconds 200
+                $name = & $front
+                if ($name) { return $name }
+                $cur = $k
+            }
+            Start-Sleep -Seconds 1
+            }
+            throw "Air Explorer: no tab in the right pane whose address starts with '$prefix'"
+        }
         Ready = { param($win, $i) }
         # A list view takes no focus through UI Automation: a click on its first row (on an
         # empty list, its middle) does.
@@ -150,6 +287,10 @@ $Adapters = @{
             $buttons = $win.FindAll($Scope::Descendants, (Prop $A::ClassNameProperty 'WindowsForms10.BUTTON.app.0.25bb5ff_r6_ad1'))
             $r = ($buttons | Sort-Object { $_.Current.BoundingRectangle.Y } | Select-Object -Last 1).Current.BoundingRectangle
             [Win]::Click([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
+        }
+        Row = {
+            param($win, $i, $name)
+            [Win]::RowPoint([IntPtr]((& $Adapters.airexplorer.Lists $win)[$i]).Current.NativeWindowHandle, $name)
         }
         # The pane's file list: a SysListView32, left to right.
         Lists = {
@@ -242,10 +383,11 @@ function Go-To($ad, $win, [int] $i, [string] $path) {
     Start-Sleep -Milliseconds 50
 }
 
-# Waits until pane `i` shows `expected` items (any settled count when 0), in seconds.
+# Waits until pane `i` shows `expected` items (when 0, any count of at least `least` that holds
+# for two seconds), in seconds.
 # With -Fresh it finds the window again each time: during a start the first window handle the
 # process reports may not be the one that ends up holding the panes.
-function Wait-Count($ad, $win, [int] $i, [int] $expected, [Diagnostics.Stopwatch] $sw, [switch] $Fresh) {
+function Wait-Count($ad, $win, [int] $i, [int] $expected, [Diagnostics.Stopwatch] $sw, [switch] $Fresh, [int] $least = 0) {
     $last = -2; $since = 0.0
     while ($sw.Elapsed.TotalSeconds -lt $Timeout) {
         if ($Fresh) { try { $win = Get-MainWindow $ad 1 } catch { Start-Sleep -Milliseconds 15; continue } }
@@ -253,7 +395,7 @@ function Wait-Count($ad, $win, [int] $i, [int] $expected, [Diagnostics.Stopwatch
         $now = $sw.Elapsed.TotalSeconds
         if ($expected -gt 0) {
             if ($n -eq $expected) { return $now }
-        } elseif ($n -ge 0) {
+        } elseif ($n -ge $least) {
             # Learning a folder's count: the same for two seconds.
             if ($n -ne $last) { $last = $n; $since = $now } elseif ($now - $since -ge 2) { return @($since, $n) }
         }
@@ -264,11 +406,35 @@ function Wait-Count($ad, $win, [int] $i, [int] $expected, [Diagnostics.Stopwatch
 
 # Opens `path` in pane `i`: the time runs from the Enter that opens it (which an app may handle
 # before the key's message returns, folder read included) until the pane shows every item.
-function Open-Folder($ad, $win, [int] $i, [string] $path, [int] $expected) {
+function Open-Folder($ad, $win, [int] $i, [string] $path, [int] $expected, [int] $least = 0) {
     Go-To $ad $win $i $path
     $sw = [Diagnostics.Stopwatch]::StartNew()
     [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-    Wait-Count $ad $win $i $expected $sw
+    Wait-Count $ad $win $i $expected $sw -least $least
+}
+
+# Opens the folder `name`, a row of pane `i`'s list, with a double click: the time runs from the
+# click until the pane shows `expected` items.
+function Open-Row($ad, $win, [int] $i, [string] $name, [int] $expected, [int] $least = 0) {
+    Close-Popups $ad $win
+    Focus-Window $win
+    $at = & $ad.Row $win $i $name
+    if (-not $at) { throw "$($ad.Name): no row '$name' in pane $i" }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    [Win]::DoubleClick($at[0], $at[1])
+    Wait-Count $ad $win $i $expected $sw -least $least
+}
+
+# Starts the app anew, with no folder listings kept from before, and waits until its window
+# shows its first folder.
+function Start-Uncached($ad) {
+    Close-App $ad
+    & $ad.Forget
+    Start-Process $ad.Exe | Out-Null
+    Wait-Count $ad (Get-MainWindow $ad) 0 0 ([Diagnostics.Stopwatch]::StartNew()) -Fresh | Out-Null
+    $win = Get-MainWindow $ad
+    Close-Popups $ad $win
+    $win
 }
 
 # Files, folders and bytes under `dir`, and whether every file can be opened alone (no program
@@ -289,7 +455,7 @@ function Download($ad, $win, $d) {
     New-Item -ItemType Directory -Force $DownloadTo | Out-Null
     & $ad.Ready $win 1
     Open-Folder $ad $win 0 $DownloadTo 0 | Out-Null
-    Open-Folder $ad $win 1 (& $ad.DrivePath $d.Drive) 0 | Out-Null
+    Open-Folder $ad $win 1 (& $ad.CloudPath $win 'drive' $d.Drive) 0 | Out-Null
     Focus-Window $win
     & $ad.Focus $win 1
     Start-Sleep -Milliseconds 200
@@ -371,24 +537,50 @@ foreach ($key in $AppList) {
     Start-Sleep -Seconds 5
     $win = Get-MainWindow $ad
 
-    # Learn each folder's count (and warm the way there), then time it.
+    # Learn each folder's count (and warm the way there), then time it: opened before in this
+    # session, and (for a cloud's) opened for the first time since the app started, with no
+    # listing of it kept from before (`-uncached`).
     foreach ($name in $Folders.Keys) {
-        if (-not (Want $name)) { continue }
         $f = $Folders[$name]
-        # A Drive folder opens in the app's Drive pane, between runs going back to the benchmark's
-        # top folder there.
+        $warm = Want $name
+        $cold = $f.Cloud -and (Want "$name-uncached")
+        if (-not ($warm -or $cold)) { continue }
+        # A cloud's folder opens in the app's cloud pane, between runs going back to the
+        # benchmark's top folder there.
         if ($f.Local) { $path = $f.Local; $pane = 0; $back = $Rest }
-        else { $path = & $ad.DrivePath $f.Drive; $pane = $ad.DrivePane; $back = & $ad.DrivePath $Gd }
+        else { $back = & $ad.CloudPath $win $f.Cloud $Gd; $path = & $ad.CloudPath $win $f.Cloud $f.Path; $pane = $ad.CloudPane }
         Open-Folder $ad $win $pane $back 0 | Out-Null
-        $learned = Open-Folder $ad $win $pane $path 0
+        # The first time in, by a double click: through its address bar, Air Explorer takes far
+        # longer for a cloud folder it hasn't listed yet.
+        $learned = if ($f.Local) { Open-Folder $ad $win $pane $path 0 -least 1 } else { Open-Row $ad $win $pane (Split-Path $f.Path -Leaf) 0 -least 1 }
         $expected = $learned[1]
-        $times = @()
-        for ($k = 0; $k -lt $Runs; $k++) {
-            Open-Folder $ad $win $pane $back 0 | Out-Null
-            $times += [math]::Round((Open-Folder $ad $win $pane $path $expected), 3)
+        if ($warm) {
+            $times = @()
+            for ($k = 0; $k -lt $Runs; $k++) {
+                Open-Folder $ad $win $pane $back 0 | Out-Null
+                $times += [math]::Round((Open-Folder $ad $win $pane $path $expected), 3)
+            }
+            Write-Host ("  {0,-20} {1,6} items  median {2:N3} s  ({3})" -f $name, $expected, (Median $times), ($times -join ', '))
+            $r[$name] = @{ items = $expected; seconds = $times; median = (Median $times) }
         }
-        Write-Host ("  {0,-20} {1,6} items  median {2:N3} s  ({3})" -f $name, $expected, (Median $times), ($times -join ', '))
-        $r[$name] = @{ items = $expected; seconds = $times; median = (Median $times) }
+        if ($cold) {
+            $times = @()
+            for ($k = 0; $k -le $Runs; $k++) {
+                # Left in the top folder, so the next start (Air Explorer reopens each tab's last
+                # folder) doesn't load the measured one before it's asked for.
+                Open-Folder $ad $win $pane (& $ad.CloudPath $win $f.Cloud $Gd) 0 -least 1 | Out-Null
+                $win = Start-Uncached $ad
+                # The way there (the account and the top folder) is the same in every run; then a
+                # double click opens the folder, as a person would. (Air Explorer takes far longer
+                # through its address bar: about 40 s for `5000 files` on OneDrive.)
+                Open-Folder $ad $win $pane (& $ad.CloudPath $win $f.Cloud $Gd) 0 -least 1 | Out-Null
+                $t = [math]::Round((Open-Row $ad $win $pane (Split-Path $f.Path -Leaf) $expected), 3)
+                Write-Host ("    {0}-uncached run {1}: {2} s" -f $name, $k, $t)
+                if ($k -gt 0) { $times += $t }
+            }
+            Write-Host ("  {0,-20} {1,6} items  median {2:N3} s  ({3})" -f "$name-uncached", $expected, (Median $times), ($times -join ', '))
+            $r["$name-uncached"] = @{ items = $expected; seconds = $times; median = (Median $times) }
+        }
     }
 
     foreach ($name in $Downloads.Keys) {
@@ -429,7 +621,7 @@ foreach ($key in $AppList) {
         Close-Popups $ad $win
         Start-Sleep -Seconds 10
         $idle = Memory-Of $ad
-        Open-Folder $ad $win $ad.DrivePane (& $ad.DrivePath "$Gd/1000 folders") 0 | Out-Null
+        Open-Folder $ad $win $ad.CloudPane (& $ad.CloudPath $win 'drive' "$Gd/1000 folders") 0 | Out-Null
         Start-Sleep -Seconds 3
         $busy = Memory-Of $ad
         Write-Host ("  memory idle {0} MB private, {1} MB working set; with 1000 folders {2} / {3} MB ({4} processes)" -f $idle.private_mb, $idle.working_set_mb, $busy.private_mb, $busy.working_set_mb, $busy.processes)

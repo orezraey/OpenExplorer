@@ -3,7 +3,7 @@
 //!
 //! - `5000 files`: 5,000 files of 1 KB, for listing a big folder.
 //! - `1000 folders`: 1,000 empty folders, for listing a folder of folders.
-//! - `transfer/large.bin`: one file of 256 MiB, for a big download.
+//! - `transfer/large/large.bin`: one file of 500 MiB, for a big download.
 //! - `transfer/small`: 200 files of 512 KiB (100 MiB), for many downloads.
 //!
 //! Run again, it adds only what's missing, so a run cut short picks up where it stopped. Drive
@@ -94,8 +94,9 @@ fn main() {
     let names: Vec<String> = (1..=200).map(|i| format!("small {i:03}.bin")).collect();
     fill(&drive, &small, &names, |name| Job::Upload(half_mb.clone(), name));
 
-    let large = local_file("bench-256m.bin", 256 << 20);
-    fill(&drive, &transfer, &["large.bin".to_string()], |name| Job::Upload(large.clone(), name));
+    let large_dir = folder(&drive, &transfer, "large");
+    let large = local_file("bench-500m.bin", 500 << 20);
+    fill(&drive, &large_dir, &["large.bin".to_string()], |name| Job::Upload(large.clone(), name));
 
     println!("done in {:.0} s", started.elapsed().as_secs_f64());
 }
