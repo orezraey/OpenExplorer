@@ -27,6 +27,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     // Menus and dialogs draw in a layer above everything.
     let mut layer = Vec::new();
     let menu = context(s, &k, &mut layer);
+    let tree_menu = tree_context(s, &k, &mut layer);
     let queue_menu = transfer_context(s, &k, &mut layer);
     let address_menu = address_context(s, &k, &mut layer);
     // The window's height, so Opções and Registrar conta always fit inside short windows from
@@ -58,6 +59,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(main_content)
         .child(transfers(s, &k))
         .child(menu)
+        .child(tree_menu)
         .child(queue_menu)
         .child(address_menu)
         // The mouse's side buttons anywhere else in Explorar: Voltar and Avançar in the active
@@ -1185,6 +1187,104 @@ fn address_context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         .build(k, layer)
 }
 
+/// The right-click menu of a node in the navigation tree: Expandir/Recolher, Recortar,
+/// Copiar, Colar, Excluir, Renomear, Nova pasta, and Propriedades.
+fn tree_context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
+    let anchor = el().key("tree-menu-anchor").size(0.0, 0.0);
+    let Some((p, node, open, empty, at)) = s.tree_menu.clone() else { return anchor };
+
+    let loc = node.to.clone();
+    let parent_entry = loc.as_ref().and_then(actions::parent_and_entry);
+    let can_expand = node.opens && !empty;
+    let can_copy = parent_entry.as_ref().is_some_and(|(par, _)| actions::items_editable(par));
+    let can_cut = parent_entry.as_ref().is_some_and(|(par, _)| actions::editable(par) && actions::items_editable(par));
+    let can_paste = loc.as_ref().is_some_and(|to| actions::can_paste_to(s, to));
+    let can_delete = can_copy;
+    let can_rename = can_copy;
+    let can_new_folder = loc.as_ref().is_some_and(actions::editable);
+    let can_props = parent_entry.is_some();
+
+    let toggle_label = if open { t("Recolher", "Collapse") } else { t("Expandir", "Expand") };
+    let n_toggle = node.clone();
+    let expand_item = MenuItem::new(toggle_label).disabled(!can_expand).on_select(move |s: &mut State| {
+        s.tree_menu = None;
+        crate::tree::toggle(s, p, &n_toggle);
+    });
+
+    let cut_pe = parent_entry.clone();
+    let cut_item = MenuItem::new(t("Recortar", "Cut")).icon(&icons::M_CUT).disabled(!can_cut).on_select(move |s: &mut State| {
+        s.tree_menu = None;
+        if let Some((par, item)) = cut_pe.clone() {
+            actions::pick_up_item(s, par, item, ClipMode::Cut);
+        }
+    });
+
+    let copy_pe = parent_entry.clone();
+    let copy_item = MenuItem::new(t("Copiar", "Copy")).icon(&icons::M_COPY).disabled(!can_copy).on_select(move |s: &mut State| {
+        s.tree_menu = None;
+        if let Some((par, item)) = copy_pe.clone() {
+            actions::pick_up_item(s, par, item, ClipMode::Copy);
+        }
+    });
+
+    let paste_loc = loc.clone();
+    let paste_item = MenuItem::new(t("Colar", "Paste")).icon(&icons::M_PASTE).disabled(!can_paste).on_select(move |s: &mut State| {
+        s.tree_menu = None;
+        if let Some(to) = paste_loc.clone() {
+            actions::paste_into(s, p, to);
+        }
+    });
+
+    let del_pe = parent_entry.clone();
+    let del_item = MenuItem::new(t("Excluir", "Delete")).icon(&icons::M_DELETE).disabled(!can_delete).danger(true).on_select(move |s: &mut State| {
+        s.tree_menu = None;
+        if let Some((par, item)) = del_pe.clone() {
+            actions::ask_delete_item(s, p, par, item);
+        }
+    });
+
+    let ren_pe = parent_entry.clone();
+    let ren_item = MenuItem::new(t("Renomear", "Rename")).icon(&icons::M_RENAME).disabled(!can_rename).on_select(move |s: &mut State| {
+        s.tree_menu = None;
+        if let Some((par, item)) = ren_pe.clone() {
+            actions::ask_rename_item(s, p, par, item);
+        }
+    });
+
+    let nf_loc = loc.clone();
+    let new_folder_item = MenuItem::new(t("Nova pasta", "New folder")).icon(&icons::M_NEW_FOLDER).disabled(!can_new_folder).on_select_tx(move |s: &mut State, tx: &mut Tx| {
+        s.tree_menu = None;
+        if let Some(to) = nf_loc.clone() {
+            actions::ask_new_folder_in(s, p, to, tx);
+        }
+    });
+
+    let props_pe = parent_entry;
+    let props_item = MenuItem::new(t("Propriedades", "Properties")).icon(&icons::M_PROPERTIES).disabled(!can_props).on_select(move |s: &mut State| {
+        s.tree_menu = None;
+        if let Some((par, item)) = props_pe.clone() {
+            actions::properties_of(s, p, par, vec![item]);
+        }
+    });
+
+    context_menu("tree-menu", anchor, Some(at))
+        .min_width(210.0)
+        .item(expand_item)
+        .separator()
+        .item(cut_item)
+        .item(copy_item)
+        .item(paste_item)
+        .separator()
+        .item(del_item)
+        .item(ren_item)
+        .separator()
+        .item(new_folder_item)
+        .separator()
+        .item(props_item)
+        .on_close(|s: &mut State| s.tree_menu = None)
+        .build(k, layer)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Context menu
 
@@ -1451,7 +1551,8 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 .child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Remover conta", "Remove account")).variant(ButtonVariant::Danger).on_press(actions::confirm_remove_account)));
             Modal::new("remove-account", title).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
         }
-        Dialog::NewFolder { error, .. } => {
+        Dialog::NewFolder { error, .. } | Dialog::Rename { error, .. } => {
+            let is_rename = matches!(d, Dialog::Rename { .. });
             // Rune's own field, so it can take the dialog's first focus (`autofocus`); Enter
             // confirms.
             let field = rune::text_input(&s.name_edit, k.ty.ui_compact)
@@ -1480,9 +1581,11 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
             if let Some(e) = error {
                 body = body.child(text(e.clone()).font(k.ty.text_small).color(k.c.danger.fg));
             }
-            let act = Button::new(t("Criar", "Create")).variant(ButtonVariant::Submit).on_press(actions::submit_name);
+            let act_label = if is_rename { t("Renomear", "Rename") } else { t("Criar", "Create") };
+            let modal_title = if is_rename { t("Renomear", "Rename") } else { t("Nova pasta", "New folder") };
+            let act = Button::new(act_label).variant(ButtonVariant::Submit).on_press(actions::submit_name);
             let body = body.child(actions_row(k, t("Cancelar", "Cancel"), act));
-            Modal::new("name", t("Nova pasta", "New folder")).open(true).child(pad(body)).width(420.0).fit().on_close(close).build(k, layer);
+            Modal::new("name", modal_title).open(true).child(pad(body)).width(420.0).fit().on_close(close).build(k, layer);
         }
         Dialog::Properties(p) => props_dialog(s, k, p, layer),
         Dialog::Options(opt) => options_dialog(s, k, opt, window_h, layer),
@@ -4372,6 +4475,7 @@ fn tree_line(s: &State, k: &Kit, p: usize, line: &crate::tree::Line) -> El {
         el().size(16.0, 16.0)
     };
     let (go, flip, here) = (node.clone(), node.clone(), line.key());
+    let (ctx_node, ctx_here) = (node.clone(), here.clone());
     let keyboard = s.tree.focused[p] && crate::tree::cursor(s, p) == Some(here.as_str());
     let mut item = row()
         .key(format!("t:{}", line.key()))
@@ -4403,6 +4507,11 @@ fn tree_line(s: &State, k: &Kit, p: usize, line: &crate::tree::Line) -> El {
             }
         })
         .on_double_press(move |s: &mut State| crate::tree::toggle(s, p, &flip))
+        .on_secondary_press(move |s: &mut State, at: rune::PointerPress, _: &mut Tx| {
+            s.active = p;
+            crate::tree::set_cursor(s, p, ctx_here.clone());
+            s.tree_menu = Some((p, (*ctx_node).clone(), open, empty, at));
+        })
         .child(arrow)
         .child(row().gap(6.0).center_y().grow(1.0).min_w(0.0).child(shell_icon(s, node.icon.as_ref(), node.fallback, 16.0)).child(
             text(node.label.clone()).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0).help_when_truncated(node.label.clone()),

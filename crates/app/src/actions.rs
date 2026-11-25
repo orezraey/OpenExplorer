@@ -50,6 +50,8 @@ pub enum Dialog {
     RemoveAccount { target: AccountTarget, provider: String, who: String },
     /// The name being typed is `State::name_edit`.
     NewFolder { pane: usize, error: Option<String> },
+    /// Renaming a folder from the navigation tree (`State::name_edit`).
+    Rename { pane: usize, loc: Location, item: Entry, error: Option<String> },
     Properties(Box<Props>),
     /// Opções: appearance, file behaviour, transfers and logs, applied as they change.
     Options(Box<crate::settings::OptionsView>),
@@ -556,18 +558,36 @@ pub fn copy_across(s: &mut State, from: usize, to: usize) {
 }
 
 pub fn paste(s: &mut State, p: usize) {
+    let to = s.panes[p].loc.clone();
+    paste_into(s, p, to);
+}
+
+/// Whether `s.clip` can be pasted directly into `to`.
+pub fn can_paste_to(s: &State, to: &Location) -> bool {
+    let Some(clip) = &s.clip else { return false };
+    editable(to) && fits(&clip.from, to)
+}
+
+/// Pastes `s.clip` into `to` (used both by the file list and by right-clicking a folder in the
+/// navigation tree).
+pub fn paste_into(s: &mut State, p: usize, to: Location) {
     let Some(clip) = &s.clip else { return };
     let (mode, from, items) = (clip.mode, clip.from.clone(), clip.items.clone());
     // A cut is used once; a copy can be pasted again.
-    if mode == ClipMode::Cut && fits(&from, &s.panes[p].loc) {
+    if mode == ClipMode::Cut && fits(&from, &to) {
         s.clip = None;
     }
-    transfer(s, mode, from, items, p);
+    transfer_to(s, mode, from, items, p, to);
 }
 
 /// Copies or moves `items` of `from` into the folder pane `p` shows, or says why it can't.
 fn transfer(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p: usize) {
     let to = s.panes[p].loc.clone();
+    transfer_to(s, mode, from, items, p, to);
+}
+
+/// Copies or moves `items` of `from` into `to`, or says why it can't.
+fn transfer_to(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>, p: usize, to: Location) {
     if (matches!(to, Location::Drive { .. }) && drive_folder(&to).is_none()) || (matches!(to, Location::Server { .. }) && !editable(&to)) {
         return not_here(s, p);
     }
@@ -1082,6 +1102,96 @@ pub fn clear_transfers(s: &mut State) {
 // ---------------------------------------------------------------------------------------------
 // Delete
 
+/// Resolves a folder `loc` to its parent folder and its own `Entry`, when it is a subfolder
+/// that can be copied, cut, renamed, deleted, or inspected via Propriedades.
+pub fn parent_and_entry(loc: &Location) -> Option<(Location, Entry)> {
+    match loc {
+        Location::Local(path) => {
+            let parent = path.parent()?;
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            let modified = std::fs::symlink_metadata(path).ok().and_then(|m| m.modified().ok());
+            Some((
+                Location::Local(parent.to_path_buf()),
+                Entry { id: name.clone(), name, is_dir: true, size: None, modified, target: None, mime: None, md5: None, starred: false },
+            ))
+        }
+        Location::Drive { email, space, path } if !path.is_empty() => {
+            let (id, name) = path.last()?.clone();
+            let parent_path = path[..path.len() - 1].to_vec();
+            Some((
+                Location::Drive { email: email.clone(), space: space.clone(), path: parent_path },
+                Entry { id, name, is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false },
+            ))
+        }
+        Location::Server { server, path, find: None } if !path.is_empty() => {
+            let name = path.last()?.clone();
+            let parent_path = path[..path.len() - 1].to_vec();
+            Some((
+                Location::Server { server: server.clone(), path: parent_path, find: None },
+                Entry { id: name.clone(), name, is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false },
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Copies or cuts a folder directly from the navigation tree.
+pub fn pick_up_item(s: &mut State, parent: Location, item: Entry, mode: ClipMode) {
+    if mode == ClipMode::Cut && !editable(&parent) {
+        return;
+    }
+    if !items_editable(&parent) {
+        return;
+    }
+    let what = shown(&item.name);
+    s.clip = Some(Clip { mode, from: parent, items: vec![item] });
+    s.status = match mode {
+        ClipMode::Copy => tr!("Copiado: {what}.", "Copied: {what}."),
+        ClipMode::Cut => tr!("Recortado: {what}.", "Cut: {what}."),
+    };
+}
+
+/// Asks to delete a folder right-clicked in the navigation tree.
+pub fn ask_delete_item(s: &mut State, p: usize, parent: Location, item: Entry) {
+    if !items_editable(&parent) {
+        return not_here(s, p);
+    }
+    if holds_a_share(&parent, std::slice::from_ref(&item)) {
+        s.status = share_stays().into();
+        return;
+    }
+    if s.panes[p].loc != parent {
+        crate::navigate(s, p, parent.clone());
+    }
+    let kept = accounts::keeps_deleted(&parent);
+    let remote = parent.local_path(&item).is_some_and(|path| crate::network::is_remote(&path));
+    if (parent.is_local() && s.settings.skip_recycle_bin) || (matches!(parent, Location::Server { .. }) && !kept) || remote {
+        s.dialog = Some(Dialog::Purge { pane: p, items: vec![item] });
+        return;
+    }
+    s.dialog = Some(Dialog::Delete { pane: p, items: vec![item] });
+}
+
+/// Opens the Rename modal for a folder right-clicked in the navigation tree.
+pub fn ask_rename_item(s: &mut State, p: usize, parent: Location, item: Entry) {
+    if !items_editable(&parent) {
+        return not_here(s, p);
+    }
+    s.name_edit = name_field(&item);
+    s.dialog = Some(Dialog::Rename { pane: p, loc: parent, item, error: None });
+}
+
+/// Navigates pane `p` to `target` and opens the Nova pasta modal inside it.
+pub fn ask_new_folder_in(s: &mut State, p: usize, target: Location, tx: &mut Tx) {
+    if !editable(&target) {
+        return not_here(s, p);
+    }
+    if s.panes[p].loc != target {
+        crate::navigate(s, p, target);
+    }
+    ask_new_folder(s, p, tx);
+}
+
 pub fn ask_delete(s: &mut State, p: usize) {
     let items = selected(s, p);
     if items.is_empty() {
@@ -1344,17 +1454,30 @@ pub fn ask_new_folder(s: &mut State, p: usize, _: &mut Tx) {
     s.dialog = Some(Dialog::NewFolder { pane: p, error: None });
 }
 
-/// Confirms Nova pasta with the name typed.
+/// Confirms Nova pasta or Renomear (from the tree) with the name typed.
 pub fn submit_name(s: &mut State) {
     let name = s.name_edit.text.trim().to_string();
-    let Some(Dialog::NewFolder { pane, error }) = &mut s.dialog else { return };
-    if let Some(why) = name_problem(&s.panes[*pane].loc, &name) {
-        *error = Some(why);
-        return;
+    match &mut s.dialog {
+        Some(Dialog::NewFolder { pane, error }) => {
+            if let Some(why) = name_problem(&s.panes[*pane].loc, &name) {
+                *error = Some(why);
+                return;
+            }
+            let pane = *pane;
+            s.dialog = None;
+            apply_name(s, pane, None, name);
+        }
+        Some(Dialog::Rename { pane, loc, item, error }) => {
+            if let Some(why) = name_problem(loc, &name) {
+                *error = Some(why);
+                return;
+            }
+            let (pane, loc, item) = (*pane, loc.clone(), item.clone());
+            s.dialog = None;
+            apply_name_in(s, pane, loc, Some(item), name);
+        }
+        _ => {}
     }
-    let pane = *pane;
-    s.dialog = None;
-    apply_name(s, pane, None, name);
 }
 
 /// Renames `item` to `name`, or with no item creates folder `name`, in pane `pane`'s folder.
@@ -1362,6 +1485,10 @@ pub fn submit_name(s: &mut State) {
 /// Drive each `／` goes back to the `/` it shows (see [`crate::model::NAME_SLASH`]).
 pub fn apply_name(s: &mut State, pane: usize, item: Option<Entry>, name: String) {
     let loc = s.panes[pane].loc.clone();
+    apply_name_in(s, pane, loc, item, name);
+}
+
+pub fn apply_name_in(s: &mut State, pane: usize, loc: Location, item: Option<Entry>, name: String) {
     let shown_name = name.clone();
     let name = if matches!(loc, Location::Drive { .. }) { typed(&name) } else { name };
     // Unchanged as shown (a real `／` kept), or the same name typed with `/`.
@@ -1504,11 +1631,20 @@ pub fn properties(s: &mut State, p: usize) {
     if items.is_empty() {
         return;
     }
+    let loc = s.panes[p].loc.clone();
+    properties_of(s, p, loc, items);
+}
+
+/// Opens Propriedades for `items` belonging to `loc` (used both by the file list and by
+/// right-clicking a folder in the navigation tree).
+pub fn properties_of(s: &mut State, p: usize, loc: Location, items: Vec<Entry>) {
+    if items.is_empty() {
+        return;
+    }
     close_properties(s);
     s.props_seq += 1;
     let id = s.props_seq;
     let alive = Arc::new(AtomicBool::new(true));
-    let loc = s.panes[p].loc.clone();
     let mut local = None;
     if loc.is_local() {
         // One item: its dates and attributes now (one metadata call). Folders and several

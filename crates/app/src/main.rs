@@ -149,6 +149,8 @@ struct State {
     panes: [Pane; 2],
     /// The context menu: the pane it was opened in and where.
     menu: Option<(usize, rune::PointerPress)>,
+    /// The tree's right-click menu: pane, node, whether it's open, whether it's empty, and where.
+    tree_menu: Option<(usize, tree::Node, bool, bool, rune::PointerPress)>,
     /// A rectangle selection being dragged out in a file list.
     lasso: Option<lasso::Lasso>,
     /// Where each pane's file list viewport is and how far it's scrolled, for the rectangle
@@ -297,6 +299,7 @@ impl State {
             accounts_search: rune::TextEdit::new(""),
             panes: [Pane::new(loc.clone()), Pane::new(loc)],
             menu: None,
+            tree_menu: None,
             lasso: None,
             views: Default::default(),
             dialog: None,
@@ -500,6 +503,7 @@ fn init() -> State {
         accounts_search: rune::TextEdit::new(""),
         panes,
         menu: None,
+        tree_menu: None,
         lasso: None,
         views: Default::default(),
         dialog: None,
