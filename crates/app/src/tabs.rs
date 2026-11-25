@@ -27,6 +27,9 @@ pub struct TabSlot {
     pub pane: Option<Pane>,
     /// The search box text saved when leaving this tab.
     pub search: String,
+    /// What that text last searched (see `State::searched`), so coming back doesn't search
+    /// again, and leaving doesn't search the next tab with this text.
+    pub searched: String,
 }
 
 /// State of the "+" new-tab picker inside a pane.
@@ -65,7 +68,7 @@ impl PaneTabs {
     /// Starts with a single active tab whose `Pane` lives in `s.panes[p]`.
     pub fn initial() -> Self {
         Self {
-            items: vec![TabSlot { id: 1, pane: None, search: String::new() }],
+            items: vec![TabSlot { id: 1, pane: None, search: String::new(), searched: String::new() }],
             active: Some(0),
             last_active: Some(0),
             picker: PickerState::default(),
@@ -96,7 +99,12 @@ impl PaneTabs {
 /// and display label, derived from what is open in that tab.
 pub fn tab_header(s: &State, loc: &Location) -> (Option<IconKey>, &'static Icon, String) {
     match loc {
-        Location::Local(_) | Location::Found(_) => (Some(IconKey::Computer), &icons::COMPUTER, t("Este Computador", "This PC").into()),
+        // A folder on the computer by its name and icon as the tree shows it ("Documentos",
+        // "Disco Local (C:)"); a search by the folder it looks in.
+        Location::Local(_) | Location::Found(_) => match crate::tree::node_of(s, loc) {
+            Some(node) => (node.icon, node.fallback, node.label),
+            None => (Some(IconKey::Computer), &icons::COMPUTER, t("Este Computador", "This PC").into()),
+        },
         Location::Mock(_) => (None, &icons::LAB, t("Drive simulado", "Simulated drive").into()),
         Location::Drive { email, .. } => {
             let label = s
@@ -135,7 +143,7 @@ pub fn tab_header(s: &State, loc: &Location) -> (Option<IconKey>, &'static Icon,
                         if !n.is_empty() { n } else { a.email.as_str() }
                     })
                     .filter(|n| !n.is_empty())
-                    .unwrap_or_else(|| if !server.user.is_empty() { server.user.as_str() } else { server.name.as_str() })
+                    .unwrap_or(if !server.user.is_empty() { server.user.as_str() } else { server.name.as_str() })
                     .to_string(),
                 _ => {
                     if !server.name.trim().is_empty() {
@@ -171,14 +179,45 @@ fn stash_active(s: &mut State, p: usize) {
         let placeholder = Pane::new(Location::Mock(Vec::new()));
         let live = std::mem::replace(&mut s.panes[p], placeholder);
         let search = std::mem::take(&mut s.search[p].text);
-        s.search[p] = rune::TextEdit::new("");
+        let searched = std::mem::take(&mut s.searched[p]);
+        set_search(s, p, String::new(), String::new());
         if let Some(slot) = s.tabs[p].items.get_mut(cur) {
             slot.pane = Some(live);
             slot.search = search;
+            slot.searched = searched;
         }
         s.tabs[p].last_active = Some(cur);
         s.tabs[p].active = None;
     }
+}
+
+/// Puts `text` in pane `p`'s search box as already seen, so it doesn't start a search, with
+/// `searched` as what it last searched.
+fn set_search(s: &mut State, p: usize, text: String, searched: String) {
+    s.typed[p] = (text.clone(), 0.0);
+    s.searched[p] = searched;
+    s.found_again[p] = 0.0;
+    s.search[p] = rune::TextEdit::new(text);
+}
+
+/// Takes tab `idx`'s pane and search state into `s.panes[p]` and makes it the active tab.
+fn bring_in(s: &mut State, p: usize, idx: usize) {
+    let (pane, search, searched) = {
+        let slot = &mut s.tabs[p].items[idx];
+        (slot.pane.take(), std::mem::take(&mut slot.search), std::mem::take(&mut slot.searched))
+    };
+    if let Some(pane) = pane {
+        s.panes[p] = pane;
+    }
+    set_search(s, p, search, searched);
+    s.tabs[p].active = Some(idx);
+    s.tabs[p].last_active = Some(idx);
+    s.icons_for[p] = u64::MAX;
+    // If the tab was still loading when left, kick off a fresh listing.
+    if s.panes[p].loading {
+        crate::list(s, p, false);
+    }
+    crate::tree::follow(s, p);
 }
 
 /// Switches pane `p` to the existing tab at `idx`.
@@ -193,22 +232,7 @@ pub fn select_tab(s: &mut State, p: usize, idx: usize) {
     }
     reset_transient(s, p);
     stash_active(s, p);
-    let (pane, search) = {
-        let slot = &mut s.tabs[p].items[idx];
-        (slot.pane.take(), std::mem::take(&mut slot.search))
-    };
-    if let Some(pane) = pane {
-        s.panes[p] = pane;
-    }
-    s.search[p] = rune::TextEdit::new(search);
-    s.tabs[p].active = Some(idx);
-    s.tabs[p].last_active = Some(idx);
-    s.icons_for[p] = u64::MAX;
-    // If the tab was still loading when left, kick off a fresh listing.
-    if s.panes[p].loading {
-        crate::list(s, p, false);
-    }
-    crate::tree::follow(s, p);
+    bring_in(s, p, idx);
 }
 
 /// Opens the "+" new-tab picker on pane `p`.
@@ -242,13 +266,13 @@ pub fn open_new_tab(s: &mut State, p: usize, loc: Location) {
     stash_active(s, p);
     let id = s.tabs[p].alloc_id();
     let idx = s.tabs[p].items.len();
-    s.tabs[p].items.push(TabSlot { id, pane: None, search: String::new() });
+    s.tabs[p].items.push(TabSlot { id, pane: None, search: String::new(), searched: String::new() });
     s.tabs[p].active = Some(idx);
     s.tabs[p].last_active = Some(idx);
     s.tabs[p].picker.filter_open = false;
     s.tabs[p].picker.search = rune::TextEdit::new("");
     s.panes[p] = Pane::new(loc);
-    s.search[p] = rune::TextEdit::new("");
+    set_search(s, p, String::new(), String::new());
     s.icons_for[p] = u64::MAX;
     crate::list(s, p, false);
     crate::tree::follow(s, p);
@@ -269,25 +293,11 @@ pub fn close_tab(s: &mut State, p: usize, idx: usize) {
         if s.tabs[p].items.is_empty() {
             s.tabs[p].last_active = None;
             s.panes[p] = Pane::new(Location::Mock(Vec::new()));
-            s.search[p] = rune::TextEdit::new("");
+            set_search(s, p, String::new(), String::new());
             return;
         }
         let next = idx.min(s.tabs[p].items.len() - 1);
-        let (pane, search) = {
-            let slot = &mut s.tabs[p].items[next];
-            (slot.pane.take(), std::mem::take(&mut slot.search))
-        };
-        if let Some(pane) = pane {
-            s.panes[p] = pane;
-        }
-        s.search[p] = rune::TextEdit::new(search);
-        s.tabs[p].active = Some(next);
-        s.tabs[p].last_active = Some(next);
-        s.icons_for[p] = u64::MAX;
-        if s.panes[p].loading {
-            crate::list(s, p, false);
-        }
-        crate::tree::follow(s, p);
+        bring_in(s, p, next);
     } else {
         s.tabs[p].items.remove(idx);
         if let Some(active) = s.tabs[p].active
@@ -392,6 +402,18 @@ pub fn repoint(s: &mut State, from: &Location, to: Option<&Location>) {
     }
 }
 
+/// Tabs left showing a folder in `reload`, which an operation changed, list it again when
+/// they come back.
+pub fn changed(s: &mut State, reload: &[Location]) {
+    for slot in s.tabs.iter_mut().flat_map(|t| t.items.iter_mut()) {
+        if let Some(pane) = &mut slot.pane
+            && reload.contains(&pane.loc)
+        {
+            pane.loading = true;
+        }
+    }
+}
+
 /// Closes any open provider filter dropdown in the "+" picker.
 pub fn close_picker_filter(s: &mut State) {
     for p in 0..2 {
@@ -463,6 +485,25 @@ mod tests {
         close_tab(&mut s, 0, 0);
         assert_eq!(s.tabs[0].active, Some(1));
         assert_eq!(s.panes[0].loc, Location::Mock(vec!["2".into()]));
+    }
+
+    #[test]
+    fn a_tab_keeps_its_search_and_switching_starts_none() {
+        let mut s = State::placeholder();
+        s.panes[0] = Pane::new(Location::Mock(vec!["A".into()]));
+        s.tabs[0] = PaneTabs::initial();
+        s.search[0] = rune::TextEdit::new("fotos");
+        s.typed[0] = ("fotos".into(), 0.0);
+        s.searched[0] = "fotos".into();
+        open_new_tab(&mut s, 0, Location::Mock(vec!["B".into()]));
+        // The new tab's box is empty and already seen: nothing waits to search there.
+        assert_eq!(s.search[0].text, "");
+        assert_eq!(s.typed[0], (String::new(), 0.0));
+        assert_eq!(s.searched[0], "");
+        select_tab(&mut s, 0, 0);
+        assert_eq!(s.search[0].text, "fotos");
+        assert_eq!(s.typed[0], ("fotos".to_string(), 0.0));
+        assert_eq!(s.searched[0], "fotos");
     }
 
     #[test]

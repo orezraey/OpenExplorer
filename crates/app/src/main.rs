@@ -889,6 +889,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                         load(s, p);
                     }
                 }
+                tabs::changed(s, &reload);
                 // A folder no pane shows (one changed from the tree's menu) is read again for
                 // the tree; a pane's listing tells the tree itself.
                 for l in &reload {

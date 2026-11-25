@@ -664,6 +664,11 @@ pub fn reread(s: &mut State, loc: &Location) {
     }
 }
 
+/// The node `loc` shows as in the tree: its name and icon, for a tab.
+pub fn node_of(s: &State, loc: &Location) -> Option<Node> {
+    chain(s, loc).pop()
+}
+
 /// The folder a Drive entry opens: a shortcut's target, else itself.
 fn opened(e: &Entry) -> &str {
     e.target.as_deref().unwrap_or(&e.id)
