@@ -102,12 +102,32 @@ pub fn quit_question_done(s: &mut State) -> bool {
         return false;
     }
     s.quit_asked = false;
+    // A Reiniciar put off by the transfers goes with the question: else a later plain close
+    // would open the app again.
+    crate::RESTART.store(false, Ordering::Relaxed);
     true
 }
 
 /// Continuar transferindo: the window stays, and so does any dialog the question covered.
 pub fn keep_running(s: &mut State) {
     s.quit_asked = false;
+    crate::RESTART.store(false, Ordering::Relaxed);
+}
+
+/// Reiniciar (Opções): the app closes as Fechar would, asking first while transfers run, and
+/// opens again once it has ended, so a setting that needs a new window (Mica) takes effect.
+pub fn restart(s: &mut State, tx: &mut Tx) {
+    crate::RESTART.store(true, Ordering::Relaxed);
+    if transfers_running(s) {
+        s.quit_asked = true;
+        return;
+    }
+    tx.close_window();
+}
+
+/// Whether the close under way is Reiniciar's.
+pub fn restarting() -> bool {
+    crate::RESTART.load(Ordering::Relaxed)
 }
 
 /// Fechar mesmo assim: the transfers are told to stop, and the window closes (a close the app

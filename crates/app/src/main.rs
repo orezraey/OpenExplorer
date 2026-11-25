@@ -289,6 +289,34 @@ struct State {
     is_placeholder: bool,
 }
 
+/// Whether the main window was created for Mica (Opções, Experimental): only then can Windows
+/// show it, and Opções says whether it did.
+pub(crate) static STARTED_WITH_MICA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether Windows has shown Mica behind the main window at least once: then a moment without it
+/// is a request still on its way, not a refusal.
+pub(crate) static MICA_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Reiniciar (Opções): once the app has ended, it opens again (see `relaunch`).
+pub(crate) static RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Opens this same program again, with the same arguments, for Reiniciar. Called as the app ends,
+/// after the caches are saved, so the new copy starts from them.
+fn relaunch() {
+    let started = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).args(std::env::args_os().skip(1)).spawn());
+    if let Err(e) = started {
+        openexplorer_gdrive::log(&format!("erro: reiniciar o Open Explorer: {e}"));
+    }
+}
+
+/// How long the window's background takes to fade in over Mica before Mica goes, in seconds:
+/// longer than the colour spring takes to settle.
+const MICA_FADE: f64 = 0.4;
+thread_local! {
+    /// When Mica, turned off in Opções, leaves the main window.
+    static MICA_OFF_AT: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+    /// The material last asked for on the main window, so `poll` asks again only when Opções
+    /// changes it.
+    static MICA_ASKED: std::cell::Cell<Option<settings::Material>> = const { std::cell::Cell::new(None) };
+}
 static ACCOUNT_WAKER: std::sync::LazyLock<std::sync::Mutex<Option<Waker>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 thread_local! {
@@ -739,6 +767,33 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     if let Some(focused) = PENDING_MAIN_FOCUS.with(|c| c.take()) {
         accounts::window_focus(s, focused, tx);
+    }
+    // Mica follows Opções while the window lives; turned on again, it comes back only in a window
+    // made for it (only its creation makes a window transparent). Turned off, the view paints the
+    // window's own background at once and fades it in over Mica, and Mica goes once that's done:
+    // taking it away first left a frame with nothing behind the window, a flash.
+    // Another material takes the old one's place at once: the view stays transparent meanwhile.
+    let want = (s.settings.mica && STARTED_WITH_MICA.load(Ordering::Relaxed)).then_some(s.settings.material);
+    let asked = MICA_ASKED.with(std::cell::Cell::get);
+    if let Some(material) = want {
+        MICA_OFF_AT.with(|t| t.set(None));
+        if asked != Some(material) {
+            MICA_ASKED.with(|a| a.set(Some(material)));
+            tx.set_window_backdrop(material.backdrop());
+        }
+    } else if asked.is_some() {
+        let at = MICA_OFF_AT.with(|t| {
+            let at = t.get().unwrap_or(now + MICA_FADE);
+            t.set(Some(at));
+            at
+        });
+        if now >= at {
+            MICA_OFF_AT.with(|t| t.set(None));
+            MICA_ASKED.with(|a| a.set(None));
+            tx.set_window_backdrop(rune::WindowBackdrop::None);
+        } else {
+            tx.wake_at(at);
+        }
     }
     // Each listing's file types get their icons asked for once.
     let versions = s.panes.each_ref().map(|p| p.version);
@@ -2667,7 +2722,12 @@ fn main() {
         })
         // The app ends without returning from `run`: what the cloud accounts changed since their
         // trees and listings were last kept is kept here, so the next start has less to catch up on.
-        .on_quit(|_, _| accounts::save_caches())
+        .on_quit(|_, _| {
+            accounts::save_caches();
+            if RESTART.load(Ordering::Relaxed) {
+                relaunch();
+            }
+        })
         .on_close_request(|s, _| actions::close_requested(s))
         // It opens where it was closed, as Explorer's does.
         .on_window(window_place::created)
@@ -2679,12 +2739,14 @@ fn main() {
     let place = window_place::options(initial.window);
     // Experimental: Mica shows through a transparent window, which only its creation sets.
     let mica = initial.mica && cfg!(windows);
+    STARTED_WITH_MICA.store(mica, Ordering::Relaxed);
+    MICA_ASKED.with(|a| a.set(mica.then_some(initial.material)));
     if place.is_some() || mica {
         let maximized = place.is_some() && initial.window.is_some_and(|w| w.maximized);
         main_app = main_app.window_options(rune::WindowOptions { transparent: mica, ..place.unwrap_or_default() }).maximized(maximized);
     }
     if mica {
-        main_app = main_app.window_backdrop(rune::WindowBackdrop::Mica).color_scheme(initial.theme.color_scheme());
+        main_app = main_app.window_backdrop(initial.material.backdrop()).color_scheme(initial.theme.color_scheme());
     }
 
     let (account_handle, _) = main_app.window(rune::windows::WindowSpec::from_app("add-account", account_app));
@@ -2805,6 +2867,14 @@ mod tests {
         drop(other);
         assert!(actions::quit_question_done(&mut s) && !s.quit_asked);
         assert_eq!(actions::close_requested(&mut s), rune::CloseResponse::Close);
+
+        // Reiniciar put off by a transfer asks the same question; once the transfer ends by itself
+        // and the question goes, a later plain close doesn't open the app again.
+        let last = transfers::queue(&mut s.transfers, None, transfers::Op::Copy, [(end(), end())]);
+        actions::restart(&mut s, &mut Tx::default());
+        assert!(s.quit_asked && actions::restarting());
+        drop(last);
+        assert!(actions::quit_question_done(&mut s) && !actions::restarting());
     }
 
     /// What a running transfer queue costs the window: 40 downloads advancing, each tick
