@@ -585,8 +585,8 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 (true, true, false) if !seen => (
                     Some((t("Não aceito pelo Windows", "Not accepted by Windows"), rune_kit::BadgeVariant::Subtle)),
                     Some(t(
-                        " Nesta janela o Windows não ativou o Mica: ele pede o Windows 11 22H2 ou mais novo e a placa de vídeo desenhando pelo DirectComposition, e o Open Explorer mostra o fundo de sempre.",
-                        " Windows didn't turn Mica on for this window: it needs Windows 11 22H2 or later and the GPU drawing through DirectComposition, so Open Explorer shows its usual background.",
+                        " Nesta janela o Windows não ativou o efeito: ele pede o Windows 11 22H2 ou mais novo e a placa de vídeo desenhando pelo DirectComposition, e o Open Explorer mostra o fundo de sempre.",
+                        " Windows didn't turn the effect on for this window: it needs Windows 11 22H2 or later and the GPU drawing through DirectComposition, so Open Explorer shows its usual background.",
                     )),
                 ),
                 _ => (None, None),
@@ -594,11 +594,33 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
             let mica_desc = format!(
                 "{}{}",
                 t(
-                    "O material Mica, tingido pelo papel de parede, aparece em volta dos painéis enquanto a janela está em primeiro plano. Desligar vale na hora; ligar, ao reiniciar o Open Explorer.",
-                    "The Mica material, tinted by the wallpaper, shows around the panes while the window is in front. Turning it off takes effect at once; turning it on, once Open Explorer restarts.",
+                    "Um material do Windows 11 aparece em volta dos painéis, na árvore e na barra de status enquanto a janela está em primeiro plano. Desligar ou trocar o efeito vale na hora; ligar, ao reiniciar o Open Explorer.",
+                    "A Windows 11 material shows around the panes, in the tree and in the status bar while the window is in front. Turning it off or changing the effect takes effect at once; turning it on, once Open Explorer restarts.",
                 ),
                 mica_note.unwrap_or_default()
             );
+            // Which material, while the background is on: each one says what it shows.
+            let material_desc = match st.material {
+                crate::settings::Material::Mica => t(
+                    "Tinge a janela de leve com as cores do papel de parede, como o Explorador de Arquivos do Windows 11.",
+                    "Tints the window lightly with the wallpaper's colours, as Windows 11's File Explorer does.",
+                ),
+                crate::settings::Material::MicaAlt => t(
+                    "Como o Mica, com o tom do papel de parede mais forte, como no Terminal do Windows.",
+                    "Like Mica, with the wallpaper's tint stronger, as in Windows Terminal.",
+                ),
+                crate::settings::Material::Acrylic => t(
+                    "Desfoca o que está atrás da janela, outros aplicativos e o papel de parede. Usa mais a placa de vídeo.",
+                    "Blurs what lies behind the window, other apps and the wallpaper. Uses the GPU more.",
+                ),
+            };
+            let mut material_pills = seg_track("material-pills");
+            for m in crate::settings::Material::ALL {
+                material_pills = material_pills.child(seg_btn(format!("material-{m:?}"), m.label(), st.material == m).on_press(move |s: &mut State| {
+                    change_settings(s, |c| c.material = m);
+                }));
+            }
+            let material_row = control_row("row-material", t("Efeito", "Effect"), material_desc, material_pills);
             let exp_card = card_box("card-experimental")
                 .child(control_row(
                     "row-render",
@@ -609,12 +631,14 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .child(divider())
                 .child(switch_row(
                     "opt-mica",
-                    t("Fundo Mica do Windows 11", "Windows 11 Mica background"),
+                    t("Fundo translúcido do Windows 11", "Windows 11 translucent background"),
                     &mica_desc,
                     mica_badge,
                     st.mica,
                     |s| change_settings(s, |c| c.mica = !c.mica),
                 ))
+                .child(if st.mica { divider() } else { el() })
+                .child(if st.mica { material_row } else { el() })
                 .child(divider())
                 .child(switch_row(
                     "opt-search-marker",

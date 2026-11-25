@@ -82,6 +82,40 @@ impl TextFont {
     }
 }
 
+/// Experimental: which Windows 11 material goes behind the window while `Settings::mica` is on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Material {
+    /// Mica with the wallpaper's tint stronger, as tabbed apps such as Terminal use.
+    MicaAlt,
+    /// What lies behind the window, other apps included, blurred.
+    Acrylic,
+    /// Tinted by the wallpaper, lightly: Windows' material for an app's main window. Last, so
+    /// a name it doesn't know reads as Mica rather than losing the whole settings file.
+    #[default]
+    #[serde(other)]
+    Mica,
+}
+
+impl Material {
+    pub const ALL: [Material; 3] = [Material::Mica, Material::MicaAlt, Material::Acrylic];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Material::Mica => "Mica",
+            Material::MicaAlt => "Mica Alt",
+            Material::Acrylic => "Acrylic",
+        }
+    }
+
+    pub fn backdrop(self) -> rune::WindowBackdrop {
+        match self {
+            Material::Mica => rune::WindowBackdrop::Mica,
+            Material::MicaAlt => rune::WindowBackdrop::MicaAlt,
+            Material::Acrylic => rune::WindowBackdrop::Acrylic,
+        }
+    }
+}
+
 /// Experimental glyph rasterizer override (kept in the Experimental tab; `Smooth` is default).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TextRender {
@@ -185,8 +219,10 @@ pub struct Settings {
     pub skip_recycle_bin: bool,
     /// Where the main window was when it last closed, to open there again.
     pub window: Option<crate::window_place::Saved>,
-    /// Experimental: Windows 11's Mica material behind the window, from the next start.
+    /// Experimental: a Windows 11 material (`material`) behind the window. Turned on, it takes
+    /// effect from the next start; turned off or changed, at once.
     pub mica: bool,
+    pub material: Material,
     /// Experimental: a search's matches in names marked as with a highlighter, rather than
     /// only coloured.
     pub search_marker: bool,
@@ -209,6 +245,7 @@ impl Default for Settings {
             skip_recycle_bin: false,
             window: None,
             mica: false,
+            material: Material::Mica,
             search_marker: false,
         }
     }
@@ -326,6 +363,18 @@ impl OptionsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Settings saved before the choice of material read as Mica, and a material this build
+    /// doesn't know reads as Mica too, without losing the rest of the file.
+    #[test]
+    fn the_material_defaults_to_mica() {
+        let old: Settings = serde_json::from_str(r#"{"theme": "Dark", "mica": true}"#).unwrap();
+        assert_eq!((old.theme, old.mica, old.material), (Theme::Dark, true, Material::Mica));
+        let later: Settings = serde_json::from_str(r#"{"theme": "Dark", "mica": true, "material": "Tabbed"}"#).unwrap();
+        assert_eq!((later.theme, later.mica, later.material), (Theme::Dark, true, Material::Mica));
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&Settings { material: Material::Acrylic, ..Settings::default() }).unwrap()).unwrap();
+        assert_eq!(back.material, Material::Acrylic);
+    }
 
     #[test]
     fn settings_read_back_and_stay_in_bounds() {
