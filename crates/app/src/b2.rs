@@ -640,7 +640,7 @@ fn hide_each(paths: &[(String, bool)], hide: impl Fn(&str, bool) -> Result<i64, 
 pub fn ask_purge(s: &mut State, p: usize, _: &mut Tx) {
     let items = selected(s, p);
     if !items.is_empty() && at(&s.panes[p].loc).is_some() && !items_fixed(&s.panes[p].loc) {
-        s.dialog = Some(Dialog::Purge { pane: p, items });
+        s.dialog = Some(Dialog::Purge { loc: s.panes[p].loc.clone(), items });
     }
 }
 

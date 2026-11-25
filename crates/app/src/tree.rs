@@ -138,9 +138,11 @@ impl Line {
 }
 
 impl Tree {
-    /// The nodes open from the start: Área de Trabalho, Este Computador and each account.
+    /// The nodes open from the start: Este Computador (once Área de Trabalho is expanded) and
+    /// each account. Área de Trabalho itself starts collapsed so each pane expands it
+    /// independently on demand.
     pub fn new(accounts: impl IntoIterator<Item = String>) -> Tree {
-        let open: HashSet<NodeId> = [NodeId::Desktop, NodeId::Computer].into_iter().chain(accounts.into_iter().map(NodeId::Account)).collect();
+        let open: HashSet<NodeId> = [NodeId::Computer].into_iter().chain(accounts.into_iter().map(NodeId::Account)).collect();
         Tree { open: [open.clone(), open], ..Tree::default() }
     }
 
@@ -204,7 +206,7 @@ fn desktop_node(places: &Places) -> Option<Node> {
 }
 
 fn computer_node() -> Node {
-    Node { id: NodeId::Computer, label: t("Este Computador", "This PC").into(), icon: None, fallback: &icons::COMPUTER, to: None, opens: true }
+    Node { id: NodeId::Computer, label: t("Este Computador", "This PC").into(), icon: Some(IconKey::Computer), fallback: &icons::COMPUTER, to: None, opens: true }
 }
 
 fn network_node() -> Node {
@@ -648,6 +650,25 @@ pub fn learn(s: &mut State, p: usize) {
     s.tree.version += 1;
 }
 
+/// The app changed what folder `loc` holds and no pane shows it (a folder made, renamed or
+/// deleted from the tree's menu): the tree, if it had read its folders, reads them again.
+pub fn reread(s: &mut State, loc: &Location) {
+    let Some(node) = chain(s, loc).pop() else { return };
+    if matches!(node.id, NodeId::Mock(_)) || !matches!(s.tree.kids.get(&node.id), Some(Kids::Ready(_) | Kids::Failed(_))) {
+        return;
+    }
+    s.tree.kids.remove(&node.id);
+    s.tree.version += 1;
+    if s.tree.open.iter().any(|open| open.contains(&node.id)) {
+        load(s, &node);
+    }
+}
+
+/// The node `loc` shows as in the tree: its name and icon, for a tab.
+pub fn node_of(s: &State, loc: &Location) -> Option<Node> {
+    chain(s, loc).pop()
+}
+
 /// The folder a Drive entry opens: a shortcut's target, else itself.
 fn opened(e: &Entry) -> &str {
     e.target.as_deref().unwrap_or(&e.id)
@@ -1087,6 +1108,8 @@ mod tests {
         s.places = Places {
             desktop: Some((root.join("Desk"), "Área de Trabalho".into())),
             desktop_also: Vec::new(),
+            documents: None,
+            pictures: None,
             user: vec![(root.join("Home/Downloads"), "Downloads".into()), (root.join("Home"), "Pessoal".into())],
             wsl: vec!["Ubuntu".into()],
         };
@@ -1215,7 +1238,7 @@ mod tests {
         s.tree.kids.insert(home.id.clone(), Kids::Ready(vec![downloads.clone(), local_node(&s.places, root.join("Home/Notas"))]));
         s.tree.kids.insert(downloads.id.clone(), Kids::Loading);
         s.tree.kids.insert(NodeId::Local(root.join("Home/Notas")), Kids::Loading);
-        for id in [home.id.clone(), downloads.id.clone(), NodeId::Local(root.join("Home/Notas"))] {
+        for id in [NodeId::Desktop, home.id.clone(), downloads.id.clone(), NodeId::Local(root.join("Home/Notas"))] {
             s.tree.open[0].insert(id);
         }
         let keys: Vec<String> = lines(&s, 0).iter().map(Line::key).collect();
@@ -1282,8 +1305,20 @@ mod tests {
         s.servers.list.clear();
         let kids = desktop_kids(&s.places, true);
         s.tree.kids.insert(NodeId::Desktop, Kids::Ready(kids));
+        s.tree.open[0].insert(NodeId::Desktop);
         s.panes[0].go(Location::Mock(Vec::new()));
         s
+    }
+
+    #[test]
+    fn desktop_starts_collapsed_and_expands_independently_per_pane() {
+        let (mut s, _) = scene("desktop-independent");
+        assert!(!s.tree.open[0].contains(&NodeId::Desktop));
+        assert!(!s.tree.open[1].contains(&NodeId::Desktop));
+        let desktop = desktop_node(&s.places).unwrap();
+        toggle(&mut s, 0, &desktop);
+        assert!(s.tree.open[0].contains(&NodeId::Desktop));
+        assert!(!s.tree.open[1].contains(&NodeId::Desktop));
     }
 
     /// The label of the row the keyboard is on.

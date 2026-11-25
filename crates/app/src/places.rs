@@ -12,6 +12,10 @@ pub struct Places {
     pub desktop: Option<(PathBuf, String)>,
     /// Other folders whose folders show on the desktop: the shared Public Desktop.
     pub desktop_also: Vec<PathBuf>,
+    /// The user's Documents folder and its display name, for quick access.
+    pub documents: Option<(PathBuf, String)>,
+    /// The user's Pictures folder and its display name, for quick access.
+    pub pictures: Option<(PathBuf, String)>,
     /// The user's folders and the home folder, each with its name.
     pub user: Vec<(PathBuf, String)>,
     /// WSL's Linux distributions, by name (see [`crate::network::distros`]).
@@ -22,6 +26,15 @@ impl Places {
     /// The name Windows gives `path` when it's one of the user's folders.
     pub fn name_of(&self, path: &Path) -> Option<&str> {
         self.user.iter().find(|(p, _)| p == path).map(|(_, n)| n.as_str())
+    }
+
+    /// Whether `path` is one of the folders Windows keeps for the user (the desktop, the home
+    /// folder, Documentos and the like), which the tree's menu doesn't delete, rename or cut.
+    pub fn is_special(&self, path: &Path) -> bool {
+        self.user.iter().any(|(p, _)| p == path)
+            || self.desktop.as_ref().is_some_and(|(p, _)| p == path)
+            || self.desktop_also.iter().any(|p| p == path)
+            || [&self.documents, &self.pictures].into_iter().flatten().any(|(p, _)| p == path)
     }
 }
 
@@ -38,9 +51,13 @@ pub fn places() -> Places {
         .filter(|p| p.is_dir())
         .map(named)
         .collect();
+    let documents = known_folder(&FOLDERID_Documents).filter(|p| p.is_dir()).map(named);
+    let pictures = known_folder(&FOLDERID_Pictures).filter(|p| p.is_dir()).map(named);
     Places {
         desktop: known_folder(&FOLDERID_Desktop).filter(|p| p.is_dir()).map(named),
         desktop_also: known_folder(&FOLDERID_PublicDesktop).filter(|p| p.is_dir()).into_iter().collect(),
+        documents,
+        pictures,
         user,
         wsl: crate::network::distros(),
     }
@@ -85,5 +102,7 @@ pub fn places() -> Places {
         (p, name)
     };
     let user = ["Documents", "Downloads", "Pictures", "Music", "Videos"].iter().map(|n| home.join(n)).chain([home.clone()]).filter(|p| p.is_dir()).map(named).collect();
-    Places { desktop: Some(home.join("Desktop")).filter(|p| p.is_dir()).map(named), desktop_also: Vec::new(), user, wsl: Vec::new() }
+    let documents = Some(home.join("Documents")).filter(|p| p.is_dir()).map(named);
+    let pictures = Some(home.join("Pictures")).filter(|p| p.is_dir()).map(named);
+    Places { desktop: Some(home.join("Desktop")).filter(|p| p.is_dir()).map(named), desktop_also: Vec::new(), documents, pictures, user, wsl: Vec::new() }
 }

@@ -39,7 +39,7 @@ icon!(UPLOAD, "upload", r##"<path d="M8 10.5V2.5M4.75 5.5L8 2.25L11.25 5.5M2.5 1
 icon!(DOWNLOAD, "download", r##"<path d="M8 2.5V10.5M4.75 7.5L8 10.75L11.25 7.5M2.5 10V13.5H13.5V10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>"##);
 
 // Places and folders.
-icon!(FOLDER, "folder", r##"<path d="M1 3.5C1 2.95 1.45 2.5 2 2.5H6L7.5 4H14C14.55 4 15 4.45 15 5V12.5C15 13.05 14.55 13.5 14 13.5H2C1.45 13.5 1 13.05 1 12.5Z" fill="#E8A93A"/><path d="M1 5.5H15V12.5C15 13.05 14.55 13.5 14 13.5H2C1.45 13.5 1 13.05 1 12.5Z" fill="#F6C451"/>"##);
+icon!(FOLDER, "folder", r##"<path d="M0.5 3.2C0.5 2.4 1.15 1.8 1.95 1.8H6.1L7.6 3.5H14.05C14.85 3.5 15.5 4.1 15.5 4.9V12.5C15.5 13.3 14.85 14 14.05 14H1.95C1.15 14 0.5 13.3 0.5 12.5Z" fill="#E6A100"/><path d="M0.5 5.3H6.3L7.5 4.3H14.05C14.85 4.3 15.5 4.9 15.5 5.7V12.3C15.5 13.05 14.85 13.6 14.05 13.6H1.95C1.15 13.6 0.5 13.05 0.5 12.3Z" fill="#FFE07D"/><path d="M1.4 13.1H14.6" stroke="#D99400" stroke-width="0.9" stroke-linecap="round"/>"##);
 icon!(FOLDER_LINK, "folder-link", r##"<path d="M1 3.5C1 2.95 1.45 2.5 2 2.5H6L7.5 4H14C14.55 4 15 4.45 15 5V12.5C15 13.05 14.55 13.5 14 13.5H2C1.45 13.5 1 13.05 1 12.5Z" fill="#E8A93A"/><path d="M1 5.5H15V12.5C15 13.05 14.55 13.5 14 13.5H2C1.45 13.5 1 13.05 1 12.5Z" fill="#F6C451"/><rect x="2" y="8" width="5.5" height="5" rx="1" fill="#FFFFFF"/><path d="M3.3 11.8L5.8 9.3M4.3 9.2H5.9V10.8" stroke="#2F6FDE" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"##);
 icon!(DESKTOP, "desktop", r##"<rect x="1.5" y="2.5" width="13" height="8.5" rx="1" fill="#4C8BF5"/><rect x="6.5" y="11" width="3" height="1.5" fill="#8A94A6"/><rect x="4.5" y="12.5" width="7" height="1.2" rx="0.6" fill="#8A94A6"/>"##);
 icon!(COMPUTER, "computer", r##"<rect x="1.5" y="2.5" width="13" height="8.5" rx="1" fill="#3B6FD8"/><rect x="2.5" y="3.5" width="11" height="6.5" fill="#8EC5FF"/><rect x="6.5" y="11" width="3" height="1.5" fill="#8A94A6"/><rect x="4.5" y="12.5" width="7" height="1.2" rx="0.6" fill="#8A94A6"/>"##);
@@ -92,6 +92,8 @@ icon!(UP, "up", r#"<path d="M8 13V3.5M4 7.5L8 3.5L12 7.5" stroke="currentColor" 
 icon!(REFRESH, "refresh", r#"<path d="M13 8A5 5 0 1 1 11.5 4.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/><path d="M11.8 1.8V4.8H8.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
 icon!(CHEVRON_DOWN, "chevron-down", r#"<path d="M4 6L8 10L12 6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
 icon!(CHEVRON, "chevron", r#"<path d="M6 4L10 8L6 12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
+icon!(PLUS, "plus", r#"<path d="M8 3.2V12.8M3.2 8H12.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>"#);
+icon!(TOGGLE_TREE, "toggle-tree", r#"<rect x="2" y="3" width="12" height="10" rx="1.8" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M6.2 3V13" stroke="currentColor" stroke-width="1.25"/>"#);
 icon!(EXTERNAL_LINK, "external-link", r#"<path d="M9.5 2.5H13.5V6.5M13.2 2.8L7.5 8.5M6.5 4H3.5C2.95 4 2.5 4.45 2.5 5V12.5C2.5 13.05 2.95 13.5 3.5 13.5H11C11.55 13.5 12 13.05 12 12.5V9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
 
 // Category tabs and titlebar in the "Registrar conta" window and Central de Contas, in `currentColor`.

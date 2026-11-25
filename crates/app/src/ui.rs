@@ -24,9 +24,24 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         return el();
     }
     let k = Kit::neutral(s.settings.theme.dark(cx.system_dark()));
+    cx.caption_color(k.c.text_base);
+    let title_leading = row()
+        .gap(8.0)
+        .center_y()
+        .child(icon(&icons::TAB_EXPLORE, 15.0).color(k.c.text_accent))
+        .child(text("Open Explorer").font(k.ty.text_small).color(k.c.text_base));
+    // Under Mica (Opções, Experimental) the title bar lets the backdrop through, as the page does.
+    let backdrop = cx.window_backdrop().is_active();
+    let titlebar = rune_kit::WindowTitlebar::from_insets(cx.chrome_insets())
+        .key("main-titlebar")
+        .leading_padding(12.0)
+        .fill(if backdrop { Color::TRANSPARENT } else { k.c.bg_base })
+        .leading(title_leading)
+        .build(&k);
     // Menus and dialogs draw in a layer above everything.
     let mut layer = Vec::new();
     let menu = context(s, &k, &mut layer);
+    let tree_menu = tree_context(s, &k, &mut layer);
     let queue_menu = transfer_context(s, &k, &mut layer);
     let address_menu = address_context(s, &k, &mut layer);
     // The window's height, so Opções and Registrar conta always fit inside short windows from
@@ -46,18 +61,20 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         layer.push(ToastRegion::new().toast(toast.build(&k).live_region(LiveRegion::Off)).build(&k));
     }
     let main_content = match s.main_tab {
-        MainTab::Explore => panes(s, &k),
+        MainTab::Explore => panes(s, &k, &mut layer),
         MainTab::Accounts => accounts_hub(s, &k),
     };
     let body = col()
         .key("window")
         .w_full()
         .h_full()
-        .fill(if cx.window_backdrop().is_active() { Color::TRANSPARENT } else { k.c.page })
+        .fill(if backdrop { Color::TRANSPARENT } else { k.c.page })
+        .child(titlebar)
         .child(toolbar(s, &k))
         .child(main_content)
         .child(transfers(s, &k))
         .child(menu)
+        .child(tree_menu)
         .child(queue_menu)
         .child(address_menu)
         // The mouse's side buttons anywhere else in Explorar: Voltar and Avançar in the active
@@ -65,7 +82,21 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .on_button(|s: &mut State, button, _: &mut Tx| crate::side_button_in_window(s, button))
         // Hover lands and leaves with the pointer, as in the system's file lists: the default
         // 100 ms fade on leaving left a trail of lit rows behind a fast pointer.
-        .hover_motion_within(Anim::INSTANT, Anim::INSTANT);
+        .hover_motion_within(Anim::INSTANT, Anim::INSTANT)
+        .on_key(|s: &mut State, ev: &KeyEvent, _: &mut Tx| {
+            if ev.key == rune::Key::Function(5) {
+                match s.main_tab {
+                    MainTab::Explore => {
+                        if !s.tabs[s.active].is_picker() {
+                            refresh(s, s.active);
+                        }
+                    }
+                    MainTab::Accounts => crate::refresh_all_quotas(s),
+                }
+                return true;
+            }
+            false
+        });
     rune_kit::root(body, layer)
 }
 
@@ -1185,6 +1216,108 @@ fn address_context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         .build(k, layer)
 }
 
+/// The right-click menu of a node in the navigation tree: Expandir/Recolher, Recortar,
+/// Copiar, Colar, Excluir, Renomear, Nova pasta, and Propriedades.
+fn tree_context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
+    let anchor = el().key("tree-menu-anchor").size(0.0, 0.0);
+    let Some((p, node, open, empty, at)) = s.tree_menu.clone() else { return anchor };
+
+    let loc = node.to.clone();
+    let parent_entry = loc.as_ref().and_then(actions::parent_and_entry);
+    let can_expand = node.opens && !empty;
+    // Windows' own folders for the user (the desktop, Documentos…) are copied, not moved,
+    // deleted or renamed from here, as in Explorer's tree.
+    let special = matches!(&loc, Some(Location::Local(path)) if s.places.is_special(path));
+    let can_copy = parent_entry.as_ref().is_some_and(|(par, _)| actions::items_editable(par));
+    let can_change = can_copy && !special;
+    let can_cut = can_change && parent_entry.as_ref().is_some_and(|(par, _)| actions::editable(par));
+    let can_paste = loc.as_ref().is_some_and(|to| actions::can_paste_to(s, to));
+    let can_delete = can_change;
+    let can_rename = can_change;
+    let can_new_folder = loc.as_ref().is_some_and(actions::editable);
+    let can_props = parent_entry.is_some();
+
+    let toggle_label = if open { t("Recolher", "Collapse") } else { t("Expandir", "Expand") };
+    let n_toggle = node.clone();
+    let expand_item = MenuItem::new(toggle_label).disabled(!can_expand).on_select(move |s: &mut State| {
+        s.tree_menu = None;
+        crate::tree::toggle(s, p, &n_toggle);
+    });
+
+    let cut_pe = parent_entry.clone();
+    let cut_item = MenuItem::new(t("Recortar", "Cut")).icon(&icons::M_CUT).disabled(!can_cut).on_select(move |s: &mut State| {
+        s.tree_menu = None;
+        if let Some((par, item)) = cut_pe.clone() {
+            actions::pick_up_item(s, par, item, ClipMode::Cut);
+        }
+    });
+
+    let copy_pe = parent_entry.clone();
+    let copy_item = MenuItem::new(t("Copiar", "Copy")).icon(&icons::M_COPY).disabled(!can_copy).on_select(move |s: &mut State| {
+        s.tree_menu = None;
+        if let Some((par, item)) = copy_pe.clone() {
+            actions::pick_up_item(s, par, item, ClipMode::Copy);
+        }
+    });
+
+    let paste_loc = loc.clone();
+    let paste_item = MenuItem::new(t("Colar", "Paste")).icon(&icons::M_PASTE).disabled(!can_paste).on_select(move |s: &mut State| {
+        s.tree_menu = None;
+        if let Some(to) = paste_loc.clone() {
+            actions::paste_into(s, p, to);
+        }
+    });
+
+    let del_pe = parent_entry.clone();
+    let del_item = MenuItem::new(t("Excluir", "Delete")).icon(&icons::M_DELETE).disabled(!can_delete).danger(true).on_select(move |s: &mut State| {
+        s.tree_menu = None;
+        if let Some((par, item)) = del_pe.clone() {
+            actions::ask_delete_item(s, p, par, item);
+        }
+    });
+
+    let ren_pe = parent_entry.clone();
+    let ren_item = MenuItem::new(t("Renomear", "Rename")).icon(&icons::M_RENAME).disabled(!can_rename).on_select(move |s: &mut State| {
+        s.tree_menu = None;
+        if let Some((par, item)) = ren_pe.clone() {
+            actions::ask_rename_item(s, p, par, item);
+        }
+    });
+
+    let nf_loc = loc.clone();
+    let new_folder_item = MenuItem::new(t("Nova pasta", "New folder")).icon(&icons::M_NEW_FOLDER).disabled(!can_new_folder).on_select_tx(move |s: &mut State, tx: &mut Tx| {
+        s.tree_menu = None;
+        if let Some(to) = nf_loc.clone() {
+            actions::ask_new_folder_in(s, p, to, tx);
+        }
+    });
+
+    let props_pe = parent_entry;
+    let props_item = MenuItem::new(t("Propriedades", "Properties")).icon(&icons::M_PROPERTIES).disabled(!can_props).on_select(move |s: &mut State| {
+        s.tree_menu = None;
+        if let Some((par, item)) = props_pe.clone() {
+            actions::properties_of(s, p, par, vec![item]);
+        }
+    });
+
+    context_menu("tree-menu", anchor, Some(at))
+        .min_width(210.0)
+        .item(expand_item)
+        .separator()
+        .item(cut_item)
+        .item(copy_item)
+        .item(paste_item)
+        .separator()
+        .item(del_item)
+        .item(ren_item)
+        .separator()
+        .item(new_folder_item)
+        .separator()
+        .item(props_item)
+        .on_close(|s: &mut State| s.tree_menu = None)
+        .build(k, layer)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Context menu
 
@@ -1336,15 +1469,15 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
     let Some(d) = &s.dialog else { return };
     let pad = |e: El| col().key("content").w_full().px(16.0).pb(16.0).child(e);
     match d {
-        Dialog::Delete { pane, items } => {
-            let local = s.panes[*pane].loc.is_local();
+        Dialog::Delete { loc, items, .. } => {
+            let local = loc.is_local();
             let title = match items.as_slice() {
                 [one] => tr!("Excluir \"{}\"?", "Delete \"{}\"?", shown(&one.name)),
                 many => tr!("Excluir {} itens?", "Delete {} items?", ui_count(many.len())),
             };
             let where_to: Cow<str> = if local {
                 t("Os itens vão para a Lixeira do Windows, de onde podem ser restaurados.", "The items go to the Windows Recycle Bin, where they can be restored.").into()
-            } else if let Some(note) = crate::accounts::delete_note(s, &s.panes[*pane].loc) {
+            } else if let Some(note) = crate::accounts::delete_note(s, loc) {
                 note
             } else {
                 t(
@@ -1356,26 +1489,26 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
             // The explanation goes in the body, where it wraps; the dialog's own description
             // line doesn't, and would run under the close button.
             let note = text(where_to.into_owned()).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
-            let body = col().w_full().gap(12.0).child(note).child(item_list(s, k, *pane, items)).child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Excluir", "Delete")).variant(ButtonVariant::Danger).on_press(actions::delete)));
+            let body = col().w_full().gap(12.0).child(note).child(item_list(s, k, loc, items)).child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Excluir", "Delete")).variant(ButtonVariant::Danger).on_press(actions::delete)));
             Modal::new("delete", title).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
         }
-        Dialog::Purge { pane, items } => {
+        Dialog::Purge { loc, items, .. } => {
             let title = match items.as_slice() {
                 [one] => tr!("Excluir \"{}\" permanentemente?", "Permanently delete \"{}\"?", shown(&one.name)),
                 many => tr!("Excluir {} itens permanentemente?", "Permanently delete {} items?", ui_count(many.len())),
             };
-            let remote = items.iter().filter_map(|e| s.panes[*pane].loc.local_path(e)).any(|path| crate::network::is_remote(&path));
-            let note: Cow<str> = if s.panes[*pane].loc.is_local() && !remote && s.settings.skip_recycle_bin {
+            let remote = items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_remote(&path));
+            let note: Cow<str> = if loc.is_local() && !remote && s.settings.skip_recycle_bin {
                 t(
                     "A exclusão direta está ativada nas Opções: os itens serão apagados para sempre, sem passar pela Lixeira. Isso não pode ser desfeito.",
                     "Permanent deletion is on in Options: the items will be deleted for good, skipping the Recycle Bin. This can't be undone.",
                 )
                 .into()
-            } else if s.panes[*pane].loc.is_local() {
+            } else if loc.is_local() {
                 t("Aqui não há Lixeira: os itens serão apagados para sempre. Isso não pode ser desfeito.", "There's no Recycle Bin here: the items will be deleted for good. This can't be undone.").into()
-            } else if let Some(note) = crate::accounts::purge_note(&s.panes[*pane].loc) {
+            } else if let Some(note) = crate::accounts::purge_note(loc) {
                 note.into()
-            } else if let Location::Server { server, .. } = &s.panes[*pane].loc {
+            } else if let Location::Server { server, .. } = loc {
                 tr!(
                     "Servidores não têm lixeira: os itens serão apagados para sempre de {}. Isso não pode ser desfeito.",
                     "Servers have no trash: the items will be deleted from {} for good. This can't be undone.",
@@ -1389,7 +1522,7 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 .w_full()
                 .gap(12.0)
                 .child(text(note.into_owned()).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
-                .child(item_list(s, k, *pane, items))
+                .child(item_list(s, k, loc, items))
                 .child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Excluir permanentemente", "Delete permanently")).variant(ButtonVariant::Danger).on_press(actions::purge)));
             Modal::new("purge", title).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
         }
@@ -1451,7 +1584,8 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 .child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Remover conta", "Remove account")).variant(ButtonVariant::Danger).on_press(actions::confirm_remove_account)));
             Modal::new("remove-account", title).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
         }
-        Dialog::NewFolder { error, .. } => {
+        Dialog::NewFolder { error, .. } | Dialog::Rename { error, .. } => {
+            let is_rename = matches!(d, Dialog::Rename { .. });
             // Rune's own field, so it can take the dialog's first focus (`autofocus`); Enter
             // confirms.
             let field = rune::text_input(&s.name_edit, k.ty.ui_compact)
@@ -1480,9 +1614,11 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
             if let Some(e) = error {
                 body = body.child(text(e.clone()).font(k.ty.text_small).color(k.c.danger.fg));
             }
-            let act = Button::new(t("Criar", "Create")).variant(ButtonVariant::Submit).on_press(actions::submit_name);
+            let act_label = if is_rename { t("Renomear", "Rename") } else { t("Criar", "Create") };
+            let modal_title = if is_rename { t("Renomear", "Rename") } else { t("Nova pasta", "New folder") };
+            let act = Button::new(act_label).variant(ButtonVariant::Submit).on_press(actions::submit_name);
             let body = body.child(actions_row(k, t("Cancelar", "Cancel"), act));
-            Modal::new("name", t("Nova pasta", "New folder")).open(true).child(pad(body)).width(420.0).fit().on_close(close).build(k, layer);
+            Modal::new("name", modal_title).open(true).child(pad(body)).width(420.0).fit().on_close(close).build(k, layer);
         }
         Dialog::Properties(p) => props_dialog(s, k, p, layer),
         Dialog::Options(opt) => options_dialog(s, k, opt, window_h, layer),
@@ -2633,11 +2769,11 @@ fn clash_dialog(s: &State, k: &Kit, ask: &actions::ClashAsk, layer: &mut Vec<El>
 }
 
 /// The first few items a dialog acts on, with "e mais N" for the rest.
-fn item_list(s: &State, k: &Kit, pane: usize, items: &[crate::model::Entry]) -> El {
+fn item_list(s: &State, k: &Kit, loc: &Location, items: &[crate::model::Entry]) -> El {
     let mut list = col().key("items").w_full().gap(4.0);
     for e in items.iter().take(6) {
         list = list.child(
-            row().gap(6.0).center_y().child(entry_icon(s, &s.panes[pane].loc, e, 16.0)).child(text(shown(&e.name)).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0)),
+            row().gap(6.0).center_y().child(entry_icon(s, loc, e, 16.0)).child(text(shown(&e.name)).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0)),
         );
     }
     if items.len() > 6 {
@@ -2745,9 +2881,8 @@ fn prop_tab(k: &Kit, label: &str, tab: actions::PropTab, on: bool) -> El {
 }
 
 /// Where an item is, in words: the folder's full path on disk, or its place in Drive.
-fn place_of(s: &State, p: &actions::Props) -> String {
-    let pane = &s.panes[p.pane];
-    match (&pane.loc, p.single()) {
+fn place_of(p: &actions::Props) -> String {
+    match (&p.loc, p.single()) {
         (loc @ (Location::Local(_) | Location::Found(_)), Some(e)) => loc.local_path(e).map(|p| p.display().to_string()).unwrap_or_default(),
         (Location::Local(dir), None) => dir.display().to_string(),
         (Location::Found(f), None) => tr!("Resultados de “{}” em {}", "Results for “{}” in {}", f.text, f.place),
@@ -2767,7 +2902,7 @@ fn place_of(s: &State, p: &actions::Props) -> String {
 
 fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
     use actions::PropTab;
-    let loc = &s.panes[p.pane].loc;
+    let loc = &p.loc;
     let drive = match loc {
         Location::Drive { email, .. } => Some(email.clone()),
         _ => None,
@@ -2780,13 +2915,12 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
     let muted = |t: &str| text(t.to_string()).font(k.ty.text_small).color(k.c.text_muted);
 
     // Header: the item's icon and its name, which renames on OK.
-    let loc = &s.panes[p.pane].loc;
     let (glyph, title) = match p.single() {
         Some(e) => (entry_icon(s, loc, e, 40.0), shown(&e.name)),
         None if p.items.iter().all(|e| e.is_dir) => (shell_icon(s, Some(&IconKey::Folder), &icons::FOLDER, 40.0), tr!("{} itens", "{} items", ui_count(p.items.len()))),
         None => (icon(&icons::FILE, 40.0), tr!("{} itens", "{} items", ui_count(p.items.len()))),
     };
-    let editable_name = p.renamable(s);
+    let editable_name = p.renamable();
     let name: El = if editable_name {
         rune::text_input(&s.name_edit, k.ty.text_small)
             .single_line()
@@ -2819,7 +2953,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
         PropTab::Details,
         p.tab == PropTab::Details,
     ));
-    if p.has_versions(s) {
+    if p.has_versions() {
         tabs = tabs.child(prop_tab(k, t("Histórico de versões", "Version history"), PropTab::Versions, p.tab == PropTab::Versions));
     }
 
@@ -2839,7 +2973,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
             }
             body = body.child(prop_sep(k));
             // Where and how big.
-            body = body.child(prop_text(k, t("Caminho", "Path"), place_of(s, p)));
+            body = body.child(prop_text(k, t("Caminho", "Path"), place_of(p)));
             let size = match (p.single(), &p.totals) {
                 (_, Some(t)) => format_bytes(t.bytes),
                 (Some(e), None) if !e.is_dir => e.size.map(format_bytes).unwrap_or_else(|| "—".into()),
@@ -2880,7 +3014,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
                         (None, None) => match drive_md5 {
                             Some(h) => mono(h),
                             None if google_format => muted(t("— (formato do Google, sem arquivo binário)", "— (Google format, no binary file)")),
-                            None if details.is_none() && p.details.is_none() && matches!(s.panes[p.pane].loc, Location::Drive { .. }) => muted(t("Carregando…", "Loading…")),
+                            None if details.is_none() && p.details.is_none() && matches!(p.loc, Location::Drive { .. }) => muted(t("Carregando…", "Loading…")),
                             None => muted("—"),
                         },
                     };
@@ -3000,19 +3134,31 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
 
 /// Windows' icon for `key` once it has loaded, else the app's own `fallback`.
 fn shell_icon(s: &State, key: Option<&IconKey>, fallback: &'static Icon, size: f32) -> El {
-    match key.and_then(|k| s.icons.get(k)).filter(|i| i.is_ready() && i.error().is_none()) {
+    let large = size > 24.0;
+    match key.and_then(|k| s.icons.get(k, large)).filter(|i| i.is_ready() && i.error().is_none()) {
         Some(image) => el().size(size, size).pixels(image.pixels()),
         None => icon(fallback, size),
     }
 }
 
-/// The icon Explorer would show for `e`: its type's program's (VLC's for a video VLC opens).
-/// A Drive shortcut to a folder keeps the app's linked-folder icon.
+/// The icon Explorer would show for `e`: its type's program's (VLC's for a video VLC opens),
+/// or a local folder's own Windows icon when it's a special/customized folder (Documentos,
+/// Downloads, Imagens, OneDrive…). A Drive shortcut to a folder keeps the app's linked-folder
+/// icon.
 fn entry_icon(s: &State, loc: &Location, e: &crate::model::Entry, size: f32) -> El {
     let kind = e.kind();
     let fallback = kind_icon(kind);
     if kind == Kind::FolderLink {
         return icon(fallback, size);
+    }
+    if e.is_dir
+        && let Some(path) = loc.local_path(e)
+    {
+        let key = IconKey::Dir(path);
+        let large = size > 24.0;
+        if let Some(image) = s.icons.get(&key, large).filter(|i| i.is_ready() && i.error().is_none()) {
+            return el().size(size, size).pixels(image.pixels());
+        }
     }
     shell_icon(s, sysicons::key_for(e, loc).as_ref(), fallback, size)
 }
@@ -3125,8 +3271,8 @@ fn toolbar(s: &State, k: &Kit) -> El {
     };
 
     let refresh_help = match s.main_tab {
-        MainTab::Explore => t("Recarregar a pasta atual", "Reload the current folder"),
-        MainTab::Accounts => t("Atualizar o espaço utilizado nas contas", "Refresh storage usage across accounts"),
+        MainTab::Explore => t("Recarregar a pasta atual (F5)", "Reload the current folder (F5)"),
+        MainTab::Accounts => t("Atualizar o espaço utilizado nas contas (F5)", "Refresh storage usage across accounts (F5)"),
     };
 
     row()
@@ -3143,7 +3289,11 @@ fn toolbar(s: &State, k: &Kit) -> El {
         .child(sep())
         .child(
             tool(k, "reload-all", &icons::REFRESH, t("Atualizar", "Refresh"), true, |s: &mut State, _| match s.main_tab {
-                MainTab::Explore => refresh(s, s.active),
+                MainTab::Explore => {
+                    if !s.tabs[s.active].is_picker() {
+                        refresh(s, s.active);
+                    }
+                }
                 MainTab::Accounts => crate::refresh_all_quotas(s),
             })
             .help(refresh_help),
@@ -3946,16 +4096,16 @@ fn splitter(k: &Kit, key: &str, thick: f32, way: Split, size: impl Fn(&mut State
 }
 
 /// The two panes, side by side in equal halves.
-fn panes(s: &State, k: &Kit) -> El {
+fn panes(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     row()
         .key("panes")
         .w_full()
         .grow(1.0)
         .min_h(160.0)
         .padding(6.0)
-        .child(pane(s, k, 0))
+        .child(pane(s, k, 0, layer))
         .child(gutter(s, k))
-        .child(pane(s, k, 1))
+        .child(pane(s, k, 1, layer))
 }
 
 /// The strip between the panes, as in Air Explorer: the window's own background, empty but
@@ -3963,29 +4113,547 @@ fn panes(s: &State, k: &Kit) -> El {
 /// the other shows. A triangle is blue while its pane has something selected, grey otherwise.
 fn gutter(s: &State, k: &Kit) -> El {
     let arrow = |key: &str, glyph: &'static Icon, help: &str, from: usize, to: usize| {
-        let ready = !s.panes[from].selected.is_empty();
+        let ready = !s.tabs[from].is_picker() && !s.tabs[to].is_picker() && !s.panes[from].selected.is_empty();
         let ink = if ready { k.alpha(k.c.text_accent, 0.7) } else { k.alpha(k.c.icon_faint, 0.6) };
         let b = el().key(key.to_string()).role("button").label(help.to_string()).help(help.to_string()).size(28.0, 28.0).center().radius(k.radius.sm);
         let b = if ready { b.hover(k.c.hover).press(k.c.pressed).cursor(Cursor::Pointer) } else { b };
-        b.on_press(move |s: &mut State| actions::copy_across(s, from, to)).child(icon(glyph, 16.0).color(ink))
+        b.on_press(move |s: &mut State| {
+            if !s.tabs[from].is_picker() && !s.tabs[to].is_picker() {
+                actions::copy_across(s, from, to);
+            }
+        })
+        .child(icon(glyph, 16.0).color(ink))
     };
     col()
         .key("gutter")
         .w(40.0)
         .h_full()
         .items_center()
-        .pt(96.0)
+        .pt(126.0)
         .gap(6.0)
         .child(arrow("copy-right", &icons::COPY_RIGHT, t("Copiar a seleção do painel esquerdo para o direito", "Copy the selection from the left pane to the right"), 0, 1))
         .child(arrow("copy-left", &icons::COPY_LEFT, t("Copiar a seleção do painel direito para o esquerdo", "Copy the selection from the right pane to the left"), 1, 0))
 }
 
 // ---------------------------------------------------------------------------------------------
-// Pane
+// Pane & Tabs
 
-fn pane(s: &State, k: &Kit, p: usize) -> El {
+/// The tab strip sitting above pane `p`: one tab per open source (showing its icon, name,
+/// and close button) followed by the "+" tab that opens the new-tab / account picker.
+/// The active tab merges seamlessly into the pane body below (no bottom line); inactive tabs
+/// and the inactive "+" button draw only the continuous top border of the pane and highlight
+/// on hover.
+fn tab_strip(s: &State, k: &Kit, p: usize, pane_border: Color) -> El {
+    let tabs = &s.tabs[p];
+    let hover_bg = if k.dark { k.alpha(k.c.white, 0.065) } else { k.alpha(k.c.black, 0.055) };
+    let top_corners = [6.0, 6.0, 0.0, 0.0];
+
+    let mut strip = row()
+        .key(format!("pane-tabs-{p}"))
+        .w_full()
+        .h(30.0)
+        .items_end()
+        .min_w(0.0);
+
+    for (idx, slot) in tabs.items.iter().enumerate() {
+        let is_active = tabs.active == Some(idx);
+        let loc = tabs.location_of(&s.panes[p], idx);
+        let (icon_key, glyph, label) = crate::tabs::tab_header(s, loc);
+
+        let fg = if is_active { k.c.text_base } else { k.c.text_muted };
+
+        let select_area = row()
+            .key(format!("tab-sel-{p}-{}", slot.id))
+            .role("tab")
+            .label(label.clone())
+            .checked(is_active)
+            .h_full()
+            .pl(10.0)
+            .pr(4.0)
+            .gap(6.0)
+            .center_y()
+            .cursor(Cursor::Pointer)
+            .on_press(move |s: &mut State| crate::tabs::select_tab(s, p, idx))
+            .child(shell_icon(s, icon_key.as_ref(), glyph, 15.0))
+            .child(text(label).font(k.ty.text_small).color(fg).truncate().max_w(160.0).min_w(0.0));
+
+        let close_btn = row()
+            .key(format!("tab-close-{p}-{}", slot.id))
+            .role("button")
+            .label(t("Fechar aba", "Close tab"))
+            .help(t("Fechar aba (Ctrl+W)", "Close tab (Ctrl+W)"))
+            .size(18.0, 18.0)
+            .mr(5.0)
+            .center()
+            .radius(k.radius.sm)
+            .hover(if k.dark { k.alpha(k.c.white, 0.12) } else { k.alpha(k.c.black, 0.09) })
+            .cursor(Cursor::Pointer)
+            .on_press(move |s: &mut State| crate::tabs::close_tab(s, p, idx))
+            .child(icon(k.glyph.close, 10.0).color(if is_active { k.c.icon_muted } else { k.c.icon_faint }));
+
+        let tab = if is_active {
+            row()
+                .key(format!("tab-{p}-{}", slot.id))
+                .h(30.0)
+                .center_y()
+                .corners(top_corners)
+                .fill(k.c.bg_base)
+                .border_sides([1.0, 1.0, 0.0, 1.0], pane_border)
+                .child(select_area)
+                .child(close_btn)
+        } else {
+            row()
+                .key(format!("tab-{p}-{}", slot.id))
+                .h(30.0)
+                .center_y()
+                .corners(top_corners)
+                .fill(Color::TRANSPARENT)
+                .hover(hover_bg)
+                .border_sides([0.0, 0.0, 1.0, 0.0], pane_border)
+                .child(select_area)
+                .child(close_btn)
+        };
+
+        strip = strip.child(tab);
+    }
+
+    // The "+" tab button at the end of the strip: transparent (no box/border) when inactive,
+    // highlighting only on hover; merges into the pane body when active.
+    let picker_on = tabs.is_picker();
+    let plus = if picker_on {
+        row()
+            .key(format!("tab-plus-{p}"))
+            .role("tab")
+            .label(t("Nova aba", "New tab"))
+            .help(t("Abrir nova aba (Ctrl+T)", "Open new tab (Ctrl+T)"))
+            .checked(true)
+            .w(48.0)
+            .h(30.0)
+            .center()
+            .corners(top_corners)
+            .fill(k.c.bg_base)
+            .border_sides([1.0, 1.0, 0.0, 1.0], pane_border)
+            .cursor(Cursor::Pointer)
+            .on_press(move |s: &mut State| crate::tabs::open_picker(s, p))
+            .child(icon(&icons::PLUS, 13.0).color(k.c.text_base))
+    } else {
+        row()
+            .key(format!("tab-plus-{p}"))
+            .role("tab")
+            .label(t("Nova aba", "New tab"))
+            .help(t("Abrir nova aba (Ctrl+T)", "Open new tab (Ctrl+T)"))
+            .checked(false)
+            .w(36.0)
+            .h(30.0)
+            .center()
+            .corners(top_corners)
+            .fill(Color::TRANSPARENT)
+            .hover(hover_bg)
+            .border_sides([0.0, 0.0, 1.0, 0.0], pane_border)
+            .cursor(Cursor::Pointer)
+            .on_press(move |s: &mut State| crate::tabs::open_picker(s, p))
+            .child(icon(&icons::PLUS, 13.0).color(k.c.icon_muted))
+    };
+
+    // Continues the pane's top border cleanly to the right edge.
+    let trailing = el()
+        .key(format!("tab-trail-{p}"))
+        .grow(1.0)
+        .h(30.0)
+        .border_sides([0.0, 0.0, 1.0, 0.0], pane_border);
+
+    strip.child(plus).child(trailing)
+}
+
+/// The "+" new-tab view inside pane `p`: provider filter, search box, "Registrar conta",
+/// local quick folders (Este Computador, Documentos, Imagens), and the list of connected
+/// cloud accounts & servers.
+fn new_tab_picker(s: &State, k: &Kit, p: usize, layer: &mut Vec<El>) -> El {
+    use crate::servers::Provider;
+
+    let picker = &s.tabs[p].picker;
+    let all_cards = hub_cards(s);
+    let active_filter = picker.filter.filter(|&prov| all_cards.iter().any(|c| c.provider == prov));
+    let query = picker.search.text.as_str();
+    let q_lower = query.trim().to_lowercase();
+
+    // 1. Top row: Provider filter dropdown ("Todos ▾") + Search box ("Pesquisar").
+    let anchor_key = format!("tab-picker-filter-{p}");
+    let filter_label = match active_filter {
+        None => t("Todos", "All"),
+        Some(Provider::GoogleDrive) => "GoogleDrive",
+        Some(prov) => prov.label(),
+    };
+    let filter_glyph: El = match active_filter {
+        None => icon(&icons::GLOBE, 15.0).color(k.c.icon_muted),
+        Some(prov) => icon(prov.icon(), 16.0),
+    };
+
+    let filter_btn = k
+        .interactive(
+            row()
+                .key(anchor_key.clone())
+                .role("button")
+                .label(filter_label.to_string())
+                .focusable(true)
+                .focus_ring(2.0, 1.0, k.c.border_focus)
+                .w(148.0)
+                .h(30.0)
+                .px(9.0)
+                .gap(7.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .fill(k.c.bg_base)
+                .border(1.0, if picker.filter_open { k.c.border_focus } else { k.c.border_weak })
+                .hover(k.c.hover)
+                .cursor(Cursor::Pointer)
+                .child(filter_glyph)
+                .child(text(filter_label.to_string()).font(k.ty.text_small).color(k.c.text_base).truncate().min_w(0.0).grow(1.0))
+                .child(icon(&icons::CHEVRON_DOWN, 12.0).color(k.c.icon_muted)),
+        )
+        .on_press(move |s: &mut State| {
+            let next = !s.tabs[p].picker.filter_open;
+            crate::tabs::close_picker_filter(s);
+            s.tabs[p].picker.filter_open = next;
+        });
+
+    if picker.filter_open {
+        layer.push(rune_kit::scrim("tab-picker-filter-scrim", crate::tabs::close_picker_filter));
+        let dropdown_bg = if k.dark { rune::oklch(0.22, 0.008, 255.0) } else { k.c.bg_base };
+        let mut menu = col().key(format!("tab-picker-filter-menu-{p}")).w(196.0).padding(4.0).gap(2.0);
+
+        let make_opt = |opt_key: String, label: &str, glyph: El, count: usize, selected: bool, pick: Option<Provider>| -> El {
+            row()
+                .key(opt_key)
+                .role("menuitem")
+                .label(label.to_string())
+                .w_full()
+                .h(30.0)
+                .px(8.0)
+                .gap(8.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .fill(if selected { k.alpha(k.c.text_accent, if k.dark { 0.20 } else { 0.10 }) } else { Color::TRANSPARENT })
+                .hover(k.c.hover)
+                .cursor(Cursor::Pointer)
+                .on_press(move |s: &mut State| {
+                    s.tabs[p].picker.filter = pick;
+                    s.tabs[p].picker.filter_open = false;
+                })
+                .child(glyph)
+                .child(text(label.to_string()).font(if selected { k.ty.text_small_medium } else { k.ty.text_small }).color(k.c.text_base).truncate().min_w(0.0).grow(1.0))
+                .child(text(count.to_string()).font(k.ty.caption()).color(k.c.text_faint))
+        };
+
+        menu = menu.child(make_opt(
+            format!("tp-opt-all-{p}"),
+            t("Todos", "All"),
+            icon(&icons::GLOBE, 15.0).color(k.c.icon_muted),
+            all_cards.len(),
+            active_filter.is_none(),
+            None,
+        ));
+
+        for prov in Provider::ALL {
+            let count = all_cards.iter().filter(|c| c.provider == prov).count();
+            if count == 0 {
+                continue;
+            }
+            let lbl = match prov {
+                Provider::GoogleDrive => "GoogleDrive",
+                _ => prov.label(),
+            };
+            menu = menu.child(make_opt(
+                format!("tp-opt-{p}-{prov:?}"),
+                lbl,
+                icon(prov.icon(), 16.0),
+                count,
+                active_filter == Some(prov),
+                Some(prov),
+            ));
+        }
+
+        let surface = menu
+            .radius(k.radius.md)
+            .fill(dropdown_bg)
+            .border(1.0, k.c.border_weak)
+            .box_shadow(rune::Shadow { y: 6.0, blur: 18.0, color: k.dark_a(0.32), ..Default::default() });
+        layer.push(rune_kit::popover::anchored(k, surface, &anchor_key, rune_kit::Placement::BottomStart, 4.0));
+    }
+
+    let search_trailing: El = if !picker.search.text.is_empty() {
+        row()
+            .key(format!("tp-search-clear-{p}"))
+            .role("button")
+            .label(t("Limpar pesquisa", "Clear search"))
+            .preserve_focus_on_press(true)
+            .size(20.0, 20.0)
+            .center()
+            .radius(k.radius.sm)
+            .hover(k.c.hover)
+            .cursor(Cursor::Pointer)
+            .on_press(move |s: &mut State| {
+                s.tabs[p].picker.search = rune::TextEdit::new("");
+                s.tabs[p].picker.search.focused = true;
+            })
+            .child(icon(k.glyph.close, 11.0).color(k.c.icon_muted))
+    } else {
+        icon(&icons::SEARCH, 13.0).color(k.c.icon_muted)
+    };
+
+    let search_input = rune_kit::TextInput::new(&picker.search)
+        .width(Some(190.0))
+        .label(t("Pesquisar contas", "Search accounts"))
+        .placeholder(t("Pesquisar", "Search"))
+        .trailing(search_trailing)
+        .on_edit(move |s: &mut State| &mut s.tabs[p].picker.search)
+        .build(k)
+        .key(format!("tp-search-{p}"));
+
+    let top_row = row()
+        .key(format!("tp-top-{p}"))
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .child(filter_btn)
+        .child(search_input);
+
+    // 2. "Registrar conta" action link (opens the same Add Account window).
+    let register_row = row()
+        .key(format!("tp-register-{p}"))
+        .role("button")
+        .label(t("Registrar conta", "Register account"))
+        .h(30.0)
+        .px(6.0)
+        .gap(8.0)
+        .center_y()
+        .radius(k.radius.sm)
+        .hover(k.alpha(k.c.text_accent, if k.dark { 0.14 } else { 0.08 }))
+        .press(k.alpha(k.c.text_accent, if k.dark { 0.22 } else { 0.14 }))
+        .cursor(Cursor::Pointer)
+        .on_press(crate::servers::ask_add)
+        .child(icon(&icons::PERSON_PLUS, 16.0).color(k.c.text_accent))
+        .child(text(t("Registrar conta", "Register account")).font(k.ty.text_small_medium).color(k.c.text_accent));
+
+    // 3. Quick local places row: Este Computador, Documentos, Imagens.
+    let mut quick_row = row().key(format!("tp-quick-{p}")).w_full().gap(6.0).center_y();
+    let mut has_quick = false;
+    let matches_local = |label: &str| q_lower.is_empty() || label.to_lowercase().contains(&q_lower);
+
+    let pc_label = t("Este Computador", "This PC");
+    if active_filter.is_none() && matches_local(pc_label) {
+        has_quick = true;
+        let pc_loc = crate::tabs::computer_location(s);
+        quick_row = quick_row.child(
+            row()
+                .key(format!("tp-quick-pc-{p}"))
+                .role("button")
+                .label(pc_label.to_string())
+                .h(30.0)
+                .px(8.0)
+                .gap(7.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .hover(k.c.hover)
+                .press(k.c.pressed)
+                .cursor(Cursor::Pointer)
+                .on_press(move |s: &mut State| crate::tabs::open_new_tab(s, p, pc_loc.clone()))
+                .child(shell_icon(s, Some(&IconKey::Computer), &icons::COMPUTER, 16.0))
+                .child(text(pc_label.to_string()).font(k.ty.text_small).color(k.c.text_base)),
+        );
+    }
+
+    if active_filter.is_none()
+        && let Some((doc_path, doc_name)) = &s.places.documents
+        && matches_local(doc_name)
+    {
+        has_quick = true;
+        let loc = Location::Local(doc_path.clone());
+        quick_row = quick_row.child(
+            row()
+                .key(format!("tp-quick-docs-{p}"))
+                .role("button")
+                .label(doc_name.clone())
+                .h(30.0)
+                .px(8.0)
+                .gap(7.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .hover(k.c.hover)
+                .press(k.c.pressed)
+                .cursor(Cursor::Pointer)
+                .on_press(move |s: &mut State| crate::tabs::open_new_tab(s, p, loc.clone()))
+                .child(shell_icon(s, Some(&IconKey::Path(doc_path.clone())), &icons::DOC, 16.0))
+                .child(text(doc_name.clone()).font(k.ty.text_small).color(k.c.text_base)),
+        );
+    }
+
+    if active_filter.is_none()
+        && let Some((pic_path, pic_name)) = &s.places.pictures
+        && matches_local(pic_name)
+    {
+        has_quick = true;
+        let loc = Location::Local(pic_path.clone());
+        quick_row = quick_row.child(
+            row()
+                .key(format!("tp-quick-pics-{p}"))
+                .role("button")
+                .label(pic_name.clone())
+                .h(30.0)
+                .px(8.0)
+                .gap(7.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .hover(k.c.hover)
+                .press(k.c.pressed)
+                .cursor(Cursor::Pointer)
+                .on_press(move |s: &mut State| crate::tabs::open_new_tab(s, p, loc.clone()))
+                .child(shell_icon(s, Some(&IconKey::Path(pic_path.clone())), &icons::IMAGE, 16.0))
+                .child(text(pic_name.clone()).font(k.ty.text_small).color(k.c.text_base)),
+        );
+    }
+
+    // 4. Collapsible "Contas" section with count badge & edit/manage icon.
+    let visible_cards: Vec<&HubCard> = all_cards
+        .iter()
+        .filter(|c| active_filter.is_none_or(|prov| c.provider == prov))
+        .filter(|c| c.matches_search(query))
+        .collect();
+
+    let pill_bg = k.alpha(k.c.text_base, if k.dark { 0.11 } else { 0.07 });
+    let accounts_toggle = row()
+        .key(format!("tp-accounts-toggle-{p}"))
+        .role("button")
+        .label(t("Contas", "Accounts"))
+        .h(26.0)
+        .px(4.0)
+        .gap(6.0)
+        .center_y()
+        .radius(k.radius.sm)
+        .hover(k.c.hover)
+        .cursor(Cursor::Pointer)
+        .on_press(move |s: &mut State| {
+            s.tabs[p].picker.accounts_open = !s.tabs[p].picker.accounts_open;
+        })
+        .child(icon(if picker.accounts_open { &icons::CHEVRON_DOWN } else { &icons::CHEVRON }, 12.0).color(k.c.icon_muted))
+        .child(text(t("Contas", "Accounts")).font(k.ty.text_small_medium).color(k.c.text_muted))
+        .child(
+            row()
+                .h(17.0)
+                .px(6.0)
+                .center()
+                .radius(8.5)
+                .fill(pill_bg)
+                .child(text(visible_cards.len().to_string()).font(k.ty.caption()).color(k.c.text_muted)),
+        );
+
+    let manage_btn = row()
+        .key(format!("tp-accounts-manage-{p}"))
+        .role("button")
+        .label(t("Gerenciar contas", "Manage accounts"))
+        .help(t("Gerenciar contas conectadas", "Manage connected accounts"))
+        .size(24.0, 24.0)
+        .center()
+        .radius(k.radius.sm)
+        .hover(k.c.hover)
+        .cursor(Cursor::Pointer)
+        .on_press(|s: &mut State| crate::set_main_tab(s, MainTab::Accounts))
+        .child(icon(&icons::M_RENAME, 13.0).color(k.c.icon_muted));
+
+    let accounts_header = row()
+        .key(format!("tp-accounts-head-{p}"))
+        .w_full()
+        .gap(4.0)
+        .center_y()
+        .child(accounts_toggle)
+        .child(manage_btn);
+
+    let mut content = col()
+        .key(format!("tp-body-{p}"))
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .padding(14.0)
+        .gap(10.0)
+        .child(top_row)
+        .child(register_row);
+
+    if has_quick {
+        content = content.child(quick_row);
+    }
+
+    content = content.child(accounts_header);
+
+    if picker.accounts_open {
+        let mut accounts_list = col()
+            .key(format!("tp-accounts-list-{p}"))
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .pl(4.0)
+            .gap(2.0)
+            .scroll(ScrollSpec { stick_bottom: false });
+
+        if visible_cards.is_empty() {
+            let msg = if all_cards.is_empty() {
+                t("Nenhuma conta conectada. Clique em Registrar conta acima.", "No accounts connected. Click Register account above.")
+            } else {
+                t("Nenhuma conta encontrada.", "No accounts found.")
+            };
+            accounts_list = accounts_list.child(
+                row()
+                    .px(8.0)
+                    .py(10.0)
+                    .child(text(msg).font(k.ty.text_small).color(k.c.text_faint)),
+            );
+        } else {
+            for c in visible_cards {
+                let loc = c.open_loc.clone();
+                let mut item = row()
+                    .key(format!("tp-acc-{p}-{}", c.key))
+                    .role("button")
+                    .label(format!("{} {}", c.drive_name, c.email_or_addr))
+                    .w_full()
+                    .h(34.0)
+                    .px(8.0)
+                    .gap(8.0)
+                    .center_y()
+                    .radius(k.radius.sm)
+                    .hover(k.c.hover)
+                    .press(k.c.pressed)
+                    .cursor(Cursor::Pointer)
+                    .on_press(move |s: &mut State| crate::tabs::open_new_tab(s, p, loc.clone()))
+                    .child(icon(c.provider.icon(), 18.0))
+                    .child(text(c.drive_name.clone()).font(k.ty.text_small).color(k.c.text_muted));
+
+                if let Some(user_name) = &c.user_name {
+                    item = item.child(text(user_name.clone()).font(k.ty.text_small_medium).color(k.c.text_base));
+                }
+
+                item = item.child(
+                    text(c.email_or_addr.clone())
+                        .font(k.ty.text_small)
+                        .color(k.c.text_muted)
+                        .truncate()
+                        .min_w(0.0)
+                        .grow(1.0),
+                );
+
+                accounts_list = accounts_list.child(item);
+            }
+        }
+
+        content = content.child(accounts_list);
+    }
+
+    content
+}
+
+fn pane(s: &State, k: &Kit, p: usize, layer: &mut Vec<El>) -> El {
     let pane = &s.panes[p];
-    let border = if pane.drop_over {
+    let is_picker = s.tabs[p].is_picker();
+    let drop_over = !is_picker && pane.drop_over;
+    let border = if drop_over {
         k.c.text_accent
     } else if s.active == p {
         // Just a hint of the accent: the active pane shouldn't shout.
@@ -3993,54 +4661,144 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
     } else {
         k.c.border_weak
     };
-    col()
+
+    let mut card = col()
         .key(pane_key(p))
         .focusable(true)
         .label(tr!("Painel {}", "Pane {}", p + 1))
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .min_w(0.0)
+        .corners([0.0, 0.0, k.radius.sm, k.radius.sm])
+        .fill(if drop_over { k.alpha(k.c.text_accent, 0.06) } else { k.c.bg_base })
+        .border_sides(if drop_over { [2.0, 2.0, 2.0, 2.0] } else { [0.0, 1.0, 1.0, 1.0] }, border)
+        .clip_rounded(0.0)
+        .on_key(move |s: &mut State, ev: &KeyEvent, tx: &mut Tx| key(s, p, ev, tx))
+        .on_press(move |s: &mut State| s.active = p)
+        // The mouse's side buttons go back and forward in the tab's history; over the "+"
+        // picker they do nothing, rather than reach the other pane.
+        .on_button(move |s: &mut State, button, _: &mut Tx| crate::side_button(s, p, button))
+        // While the folder loads (or a search runs), the arrow with the busy circle, as in
+        // Explorer: the pane still takes clicks. Buttons and fields keep their own pointers.
+        .cursor(if !is_picker && pane.loading { Cursor::Progress } else { Cursor::Default });
+
+    if is_picker {
+        card = card.child(new_tab_picker(s, k, p, layer));
+    } else {
+        card = card
+            .on_drop_files(move |s: &mut State, files: &[PathBuf], _| {
+                crate::autoscroll::left(&mut s.autoscroll, p);
+                dropped(s, p, files)
+            })
+            .on_drop_hover(move |s: &mut State, over, _| {
+                s.panes[p].drop_over = over;
+                if !over {
+                    crate::autoscroll::left(&mut s.autoscroll, p);
+                }
+            })
+            // Held near the top or bottom of the list or the tree, the drag scrolls it.
+            .on_drop_move(move |s: &mut State, at: rune::PointerEvent, tx: &mut Tx| {
+                crate::autoscroll::moved(&mut s.autoscroll, p, (at.window_x, at.window_y), tx.clock(), tx)
+            })
+            .child(navbar(s, k, p))
+            .child(pane_actions(s, k, p))
+            .child(search_bar(s, k, p))
+            .child({
+                let mut body = row().key("body").instant_changes().w_full().grow(1.0).min_h(0.0);
+                if s.show_tree[p] {
+                    body = body
+                        .child(tree(s, k, p))
+                        .child(
+                            splitter(k, "tree-split", 5.0, Split::Right, move |s: &mut State| &mut s.layout.tree[p], layout::TREE_W, clamp_tree)
+                                .child(el().w(1.0).h_full().fill(k.c.border_weak)),
+                        );
+                }
+                body.child(list(s, k, p))
+            })
+            .child(statusbar(s, k, p));
+    }
+
+    col()
+        .key(format!("pane-wrap-{p}"))
         .w(0.0)
         .grow(1.0)
         .h_full()
         .min_w(0.0)
+        .child(tab_strip(s, k, p, border))
+        .child(card)
+}
+
+/// Action strip directly beneath the navigation bar: toggle folder tree visibility and create
+/// a new folder in pane `p`.
+fn pane_actions(s: &State, k: &Kit, p: usize) -> El {
+    let tree_on = s.show_tree[p];
+    let tree_help = if tree_on {
+        t("Ocultar árvore", "Hide tree")
+    } else {
+        t("Exibir árvore", "Show tree")
+    };
+    let tree_bg = if tree_on {
+        k.alpha(k.c.text_accent, if k.dark { 0.22 } else { 0.14 })
+    } else {
+        Color::TRANSPARENT
+    };
+    let tree_hover = if tree_on {
+        k.alpha(k.c.text_accent, if k.dark { 0.30 } else { 0.20 })
+    } else {
+        k.c.hover
+    };
+    let tree_btn = row()
+        .key(format!("toggle-tree-{p}"))
+        .role("button")
+        .label(tree_help.to_string())
+        .help(tree_help.to_string())
+        .checked(tree_on)
+        .size(28.0, 24.0)
+        .center()
         .radius(k.radius.sm)
-        .fill(if pane.drop_over { k.alpha(k.c.text_accent, 0.06) } else { k.c.bg_base })
-        .border(if pane.drop_over { 2.0 } else { 1.0 }, border)
-        .clip_rounded(k.radius.sm)
-        .on_key(move |s: &mut State, ev: &KeyEvent, tx: &mut Tx| key(s, p, ev, tx))
-        .on_press(move |s: &mut State| s.active = p)
-        .on_button(move |s: &mut State, button, _: &mut Tx| crate::side_button(s, p, button))
-        // While the folder loads (or a search runs), the arrow with the busy circle, as in
-        // Explorer: the pane still takes clicks. Buttons and fields keep their own pointers.
-        .cursor(if pane.loading { Cursor::Progress } else { Cursor::Default })
-        .on_drop_files(move |s: &mut State, files: &[PathBuf], _| {
-            crate::autoscroll::left(&mut s.autoscroll, p);
-            dropped(s, p, files)
+        .fill(tree_bg)
+        .hover(tree_hover)
+        .press(k.c.pressed)
+        .cursor(Cursor::Pointer)
+        .on_press(move |s: &mut State| {
+            s.active = p;
+            s.show_tree[p] = !s.show_tree[p];
         })
-        .on_drop_hover(move |s: &mut State, over, _| {
-            s.panes[p].drop_over = over;
-            if !over {
-                crate::autoscroll::left(&mut s.autoscroll, p);
-            }
-        })
-        // Held near the top or bottom of the list or the tree, the drag scrolls it.
-        .on_drop_move(move |s: &mut State, at: rune::PointerEvent, tx: &mut Tx| {
-            crate::autoscroll::moved(&mut s.autoscroll, p, (at.window_x, at.window_y), tx.clock(), tx)
-        })
-        .child(navbar(s, k, p))
-        .child(search_bar(s, k, p))
-        .child(
-            row()
-                .key("body")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .child(tree(s, k, p))
-                .child(
-                    splitter(k, "tree-split", 5.0, Split::Right, move |s: &mut State| &mut s.layout.tree[p], layout::TREE_W, clamp_tree)
-                    .child(el().w(1.0).h_full().fill(k.c.border_weak)),
-                )
-                .child(list(s, k, p)),
-        )
-        .child(statusbar(s, k, p))
+        .child(icon(&icons::TOGGLE_TREE, 15.0).color(if tree_on { k.c.text_base } else { k.c.icon_muted }));
+
+    let can_new = actions::editable(&s.panes[p].loc);
+    let new_help = t("Nova pasta (Ctrl+Shift+N)", "New folder (Ctrl+Shift+N)");
+    let mut new_btn = row()
+        .key(format!("pane-new-folder-{p}"))
+        .role("button")
+        .label(new_help.to_string())
+        .help(new_help.to_string())
+        .size(28.0, 24.0)
+        .center()
+        .radius(k.radius.sm)
+        .child(icon(&icons::M_NEW_FOLDER, 15.0).color(if can_new { k.c.icon_base } else { k.c.icon_faint }));
+    if can_new {
+        new_btn = new_btn
+            .hover(k.c.hover)
+            .press(k.c.pressed)
+            .cursor(Cursor::Pointer)
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                s.active = p;
+                actions::ask_new_folder(s, p, tx);
+            });
+    }
+
+    row()
+        .key(format!("pane-actions-{p}"))
+        .w_full()
+        .h(30.0)
+        .px(8.0)
+        .gap(6.0)
+        .center_y()
+        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+        .child(tree_btn)
+        .child(new_btn)
 }
 
 /// A square icon button for the navigation bar.
@@ -4121,7 +4879,7 @@ fn path_bar(s: &State, k: &Kit, p: usize) -> El {
                 .on_press(move |s: &mut State| navigate(s, p, to.clone()))
                 .child(
                     text(c.label.clone())
-                        .font(if i == last { k.ty.text_small_medium } else { k.ty.text_small })
+                        .font(k.ty.text_small)
                         .color(if i == last { k.c.text_base } else { k.c.text_muted })
                         .truncate()
                         .shrink()
@@ -4360,6 +5118,7 @@ fn tree_line(s: &State, k: &Kit, p: usize, line: &crate::tree::Line) -> El {
         el().size(16.0, 16.0)
     };
     let (go, flip, here) = (node.clone(), node.clone(), line.key());
+    let (ctx_node, ctx_here) = (node.clone(), here.clone());
     let keyboard = s.tree.focused[p] && crate::tree::cursor(s, p) == Some(here.as_str());
     let mut item = row()
         .key(format!("t:{}", line.key()))
@@ -4391,9 +5150,14 @@ fn tree_line(s: &State, k: &Kit, p: usize, line: &crate::tree::Line) -> El {
             }
         })
         .on_double_press(move |s: &mut State| crate::tree::toggle(s, p, &flip))
+        .on_secondary_press(move |s: &mut State, at: rune::PointerPress, _: &mut Tx| {
+            s.active = p;
+            crate::tree::set_cursor(s, p, ctx_here.clone());
+            s.tree_menu = Some((p, (*ctx_node).clone(), open, empty, at));
+        })
         .child(arrow)
-        .child(row().gap(6.0).center_y().grow(1.0).min_w(0.0).child(shell_icon(s, node.icon.as_ref(), node.fallback, 16.0)).child(
-            text(node.label.clone()).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0).help_when_truncated(node.label.clone()),
+        .child(row().gap(6.0).center_y().child(shell_icon(s, node.icon.as_ref(), node.fallback, 16.0)).child(
+            text(node.label.clone()).font(k.ty.text_small).color(k.c.text_base),
         ))
 }
 
@@ -4406,25 +5170,50 @@ pub(crate) fn tree_key(p: usize) -> String {
     format!("tree-scroll-{p}")
 }
 
+/// Estimates the horizontal width needed to show every row in `lines` without clipping, so the
+/// tree's horizontal scroll bar appears whenever nested folders or long account names overflow.
+fn tree_content_width(lines: &[crate::tree::Line]) -> f32 {
+    let mut widest: f32 = 0.0;
+    for line in lines {
+        let w = match line {
+            crate::tree::Line::Heading(h) => 20.0 + h.chars().count() as f32 * 7.2,
+            crate::tree::Line::Note { depth, text, .. } => {
+                4.0 + (*depth as f32) * 16.0 + 22.0 + text.chars().count() as f32 * 7.0 + 16.0
+            }
+            crate::tree::Line::Node { depth, node, .. } => {
+                4.0 + (*depth as f32) * 16.0 + 16.0 + 4.0 + 16.0 + 6.0 + node.label.chars().count() as f32 * 8.0 + 20.0
+            }
+        };
+        if w > widest {
+            widest = w;
+        }
+    }
+    widest
+}
+
 /// The tree beside pane `p` (see [`crate::tree`]): only the rows in view are built, so a node
 /// with thousands of folders opens at once. It's one Tab stop that keeps the keyboard itself
 /// (its rows come and go as it scrolls), naming the row the keyboard is on for screen readers.
 fn tree(s: &State, k: &Kit, p: usize) -> El {
     let lines = std::rc::Rc::new(crate::tree::lines(s, p));
-    let (keys, kit, n) = (lines.clone(), k.clone(), lines.len());
     let bar = bar_style(k);
+    let strip = bar.strip();
+    let min_w = tree_content_width(&lines);
+    let (keys, kit, n) = (lines.clone(), k.clone(), lines.len());
     let rows = col()
         .key("tree")
         .w_full()
-        .pb(8.0)
-        .pr(bar.strip())
+        .min_w(min_w)
+        .pb(strip + 6.0)
         .growth(GrowthSpec::default())
         .virtual_rows(n, ROW_H, move |_: &State, i| Cow::Owned(format!("t:{}", keys[i].key())), move |s: &State, i| tree_line(s, &kit, p, &lines[i]))
         .virtual_rows_version((s.tree.version, s.panes[p].moves, s.accounts.len(), s.servers.list.len()));
     let at = crate::tree::cursor(s, p).map(|c| format!("t:{c}")).unwrap_or_default();
+    let tree_bg = k.alpha(k.c.text_base, if k.dark { 0.02 } else { 0.015 });
     // Opening or closing a node lands at once, as in Explorer, rather than sliding its rows.
+    let key = tree_key(p);
     let viewport = col()
-        .key(tree_key(p))
+        .key(key.clone())
         .role("tree")
         .label(t("Pastas", "Folders"))
         .focusable(true)
@@ -4433,12 +5222,21 @@ fn tree(s: &State, k: &Kit, p: usize) -> El {
         .active_descendant(at)
         .on_key(move |s: &mut State, ev: &KeyEvent, tx: &mut Tx| crate::tree::key(s, p, ev, tx))
         .instant_changes()
+        .w_full()
+        .h_full()
+        .scroll_xy()
+        .child(rows);
+    let viewport = s.edges[p].tree.on(viewport);
+    // Reserve `strip` on the right for the vertical scrollbar so scrolled folder names clip
+    // cleanly before the bar instead of bleeding behind it.
+    col()
+        .key(format!("tree-wrap-{p}"))
         .w(s.layout.tree[p])
         .h_full()
-        .fill(k.alpha(k.c.text_base, if k.dark { 0.02 } else { 0.015 }))
-        .scroll(ScrollSpec { stick_bottom: false })
-        .child(rows);
-    s.edges[p].tree.on(viewport).scroll_bar_styled(bar)
+        .pr(strip)
+        .fill(tree_bg)
+        .clip_rounded(0.0)
+        .child(with_scroll_bars(k, &key, viewport, bar.track_offset(0.0, -strip), false))
 }
 // ---------------------------------------------------------------------------------------------
 // File list
@@ -4473,6 +5271,183 @@ fn grip(k: &Kit, key: &str, edge: f32, height: f32, size: impl Fn(&mut State) ->
 /// viewport's end edge: what it scrolls leaves [`ScrollBarStyle::strip`] of room there.
 fn bar_style(k: &Kit) -> ScrollBarStyle {
     ScrollBarStyle::from_kit(k).thumb(k.alpha(k.c.text_base, 0.3)).thumb_hover(k.alpha(k.c.text_base, 0.5)).width(8.0).hover_width(10.0)
+}
+
+/// Live state for a horizontal scrollbar overlaid at the bottom of a `scroll_xy()` viewport,
+/// appearing automatically only when the content overflows horizontally (`max[0] > 0.5`).
+struct HBar {
+    pos: std::cell::Cell<rune::ScrollPos>,
+    hover: std::cell::Cell<bool>,
+    drag: std::cell::Cell<Option<(f32, f32)>>,
+    rest_color: std::cell::Cell<Color>,
+    hover_color: std::cell::Cell<Color>,
+    v_strip: std::cell::Cell<f32>,
+    track: rune::Live<[f32; 4]>,
+    thumb: rune::Live<[f32; 4]>,
+    fill: rune::Live<Color>,
+    opacity: rune::Live<f32>,
+}
+
+impl HBar {
+    const STRIP: f32 = 12.0;
+    const THUMB: f32 = 4.0;
+    const THUMB_HOVER: f32 = 6.0;
+    const EDGE: f32 = 3.0;
+    const INSET: f32 = 4.0;
+    const MIN_THUMB: f32 = 28.0;
+
+    fn metrics(&self, at: rune::ScrollPos) -> Option<(f32, f32, f32, f32)> {
+        if at.max[0] <= 0.5 {
+            return None;
+        }
+        let right_clear = if at.max[1] > 0.5 { self.v_strip.get() } else { 0.0 };
+        let track_len = (at.viewport[0] - right_clear - 2.0 * Self::INSET).max(0.0);
+        if track_len < Self::MIN_THUMB {
+            return None;
+        }
+        let thumb_w = (track_len * at.viewport[0] / (at.viewport[0] + at.max[0]).max(1.0))
+            .max(Self::MIN_THUMB)
+            .min(track_len);
+        let travel = (track_len - thumb_w).max(0.0);
+        let thumb_x = if at.max[0] > 0.0 { travel * (at.offset[0] / at.max[0]).clamp(0.0, 1.0) } else { 0.0 };
+        Some((track_len, thumb_x, thumb_w, travel))
+    }
+
+    fn sync(&self) {
+        let at = self.pos.get();
+        let active = self.hover.get() || self.drag.get().is_some();
+        self.fill.set(if active { self.hover_color.get() } else { self.rest_color.get() });
+        if let Some((track_len, thumb_x, thumb_w, _)) = self.metrics(at) {
+            let thick = if active { Self::THUMB_HOVER } else { Self::THUMB };
+            self.track.set([Self::INSET, (at.viewport[1] - Self::STRIP).max(0.0), track_len, Self::STRIP]);
+            self.thumb.set([thumb_x, Self::STRIP - Self::EDGE - thick, thumb_w, thick]);
+            self.opacity.set(1.0);
+        } else {
+            self.track.set([0.0; 4]);
+            self.thumb.set([0.0; 4]);
+            self.opacity.set(0.0);
+        }
+    }
+
+    fn follow(&self, at: rune::ScrollPos) {
+        self.pos.set(at);
+        self.sync();
+    }
+
+    fn on_drag(&self, target: &str, d: &mut Drag, tx: &mut Tx) {
+        tx.live_only();
+        let at = self.pos.get();
+        let Some((_, thumb_x, thumb_w, travel)) = self.metrics(at) else {
+            self.drag.set(None);
+            return;
+        };
+        match d.phase {
+            Phase::Down => {
+                // Click on thumb: grab it; click on track: jump thumb center to pointer.
+                let start_off = if d.x >= thumb_x && d.x <= thumb_x + thumb_w {
+                    at.offset[0]
+                } else if travel > 0.0 {
+                    let next = ((d.x - thumb_w * 0.5) / travel * at.max[0]).clamp(0.0, at.max[0]);
+                    tx.scroll_to_instant(target, next, at.offset[1]);
+                    next
+                } else {
+                    at.offset[0]
+                };
+                self.drag.set(Some((d.x, start_off)));
+                self.sync();
+            }
+            Phase::Move => {
+                if let Some((start_x, start_off)) = self.drag.get()
+                    && travel > 0.0
+                {
+                    let next = (start_off + (d.x - start_x) / travel * at.max[0]).clamp(0.0, at.max[0]);
+                    tx.scroll_to_instant(target, next, at.offset[1]);
+                }
+            }
+            Phase::Up => {
+                self.drag.set(None);
+                self.sync();
+            }
+        }
+    }
+}
+
+fn kept_hbar(key: &str) -> std::rc::Rc<HBar> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+    thread_local! {
+        static HBARS: RefCell<HashMap<(u64, String), Rc<HBar>>> = RefCell::new(HashMap::new());
+    }
+    let id = (rune::current_runtime_id(), key.to_owned());
+    HBARS.with(|bars| {
+        let mut bars = bars.borrow_mut();
+        if bars.len() >= 64 && !bars.contains_key(&id) {
+            bars.clear();
+        }
+        bars.entry(id)
+            .or_insert_with(|| {
+                Rc::new(HBar {
+                    pos: std::cell::Cell::new(rune::ScrollPos::default()),
+                    hover: std::cell::Cell::new(false),
+                    drag: std::cell::Cell::new(None),
+                    rest_color: std::cell::Cell::new(Color::TRANSPARENT),
+                    hover_color: std::cell::Cell::new(Color::TRANSPARENT),
+                    v_strip: std::cell::Cell::new(14.0),
+                    track: rune::Live::new([0.0; 4]),
+                    thumb: rune::Live::new([0.0; 4]),
+                    fill: rune::Live::new(Color::TRANSPARENT),
+                    opacity: rune::Live::new(0.0),
+                })
+            })
+            .clone()
+    })
+}
+
+/// Attaches both the vertical `rune-kit` scrollbar and an automatic bottom horizontal scrollbar
+/// (visible only when content overflows sideways) to a `scroll_xy()` viewport keyed `key`.
+/// When `v_overlaps` is true, the horizontal track leaves room on the right for the vertical bar.
+fn with_scroll_bars(k: &Kit, key: &str, viewport: El, v_bar: ScrollBarStyle, v_overlaps: bool) -> El {
+    let hbar = kept_hbar(key);
+    hbar.rest_color.set(k.alpha(k.c.text_base, 0.34));
+    hbar.hover_color.set(k.alpha(k.c.text_base, 0.56));
+    hbar.v_strip.set(if v_overlaps { v_bar.strip() } else { 0.0 });
+    hbar.sync();
+
+    let (watch, hover_bar, drag_bar) = (hbar.clone(), hbar.clone(), hbar.clone());
+    let target = key.to_owned();
+    let viewport = viewport.chain_scroll_offset(move |at| watch.follow(at)).scroll_bar_styled(v_bar);
+
+    let thumb = el()
+        .key("h-thumb")
+        .absolute(0.0, 0.0)
+        .live_rect(&hbar.thumb)
+        .radius(HBar::THUMB_HOVER / 2.0)
+        .live_fill(&hbar.fill);
+
+    let track = el()
+        .key(format!("h-bar-{key}"))
+        .absolute(0.0, 0.0)
+        .live_rect(&hbar.track)
+        .live_opacity(&hbar.opacity)
+        .cursor(Cursor::Pointer)
+        .a11y_hidden()
+        .on_hover_change_any(move |inside, tx| {
+            tx.live_only();
+            hover_bar.hover.set(inside);
+            hover_bar.sync();
+        })
+        .on_drag_any(move |d: &mut Drag, tx: &mut Tx| drag_bar.on_drag(&target, d, tx))
+        .child(thumb);
+
+    col()
+        .key(format!("xy-bars-{key}"))
+        .w_full()
+        .h_full()
+        .min_w(0.0)
+        .min_h(0.0)
+        .child(viewport)
+        .child(track)
 }
 
 /// The scroll view of pane `p`'s file list.
@@ -4709,6 +5684,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let scrolled = s.views[p].scroll.clone();
     let viewport = col()
         .key(list_key(p))
+        .instant_changes()
         .w_full()
         .h_full()
         .scroll_xy()
@@ -4729,8 +5705,9 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         })
         .child(table);
     // The bar runs below the header, which stays put, as Explorer's does.
-    let viewport = s.edges[p].list.on(viewport).scroll_bar_styled(bar);
-    col().key("list").w(0.0).grow(1.0).h_full().min_w(0.0).child(viewport)
+    let key = list_key(p);
+    let viewport = s.edges[p].list.on(viewport);
+    col().key("list").w(0.0).grow(1.0).h_full().min_w(0.0).child(with_scroll_bars(k, &key, viewport, bar, true))
 }
 
 // ---------------------------------------------------------------------------------------------
