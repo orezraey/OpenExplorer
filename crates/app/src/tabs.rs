@@ -191,10 +191,12 @@ fn stash_active(s: &mut State, p: usize) {
     }
 }
 
-/// Puts `text` in pane `p`'s search box as already seen, so it doesn't start a search, with
-/// `searched` as what it last searched.
+/// Puts `text` in pane `p`'s search box, with `searched` as what it last searched. Text already
+/// searched starts nothing; text typed but not searched yet (the tab was left within the typing
+/// pause) is due at once, and `poll` runs it at the start of the next frame.
 fn set_search(s: &mut State, p: usize, text: String, searched: String) {
-    s.typed[p] = (text.clone(), 0.0);
+    let due = if text != searched { f64::MIN_POSITIVE } else { 0.0 };
+    s.typed[p] = (text.clone(), due);
     s.searched[p] = searched;
     s.found_again[p] = 0.0;
     s.search[p] = rune::TextEdit::new(text);
@@ -504,6 +506,15 @@ mod tests {
         assert_eq!(s.search[0].text, "fotos");
         assert_eq!(s.typed[0], ("fotos".to_string(), 0.0));
         assert_eq!(s.searched[0], "fotos");
+
+        // Text typed and left within the typing pause is searched once its tab is back.
+        s.search[0] = rune::TextEdit::new("fotos 2024");
+        select_tab(&mut s, 0, 1);
+        assert_eq!(s.typed[0], (String::new(), 0.0));
+        select_tab(&mut s, 0, 0);
+        assert_eq!(s.search[0].text, "fotos 2024");
+        assert_eq!(s.searched[0], "fotos");
+        assert!(s.typed[0].0 == "fotos 2024" && s.typed[0].1 > 0.0, "due at once: {:?}", s.typed[0]);
     }
 
     #[test]
