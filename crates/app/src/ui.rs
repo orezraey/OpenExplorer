@@ -131,7 +131,8 @@ fn toggle_clear_completed(s: &mut State) {
 
 fn reset_settings(s: &mut State, tx: &mut Tx) {
     let was_hidden = s.settings.show_hidden;
-    s.settings = crate::settings::Settings::default();
+    // Where the window was isn't an option: it stays.
+    s.settings = crate::settings::Settings { window: s.settings.window, ..Default::default() };
     s.settings.save();
     s.settings.language.apply();
     let (sans, mono) = s.settings.font.families();

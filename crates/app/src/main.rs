@@ -43,6 +43,7 @@ mod undo;
 mod uploads;
 mod ui;
 mod watch;
+mod window_place;
 mod work;
 
 use std::collections::HashMap;
@@ -2574,7 +2575,17 @@ fn main() {
         // The app ends without returning from `run`: what the cloud accounts changed since their
         // trees and listings were last kept is kept here, so the next start has less to catch up on.
         .on_quit(|_, _| accounts::save_caches())
-        .on_close_request(|s, _| actions::close_requested(s));
+        .on_close_request(|s, _| actions::close_requested(s))
+        // It opens where it was closed, as Explorer's does.
+        .on_window(window_place::created)
+        .on_window_geometry(|_, _, _| {
+            window_place::resized();
+            false
+        })
+        .on_close(|s, _| window_place::remember(s));
+    if let Some(options) = window_place::options(initial.window) {
+        main_app = main_app.window_options(options).maximized(initial.window.is_some_and(|w| w.maximized));
+    }
 
     let (account_handle, _) = main_app.window(rune::windows::WindowSpec::from_app("add-account", account_app));
     let main_handle = main_app.handle();

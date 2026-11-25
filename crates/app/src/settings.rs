@@ -183,6 +183,8 @@ pub struct Settings {
     pub clear_completed: bool,
     /// Delete local files permanently (with confirmation) instead of sending them to Recycle Bin.
     pub skip_recycle_bin: bool,
+    /// Where the main window was when it last closed, to open there again.
+    pub window: Option<crate::window_place::Saved>,
 }
 
 impl Default for Settings {
@@ -200,6 +202,7 @@ impl Default for Settings {
             show_hidden: false,
             clear_completed: true,
             skip_recycle_bin: false,
+            window: None,
         }
     }
 }
