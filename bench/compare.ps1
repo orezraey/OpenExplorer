@@ -19,6 +19,9 @@ param(
     [int] $Runs = 5,
     # Give up on a run after this long, in seconds.
     [int] $Timeout = 180,
+    # Files Open Explorer moves at once each way while measured (Opções: Uploads and Downloads
+    # simultâneos): Air Explorer's free version moves 2.
+    [int] $AtOnce = 2,
     # Comma-separated (powershell -File passes a list as one word): openexplorer,airexplorer.
     [string] $Apps = 'openexplorer,airexplorer',
     # Only these measurements, comma-separated: system32,winsxs,drive-1000-folders,onedrive-5000-files,start,memory...
@@ -677,6 +680,18 @@ function Upload($ad, $win, $u) {
     $t
 }
 
+# Open Explorer's Opções, set to move `$AtOnce` files at once each way while it's measured; the
+# file as it was comes back at the end.
+$SettingsFile = Join-Path $Config 'settings.json'
+$SettingsBefore = if (Test-Path $SettingsFile) { [System.IO.File]::ReadAllText($SettingsFile) } else { $null }
+function Set-AtOnce {
+    if ($null -eq $SettingsBefore) { return }
+    $o = $SettingsBefore | ConvertFrom-Json
+    $o.uploads = $AtOnce
+    $o.downloads = $AtOnce
+    [System.IO.File]::WriteAllText($SettingsFile, ($o | ConvertTo-Json -Depth 8))
+}
+
 function Memory-Of($ad) {
     $root = Get-Process -Name $ad.Process | Select-Object -First 1
     $all = @(Get-CimInstance Win32_Process)
@@ -713,6 +728,7 @@ $results = [ordered]@{
         ram_gb = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
     }
     runs = $Runs
+    at_once = $AtOnce
     apps = [ordered]@{}
 }
 
@@ -720,6 +736,10 @@ foreach ($key in $AppList) {
     $ad = $Adapters[$key]
     # The other app closed: its window over this one's would take the clicks, and its keys.
     foreach ($other in $Adapters.Keys) { if ($other -ne $key) { Close-App $Adapters[$other] } }
+    if ($key -eq 'openexplorer') {
+        Close-App $ad
+        Set-AtOnce
+    }
     $dlCount = @($Downloads.Keys | Where-Object { Want $_ }).Count
     if ($dlCount) {
         Close-App $ad
@@ -854,6 +874,7 @@ foreach ($key in $AppList) {
 }
 
 foreach ($key in $AppList) { Close-App $Adapters[$key] }
+if ($null -ne $SettingsBefore) { [System.IO.File]::WriteAllText($SettingsFile, $SettingsBefore) }
 Get-ChildItem -LiteralPath $DownloadRoot -Directory -Filter 'dl-*' -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 # The uploads' Drive folders go for good, to give the account its room back.
 if (@($Uploads.Keys | Where-Object { Want $_ }).Count) { & $UploadTarget $Google.email clean | Out-Null }

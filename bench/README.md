@@ -17,6 +17,7 @@ Each measurement runs once untimed, then `-Runs` times (5 by default); the media
 | `<cloud>-1000-folders-uncached`, `<cloud>-5000-files-uncached` | a double click on the folder in `Open Explorer benchmark`, right after the app started with no listing kept from before | the pane shows every item |
 | `download-large` | the arrow between the panes that copies the Drive pane's selection (all of `transfer/large`: one 500 MiB file) into the other pane's empty local folder | the file is on disk whole and no program still writes it |
 | `download-100-folders` | the same, for `100 folders` (100 empty folders) | all 100 folders are on disk |
+| `upload-large`, `upload-100-files` | the arrow that copies the left pane's selection (all of `C:\OEBench\up\large`, one file of 100 MiB, or `up\small`, 100 of 512 KiB, made once with random bytes) into an empty Drive folder under `Open Explorer benchmark/uploads` | Drive holds every file (asked every 200 ms by the `upload_target` example; Drive shows a file only once its upload finished) |
 | `memory` | 10 s idle after a start, then after opening the Drive folder | private bytes and working set of the app's processes |
 
 `<cloud>` is `drive` (Google Drive), `onedrive`, `dropbox` or `mega`: each cloud whose account
@@ -59,9 +60,16 @@ keeps on disk (`%LOCALAPPDATA%\OpenExplorer`: `cache` for Google Drive, and a fo
 Air Explorer keeps none. They open the folder with a double click, as a person would: through its
 address bar Air Explorer took about 40 s for a OneDrive folder it hadn't listed yet.
 
+Each download goes to a folder of its own (`C:\OEBench\dl-*`) and each upload to a Drive folder
+of its own (`Open Explorer benchmark/uploads/up-*`), all made before each app starts: Air
+Explorer doesn't see a folder made after it listed the one holding it. Nothing is emptied while
+an app may still write to it; the folders go at the end, the Drive ones for good. The other app
+is closed while one is measured, so its window can't take the clicks. Run one copy of the
+script at a time.
+
 Air Explorer keeps unfinished transfers and resumes them at its next start: if a run is cut short
 while it copies, cancel what's left in its queue (select the rows, Shift+End, right click,
-Cancelar) before running again, or it fills the download folder.
+Cancelar) before running again.
 
 `uia-dump.ps1` (an app's UI Automation tree) and `list-count.ps1` (Air Explorer's list counts) are
 the read-only tools the script was written with. The examples `drive_ls` (a Drive folder's
