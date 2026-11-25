@@ -67,7 +67,21 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .on_button(|s: &mut State, button, _: &mut Tx| crate::side_button_in_window(s, button))
         // Hover lands and leaves with the pointer, as in the system's file lists: the default
         // 100 ms fade on leaving left a trail of lit rows behind a fast pointer.
-        .hover_motion_within(Anim::INSTANT, Anim::INSTANT);
+        .hover_motion_within(Anim::INSTANT, Anim::INSTANT)
+        .on_key(|s: &mut State, ev: &KeyEvent, _: &mut Tx| {
+            if ev.key == rune::Key::Function(5) {
+                match s.main_tab {
+                    MainTab::Explore => {
+                        if !s.tabs[s.active].is_picker() {
+                            refresh(s, s.active);
+                        }
+                    }
+                    MainTab::Accounts => crate::refresh_all_quotas(s),
+                }
+                return true;
+            }
+            false
+        });
     rune_kit::root(body, layer)
 }
 
@@ -1673,7 +1687,21 @@ pub fn account_window_view(s: &State, cx: &mut Cx<State>) -> El {
         .fill(window_bg)
         .child(titlebar)
         .child(content)
-        .hover_motion_within(Anim::INSTANT, Anim::INSTANT);
+        .hover_motion_within(Anim::INSTANT, Anim::INSTANT)
+        .on_key(|s: &mut State, ev: &KeyEvent, _: &mut Tx| {
+            if ev.key == rune::Key::Function(5) {
+                match s.main_tab {
+                    MainTab::Explore => {
+                        if !s.tabs[s.active].is_picker() {
+                            refresh(s, s.active);
+                        }
+                    }
+                    MainTab::Accounts => crate::refresh_all_quotas(s),
+                }
+                return true;
+            }
+            false
+        });
 
     rune_kit::root(root, layer)
 }
@@ -3240,8 +3268,8 @@ fn toolbar(s: &State, k: &Kit) -> El {
     };
 
     let refresh_help = match s.main_tab {
-        MainTab::Explore => t("Recarregar a pasta atual", "Reload the current folder"),
-        MainTab::Accounts => t("Atualizar o espaço utilizado nas contas", "Refresh storage usage across accounts"),
+        MainTab::Explore => t("Recarregar a pasta atual (F5)", "Reload the current folder (F5)"),
+        MainTab::Accounts => t("Atualizar o espaço utilizado nas contas (F5)", "Refresh storage usage across accounts (F5)"),
     };
 
     row()

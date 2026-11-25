@@ -1707,6 +1707,11 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             actions::edit_address(s, p);
             return true;
         }
+        // F5 reloads the focused pane's current folder, as in Explorer.
+        Key::Function(5) => {
+            refresh(s, p);
+            return true;
+        }
         _ if ev.is_command('l') => {
             actions::edit_address(s, p);
             return true;
