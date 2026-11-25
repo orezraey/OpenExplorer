@@ -1569,6 +1569,8 @@ pub enum PropUpdate {
 /// The open Propriedades: what it shows and what's still being worked out.
 pub struct Props {
     pub pane: usize,
+    /// The folder the items are in: the pane's, or a tree folder's parent.
+    pub loc: Location,
     pub items: Vec<Entry>,
     pub tab: PropTab,
     /// Numbers this dialog, so answers meant for one closed since are dropped.
@@ -1600,14 +1602,13 @@ impl Props {
     }
 
     /// Whether the name field renames: one item, somewhere names can change.
-    pub fn renamable(&self, s: &State) -> bool {
-        let loc = &s.panes[self.pane].loc;
-        self.single().is_some() && items_editable(loc) && !holds_a_share(loc, &self.items)
+    pub fn renamable(&self) -> bool {
+        self.single().is_some() && items_editable(&self.loc) && !holds_a_share(&self.loc, &self.items)
     }
 
     /// The Histórico de versões tab is for one Drive file (folders have no versions).
-    pub fn has_versions(&self, s: &State) -> bool {
-        matches!(s.panes[self.pane].loc, Location::Drive { .. }) && self.single().is_some_and(|e| !e.is_dir)
+    pub fn has_versions(&self) -> bool {
+        matches!(self.loc, Location::Drive { .. }) && self.single().is_some_and(|e| !e.is_dir)
     }
 }
 
@@ -1680,6 +1681,7 @@ pub fn properties_of(s: &mut State, p: usize, loc: Location, items: Vec<Entry>) 
     let listed_bytes = items.iter().filter_map(|e| e.size).sum();
     s.dialog = Some(Dialog::Properties(Box::new(Props {
         pane: p,
+        loc,
         kind,
         listed_bytes,
         items,
@@ -1720,9 +1722,10 @@ pub fn props_tab(s: &mut State, tab: PropTab) {
         return;
     }
     p.revisions_asked = true;
-    let (id, pane) = (p.id, p.pane);
+    let id = p.id;
     let Some(item_id) = p.single().map(|e| e.id.clone()) else { return };
-    let Some(email) = account(&s.panes[pane].loc) else { return };
+    let Some(email) = account(&p.loc).map(str::to_string) else { return };
+    let email = email.as_str();
     drive_task(s, email, t("ler as versões", "read the versions"), move |d| d.revisions(&item_id), move |r| Msg::Prop { id, update: PropUpdate::Revisions(r) });
 }
 
@@ -1738,17 +1741,17 @@ pub fn props_md5(s: &mut State) {
 /// OK: renames when the name was changed, then closes.
 pub fn props_ok(s: &mut State) {
     let Some(Dialog::Properties(p)) = &s.dialog else { return };
-    let rename = p.renamable(s).then(|| (p.pane, p.single().cloned())).and_then(|(pane, e)| e.map(|e| (pane, e)));
+    let rename = p.renamable().then(|| (p.pane, p.loc.clone(), p.single().cloned())).and_then(|(pane, loc, e)| e.map(|e| (pane, loc, e)));
     let name = s.name_edit.text.trim().to_string();
-    if let Some((pane, item)) = rename
+    if let Some((pane, loc, item)) = rename
         && name != shown(&item.name)
     {
-        if let Some(why) = name_problem(&s.panes[pane].loc, &name) {
+        if let Some(why) = name_problem(&loc, &name) {
             s.status = why;
             return;
         }
         close_properties(s);
-        apply_name(s, pane, Some(item), name);
+        apply_name_in(s, pane, loc, Some(item), name);
         return;
     }
     close_properties(s);

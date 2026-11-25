@@ -2891,9 +2891,8 @@ fn prop_tab(k: &Kit, label: &str, tab: actions::PropTab, on: bool) -> El {
 }
 
 /// Where an item is, in words: the folder's full path on disk, or its place in Drive.
-fn place_of(s: &State, p: &actions::Props) -> String {
-    let pane = &s.panes[p.pane];
-    match (&pane.loc, p.single()) {
+fn place_of(p: &actions::Props) -> String {
+    match (&p.loc, p.single()) {
         (loc @ (Location::Local(_) | Location::Found(_)), Some(e)) => loc.local_path(e).map(|p| p.display().to_string()).unwrap_or_default(),
         (Location::Local(dir), None) => dir.display().to_string(),
         (Location::Found(f), None) => tr!("Resultados de “{}” em {}", "Results for “{}” in {}", f.text, f.place),
@@ -2913,7 +2912,7 @@ fn place_of(s: &State, p: &actions::Props) -> String {
 
 fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
     use actions::PropTab;
-    let loc = &s.panes[p.pane].loc;
+    let loc = &p.loc;
     let drive = match loc {
         Location::Drive { email, .. } => Some(email.clone()),
         _ => None,
@@ -2926,13 +2925,12 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
     let muted = |t: &str| text(t.to_string()).font(k.ty.text_small).color(k.c.text_muted);
 
     // Header: the item's icon and its name, which renames on OK.
-    let loc = &s.panes[p.pane].loc;
     let (glyph, title) = match p.single() {
         Some(e) => (entry_icon(s, loc, e, 40.0), shown(&e.name)),
         None if p.items.iter().all(|e| e.is_dir) => (shell_icon(s, Some(&IconKey::Folder), &icons::FOLDER, 40.0), tr!("{} itens", "{} items", ui_count(p.items.len()))),
         None => (icon(&icons::FILE, 40.0), tr!("{} itens", "{} items", ui_count(p.items.len()))),
     };
-    let editable_name = p.renamable(s);
+    let editable_name = p.renamable();
     let name: El = if editable_name {
         rune::text_input(&s.name_edit, k.ty.text_small)
             .single_line()
@@ -2965,7 +2963,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
         PropTab::Details,
         p.tab == PropTab::Details,
     ));
-    if p.has_versions(s) {
+    if p.has_versions() {
         tabs = tabs.child(prop_tab(k, t("Histórico de versões", "Version history"), PropTab::Versions, p.tab == PropTab::Versions));
     }
 
@@ -2985,7 +2983,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
             }
             body = body.child(prop_sep(k));
             // Where and how big.
-            body = body.child(prop_text(k, t("Caminho", "Path"), place_of(s, p)));
+            body = body.child(prop_text(k, t("Caminho", "Path"), place_of(p)));
             let size = match (p.single(), &p.totals) {
                 (_, Some(t)) => format_bytes(t.bytes),
                 (Some(e), None) if !e.is_dir => e.size.map(format_bytes).unwrap_or_else(|| "—".into()),
@@ -3026,7 +3024,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
                         (None, None) => match drive_md5 {
                             Some(h) => mono(h),
                             None if google_format => muted(t("— (formato do Google, sem arquivo binário)", "— (Google format, no binary file)")),
-                            None if details.is_none() && p.details.is_none() && matches!(s.panes[p.pane].loc, Location::Drive { .. }) => muted(t("Carregando…", "Loading…")),
+                            None if details.is_none() && p.details.is_none() && matches!(p.loc, Location::Drive { .. }) => muted(t("Carregando…", "Loading…")),
                             None => muted("—"),
                         },
                     };
