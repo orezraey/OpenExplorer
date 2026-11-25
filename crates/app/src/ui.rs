@@ -1702,21 +1702,7 @@ pub fn account_window_view(s: &State, cx: &mut Cx<State>) -> El {
         .fill(window_bg)
         .child(titlebar)
         .child(content)
-        .hover_motion_within(Anim::INSTANT, Anim::INSTANT)
-        .on_key(|s: &mut State, ev: &KeyEvent, _: &mut Tx| {
-            if ev.key == rune::Key::Function(5) {
-                match s.main_tab {
-                    MainTab::Explore => {
-                        if !s.tabs[s.active].is_picker() {
-                            refresh(s, s.active);
-                        }
-                    }
-                    MainTab::Accounts => crate::refresh_all_quotas(s),
-                }
-                return true;
-            }
-            false
-        });
+        .hover_motion_within(Anim::INSTANT, Anim::INSTANT);
 
     rune_kit::root(root, layer)
 }
