@@ -154,6 +154,9 @@ struct State {
     /// selection and the menu the keyboard opens.
     views: [lasso::Viewport; 2],
     dialog: Option<actions::Dialog>,
+    /// The window was asked to close while transfers ran: Fechar o Open Explorer? shows over
+    /// everything, the dialog under it untouched (see [`actions::close_requested`]).
+    quit_asked: bool,
     /// Uploads whose clash dialog waits for the one open (or another dialog) to close.
     clash_waiting: std::collections::VecDeque<actions::ClashAsk>,
     /// The name typed in Renomear or Nova pasta, or the e-mail typed in Compartilhar.
@@ -291,6 +294,7 @@ impl State {
             lasso: None,
             views: Default::default(),
             dialog: None,
+            quit_asked: false,
             clash_waiting: Default::default(),
             name_edit: rune::TextEdit::new(""),
             renaming: None,
@@ -491,6 +495,7 @@ fn init() -> State {
         lasso: None,
         views: Default::default(),
         dialog: None,
+        quit_asked: false,
         clash_waiting: Default::default(),
         name_edit: rune::TextEdit::new(""),
         renaming: None,
@@ -766,6 +771,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     let live = s.transfers.iter().filter(|t| !t.progress.over()).count();
     changed |= live > 0 || live != s.transfers_live || s.transfers.len() != rows;
     s.transfers_live = live;
+    changed |= actions::quit_question_done(s);
     while let Ok(msg) = s.inbox.try_recv() {
         changed = true;
         match msg {
@@ -2567,7 +2573,8 @@ fn main() {
         })
         // The app ends without returning from `run`: what the cloud accounts changed since their
         // trees and listings were last kept is kept here, so the next start has less to catch up on.
-        .on_quit(|_, _| accounts::save_caches());
+        .on_quit(|_, _| accounts::save_caches())
+        .on_close_request(|s, _| actions::close_requested(s));
 
     let (account_handle, _) = main_app.window(rune::windows::WindowSpec::from_app("add-account", account_app));
     let main_handle = main_app.handle();
@@ -2659,6 +2666,34 @@ mod tests {
         assert!(s.account_form.is_some() && s.account_closes == 0);
         s.account_window_closed();
         assert!(s.account_form.is_none());
+    }
+
+    /// Closing the window asks only while a transfer runs, over the dialog open, which stays;
+    /// a second close goes through and stops the transfers, and the question goes away by
+    /// itself once they end.
+    #[test]
+    fn closing_asks_only_while_transfers_run() {
+        let mut s = init();
+        assert_eq!(actions::close_requested(&mut s), rune::CloseResponse::Close);
+        let end = || transfers::End::local(std::path::Path::new(r"C:\x"));
+        let batch = transfers::queue(&mut s.transfers, None, transfers::Op::Copy, [(end(), end())]);
+        s.dialog = Some(actions::Dialog::EmptyTrash { email: "ana@gmail.com".into() });
+        assert_eq!(actions::close_requested(&mut s), rune::CloseResponse::Defer);
+        assert!(s.quit_asked && matches!(s.dialog, Some(actions::Dialog::EmptyTrash { .. })));
+        assert!(!actions::quit_question_done(&mut s) && s.quit_asked);
+        actions::keep_running(&mut s);
+        assert!(!s.quit_asked && matches!(s.dialog, Some(actions::Dialog::EmptyTrash { .. })));
+
+        assert_eq!(actions::close_requested(&mut s), rune::CloseResponse::Defer);
+        assert_eq!(actions::close_requested(&mut s), rune::CloseResponse::Close);
+        assert!(!s.quit_asked && !actions::transfers_running(&s));
+        drop(batch);
+
+        let other = transfers::queue(&mut s.transfers, None, transfers::Op::Copy, [(end(), end())]);
+        assert_eq!(actions::close_requested(&mut s), rune::CloseResponse::Defer);
+        drop(other);
+        assert!(actions::quit_question_done(&mut s) && !s.quit_asked);
+        assert_eq!(actions::close_requested(&mut s), rune::CloseResponse::Close);
     }
 
     /// The mouse's side buttons step through a pane's history as Voltar and Avançar do; the

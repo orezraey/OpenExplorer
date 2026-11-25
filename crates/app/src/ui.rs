@@ -33,6 +33,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     // the very first frame they open.
     let window_h = s.dialog.is_some().then(|| cx.layout_with("window", |r| r[3])).flatten();
     dialog(s, &k, window_h, &mut layer);
+    quit_question(s, &k, &mut layer);
     // What the last action said, for a few seconds at the bottom right.
     if !s.status.is_empty() && s.now < s.status_until {
         let close = |s: &mut State| s.status_until = 0.0;
@@ -1279,6 +1280,42 @@ fn actions_row(k: &Kit, cancel: &str, act: Button) -> El {
         .justify_end()
         .child(Button::new(cancel).variant(ButtonVariant::Neutral).on_press(close).build(k).cursor(Cursor::Pointer))
         .child(act.build(k).default_button().cursor(Cursor::Pointer))
+}
+
+/// Fechar o Open Explorer?, while transfers run (see [`actions::close_requested`]): over any
+/// dialog open, which stays as it was.
+fn quit_question(s: &State, k: &Kit, layer: &mut Vec<El>) {
+    if !s.quit_asked {
+        return;
+    }
+    let pad = |e: El| col().key("content").w_full().px(16.0).pb(16.0).child(e);
+    let note = match s.transfers.iter().filter(|t| !t.progress.over()).count() {
+        1 => t(
+            "Uma transferência ainda está em andamento. Se fechar agora, ela será cancelada.",
+            "A transfer is still in progress. If you close now, it will be cancelled.",
+        )
+        .to_string(),
+        n => tr!(
+            "{} transferências ainda estão em andamento. Se fechar agora, elas serão canceladas.",
+            "{} transfers are still in progress. If you close now, they will be cancelled.",
+            ui_count(n)
+        ),
+    };
+    let body = col()
+        .w_full()
+        .gap(12.0)
+        .child(text(note).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
+        .child(
+            row()
+                .key("actions")
+                .w_full()
+                .pt(16.0)
+                .gap(8.0)
+                .justify_end()
+                .child(Button::new(t("Continuar transferindo", "Keep transferring")).variant(ButtonVariant::Neutral).on_press(actions::keep_running).build(k).default_button().cursor(Cursor::Pointer))
+                .child(Button::new(t("Fechar mesmo assim", "Close anyway")).variant(ButtonVariant::Danger).on_press_tx(actions::quit_anyway).build(k).cursor(Cursor::Pointer)),
+        );
+    Modal::new("quit", t("Fechar o Open Explorer?", "Close Open Explorer?")).open(true).child(pad(body)).width(460.0).fit().on_close(actions::keep_running).build(k, layer);
 }
 
 fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {

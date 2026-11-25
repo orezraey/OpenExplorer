@@ -69,6 +69,52 @@ pub enum Dialog {
     B2Unfinished(Box<crate::b2::Unfinished>),
 }
 
+/// The main window's close button, Alt+F4 or the taskbar's Fechar janela: with transfers still
+/// running it asks first (`State::quit_asked`), as closing would cut them off. Pressed again
+/// while it asks, it closes as Fechar mesmo assim does.
+pub fn close_requested(s: &mut State) -> rune::CloseResponse {
+    if s.is_placeholder {
+        return rune::CloseResponse::Close;
+    }
+    if std::mem::take(&mut s.quit_asked) {
+        cancel_all_transfers(s);
+        return rune::CloseResponse::Close;
+    }
+    if !transfers_running(s) {
+        return rune::CloseResponse::Close;
+    }
+    s.quit_asked = true;
+    rune::CloseResponse::Defer
+}
+
+/// Whether any row of the queue is still waiting or running.
+pub fn transfers_running(s: &State) -> bool {
+    s.transfers.iter().any(|t| !t.progress.over())
+}
+
+/// The transfers ended while Fechar o Open Explorer? asked: nothing is left to lose, so the
+/// question goes. Whether it went.
+pub fn quit_question_done(s: &mut State) -> bool {
+    if !s.quit_asked || transfers_running(s) {
+        return false;
+    }
+    s.quit_asked = false;
+    true
+}
+
+/// Continuar transferindo: the window stays, and so does any dialog the question covered.
+pub fn keep_running(s: &mut State) {
+    s.quit_asked = false;
+}
+
+/// Fechar mesmo assim: the transfers are told to stop, and the window closes (a close the app
+/// asks for doesn't ask again).
+pub fn quit_anyway(s: &mut State, tx: &mut Tx) {
+    cancel_all_transfers(s);
+    s.quit_asked = false;
+    tx.close_window();
+}
+
 pub fn selected(s: &State, p: usize) -> Vec<Entry> {
     let pane = &s.panes[p];
     pane.entries.iter().filter(|e| pane.selected.contains(&e.id)).cloned().collect()
