@@ -31,7 +31,13 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(icon(&icons::TAB_EXPLORE, 15.0).color(k.c.text_accent))
         .child(text("Open Explorer").font(k.ty.text_small).color(k.c.text_base));
     // Under Mica (Opções, Experimental) the title bar lets the backdrop through, as the page does.
-    let backdrop = cx.window_backdrop().is_active();
+    // Turned off in Opções, the view paints the window's own background at once, and Mica leaves
+    // once that has faded in (see `poll`).
+    let active = cx.window_backdrop().is_active();
+    if active {
+        crate::MICA_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let backdrop = active && s.settings.mica;
     let titlebar = rune_kit::WindowTitlebar::from_insets(cx.chrome_insets())
         .key("main-titlebar")
         .leading_padding(12.0)
@@ -47,7 +53,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     // The window's height, so Opções and Registrar conta always fit inside short windows from
     // the very first frame they open.
     let window_h = s.dialog.is_some().then(|| cx.layout_with("window", |r| r[3])).flatten();
-    dialog(s, &k, window_h, &mut layer);
+    dialog(s, &k, window_h, backdrop, &mut layer);
     quit_question(s, &k, &mut layer);
     // What the last action said, for a few seconds at the bottom right.
     if !s.status.is_empty() && s.now < s.status_until {
@@ -61,7 +67,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         layer.push(ToastRegion::new().toast(toast.build(&k).live_region(LiveRegion::Off)).build(&k));
     }
     let main_content = match s.main_tab {
-        MainTab::Explore => panes(s, &k, &mut layer),
+        MainTab::Explore => panes(s, &k, backdrop, &mut layer),
         MainTab::Accounts => accounts_hub(s, &k),
     };
     let body = col()
@@ -201,7 +207,7 @@ fn options_height(window_h: Option<f32>) -> f32 {
     window_h.map_or(530.0, |h| (h - 2.0 * 16.0 - 48.0).clamp(240.0, 530.0))
 }
 
-fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window_h: Option<f32>, layer: &mut Vec<El>) {
+fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window_h: Option<f32>, backdrop: bool, layer: &mut Vec<El>) {
     use crate::settings::{OptionsTab, Settings, TextFont, TextRender, Theme, at_once};
     let st = s.settings;
 
@@ -566,6 +572,33 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                     "This system uses native vector smoothing on the GPU (DirectWrite and ClearType are only available on Windows).",
                 )
             };
+            // Whether Mica shows now: Windows takes it only on some systems (Windows 11 22H2 or
+            // later, a GPU drawing through DirectComposition), and Rune turns it off quietly when
+            // it can't, so the row says so.
+            let started_with_mica = crate::STARTED_WITH_MICA.load(std::sync::atomic::Ordering::Relaxed);
+            // Turned back on, Mica takes a frame or two to come: not a refusal once Windows has
+            // shown it in this window.
+            let seen = crate::MICA_SEEN.load(std::sync::atomic::Ordering::Relaxed);
+            let (mica_badge, mica_note) = match (st.mica, started_with_mica, backdrop) {
+                (true, _, true) => (Some((t("Ativo", "On"), rune_kit::BadgeVariant::Accent)), None),
+                (true, false, _) if cfg!(windows) => (Some((t("Reinicie para aplicar", "Restart to apply"), rune_kit::BadgeVariant::Neutral)), None),
+                (true, true, false) if !seen => (
+                    Some((t("Não aceito pelo Windows", "Not accepted by Windows"), rune_kit::BadgeVariant::Subtle)),
+                    Some(t(
+                        " Nesta janela o Windows não ativou o Mica: ele pede o Windows 11 22H2 ou mais novo e a placa de vídeo desenhando pelo DirectComposition, e o Open Explorer mostra o fundo de sempre.",
+                        " Windows didn't turn Mica on for this window: it needs Windows 11 22H2 or later and the GPU drawing through DirectComposition, so Open Explorer shows its usual background.",
+                    )),
+                ),
+                _ => (None, None),
+            };
+            let mica_desc = format!(
+                "{}{}",
+                t(
+                    "O material Mica, tingido pelo papel de parede, aparece em volta dos painéis enquanto a janela está em primeiro plano. Desligar vale na hora; ligar, ao reiniciar o Open Explorer.",
+                    "The Mica material, tinted by the wallpaper, shows around the panes while the window is in front. Turning it off takes effect at once; turning it on, once Open Explorer restarts.",
+                ),
+                mica_note.unwrap_or_default()
+            );
             let exp_card = card_box("card-experimental")
                 .child(control_row(
                     "row-render",
@@ -577,11 +610,8 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .child(switch_row(
                     "opt-mica",
                     t("Fundo Mica do Windows 11", "Windows 11 Mica background"),
-                    t(
-                        "O material Mica, tingido pelo papel de parede, aparece em volta dos painéis enquanto a janela está em primeiro plano. Vale ao abrir o Open Explorer de novo.",
-                        "The Mica material, tinted by the wallpaper, shows around the panes while the window is in front. Takes effect the next time Open Explorer opens.",
-                    ),
-                    None,
+                    &mica_desc,
+                    mica_badge,
                     st.mica,
                     |s| change_settings(s, |c| c.mica = !c.mica),
                 ))
@@ -847,6 +877,13 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
         .border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_weak)
         .child(el().size(6.0, 6.0).radius(3.0).fill(k.c.success.fg))
         .child(text(t("Alterações salvas automaticamente", "Changes are saved automatically")).font(k.ty.caption()).color(k.c.text_faint).grow(1.0))
+        // Reiniciar, while a setting waits for a new window: Mica turned on in a window made
+        // without it.
+        .child(if s.settings.mica && cfg!(windows) && !crate::STARTED_WITH_MICA.load(std::sync::atomic::Ordering::Relaxed) {
+            Button::new(t("Reiniciar", "Restart")).variant(ButtonVariant::Neutral).on_press_tx(actions::restart).build(k).cursor(Cursor::Pointer)
+        } else {
+            el()
+        })
         .child(Button::new(t("Concluído", "Done")).variant(ButtonVariant::Submit).on_press(close).build(k).cursor(Cursor::Pointer).default_button());
 
     let right_col = col().key("opt-right").grow(1.0).w(0.0).h_full().min_w(0.0).child(main_scroll).child(footer);
@@ -1436,17 +1473,34 @@ fn quit_question(s: &State, k: &Kit, layer: &mut Vec<El>) {
         return;
     }
     let pad = |e: El| col().key("content").w_full().px(16.0).pb(16.0).child(e);
-    let note = match s.transfers.iter().filter(|t| !t.progress.over()).count() {
-        1 => t(
+    // Reiniciar asks the same question in its own words.
+    let restart = actions::restarting();
+    let note = match (s.transfers.iter().filter(|t| !t.progress.over()).count(), restart) {
+        (1, false) => t(
             "Uma transferência ainda está em andamento. Se fechar agora, ela será cancelada.",
             "A transfer is still in progress. If you close now, it will be cancelled.",
         )
         .to_string(),
-        n => tr!(
+        (1, true) => t(
+            "Uma transferência ainda está em andamento. Se reiniciar agora, ela será cancelada.",
+            "A transfer is still in progress. If you restart now, it will be cancelled.",
+        )
+        .to_string(),
+        (n, false) => tr!(
             "{} transferências ainda estão em andamento. Se fechar agora, elas serão canceladas.",
             "{} transfers are still in progress. If you close now, they will be cancelled.",
             ui_count(n)
         ),
+        (n, true) => tr!(
+            "{} transferências ainda estão em andamento. Se reiniciar agora, elas serão canceladas.",
+            "{} transfers are still in progress. If you restart now, they will be cancelled.",
+            ui_count(n)
+        ),
+    };
+    let (title, go) = if restart {
+        (t("Reiniciar o Open Explorer?", "Restart Open Explorer?"), t("Reiniciar mesmo assim", "Restart anyway"))
+    } else {
+        (t("Fechar o Open Explorer?", "Close Open Explorer?"), t("Fechar mesmo assim", "Close anyway"))
     };
     let body = col()
         .w_full()
@@ -1460,12 +1514,13 @@ fn quit_question(s: &State, k: &Kit, layer: &mut Vec<El>) {
                 .gap(8.0)
                 .justify_end()
                 .child(Button::new(t("Continuar transferindo", "Keep transferring")).variant(ButtonVariant::Neutral).on_press(actions::keep_running).build(k).default_button().cursor(Cursor::Pointer))
-                .child(Button::new(t("Fechar mesmo assim", "Close anyway")).variant(ButtonVariant::Danger).on_press_tx(actions::quit_anyway).build(k).cursor(Cursor::Pointer)),
+                .child(Button::new(go).variant(ButtonVariant::Danger).on_press_tx(actions::quit_anyway).build(k).cursor(Cursor::Pointer)),
         );
-    Modal::new("quit", t("Fechar o Open Explorer?", "Close Open Explorer?")).open(true).child(pad(body)).width(460.0).fit().on_close(actions::keep_running).build(k, layer);
+    Modal::new("quit", title).open(true).child(pad(body)).width(460.0).fit().on_close(actions::keep_running).build(k, layer);
 }
 
-fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
+/// `backdrop`: Windows shows Mica behind the main window now.
+fn dialog(s: &State, k: &Kit, window_h: Option<f32>, backdrop: bool, layer: &mut Vec<El>) {
     let Some(d) = &s.dialog else { return };
     let pad = |e: El| col().key("content").w_full().px(16.0).pb(16.0).child(e);
     match d {
@@ -1621,7 +1676,7 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
             Modal::new("name", modal_title).open(true).child(pad(body)).width(420.0).fit().on_close(close).build(k, layer);
         }
         Dialog::Properties(p) => props_dialog(s, k, p, layer),
-        Dialog::Options(opt) => options_dialog(s, k, opt, window_h, layer),
+        Dialog::Options(opt) => options_dialog(s, k, opt, window_h, backdrop, layer),
         Dialog::Clash(ask) => clash_dialog(s, k, ask, layer),
         Dialog::Share(sh) => crate::sharing::share_dialog(s, k, sh, layer),
         Dialog::MakePublic(m) => crate::sharing::public_dialog(k, m, layer),
@@ -4096,16 +4151,17 @@ fn splitter(k: &Kit, key: &str, thick: f32, way: Split, size: impl Fn(&mut State
 }
 
 /// The two panes, side by side in equal halves.
-fn panes(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
+/// `backdrop`: Mica shows behind the window (Opções, Experimental).
+fn panes(s: &State, k: &Kit, backdrop: bool, layer: &mut Vec<El>) -> El {
     row()
         .key("panes")
         .w_full()
         .grow(1.0)
         .min_h(160.0)
         .padding(6.0)
-        .child(pane(s, k, 0, layer))
+        .child(pane(s, k, 0, backdrop, layer))
         .child(gutter(s, k))
-        .child(pane(s, k, 1, layer))
+        .child(pane(s, k, 1, backdrop, layer))
 }
 
 /// The strip between the panes, as in Air Explorer: the window's own background, empty but
@@ -4649,7 +4705,7 @@ fn new_tab_picker(s: &State, k: &Kit, p: usize, layer: &mut Vec<El>) -> El {
     content
 }
 
-fn pane(s: &State, k: &Kit, p: usize, layer: &mut Vec<El>) -> El {
+fn pane(s: &State, k: &Kit, p: usize, backdrop: bool, layer: &mut Vec<El>) -> El {
     let pane = &s.panes[p];
     let is_picker = s.tabs[p].is_picker();
     let drop_over = !is_picker && pane.drop_over;
@@ -4661,6 +4717,18 @@ fn pane(s: &State, k: &Kit, p: usize, layer: &mut Vec<El>) -> El {
     } else {
         k.c.border_weak
     };
+    // Under Mica the card lets it through, and with it the folder tree and the status bar; the
+    // bars on top, the file list and the "+" picker keep the pane's own background.
+    let card_fill = if drop_over {
+        k.alpha(k.c.text_accent, 0.06)
+    } else if backdrop {
+        Color::TRANSPARENT
+    } else {
+        k.c.bg_base
+    };
+    // Over a drop, those parts carry the card's highlight, which they cover.
+    let solid_fill = if drop_over { k.c.bg_base.mix(k.c.text_accent, 0.06) } else { k.c.bg_base };
+    let solid = |e: El| if backdrop { e.fill(solid_fill) } else { e };
 
     let mut card = col()
         .key(pane_key(p))
@@ -4671,7 +4739,7 @@ fn pane(s: &State, k: &Kit, p: usize, layer: &mut Vec<El>) -> El {
         .min_h(0.0)
         .min_w(0.0)
         .corners([0.0, 0.0, k.radius.sm, k.radius.sm])
-        .fill(if drop_over { k.alpha(k.c.text_accent, 0.06) } else { k.c.bg_base })
+        .fill(card_fill)
         .border_sides(if drop_over { [2.0, 2.0, 2.0, 2.0] } else { [0.0, 1.0, 1.0, 1.0] }, border)
         .clip_rounded(0.0)
         .on_key(move |s: &mut State, ev: &KeyEvent, tx: &mut Tx| key(s, p, ev, tx))
@@ -4684,7 +4752,7 @@ fn pane(s: &State, k: &Kit, p: usize, layer: &mut Vec<El>) -> El {
         .cursor(if !is_picker && pane.loading { Cursor::Progress } else { Cursor::Default });
 
     if is_picker {
-        card = card.child(new_tab_picker(s, k, p, layer));
+        card = card.child(solid(new_tab_picker(s, k, p, layer)));
     } else {
         card = card
             .on_drop_files(move |s: &mut State, files: &[PathBuf], _| {
@@ -4701,9 +4769,9 @@ fn pane(s: &State, k: &Kit, p: usize, layer: &mut Vec<El>) -> El {
             .on_drop_move(move |s: &mut State, at: rune::PointerEvent, tx: &mut Tx| {
                 crate::autoscroll::moved(&mut s.autoscroll, p, (at.window_x, at.window_y), tx.clock(), tx)
             })
-            .child(navbar(s, k, p))
-            .child(pane_actions(s, k, p))
-            .child(search_bar(s, k, p))
+            .child(solid(navbar(s, k, p)))
+            .child(solid(pane_actions(s, k, p)))
+            .child(solid(search_bar(s, k, p)))
             .child({
                 let mut body = row().key("body").instant_changes().w_full().grow(1.0).min_h(0.0);
                 if s.show_tree[p] {
@@ -4714,7 +4782,7 @@ fn pane(s: &State, k: &Kit, p: usize, layer: &mut Vec<El>) -> El {
                                 .child(el().w(1.0).h_full().fill(k.c.border_weak)),
                         );
                 }
-                body.child(list(s, k, p))
+                body.child(solid(list(s, k, p)))
             })
             .child(statusbar(s, k, p));
     }
