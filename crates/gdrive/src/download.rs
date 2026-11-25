@@ -64,11 +64,14 @@ pub fn local_name(file: &DriveFile) -> String {
 }
 
 /// Where a download is written until it's complete.
-pub fn part_path(to: &Path) -> PathBuf {
+pub fn part_path(to: &Path, n: u64) -> PathBuf {
     let mut name = to.file_name().unwrap_or_default().to_os_string();
-    name.push(".openexplorer-part");
+    name.push(format!(".{}-{n}.openexplorer-part", std::process::id()));
     to.with_file_name(name)
 }
+
+/// Numbers each download's part file in this process (see [`part_path`]).
+static PARTS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether an answer is worth trying again: Google busy or limiting the rate.
 fn transient(status: u16, body: &str) -> bool {
@@ -130,7 +133,10 @@ impl Drive {
             return Err(tr!("Id inválido: {}", "Invalid id: {}", file.id));
         }
         let (url, size) = self.media_url(file, &what)?;
-        let part = part_path(to);
+        // A part file of this download's own: two downloads to one place (a copy asked twice)
+        // each write theirs, and the last to finish names the file. With one name for both, the
+        // first renamed it away under the second, which failed with "file not found".
+        let part = part_path(to, PARTS.fetch_add(1, Ordering::Relaxed));
         let started = Instant::now();
         let out = self.fetch_to(&url, &part, size, pieces, got, &what).and_then(|written| {
             if let Some(t) = file.modified {
@@ -414,6 +420,52 @@ mod tests {
         (0..n as u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect()
     }
 
+    /// Whether no download left a part file in `dir`.
+    fn no_parts(dir: &Path) -> bool {
+        std::fs::read_dir(dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".openexplorer-part"))
+    }
+
+    /// The same file asked twice into one folder at once (a copy started twice): both downloads
+    /// finish, the file is whole, and no part file is left.
+    #[test]
+    fn two_downloads_to_one_place_both_finish() {
+        let data = content(2 * 1024 * 1024 + 5);
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let served = data.clone();
+        let fake = std::thread::spawn(move || {
+            let conns: Vec<_> = (0..2).map(|_| server.accept().unwrap().0).collect();
+            let feeds: Vec<_> = conns
+                .into_iter()
+                .map(|c| {
+                    let served = served.clone();
+                    std::thread::spawn(move || {
+                        let mut s = BufReader::new(c);
+                        request(&mut s);
+                        answer(&mut s, "200 OK", "", &served, served.len(), None);
+                    })
+                })
+                .collect();
+            feeds.into_iter().for_each(|f| f.join().unwrap());
+        });
+        let dir = scratch("twice");
+        let to = dir.join("a.bin");
+        let file = drive_file("ab", "a.bin", Some(data.len() as u64), "application/octet-stream");
+        let runs: Vec<_> = (0..2)
+            .map(|_| {
+                let (d, file, to) = (Drive::for_tests(format!("{base}/")), file.clone(), to.clone());
+                std::thread::spawn(move || d.download(&file, &to, false, &mut |_| true))
+            })
+            .collect();
+        for r in runs {
+            assert_eq!(r.join().unwrap().unwrap(), data.len() as u64);
+        }
+        fake.join().unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), data);
+        assert!(no_parts(&dir));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("openexplorer-download-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -469,7 +521,7 @@ mod tests {
         fake.join().unwrap();
         assert_eq!(n.unwrap(), data.len() as u64);
         assert_eq!(std::fs::read(&to).unwrap(), data);
-        assert!(!part_path(&to).exists(), "the part file took the final name");
+        assert!(no_parts(&dir), "the part file took the final name");
         // The bar only went forward: the resumed part continued from 1 MB.
         assert!(seen.windows(2).all(|w| w[0] <= w[1]));
         assert!(seen.contains(&(1 << 20)));
@@ -546,7 +598,7 @@ mod tests {
         let file = drive_file("c", "a.bin", Some(data.len() as u64), "application/zip");
         let out = d.download(&file, &to, false, &mut |n| n < 300_000);
         assert_eq!(out.unwrap_err(), CANCELLED);
-        assert!(!to.exists() && !part_path(&to).exists());
+        assert!(!to.exists() && no_parts(&dir));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -588,6 +640,6 @@ mod tests {
         assert_eq!(f("Nota.docx", "application/vnd.google-apps.document"), "Nota.docx");
         assert_eq!(f("foto.jpg", "image/jpeg"), "foto.jpg");
         assert_eq!(export_format("application/vnd.google-apps.form"), None);
-        assert_eq!(part_path(Path::new(r"C:\a\b.txt")), Path::new(r"C:\a\b.txt.openexplorer-part"));
+        assert_eq!(part_path(Path::new(r"C:\a\b.txt"), 7), PathBuf::from(format!(r"C:\a\b.txt.{}-7.openexplorer-part", std::process::id())));
     }
 }
