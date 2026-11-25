@@ -17,6 +17,11 @@ pub const SHORTCUT_MIME: &str = "application/vnd.google-apps.shortcut";
 pub(crate) const FILE_FIELDS: &str = "id,name,mimeType,size,modifiedTime,md5Checksum,starred,shortcutDetails(targetId,targetMimeType)";
 /// What a listing asks of each file: [`FILE_FIELDS`] and the next page.
 const LIST_FIELDS: &str = "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,starred,shortcutDetails(targetId,targetMimeType))";
+/// What [`Drive::list_many`] asks of each file: [`FILE_FIELDS`], its folders, the next page.
+const MANY_FIELDS: &str = "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,starred,shortcutDetails(targetId,targetMimeType),parents)";
+/// The most folders [`Drive::list_many`] reads in one listing: Drive takes a query of this many
+/// `in parents` (a few KB).
+pub const MANY: usize = 50;
 /// What the trash listing asks of each file, to keep only what this account can restore.
 const TRASH_FIELDS: &str =
     "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,starred,shortcutDetails(targetId,targetMimeType),explicitlyTrashed,ownedByMe,driveId,capabilities(canUntrash))";
@@ -392,6 +397,37 @@ impl Drive {
         self.pages("/files", &query, "files", t("Listagem da pasta", "Folder listing"), |raw: Vec<RawFile>, more| each(raw.into_iter().map(DriveFile::from).collect(), more))
     }
 
+    /// The contents of the folders `ids` (up to [`MANY`]) in one listing, `'a' in parents or 'b'
+    /// in parents…`, handed to `each` a page at a time, each file with the folder of `ids` it's
+    /// in: one request where reading them one by one takes one each (a download of 100 empty
+    /// folders: 1 request instead of 100). A file in two of them comes once for each.
+    pub fn list_many(&self, ids: &[&str], mut each: impl FnMut(Vec<(String, DriveFile)>) -> bool) -> Result<()> {
+        if ids.is_empty() || ids.len() > MANY {
+            return Err(format!("list_many: {} folders", ids.len()));
+        }
+        let parents = ids.iter().map(|id| checked(id).map(|id| format!("'{id}' in parents"))).collect::<Result<Vec<_>>>()?;
+        let q = format!("({}) and trashed = false", parents.join(" or "));
+        let query = [
+            ("q", q.as_str()),
+            ("fields", MANY_FIELDS),
+            ("pageSize", "1000"),
+            ("supportsAllDrives", "true"),
+            ("includeItemsFromAllDrives", "true"),
+            ("corpora", "allDrives"),
+        ];
+        self.pages("/files", &query, "files", t("Listagem das pastas", "Folders listing"), |raw: Vec<RawFile>, _| {
+            let mut page = Vec::with_capacity(raw.len());
+            for mut r in raw {
+                let theirs: Vec<String> = std::mem::take(&mut r.parents).into_iter().filter(|p| ids.contains(&p.as_str())).collect();
+                let f = DriveFile::from(r);
+                for p in theirs {
+                    page.push((p, f.clone()));
+                }
+            }
+            each(page)
+        })
+    }
+
     /// The folders in folder `folder_id` (and shortcuts to folders), for the tree: only those
     /// are asked for, so a folder of thousands of files costs no more than its folders.
     pub fn folders(&self, folder_id: &str, shared_drive: Option<&str>) -> Result<Vec<DriveFile>> {
@@ -754,6 +790,9 @@ pub(crate) struct RawFile {
     md5_checksum: Option<String>,
     shortcut_details: Option<Shortcut>,
     starred: Option<bool>,
+    /// Asked only by [`Drive::list_many`].
+    #[serde(default)]
+    parents: Vec<String>,
     /// The trash listing's fields, see `in_trash_view`.
     explicitly_trashed: Option<bool>,
     owned_by_me: Option<bool>,
@@ -800,6 +839,50 @@ fn parse_time(t: &str) -> Option<SystemTime> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Several folders' contents in one request, each file with the folder of those asked it's
+    /// in, once for each of them (a file in two), and one for a folder not asked left out.
+    #[test]
+    fn many_folders_are_listed_in_one_request() {
+        use std::io::{BufRead, BufReader, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/", server.local_addr().unwrap());
+        let fake = std::thread::spawn(move || {
+            let (conn, _) = server.accept().unwrap();
+            let mut r = BufReader::new(conn);
+            let mut first = String::new();
+            r.read_line(&mut first).unwrap();
+            let mut line = String::new();
+            while r.read_line(&mut line).unwrap() > 2 {
+                line.clear();
+            }
+            let body = r#"{"files":[
+                {"id":"f1","name":"a.txt","mimeType":"text/plain","size":"3","parents":["A"]},
+                {"id":"d1","name":"sub","mimeType":"application/vnd.google-apps.folder","parents":["B"]},
+                {"id":"f2","name":"both.txt","mimeType":"text/plain","size":"1","parents":["A","B","Z"]}]}"#;
+            let mut conn = r.into_inner();
+            write!(conn, "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{body}", body.len()).unwrap();
+            first
+        });
+        let d = Drive::for_tests(base);
+        let mut got = Vec::new();
+        d.list_many(&["A", "B"], |page| {
+            got.extend(page.into_iter().map(|(p, f)| (p, f.name, f.is_dir)));
+            true
+        })
+        .unwrap();
+        let asked = fake.join().unwrap();
+        assert!(asked.contains("%27A%27+in+parents+or+%27B%27+in+parents") || asked.contains("%27A%27%20in%20parents%20or%20%27B%27%20in%20parents"), "{asked}");
+        got.sort();
+        let want = [("A", "a.txt", false), ("A", "both.txt", false), ("B", "both.txt", false), ("B", "sub", true)];
+        assert_eq!(got, want.map(|(p, n, d)| (p.to_string(), n.to_string(), d)));
+        assert!(d.list_many(&[], |_| true).is_err() && d.list_many(&["x'"], |_| true).is_err());
+    }
 
     #[test]
     fn drive_times_out_of_range_are_dropped_instead_of_panicking() {

@@ -32,6 +32,22 @@ impl<W> Queue<W> {
         }
     }
 
+    /// Up to `max` more queued pieces that `want` picks, taken for a worker to do along with the
+    /// piece it holds (and finished with it).
+    pub fn take(&self, max: usize, want: impl Fn(&W) -> bool) -> Vec<W> {
+        let mut s = self.state.lock().unwrap();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < s.0.len() && out.len() < max {
+            if want(&s.0[i]) {
+                out.extend(s.0.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
     pub fn add(&self, work: impl IntoIterator<Item = W>) {
         self.state.lock().unwrap().0.extend(work);
         self.ready.notify_all();
@@ -59,6 +75,19 @@ impl<W> Drop for Finished<'_, W> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A worker takes the queued pieces it can do along with its own, in order, as many as it
+    /// asks, and the others stay.
+    #[test]
+    fn taking_more_leaves_the_rest_in_order() {
+        let queue = Queue::new([1, 2, 3, 4, 5, 6]);
+        let (first, done) = queue.next().unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(queue.take(2, |n| n % 2 == 0), vec![2, 4]);
+        drop(done);
+        let rest: Vec<i32> = std::iter::from_fn(|| queue.next().map(|(n, _)| n)).collect();
+        assert_eq!(rest, vec![3, 5, 6]);
+    }
 
     /// Workers keep going while a busy one may still add work, and all stop once nothing is
     /// queued or running: every piece, nested ones included, is taken exactly once.
