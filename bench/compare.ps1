@@ -144,7 +144,11 @@ $Downloads = [ordered]@{
     # Air Explorer makes about one local folder every 2 s here, so 100 rather than 1,000.
     'download-100-folders'  = @{ Drive = "$Gd/100 folders"; Files = 0; Dirs = 100; Bytes = 0 }
 }
-$DownloadTo = 'C:\OEBench\dl'
+# Each download goes to a folder of its own under this one, never emptied while an app may
+# still write there (a download still running would fail with "file not found"); they go at
+# the end, with the apps closed.
+$DownloadRoot = 'C:\OEBench'
+$DownloadTo = $null
 
 # ------------------------------------------------------------------------------------------------
 # What differs between the apps: how to find their window, a pane's address bar, and the number
@@ -152,7 +156,7 @@ $DownloadTo = 'C:\OEBench\dl'
 
 $Adapters = @{
     openexplorer = @{
-        Name = 'Open Explorer'; Exe = $OpenExplorer; Process = 'openexplorer'
+        Name = 'Open Explorer'; Exe = $OpenExplorer; Process = 'openexplorer'; Title = '^Open Explorer'
         CloudPath = { param($win, $c, $p) "$($Clouds[$c].Oe)/$p" }
         # Deletes the folder listings it keeps on disk between runs (Google Drive's and each
         # cloud's), with the app closed. A process started from a packaged app (the Claude app)
@@ -183,6 +187,14 @@ $Adapters = @{
             $b.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
         }
         Pane = { param($win, $i) $win.FindFirst($Scope::Descendants, (Prop $A::AutomationIdProperty "pane-$i")) }
+        # The folder pane `i` shows: the last step of its breadcrumb (`crumb-N`).
+        Where = {
+            param($win, $i)
+            $pane = & $Adapters.openexplorer.Pane $win $i
+            if (-not $pane) { return $null }
+            $crumbs = $pane.FindAll($Scope::Descendants, (Prop $A::ControlTypeProperty ([System.Windows.Automation.ControlType]::Hyperlink))) | Where-Object { $_.Current.AutomationId -like 'crumb-*' }
+            ($crumbs | Sort-Object { [int]($_.Current.AutomationId -replace '\D', '') } | Select-Object -Last 1).Current.Name
+        }
         # The screen point of the row `name` in pane `i`'s list.
         Row = {
             param($win, $i, $name)
@@ -222,7 +234,7 @@ $Adapters = @{
         }
     }
     airexplorer = @{
-        Name = 'Air Explorer'; Exe = $AirExplorer; Process = 'AirExplorer'
+        Name = 'Air Explorer'; Exe = $AirExplorer; Process = 'AirExplorer'; Title = '^Air Explorer v'
         # Each tab belongs to one account: the left pane's is This PC, and the right pane has a
         # tab for each cloud account (opened before running). This brings the cloud's tab
         # forward and starts the path with the account's name as its address bar shows it.
@@ -272,6 +284,8 @@ $Adapters = @{
             throw "Air Explorer: no tab in the right pane whose address starts with '$prefix'"
         }
         Ready = { param($win, $i) }
+        # Its address bar stays on the old folder until the new one is open: nothing to wait for.
+        Where = { param($win, $i) $null }
         # A list view takes no focus through UI Automation: a click on its first row (on an
         # empty list, its middle) does.
         Focus = {
@@ -321,11 +335,16 @@ $Adapters = @{
 
 # ------------------------------------------------------------------------------------------------
 
+# The app's main window: of its process's top-level windows, the one whose title matches the
+# adapter's `Title` (Air Explorer's promotion can be the window Windows calls main).
 function Get-MainWindow($ad, [int] $wait = 60) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while ($sw.Elapsed.TotalSeconds -lt $wait) {
-        $proc = Get-Process -Name $ad.Process -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-        if ($proc) { return $A::FromHandle($proc.MainWindowHandle) }
+        foreach ($proc in Get-Process -Name $ad.Process -ErrorAction SilentlyContinue) {
+            $mine = $A::RootElement.FindAll($Scope::Children, (Prop $A::ProcessIdProperty $proc.Id))
+            $win = $mine | Where-Object { $_.Current.Name -match $ad.Title } | Select-Object -First 1
+            if ($win) { return $win }
+        }
         Start-Sleep -Milliseconds 20
     }
     throw "$($ad.Name): no window after $wait s"
@@ -344,7 +363,9 @@ function Close-App($ad) {
 function Close-Popups($ad, $win) {
     if ($ad.Process -ne 'AirExplorer') { return }
     $cond = Prop $A::ControlTypeProperty ([System.Windows.Automation.ControlType]::Window)
-    foreach ($w in $win.FindAll($Scope::Children, $cond)) {
+    # Over the main window, or a window of its own.
+    $others = $A::RootElement.FindAll($Scope::Children, (Prop $A::ProcessIdProperty $win.Current.ProcessId)) | Where-Object { $_.Current.Name -notmatch $ad.Title }
+    foreach ($w in @($win.FindAll($Scope::Children, $cond)) + @($others)) {
         $wp = $null
         if ($w.TryGetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern, [ref] $wp)) {
             Write-Host "  closing $($ad.Name)'s window '$($w.Current.Name)'"
@@ -410,6 +431,15 @@ function Open-Folder($ad, $win, [int] $i, [string] $path, [int] $expected, [int]
     Go-To $ad $win $i $path
     $sw = [Diagnostics.Stopwatch]::StartNew()
     [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+    # Learning a count: not the old folder's, while the new one is still being found.
+    if ($expected -eq 0) {
+        $leaf = ($path -split '[\\/]' | Where-Object { $_ } | Select-Object -Last 1)
+        while ($sw.Elapsed.TotalSeconds -lt $Timeout) {
+            $at = & $ad.Where $win $i
+            if ($null -eq $at -or $at -eq $leaf) { break }
+            Start-Sleep -Milliseconds 15
+        }
+    }
     Wait-Count $ad $win $i $expected $sw -least $least
 }
 
@@ -418,7 +448,12 @@ function Open-Folder($ad, $win, [int] $i, [string] $path, [int] $expected, [int]
 function Open-Row($ad, $win, [int] $i, [string] $name, [int] $expected, [int] $least = 0) {
     Close-Popups $ad $win
     Focus-Window $win
-    $at = & $ad.Row $win $i $name
+    # The list may still be filling in, or the pane being redrawn: a few seconds' tries.
+    $at = $null
+    for ($try = 0; $try -lt 100 -and -not $at; $try++) {
+        $at = try { & $ad.Row $win $i $name } catch { $null }
+        if (-not $at) { Start-Sleep -Milliseconds 100 }
+    }
     if (-not $at) { throw "$($ad.Name): no row '$name' in pane $i" }
     $sw = [Diagnostics.Stopwatch]::StartNew()
     [Win]::DoubleClick($at[0], $at[1])
@@ -430,6 +465,11 @@ function Open-Row($ad, $win, [int] $i, [string] $name, [int] $expected, [int] $l
 function Start-Uncached($ad) {
     Close-App $ad
     & $ad.Forget
+    Start-App $ad
+}
+
+# Starts the app and waits until its window shows its first folder: its panes are there.
+function Start-App($ad) {
     Start-Process $ad.Exe | Out-Null
     Wait-Count $ad (Get-MainWindow $ad) 0 0 ([Diagnostics.Stopwatch]::StartNew()) -Fresh | Out-Null
     $win = Get-MainWindow $ad
@@ -451,11 +491,15 @@ function Tree-Of([string] $dir) {
 }
 
 function Download($ad, $win, $d) {
-    if (Test-Path $DownloadTo) { Remove-Item -LiteralPath $DownloadTo -Recurse -Force }
+    $script:DownloadTo = Join-Path $DownloadRoot ('dl-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     New-Item -ItemType Directory -Force $DownloadTo | Out-Null
     & $ad.Ready $win 1
     Open-Folder $ad $win 0 $DownloadTo 0 | Out-Null
-    Open-Folder $ad $win 1 (& $ad.CloudPath $win 'drive' $d.Drive) 0 | Out-Null
+    # The folder above through the address bar, the folder itself by a double click (Air
+    # Explorer's address bar stalls on a folder it hasn't listed yet).
+    $up = Split-Path $d.Drive -Parent
+    Open-Folder $ad $win 1 (& $ad.CloudPath $win 'drive' ($up -replace '\\', '/')) 0 -least 1 | Out-Null
+    Open-Row $ad $win 1 (Split-Path $d.Drive -Leaf) 0 -least 1 | Out-Null
     Focus-Window $win
     & $ad.Focus $win 1
     Start-Sleep -Milliseconds 200
@@ -464,15 +508,17 @@ function Download($ad, $win, $d) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     & $ad.CopyLeft $win
     $pasted = $false
+    $first = $null
     while ($sw.Elapsed.TotalSeconds -lt $Timeout) {
         Close-Popups $ad $win
         $t = Tree-Of $DownloadTo
         if ($t.files -gt 0 -or $t.dirs -gt 0) { $pasted = $true }
-        # Nothing arrived after a few seconds: the copy didn't start. The run starts over.
-        if (-not $pasted -and $sw.Elapsed.TotalSeconds -gt 8) {
-            Write-Host "    (the copy didn't start; trying again)"
-            return Download $ad $win $d
+        # Nothing arrived for a long while: the copy didn't start. Stopped here rather than
+        # started over: deleting the folder under a copy that was only slow to begin breaks it.
+        if (-not $pasted -and $sw.Elapsed.TotalSeconds -gt 30) {
+            throw "$($ad.Name): nothing arrived in $DownloadTo 30 s after the copy of $($d.Drive)"
         }
+        if ($pasted -and -not $first) { $first = $sw.Elapsed.TotalSeconds; Write-Host ("      first item on disk after {0:N2} s" -f $first) }
         if ($t.files -eq $d.Files -and $t.dirs -eq $d.Dirs -and $t.bytes -eq $d.Bytes -and $t.free) { return $sw.Elapsed.TotalSeconds }
         Start-Sleep -Milliseconds 50
     }
@@ -521,6 +567,8 @@ $results = [ordered]@{
 
 foreach ($key in $AppList) {
     $ad = $Adapters[$key]
+    # The other app closed: its window over this one's would take the clicks, and its keys.
+    foreach ($other in $Adapters.Keys) { if ($other -ne $key) { Close-App $Adapters[$other] } }
     $exe = Get-Item $ad.Exe
     $version = $exe.VersionInfo.ProductVersion
     if (-not $version -and $key -eq 'openexplorer') {
@@ -532,10 +580,7 @@ foreach ($key in $AppList) {
     $r = [ordered]@{ version = $version; exe_mb = [math]::Round($exe.Length / 1MB, 1) }
 
     Close-App $ad
-    Start-Process $ad.Exe | Out-Null
-    $win = Get-MainWindow $ad
-    Start-Sleep -Seconds 5
-    $win = Get-MainWindow $ad
+    $win = Start-App $ad
 
     # Learn each folder's count (and warm the way there), then time it: opened before in this
     # session, and (for a cloud's) opened for the first time since the app started, with no
@@ -631,6 +676,9 @@ foreach ($key in $AppList) {
 
     $results.apps[$key] = $r
 }
+
+foreach ($key in $AppList) { Close-App $Adapters[$key] }
+Get-ChildItem -LiteralPath $DownloadRoot -Directory -Filter 'dl-*' -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
 New-Item -ItemType Directory -Force (Split-Path $Out) | Out-Null
 $results | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 $Out
