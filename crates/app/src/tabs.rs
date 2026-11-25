@@ -373,16 +373,35 @@ pub fn moved(loc: &Location, from: &Location, to: Option<&Location>) -> Option<L
 
 /// Whether a pane or a tab shows folder `from` or a folder inside it.
 pub fn any_inside(s: &State, from: &Location) -> bool {
-    (0..2).any(|p| {
-        (!s.tabs[p].is_picker() && moved(&s.panes[p].loc, from, None).is_some())
-            || s.tabs[p].items.iter().filter_map(|slot| slot.pane.as_ref()).any(|pane| moved(&pane.loc, from, None).is_some())
-    })
+    let inside = |pane: &Pane| pane.back.iter().chain(&pane.forward).chain([&pane.loc]).any(|l| moved(l, from, None).is_some());
+    (0..2).any(|p| (!s.tabs[p].is_picker() && inside(&s.panes[p])) || s.tabs[p].items.iter().filter_map(|slot| slot.pane.as_ref()).any(inside))
 }
 
-/// Moves the panes and tabs inside folder `from` to where [`moved`] says, so none shows a
-/// folder that was renamed or deleted.
+/// Voltar's and Avançar's steps inside folder `from` follow it to `to`, or go when it's
+/// deleted (`to` is `None`), so neither leads to a folder that's gone.
+fn remap_history(pane: &mut Pane, from: &Location, to: Option<&Location>) {
+    for steps in [&mut pane.back, &mut pane.forward] {
+        match to {
+            Some(_) => {
+                for l in steps.iter_mut() {
+                    if let Some(new) = moved(l, from, to) {
+                        *l = new;
+                    }
+                }
+            }
+            None => steps.retain(|l| moved(l, from, None).is_none()),
+        }
+    }
+}
+
+/// Moves the panes and tabs inside folder `from` to where [`moved`] says, and their history
+/// with them, so none shows or goes back to a folder that was renamed or deleted.
 pub fn repoint(s: &mut State, from: &Location, to: Option<&Location>) {
     for p in 0..2 {
+        remap_history(&mut s.panes[p], from, to);
+        for pane in s.tabs[p].items.iter_mut().filter_map(|slot| slot.pane.as_mut()) {
+            remap_history(pane, from, to);
+        }
         if !s.tabs[p].is_picker()
             && let Some(loc) = moved(&s.panes[p].loc, from, to)
         {
@@ -539,13 +558,29 @@ mod tests {
         let mut s = State::placeholder();
         s.tabs = [PaneTabs::initial(), PaneTabs::initial()];
         s.panes[0] = Pane::new(local(r"C:\Fotos\2024"));
+        s.panes[0].back = vec![local(r"C:\"), local(r"C:\Fotos")];
         open_new_tab(&mut s, 0, Location::Mock(Vec::new()));
         s.panes[1] = Pane::new(local(r"C:\Fotos"));
         assert!(any_inside(&s, &local(r"C:\Fotos")));
         assert!(!any_inside(&s, &local(r"C:\Outra")));
         repoint(&mut s, &local(r"C:\Fotos"), Some(&local(r"C:\Imagens")));
-        assert_eq!(s.tabs[0].items[0].pane.as_ref().unwrap().loc, local(r"C:\Imagens\2024"));
+        let left = s.tabs[0].items[0].pane.as_ref().unwrap();
+        assert_eq!(left.loc, local(r"C:\Imagens\2024"));
+        // Voltar follows the rename too.
+        assert_eq!(left.back, vec![local(r"C:\"), local(r"C:\Imagens")]);
         assert_eq!(s.panes[1].loc, local(r"C:\Imagens"));
         assert_eq!(s.panes[0].loc, Location::Mock(Vec::new()));
+
+        // A folder only Voltar or Avançar leads to counts, and is dropped when deleted.
+        s.panes[1] = Pane::new(local(r"C:\Outra"));
+        s.panes[1].back = vec![local(r"C:\"), local(r"C:\Imagens\2024")];
+        s.panes[1].forward = vec![local(r"C:\Imagens")];
+        assert!(any_inside(&s, &local(r"C:\Imagens\2024")));
+        repoint(&mut s, &local(r"C:\Imagens"), None);
+        assert_eq!(s.panes[1].loc, local(r"C:\Outra"));
+        assert_eq!(s.panes[1].back, vec![local(r"C:\")]);
+        assert!(s.panes[1].forward.is_empty());
+        let left = s.tabs[0].items[0].pane.as_ref().unwrap();
+        assert_eq!((left.loc.clone(), left.back.clone()), (local(r"C:\"), vec![local(r"C:\")]));
     }
 }
