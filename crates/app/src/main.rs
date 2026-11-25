@@ -85,7 +85,7 @@ enum Msg {
     /// Something Propriedades number `id` was waiting for.
     Prop { id: u64, update: actions::PropUpdate },
     /// Windows' icon for a file type, a folder or a drive.
-    Icon { key: sysicons::IconKey, rgba: Option<sysicons::Rgba> },
+    Icon { key: sysicons::IconKey, rgba: Option<sysicons::IconBitmaps> },
     /// What the Drive folder an upload goes into holds, to check its names against.
     Clashes { up: actions::Upload, result: Result<Vec<Entry>, String> },
     /// An account's storage, for the status bar.

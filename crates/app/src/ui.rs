@@ -3000,19 +3000,31 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
 
 /// Windows' icon for `key` once it has loaded, else the app's own `fallback`.
 fn shell_icon(s: &State, key: Option<&IconKey>, fallback: &'static Icon, size: f32) -> El {
-    match key.and_then(|k| s.icons.get(k)).filter(|i| i.is_ready() && i.error().is_none()) {
+    let large = size > 24.0;
+    match key.and_then(|k| s.icons.get(k, large)).filter(|i| i.is_ready() && i.error().is_none()) {
         Some(image) => el().size(size, size).pixels(image.pixels()),
         None => icon(fallback, size),
     }
 }
 
-/// The icon Explorer would show for `e`: its type's program's (VLC's for a video VLC opens).
-/// A Drive shortcut to a folder keeps the app's linked-folder icon.
+/// The icon Explorer would show for `e`: its type's program's (VLC's for a video VLC opens),
+/// or a local folder's own Windows icon when it's a special/customized folder (Documentos,
+/// Downloads, Imagens, OneDrive…). A Drive shortcut to a folder keeps the app's linked-folder
+/// icon.
 fn entry_icon(s: &State, loc: &Location, e: &crate::model::Entry, size: f32) -> El {
     let kind = e.kind();
     let fallback = kind_icon(kind);
     if kind == Kind::FolderLink {
         return icon(fallback, size);
+    }
+    if e.is_dir
+        && let Some(path) = loc.local_path(e)
+    {
+        let key = IconKey::Path(path);
+        let large = size > 24.0;
+        if let Some(image) = s.icons.get(&key, large).filter(|i| i.is_ready() && i.error().is_none()) {
+            return el().size(size, size).pixels(image.pixels());
+        }
     }
     shell_icon(s, sysicons::key_for(e, loc).as_ref(), fallback, size)
 }

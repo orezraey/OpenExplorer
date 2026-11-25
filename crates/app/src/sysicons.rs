@@ -18,6 +18,8 @@ pub enum IconKey {
     /// Any file with this extension, lowercased ("" for none).
     Ext(String),
     Folder,
+    /// Windows' official "Este Computador" / "This PC" stock icon (`SIID_DESKTOPPC`).
+    Computer,
     /// A drive, a special folder or a file whose icon is its own (`.exe`, `.lnk`, `.ico`).
     Path(PathBuf),
 }
@@ -45,11 +47,24 @@ pub fn key_for(e: &Entry, loc: &Location) -> Option<IconKey> {
 /// Straight-alpha RGBA pixels of an icon.
 pub type Rgba = (u32, u32, Vec<u8>);
 
+/// Both sizes Windows Explorer uses for an icon: `small` from `SHIL_SMALL` (the exact
+/// 16 px / DPI-scaled artwork shown in Explorer's Details list and Navigation Tree) and
+/// `large` from `SHIL_EXTRALARGE` (48 px, used in Propriedades).
+pub struct IconBitmaps {
+    pub small: Rgba,
+    pub large: Option<Rgba>,
+}
+
+struct StoredIcon {
+    small: Image,
+    large: Option<Image>,
+}
+
 #[derive(Default)]
 pub struct SysIcons {
     images: Option<ImageCache>,
     /// `None` while the lookup runs or when Windows had no icon.
-    known: HashMap<IconKey, Option<Image>>,
+    known: HashMap<IconKey, Option<StoredIcon>>,
     /// Lookups by type (quick, from the registry) and by path (a drive or a file, which can
     /// stall on an empty DVD drive or an offline share), on separate threads so a slow path
     /// never holds up the types.
@@ -89,7 +104,7 @@ impl SysIcons {
         self.images = Some(images);
         self.fixed = fixed.into_iter().collect();
         let fixed: Vec<IconKey> = self.fixed.iter().cloned().collect();
-        self.want(fixed.into_iter().chain([IconKey::Folder]));
+        self.want(fixed.into_iter().chain([IconKey::Folder, IconKey::Computer]));
     }
 
     /// Asks for the icons of `keys` not seen yet.
@@ -114,10 +129,13 @@ impl SysIcons {
         self.want(keys);
     }
 
-    pub fn arrived(&mut self, key: IconKey, rgba: Option<Rgba>) {
+    pub fn arrived(&mut self, key: IconKey, rgba: Option<IconBitmaps>) {
         // One let go of while it was being looked up stays gone.
         let (Some(slot), Some(images)) = (self.known.get_mut(&key), &self.images) else { return };
-        *slot = rgba.map(|(w, h, px)| images.rgba(w, h, px));
+        *slot = rgba.map(|b| StoredIcon {
+            small: images.rgba(b.small.0, b.small.1, b.small.2),
+            large: b.large.map(|(w, h, px)| images.rgba(w, h, px)),
+        });
         if slot.is_some() {
             self.decoding.push(key);
         }
@@ -128,64 +146,110 @@ impl SysIcons {
     pub fn settle(&mut self) -> bool {
         let before = self.decoding.len();
         let known = &self.known;
-        self.decoding.retain(|k| matches!(known.get(k), Some(Some(image)) if !image.is_ready()));
+        self.decoding.retain(|k| {
+            matches!(
+                known.get(k),
+                Some(Some(pair)) if !pair.small.is_ready() || pair.large.as_ref().is_some_and(|l| !l.is_ready())
+            )
+        });
         self.decoding.len() != before
     }
 
-    /// The icon for `key`, once Windows gave one.
-    pub fn get(&self, key: &IconKey) -> Option<&Image> {
-        self.known.get(key)?.as_ref()
+    /// The icon for `key`, once Windows gave one: `large = false` returns Windows Explorer's
+    /// `SHIL_SMALL` (16 px / DPI-scaled) artwork; `large = true` returns the 48 px icon for
+    /// large displays like Propriedades.
+    pub fn get(&self, key: &IconKey, large: bool) -> Option<&Image> {
+        let pair = self.known.get(key)?.as_ref()?;
+        if large {
+            pair.large.as_ref().or(Some(&pair.small))
+        } else {
+            Some(&pair.small)
+        }
     }
 }
 
-/// The shell's icon for `key`, from its 48 px list so it stays sharp on high-DPI screens and in
-/// Propriedades; the 32 px one if that list isn't there.
+/// The shell's icons for `key`: `SHIL_SMALL` (the exact 16 px / DPI-scaled icon Windows
+/// Explorer draws in Details view and the Navigation Tree) and `SHIL_EXTRALARGE` (48 px, for
+/// Propriedades).
 #[cfg(windows)]
-fn lookup(key: &IconKey) -> Option<Rgba> {
+fn lookup(key: &IconKey) -> Option<IconBitmaps> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::Controls::{HIMAGELIST, ImageList_GetIcon};
-    use windows_sys::Win32::UI::Shell::{SHFILEINFOW, SHGFI_ICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SHGetImageList, SHIL_EXTRALARGE};
+    use windows_sys::Win32::UI::Shell::{
+        SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGSI_SYSICONINDEX,
+        SHGetFileInfoW, SHGetImageList, SHGetStockIconInfo, SHIL_EXTRALARGE, SHIL_SMALL, SHSTOCKICONINFO, SIID_DESKTOPPC,
+    };
     const NORMAL: u32 = 0x80;
     const DIRECTORY: u32 = 0x10;
+
+    // System image lists, kept for the thread's life (they are the shell's own, shared).
+    thread_local!(static LISTS: (HIMAGELIST, HIMAGELIST) = {
+        // IID_IImageList; the interface pointer works as an HIMAGELIST.
+        let iid = windows_sys::core::GUID::from_u128(0x46eb5926_582e_4017_9fdf_e8998daa0950);
+        let get = |shil: u32| -> HIMAGELIST {
+            let mut list = std::ptr::null_mut();
+            // SAFETY: a GUID and an out pointer.
+            let hr = unsafe { SHGetImageList(shil as i32, &iid, &mut list) };
+            if hr < 0 { 0 } else { list as HIMAGELIST }
+        };
+        (get(SHIL_SMALL), get(SHIL_EXTRALARGE))
+    });
+    let from_index = |index: i32| -> Option<IconBitmaps> {
+        let (small_list, large_list) = LISTS.with(|l| *l);
+        let from_list = |list: HIMAGELIST, trim: bool| -> Option<Rgba> {
+            if list == 0 {
+                return None;
+            }
+            // SAFETY: the system list and an index it gave; ILD_TRANSPARENT.
+            let icon = unsafe { ImageList_GetIcon(list, index, 1) };
+            if icon.is_null() {
+                return None;
+            }
+            let px = hicon_rgba(icon)?;
+            Some(if trim { trim_small(px) } else { px })
+        };
+        let small = from_list(small_list, false);
+        let large = from_list(large_list, true);
+        if let Some(small) = small {
+            return Some(IconBitmaps { small, large });
+        }
+        large.map(|large| IconBitmaps { small: large, large: None })
+    };
+
+    if matches!(key, IconKey::Computer) {
+        let mut stock: SHSTOCKICONINFO = unsafe { std::mem::zeroed() };
+        stock.cbSize = std::mem::size_of::<SHSTOCKICONINFO>() as u32;
+        // SAFETY: `cbSize` is set to the struct's size.
+        if unsafe { SHGetStockIconInfo(SIID_DESKTOPPC, SHGSI_SYSICONINDEX, &mut stock) } >= 0 {
+            return from_index(stock.iSysImageIndex);
+        }
+        return None;
+    }
+
     // By type (no file needs to exist) for extensions and folders; by path for the rest.
     let (name, attrs, by): (PathBuf, u32, u32) = match key {
         IconKey::Ext(ext) if ext.is_empty() => ("arquivo".into(), NORMAL, SHGFI_USEFILEATTRIBUTES),
         IconKey::Ext(ext) => (format!("arquivo.{ext}").into(), NORMAL, SHGFI_USEFILEATTRIBUTES),
         IconKey::Folder => ("pasta".into(), DIRECTORY, SHGFI_USEFILEATTRIBUTES),
+        IconKey::Computer => unreachable!(),
         IconKey::Path(p) => (p.clone(), 0, 0),
     };
     let wide: Vec<u16> = name.as_os_str().encode_wide().chain([0]).collect();
     let size = std::mem::size_of::<SHFILEINFOW>() as u32;
     let mut info: SHFILEINFOW = unsafe { std::mem::zeroed() };
     // SAFETY: a NUL-terminated path and an out struct of the size given.
-    if unsafe { SHGetFileInfoW(wide.as_ptr(), attrs, &mut info, size, SHGFI_SYSICONINDEX | by) } != 0 {
-        // The 48 px system list, kept for the thread's life (it's the shell's own, shared).
-        thread_local!(static LIST: HIMAGELIST = {
-            // IID_IImageList; the interface pointer works as an HIMAGELIST.
-            let iid = windows_sys::core::GUID::from_u128(0x46eb5926_582e_4017_9fdf_e8998daa0950);
-            let mut list = std::ptr::null_mut();
-            // SAFETY: a GUID and an out pointer.
-            let hr = unsafe { SHGetImageList(SHIL_EXTRALARGE as i32, &iid, &mut list) };
-            if hr < 0 { 0 } else { list as HIMAGELIST }
-        });
-        let list = LIST.with(|l| *l);
-        if list != 0 {
-            // SAFETY: the system list and an index it gave; ILD_TRANSPARENT.
-            let icon = unsafe { ImageList_GetIcon(list, info.iIcon, 1) };
-            if !icon.is_null()
-                && let Some(px) = hicon_rgba(icon)
-            {
-                return Some(trim_small(px));
-            }
-        }
+    if unsafe { SHGetFileInfoW(wide.as_ptr(), attrs, &mut info, size, SHGFI_SYSICONINDEX | by) } != 0
+        && let Some(bitmaps) = from_index(info.iIcon)
+    {
+        return Some(bitmaps);
     }
     let mut info: SHFILEINFOW = unsafe { std::mem::zeroed() };
-    // SAFETY: as above; SHGFI_ICON hands over an icon this function destroys.
-    let ok = unsafe { SHGetFileInfoW(wide.as_ptr(), attrs, &mut info, size, SHGFI_ICON | by) };
+    // SAFETY: as above; SHGFI_ICON | SHGFI_SMALLICON hands over an icon this function destroys.
+    let ok = unsafe { SHGetFileInfoW(wide.as_ptr(), attrs, &mut info, size, SHGFI_ICON | SHGFI_SMALLICON | by) };
     if ok == 0 || info.hIcon.is_null() {
         return None;
     }
-    hicon_rgba(info.hIcon)
+    Some(IconBitmaps { small: hicon_rgba(info.hIcon)?, large: None })
 }
 
 /// An icon that only has a 32 px image comes out of the 48 px list drawn in its top-left
@@ -207,7 +271,7 @@ fn trim_small((w, h, px): Rgba) -> Rgba {
 }
 
 #[cfg(not(windows))]
-fn lookup(_: &IconKey) -> Option<Rgba> {
+fn lookup(_: &IconKey) -> Option<IconBitmaps> {
     None
 }
 
@@ -291,10 +355,44 @@ fn hicon_rgba(icon: windows_sys::Win32::UI::WindowsAndMessaging::HICON) -> Optio
     result
 }
 
-/// The icon keys a pane needs: one per type in its listing.
+/// Whether a local directory has a Windows custom/special folder icon (`desktop.ini` is only
+/// consulted by Windows Explorer on folders marked Read-Only or System).
+#[cfg(windows)]
+fn has_custom_folder_icon(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const READONLY_OR_SYSTEM: u32 = 0x1 | 0x4;
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    (meta.file_attributes() & READONLY_OR_SYSTEM) != 0 && path.join("desktop.ini").is_file()
+}
+
+#[cfg(not(windows))]
+fn has_custom_folder_icon(_: &Path) -> bool {
+    false
+}
+
+/// The icon keys a pane needs: one per type in its listing, plus individual paths for local
+/// folders that carry a custom/special Windows icon (Documentos, Downloads, Imagens, OneDrive…).
 pub fn keys_of(entries: &[Entry], loc: &Location) -> Vec<IconKey> {
     let mut seen = std::collections::HashSet::new();
-    entries.iter().filter_map(|e| key_for(e, loc)).filter(|k| seen.insert(k.clone())).collect()
+    let mut keys = Vec::new();
+    for e in entries {
+        if e.is_dir
+            && let Some(path) = loc.local_path(e)
+            && has_custom_folder_icon(&path)
+        {
+            let k = IconKey::Path(path);
+            if seen.insert(k.clone()) {
+                keys.push(k);
+            }
+            continue;
+        }
+        if let Some(k) = key_for(e, loc)
+            && seen.insert(k.clone())
+        {
+            keys.push(k);
+        }
+    }
+    keys
 }
 
 /// The home folder's key, for the tree.

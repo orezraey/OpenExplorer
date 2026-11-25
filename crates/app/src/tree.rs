@@ -204,7 +204,7 @@ fn desktop_node(places: &Places) -> Option<Node> {
 }
 
 fn computer_node() -> Node {
-    Node { id: NodeId::Computer, label: t("Este Computador", "This PC").into(), icon: None, fallback: &icons::COMPUTER, to: None, opens: true }
+    Node { id: NodeId::Computer, label: t("Este Computador", "This PC").into(), icon: Some(IconKey::Computer), fallback: &icons::COMPUTER, to: None, opens: true }
 }
 
 fn network_node() -> Node {
