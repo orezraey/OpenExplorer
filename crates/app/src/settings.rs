@@ -185,6 +185,11 @@ pub struct Settings {
     pub skip_recycle_bin: bool,
     /// Where the main window was when it last closed, to open there again.
     pub window: Option<crate::window_place::Saved>,
+    /// Experimental: Windows 11's Mica material behind the window, from the next start.
+    pub mica: bool,
+    /// Experimental: a search's matches in names marked as with a highlighter, rather than
+    /// only coloured.
+    pub search_marker: bool,
 }
 
 impl Default for Settings {
@@ -203,6 +208,8 @@ impl Default for Settings {
             clear_completed: true,
             skip_recycle_bin: false,
             window: None,
+            mica: false,
+            search_marker: false,
         }
     }
 }
@@ -214,6 +221,17 @@ pub fn at_once(n: i32) -> u8 {
 
 fn file() -> std::path::PathBuf {
     openexplorer_gdrive::config_dir().join("settings.json")
+}
+
+impl Theme {
+    /// The window's own light or dark (its title bar, and Mica's tint) for this theme.
+    pub fn color_scheme(self) -> rune::ColorScheme {
+        match self {
+            Theme::Auto => rune::ColorScheme::System,
+            Theme::Light => rune::ColorScheme::Light,
+            Theme::Dark => rune::ColorScheme::Dark,
+        }
+    }
 }
 
 impl Settings {

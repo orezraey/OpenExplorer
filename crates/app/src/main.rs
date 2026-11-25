@@ -2241,6 +2241,11 @@ fn main() {
             // A search of the computer with results, a disk still being read; and one without
             // the service installed.
             ("found", |s| found_scene(s, true)),
+            // The same, with the experimental highlighter on its matches.
+            ("found-marker", |s| {
+                s.settings.search_marker = true;
+                found_scene(s, true);
+            }),
             ("found-missing", |s| found_scene(s, false)),
             // An upload whose names are taken in the Drive folder: all at once, or the second
             // of three asked on its own.
@@ -2597,8 +2602,15 @@ fn main() {
             false
         })
         .on_close(|s, _| window_place::remember(s));
-    if let Some(options) = window_place::options(initial.window) {
-        main_app = main_app.window_options(options).maximized(initial.window.is_some_and(|w| w.maximized));
+    let place = window_place::options(initial.window);
+    // Experimental: Mica shows through a transparent window, which only its creation sets.
+    let mica = initial.mica && cfg!(windows);
+    if place.is_some() || mica {
+        let maximized = place.is_some() && initial.window.is_some_and(|w| w.maximized);
+        main_app = main_app.window_options(rune::WindowOptions { transparent: mica, ..place.unwrap_or_default() }).maximized(maximized);
+    }
+    if mica {
+        main_app = main_app.window_backdrop(rune::WindowBackdrop::Mica).color_scheme(initial.theme.color_scheme());
     }
 
     let (account_handle, _) = main_app.window(rune::windows::WindowSpec::from_app("add-account", account_app));

@@ -53,7 +53,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .key("window")
         .w_full()
         .h_full()
-        .fill(k.c.page)
+        .fill(if cx.window_backdrop().is_active() { Color::TRANSPARENT } else { k.c.page })
         .child(toolbar(s, &k))
         .child(main_content)
         .child(transfers(s, &k))
@@ -130,9 +130,13 @@ fn toggle_clear_completed(s: &mut State) {
 }
 
 fn reset_settings(s: &mut State, tx: &mut Tx) {
-    let was_hidden = s.settings.show_hidden;
+    let (was_hidden, had_mica) = (s.settings.show_hidden, s.settings.mica);
     // Where the window was isn't an option: it stays.
     s.settings = crate::settings::Settings { window: s.settings.window, ..Default::default() };
+    // The window stays transparent until it opens again: Mica's tint follows the theme back.
+    if had_mica {
+        tx.set_color_scheme(s.settings.theme.color_scheme());
+    }
     s.settings.save();
     s.settings.language.apply();
     let (sans, mono) = s.settings.font.families();
@@ -413,7 +417,12 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                             .border(1.0, border)
                             .cursor(Cursor::Pointer),
                     )
-                    .on_press(move |s: &mut State| change_settings(s, |c| c.theme = th))
+                    .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                        change_settings(s, |c| c.theme = th);
+                        if s.settings.mica {
+                            tx.set_color_scheme(th.color_scheme());
+                        }
+                    })
                     .child(icon(th.icon(), 15.0).color(if on { k.c.text_accent } else { k.c.icon_muted }))
                     .child(text(th.label()).font(if on { k.ty.text_small_medium } else { k.ty.text_small }).color(if on { k.c.text_base } else { k.c.text_muted }));
                 theme_pills = theme_pills.child(pill);
@@ -504,8 +513,8 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .child(rune_kit::Badge::new("Experimental").variant(rune_kit::BadgeVariant::Accent).build(k))
                 .child(
                     text(t(
-                        "Opções avançadas de diagnóstico do motor gráfico. O padrão Suave (GPU) já entrega a melhor qualidade e eficiência.",
-                        "Advanced diagnostic options for the graphics engine. The default, Smooth (GPU), already gives the best quality and efficiency.",
+                        "Recursos em teste e opções avançadas do motor gráfico. O padrão Suave (GPU) já entrega a melhor qualidade e eficiência.",
+                        "Features being tried out, and advanced options for the graphics engine. The default, Smooth (GPU), already gives the best quality and efficiency.",
                     ))
                         .font(k.ty.caption())
                         .color(k.c.text_muted)
@@ -526,18 +535,43 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                     "This system uses native vector smoothing on the GPU (DirectWrite and ClearType are only available on Windows).",
                 )
             };
-            let exp_card = card_box("card-experimental").child(control_row(
-                "row-render",
-                t("Nitidez e rasterização de texto", "Text sharpness and rendering"),
-                render_desc,
-                make_render_pills("render-pills", "render"),
-            ));
+            let exp_card = card_box("card-experimental")
+                .child(control_row(
+                    "row-render",
+                    t("Nitidez e rasterização de texto", "Text sharpness and rendering"),
+                    render_desc,
+                    make_render_pills("render-pills", "render"),
+                ))
+                .child(divider())
+                .child(switch_row(
+                    "opt-mica",
+                    t("Fundo Mica do Windows 11", "Windows 11 Mica background"),
+                    t(
+                        "O material Mica, tingido pelo papel de parede, aparece em volta dos painéis enquanto a janela está em primeiro plano. Vale ao abrir o Open Explorer de novo.",
+                        "The Mica material, tinted by the wallpaper, shows around the panes while the window is in front. Takes effect the next time Open Explorer opens.",
+                    ),
+                    None,
+                    st.mica,
+                    |s| change_settings(s, |c| c.mica = !c.mica),
+                ))
+                .child(divider())
+                .child(switch_row(
+                    "opt-search-marker",
+                    t("Marca-texto nos resultados da busca", "Highlighter on search results"),
+                    t(
+                        "Marca as letras encontradas nos nomes com um fundo, como um marca-texto, em vez de só mudar a cor delas.",
+                        "Marks the matched letters in names with a background, like a highlighter, instead of only changing their colour.",
+                    ),
+                    None,
+                    st.search_marker,
+                    |s| change_settings(s, |c| c.search_marker = !c.search_marker),
+                ));
 
             col()
                 .key("page-experimental")
                 .w_full()
                 .gap(12.0)
-                .child(section_head("Experimental", t("Parâmetros internos de renderização para testes e monitores específicos.", "Internal rendering settings for testing and specific monitors.")))
+                .child(section_head("Experimental", t("Recursos em teste e parâmetros internos de renderização.", "Features being tried out, and internal rendering settings.")))
                 .child(banner)
                 .child(exp_card)
         }
@@ -4525,6 +4559,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     // its ranges as it's built, so only the rows on screen pay for them.
     let words = std::rc::Rc::new(searched_words(&pane.loc));
     let accent = k.c.text_accent;
+    let marker = k.alpha(k.c.text_accent, 0.28);
     let build = move |s: &State, i: usize| -> El {
         let pane = &s.panes[p];
         let e = &pane.entries[i];
@@ -4551,8 +4586,16 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                     Some((rp, item)) if *rp == p && item.id == e.id => rename_field(s, rename_look),
                     _ => {
                         let name = shown(&e.name);
-                        let spans: Vec<Span> = crate::finder::match_ranges(&words, &name).into_iter().map(|r| Span::new(r.start, r.end).color(accent)).collect();
-                        text(name).font(font).color(text_c).spans(spans).truncate().shrink().min_w(0.0)
+                        let ranges = crate::finder::match_ranges(&words, &name);
+                        if s.settings.search_marker {
+                            // Experimental: as a highlighter marks them, painted under the
+                            // glyphs without reshaping the name.
+                            let marks = ranges.into_iter().map(|r| rune::TextHighlight::new(r, marker));
+                            text(name).font(font).color(text_c).text_highlights(marks).truncate().shrink().min_w(0.0)
+                        } else {
+                            let spans: Vec<Span> = ranges.into_iter().map(|r| Span::new(r.start, r.end).color(accent)).collect();
+                            text(name).font(font).color(text_c).spans(spans).truncate().shrink().min_w(0.0)
+                        }
                     }
                 }),
         )
