@@ -1456,6 +1456,23 @@ fn go_forward(s: &mut State, p: usize) {
     }
 }
 
+/// The mouse's side buttons over pane `p`: Voltar and Avançar, as in Explorer. Other extra
+/// buttons (the wheel's press) are left to the system.
+fn side_button(s: &mut State, p: usize, button: rune::PointerButton) -> bool {
+    match button {
+        rune::PointerButton::Back => go_back(s, p),
+        rune::PointerButton::Forward => go_forward(s, p),
+        _ => return false,
+    }
+    true
+}
+
+/// The side buttons anywhere else in the window: the active pane's, while Explorar shows.
+fn side_button_in_window(s: &mut State, button: rune::PointerButton) -> bool {
+    let p = s.active;
+    s.main_tab == MainTab::Explore && side_button(s, p, button)
+}
+
 fn open(s: &mut State, p: usize, id: &str) {
     actions::remember_search(s, p);
     let pane = &mut s.panes[p];
@@ -2642,6 +2659,29 @@ mod tests {
         assert!(s.account_form.is_some() && s.account_closes == 0);
         s.account_window_closed();
         assert!(s.account_form.is_none());
+    }
+
+    /// The mouse's side buttons step through a pane's history as Voltar and Avançar do; the
+    /// wheel's press is left alone.
+    #[test]
+    fn side_buttons_go_back_and_forward() {
+        let mut s = init();
+        let start = s.panes[1].loc.clone();
+        let there = Location::Mock(vec!["Documentos".into()]);
+        navigate(&mut s, 1, there.clone());
+        s.active = 0;
+        assert!(side_button(&mut s, 1, rune::PointerButton::Back));
+        assert_eq!((&s.panes[1].loc, s.active), (&start, 1));
+        assert!(side_button(&mut s, 1, rune::PointerButton::Forward));
+        assert_eq!(s.panes[1].loc, there);
+        assert!(!side_button(&mut s, 1, rune::PointerButton::Middle));
+        assert_eq!(s.panes[1].loc, there);
+        // Over the transfer queue or the toolbar: the active pane; not while Contas shows.
+        s.main_tab = MainTab::Accounts;
+        assert!(!side_button_in_window(&mut s, rune::PointerButton::Back));
+        s.main_tab = MainTab::Explore;
+        assert!(side_button_in_window(&mut s, rune::PointerButton::Back));
+        assert_eq!(s.panes[1].loc, start);
     }
 
     #[test]

@@ -59,6 +59,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(menu)
         .child(queue_menu)
         .child(address_menu)
+        // The mouse's side buttons anywhere else in Explorar: Voltar and Avançar in the active
+        // pane (over a pane, its own handler took them first).
+        .on_button(|s: &mut State, button, _: &mut Tx| crate::side_button_in_window(s, button))
         // Hover lands and leaves with the pointer, as in the system's file lists: the default
         // 100 ms fade on leaving left a trail of lit rows behind a fast pointer.
         .hover_motion_within(Anim::INSTANT, Anim::INSTANT);
@@ -3953,6 +3956,7 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
         .clip_rounded(k.radius.sm)
         .on_key(move |s: &mut State, ev: &KeyEvent, tx: &mut Tx| key(s, p, ev, tx))
         .on_press(move |s: &mut State| s.active = p)
+        .on_button(move |s: &mut State, button, _: &mut Tx| crate::side_button(s, p, button))
         .on_drop_files(move |s: &mut State, files: &[PathBuf], _| {
             crate::autoscroll::left(&mut s.autoscroll, p);
             dropped(s, p, files)
