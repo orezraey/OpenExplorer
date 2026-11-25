@@ -24,6 +24,20 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         return el();
     }
     let k = Kit::neutral(s.settings.theme.dark(cx.system_dark()));
+    cx.caption_color(k.c.text_base);
+    let title_leading = row()
+        .gap(8.0)
+        .center_y()
+        .child(icon(&icons::TAB_EXPLORE, 15.0).color(k.c.text_accent))
+        .child(text("Open Explorer").font(k.ty.text_small).color(k.c.text_base));
+    // Under Mica (Opções, Experimental) the title bar lets the backdrop through, as the page does.
+    let backdrop = cx.window_backdrop().is_active();
+    let titlebar = rune_kit::WindowTitlebar::from_insets(cx.chrome_insets())
+        .key("main-titlebar")
+        .leading_padding(12.0)
+        .fill(if backdrop { Color::TRANSPARENT } else { k.c.bg_base })
+        .leading(title_leading)
+        .build(&k);
     // Menus and dialogs draw in a layer above everything.
     let mut layer = Vec::new();
     let menu = context(s, &k, &mut layer);
@@ -54,7 +68,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .key("window")
         .w_full()
         .h_full()
-        .fill(if cx.window_backdrop().is_active() { Color::TRANSPARENT } else { k.c.page })
+        .fill(if backdrop { Color::TRANSPARENT } else { k.c.page })
+        .child(titlebar)
         .child(toolbar(s, &k))
         .child(main_content)
         .child(transfers(s, &k))

@@ -2624,6 +2624,7 @@ fn main() {
     });
 
     let mut main_app = rune::App::new(main_spec)
+        .titlebar(rune::Titlebar::new(34.0))
         .font_smoothing(initial.text_render.smoothing())
         .args(rune_args(std::env::args().skip(1)))
         .turn_scope(enter_turn, leave_turn)
