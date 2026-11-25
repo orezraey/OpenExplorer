@@ -3974,6 +3974,9 @@ fn pane(s: &State, k: &Kit, p: usize) -> El {
         .on_key(move |s: &mut State, ev: &KeyEvent, tx: &mut Tx| key(s, p, ev, tx))
         .on_press(move |s: &mut State| s.active = p)
         .on_button(move |s: &mut State, button, _: &mut Tx| crate::side_button(s, p, button))
+        // While the folder loads (or a search runs), the arrow with the busy circle, as in
+        // Explorer: the pane still takes clicks. Buttons and fields keep their own pointers.
+        .cursor(if pane.loading { Cursor::Progress } else { Cursor::Default })
         .on_drop_files(move |s: &mut State, files: &[PathBuf], _| {
             crate::autoscroll::left(&mut s.autoscroll, p);
             dropped(s, p, files)
