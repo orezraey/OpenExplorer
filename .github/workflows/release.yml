@@ -4,19 +4,32 @@
 #   a release with their packages. The tag must match the version in Cargo.toml.
 # - Run by hand (Actions > Release > Run workflow), it only builds: the packages stay in the run's
 #   artifacts, a dry run before tagging.
+# - A push to main that changes the dependencies, the toolchain or this file only compiles, to keep
+#   the build cache current. A tag's run can restore only the caches of main (GitHub scopes caches
+#   to the branch or tag that made them), so without this a release after a Rune bump compiled
+#   Rune, wgpu and naga from scratch: 0.4.0's macOS build took 7.5 minutes against 0.3.0's 2.5.
 
 name: Release
 
 on:
   push:
     tags: ["v*"]
+    branches: [main]
+    paths: ["Cargo.lock", "rust-toolchain.toml", ".github/workflows/release.yml"]
   workflow_dispatch:
+
+# A newer push to main makes an older cache build moot; a tag's run always finishes.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # A push to main only warms the cache: no packages, no installer run.
+  CACHE_ONLY: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
 jobs:
   build:
@@ -58,9 +71,12 @@ jobs:
           if [[ "$RUNNER_OS" == macOS ]]; then rustup target add aarch64-apple-darwin x86_64-apple-darwin; fi
           rustc --version
 
+      # Only main saves: a tag's cache could serve no other run, and each is about 1 GB of the
+      # repository's 10 GB.
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.name }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Linux libraries
         if: runner.os == 'Linux'
@@ -84,7 +100,7 @@ jobs:
       # programs) and the same .exe to run without installing. One .exe is the app and also the
       # search service (`openexplorer index`).
       - name: Package (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && env.CACHE_ONLY != 'true'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
@@ -96,7 +112,7 @@ jobs:
 
       # The installer installs, the search service joins it, and uninstalling takes both away.
       - name: Try the installer (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && env.CACHE_ONLY != 'true'
         shell: pwsh
         run: |
           $setup = Get-Item "dist/$env:PKG-setup.exe"
@@ -116,7 +132,7 @@ jobs:
       # The executable (also the search service) in a .tar.gz, which keeps its permission to run:
       # a bare file downloaded by a browser loses it.
       - name: Package (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && env.CACHE_ONLY != 'true'
         run: |
           mkdir -p dist
           chmod +x target/release/openexplorer
@@ -125,7 +141,7 @@ jobs:
       # An .app bundle, signed ad hoc (no Apple Developer account): macOS asks once before opening it.
       # A bundle is a folder, so it goes in a .zip (ditto keeps its signature).
       - name: Package (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && env.CACHE_ONLY != 'true'
         run: |
           app="dist/Open Explorer.app"
           mkdir -p "$app/Contents/MacOS"
@@ -153,6 +169,7 @@ jobs:
           cd dist && ditto -c -k --keepParent "Open Explorer.app" "$PKG.zip" && rm -rf "Open Explorer.app"
 
       - uses: actions/upload-artifact@v4
+        if: env.CACHE_ONLY != 'true'
         with:
           name: ${{ env.PKG }}
           path: dist/*
