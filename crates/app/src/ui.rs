@@ -4891,7 +4891,7 @@ fn path_bar(s: &State, k: &Kit, p: usize) -> El {
                 .on_press(move |s: &mut State| navigate(s, p, to.clone()))
                 .child(
                     text(c.label.clone())
-                        .font(if i == last { k.ty.text_small_medium } else { k.ty.text_small })
+                        .font(k.ty.text_small)
                         .color(if i == last { k.c.text_base } else { k.c.text_muted })
                         .truncate()
                         .shrink()
