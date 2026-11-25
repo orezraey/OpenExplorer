@@ -22,6 +22,10 @@ pub enum IconKey {
     Computer,
     /// A drive, a special folder or a file whose icon is its own (`.exe`, `.lnk`, `.ico`).
     Path(PathBuf),
+    /// A local folder that may carry an icon of its own (a `desktop.ini`). Checked on the path
+    /// thread, as reading a folder's attributes can stall on an offline share; `None` when it
+    /// has no icon of its own, and the folder shows [`IconKey::Folder`].
+    Dir(PathBuf),
 }
 
 /// Extensions whose files each carry their own icon, so they're looked up by path.
@@ -113,7 +117,7 @@ impl SysIcons {
             if self.known.contains_key(&k) {
                 continue;
             }
-            let worker = if matches!(k, IconKey::Path(_)) { &self.by_path } else { &self.by_type };
+            let worker = if matches!(k, IconKey::Path(_) | IconKey::Dir(_)) { &self.by_path } else { &self.by_type };
             let Some(worker) = worker else { return };
             let _ = worker.send(k.clone());
             self.known.insert(k, None);
@@ -125,7 +129,7 @@ impl SysIcons {
     pub fn show(&mut self, keys: Vec<IconKey>) {
         let listed: HashSet<&IconKey> = keys.iter().collect();
         let fixed = &self.fixed;
-        self.known.retain(|k, _| !matches!(k, IconKey::Path(_)) || fixed.contains(k) || listed.contains(k));
+        self.known.retain(|k, _| !matches!(k, IconKey::Path(_) | IconKey::Dir(_)) || fixed.contains(k) || listed.contains(k));
         self.want(keys);
     }
 
@@ -232,7 +236,8 @@ fn lookup(key: &IconKey) -> Option<IconBitmaps> {
         IconKey::Ext(ext) => (format!("arquivo.{ext}").into(), NORMAL, SHGFI_USEFILEATTRIBUTES),
         IconKey::Folder => ("pasta".into(), DIRECTORY, SHGFI_USEFILEATTRIBUTES),
         IconKey::Computer => unreachable!(),
-        IconKey::Path(p) => (p.clone(), 0, 0),
+        IconKey::Dir(p) if !has_custom_folder_icon(p) => return None,
+        IconKey::Path(p) | IconKey::Dir(p) => (p.clone(), 0, 0),
     };
     let wide: Vec<u16> = name.as_os_str().encode_wide().chain([0]).collect();
     let size = std::mem::size_of::<SHFILEINFOW>() as u32;
@@ -370,21 +375,17 @@ fn has_custom_folder_icon(_: &Path) -> bool {
     false
 }
 
-/// The icon keys a pane needs: one per type in its listing, plus individual paths for local
-/// folders that carry a custom/special Windows icon (Documentos, Downloads, Imagens, OneDrive…).
+/// The icon keys a pane needs: one per type in its listing, plus each local folder, which may
+/// carry an icon of its own (Documentos, Downloads, Imagens, OneDrive…). Nothing here touches
+/// the disk: it runs on the UI thread, and the path thread checks the folders.
 pub fn keys_of(entries: &[Entry], loc: &Location) -> Vec<IconKey> {
     let mut seen = std::collections::HashSet::new();
     let mut keys = Vec::new();
     for e in entries {
         if e.is_dir
             && let Some(path) = loc.local_path(e)
-            && has_custom_folder_icon(&path)
         {
-            let k = IconKey::Path(path);
-            if seen.insert(k.clone()) {
-                keys.push(k);
-            }
-            continue;
+            keys.push(IconKey::Dir(path));
         }
         if let Some(k) = key_for(e, loc)
             && seen.insert(k.clone())
@@ -430,6 +431,34 @@ mod tests {
         assert_eq!(key_for(&file("setup.exe"), &drive), Some(IconKey::Ext("exe".into())));
         let keys = keys_of(&[file("a.mp4"), file("b.MP4"), file("c.mkv")], &drive);
         assert_eq!(keys, vec![IconKey::Ext("mp4".into()), IconKey::Ext("mkv".into())]);
+    }
+
+    /// Benchmark: building a listing's icon keys, which `poll` does on the UI thread each time a
+    /// pane's listing changes.
+    /// `cargo test --release -p openexplorer keys_of_cost -- --ignored --nocapture`
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn keys_of_cost() {
+        for dir in [r"C:\Windows\WinSxS", r"C:\Windows\System32"] {
+            let dir = PathBuf::from(dir);
+            let entries: Vec<Entry> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| Entry { is_dir: e.file_type().is_ok_and(|t| t.is_dir()), ..file(&e.file_name().to_string_lossy()) })
+                .collect();
+            let folders = entries.iter().filter(|e| e.is_dir).count();
+            let loc = Location::Local(dir.clone());
+            // Once to warm the file system's cache, as a listing just read has.
+            std::hint::black_box(keys_of(&entries, &loc));
+            let rounds = 20;
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                std::hint::black_box(keys_of(&entries, &loc));
+            }
+            let ms = started.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
+            println!("{}: {} entries, {folders} folders: {ms:.3} ms per keys_of", dir.display(), entries.len());
+        }
     }
 
     #[cfg(windows)]

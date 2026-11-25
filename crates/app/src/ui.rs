@@ -3166,7 +3166,7 @@ fn entry_icon(s: &State, loc: &Location, e: &crate::model::Entry, size: f32) -> 
     if e.is_dir
         && let Some(path) = loc.local_path(e)
     {
-        let key = IconKey::Path(path);
+        let key = IconKey::Dir(path);
         let large = size > 24.0;
         if let Some(image) = s.icons.get(&key, large).filter(|i| i.is_ready() && i.error().is_none()) {
             return el().size(size, size).pixels(image.pixels());
