@@ -155,6 +155,10 @@ struct State {
     menu: Option<(usize, rune::PointerPress)>,
     /// The tree's right-click menu: pane, node, whether it's open, whether it's empty, and where.
     tree_menu: Option<(usize, tree::Node, bool, bool, rune::PointerPress)>,
+    /// Folders being renamed that a pane or a tab is in: the folder they're in, the folder and
+    /// its new place. When the rename's reload of that folder comes back done, the panes and
+    /// tabs inside move with it.
+    renamed: Vec<(Location, Location, Location)>,
     /// A rectangle selection being dragged out in a file list.
     lasso: Option<lasso::Lasso>,
     /// Where each pane's file list viewport is and how far it's scrolled, for the rectangle
@@ -306,6 +310,7 @@ impl State {
             show_tree: [true, true],
             menu: None,
             tree_menu: None,
+            renamed: Vec::new(),
             lasso: None,
             views: Default::default(),
             dialog: None,
@@ -512,6 +517,7 @@ fn init() -> State {
         show_tree: [true, true],
         menu: None,
         tree_menu: None,
+        renamed: Vec::new(),
         lasso: None,
         views: Default::default(),
         dialog: None,
@@ -859,6 +865,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
             Msg::Done { reload, result } => {
                 changed_here(s, &reload);
+                let ok = result.is_ok();
                 match &result {
                     Ok(msg) => openexplorer_gdrive::log(&format!("operação: {msg}")),
                     Err(msg) => openexplorer_gdrive::log(&format!("erro: {msg}")),
@@ -870,9 +877,23 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     Ok(msg) => s.status = msg,
                     Err(msg) => fail(s, msg),
                 }
+                for (parent, from, to) in std::mem::take(&mut s.renamed) {
+                    if !reload.contains(&parent) {
+                        s.renamed.push((parent, from, to));
+                    } else if ok {
+                        tabs::repoint(s, &from, Some(&to));
+                    }
+                }
                 for p in 0..2 {
                     if reload.contains(&s.panes[p].loc) {
                         load(s, p);
+                    }
+                }
+                // A folder no pane shows (one changed from the tree's menu) is read again for
+                // the tree; a pane's listing tells the tree itself.
+                for l in &reload {
+                    if !s.panes.iter().any(|p| &p.loc == l) {
+                        tree::reread(s, l);
                     }
                 }
                 // An upload, a copy or a delete there changes what the account uses.
@@ -1522,7 +1543,13 @@ fn open(s: &mut State, p: usize, id: &str) {
     if !e.is_dir {
         return actions::open_file(s, p, &e);
     }
-    let mut loc = pane.loc.clone();
+    let loc = folder_in(&pane.loc, &e);
+    navigate(s, p, loc);
+}
+
+/// Where folder `e` of `at` opens.
+pub(crate) fn folder_in(at: &Location, e: &Entry) -> Location {
+    let mut loc = at.clone();
     match &mut loc {
         // A folder found opens where it is.
         Location::Found(_) => loc = Location::Local(PathBuf::from(&e.id)),
@@ -1532,11 +1559,11 @@ fn open(s: &mut State, p: usize, id: &str) {
         Location::Drive { path, .. } => path.push((e.target.clone().unwrap_or_else(|| e.id.clone()), e.name.clone())),
         // A folder found opens where it is.
         Location::Server { server, .. } => {
-            let segs = servers::segs_of(&pane.loc, &e);
+            let segs = servers::segs_of(at, e);
             loc = servers::folder(server, segs);
         }
     }
-    navigate(s, p, loc);
+    loc
 }
 
 fn go_up(s: &mut State, p: usize) {

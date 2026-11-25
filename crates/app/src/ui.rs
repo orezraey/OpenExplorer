@@ -1225,11 +1225,15 @@ fn tree_context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     let loc = node.to.clone();
     let parent_entry = loc.as_ref().and_then(actions::parent_and_entry);
     let can_expand = node.opens && !empty;
+    // Windows' own folders for the user (the desktop, Documentos…) are copied, not moved,
+    // deleted or renamed from here, as in Explorer's tree.
+    let special = matches!(&loc, Some(Location::Local(path)) if s.places.is_special(path));
     let can_copy = parent_entry.as_ref().is_some_and(|(par, _)| actions::items_editable(par));
-    let can_cut = parent_entry.as_ref().is_some_and(|(par, _)| actions::editable(par) && actions::items_editable(par));
+    let can_change = can_copy && !special;
+    let can_cut = can_change && parent_entry.as_ref().is_some_and(|(par, _)| actions::editable(par));
     let can_paste = loc.as_ref().is_some_and(|to| actions::can_paste_to(s, to));
-    let can_delete = can_copy;
-    let can_rename = can_copy;
+    let can_delete = can_change;
+    let can_rename = can_change;
     let can_new_folder = loc.as_ref().is_some_and(actions::editable);
     let can_props = parent_entry.is_some();
 
@@ -1465,15 +1469,15 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
     let Some(d) = &s.dialog else { return };
     let pad = |e: El| col().key("content").w_full().px(16.0).pb(16.0).child(e);
     match d {
-        Dialog::Delete { pane, items } => {
-            let local = s.panes[*pane].loc.is_local();
+        Dialog::Delete { loc, items, .. } => {
+            let local = loc.is_local();
             let title = match items.as_slice() {
                 [one] => tr!("Excluir \"{}\"?", "Delete \"{}\"?", shown(&one.name)),
                 many => tr!("Excluir {} itens?", "Delete {} items?", ui_count(many.len())),
             };
             let where_to: Cow<str> = if local {
                 t("Os itens vão para a Lixeira do Windows, de onde podem ser restaurados.", "The items go to the Windows Recycle Bin, where they can be restored.").into()
-            } else if let Some(note) = crate::accounts::delete_note(s, &s.panes[*pane].loc) {
+            } else if let Some(note) = crate::accounts::delete_note(s, loc) {
                 note
             } else {
                 t(
@@ -1485,26 +1489,26 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
             // The explanation goes in the body, where it wraps; the dialog's own description
             // line doesn't, and would run under the close button.
             let note = text(where_to.into_owned()).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
-            let body = col().w_full().gap(12.0).child(note).child(item_list(s, k, *pane, items)).child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Excluir", "Delete")).variant(ButtonVariant::Danger).on_press(actions::delete)));
+            let body = col().w_full().gap(12.0).child(note).child(item_list(s, k, loc, items)).child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Excluir", "Delete")).variant(ButtonVariant::Danger).on_press(actions::delete)));
             Modal::new("delete", title).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
         }
-        Dialog::Purge { pane, items } => {
+        Dialog::Purge { loc, items, .. } => {
             let title = match items.as_slice() {
                 [one] => tr!("Excluir \"{}\" permanentemente?", "Permanently delete \"{}\"?", shown(&one.name)),
                 many => tr!("Excluir {} itens permanentemente?", "Permanently delete {} items?", ui_count(many.len())),
             };
-            let remote = items.iter().filter_map(|e| s.panes[*pane].loc.local_path(e)).any(|path| crate::network::is_remote(&path));
-            let note: Cow<str> = if s.panes[*pane].loc.is_local() && !remote && s.settings.skip_recycle_bin {
+            let remote = items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_remote(&path));
+            let note: Cow<str> = if loc.is_local() && !remote && s.settings.skip_recycle_bin {
                 t(
                     "A exclusão direta está ativada nas Opções: os itens serão apagados para sempre, sem passar pela Lixeira. Isso não pode ser desfeito.",
                     "Permanent deletion is on in Options: the items will be deleted for good, skipping the Recycle Bin. This can't be undone.",
                 )
                 .into()
-            } else if s.panes[*pane].loc.is_local() {
+            } else if loc.is_local() {
                 t("Aqui não há Lixeira: os itens serão apagados para sempre. Isso não pode ser desfeito.", "There's no Recycle Bin here: the items will be deleted for good. This can't be undone.").into()
-            } else if let Some(note) = crate::accounts::purge_note(&s.panes[*pane].loc) {
+            } else if let Some(note) = crate::accounts::purge_note(loc) {
                 note.into()
-            } else if let Location::Server { server, .. } = &s.panes[*pane].loc {
+            } else if let Location::Server { server, .. } = loc {
                 tr!(
                     "Servidores não têm lixeira: os itens serão apagados para sempre de {}. Isso não pode ser desfeito.",
                     "Servers have no trash: the items will be deleted from {} for good. This can't be undone.",
@@ -1518,7 +1522,7 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, layer: &mut Vec<El>) {
                 .w_full()
                 .gap(12.0)
                 .child(text(note.into_owned()).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0))
-                .child(item_list(s, k, *pane, items))
+                .child(item_list(s, k, loc, items))
                 .child(actions_row(k, t("Cancelar", "Cancel"), Button::new(t("Excluir permanentemente", "Delete permanently")).variant(ButtonVariant::Danger).on_press(actions::purge)));
             Modal::new("purge", title).open(true).child(pad(body)).width(460.0).fit().on_close(close).build(k, layer);
         }
@@ -2765,11 +2769,11 @@ fn clash_dialog(s: &State, k: &Kit, ask: &actions::ClashAsk, layer: &mut Vec<El>
 }
 
 /// The first few items a dialog acts on, with "e mais N" for the rest.
-fn item_list(s: &State, k: &Kit, pane: usize, items: &[crate::model::Entry]) -> El {
+fn item_list(s: &State, k: &Kit, loc: &Location, items: &[crate::model::Entry]) -> El {
     let mut list = col().key("items").w_full().gap(4.0);
     for e in items.iter().take(6) {
         list = list.child(
-            row().gap(6.0).center_y().child(entry_icon(s, &s.panes[pane].loc, e, 16.0)).child(text(shown(&e.name)).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0)),
+            row().gap(6.0).center_y().child(entry_icon(s, loc, e, 16.0)).child(text(shown(&e.name)).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0)),
         );
     }
     if items.len() > 6 {

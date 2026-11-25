@@ -41,15 +41,16 @@ pub enum AccountTarget {
 
 /// The dialog open over the window, if any.
 pub enum Dialog {
-    Delete { pane: usize, items: Vec<Entry> },
+    /// `loc` is the folder the items are in: the pane's, or a tree folder's parent.
+    Delete { pane: usize, loc: Location, items: Vec<Entry> },
     /// Excluir permanentemente, from Lixeira.
-    Purge { pane: usize, items: Vec<Entry> },
+    Purge { loc: Location, items: Vec<Entry> },
     /// Esvaziar lixeira of an account.
     EmptyTrash { email: String },
     /// Remover conta / servidor da Central de Contas.
     RemoveAccount { target: AccountTarget, provider: String, who: String },
-    /// The name being typed is `State::name_edit`.
-    NewFolder { pane: usize, error: Option<String> },
+    /// The name being typed is `State::name_edit`; `loc` is the folder it goes into.
+    NewFolder { pane: usize, loc: Location, error: Option<String> },
     /// Renaming a folder from the navigation tree (`State::name_edit`).
     Rename { pane: usize, loc: Location, item: Entry, error: Option<String> },
     Properties(Box<Props>),
@@ -262,6 +263,24 @@ fn not_here(s: &mut State, p: usize) {
 /// reach past one folder: a restored file goes back to its folder, a star shows in Com estrela.
 fn account_panes(s: &State, email: &str) -> Vec<Location> {
     s.panes.iter().map(|p| p.loc.clone()).filter(|l| account(l) == Some(email)).collect()
+}
+
+/// [`account_panes`] and `loc`, the folder changed: the tree's menu works in folders no pane
+/// shows, and the tree reads those again.
+fn account_panes_and(s: &State, email: &str, loc: &Location) -> Vec<Location> {
+    let mut out = account_panes(s, email);
+    if !out.contains(loc) {
+        out.push(loc.clone());
+    }
+    out
+}
+
+/// The panes and tabs in a folder about to be deleted go up to the folder it's in: none is left
+/// showing a folder that's gone, or holding it open on the disk.
+fn leave_deleted(s: &mut State, loc: &Location, items: &[Entry]) {
+    for e in items.iter().filter(|e| e.is_dir) {
+        crate::tabs::repoint(s, &crate::folder_in(loc, e), None);
+    }
 }
 
 /// Runs `work` on a background thread with the account's [`Drive`], then reloads `reload`.
@@ -1160,16 +1179,13 @@ pub fn ask_delete_item(s: &mut State, p: usize, parent: Location, item: Entry) {
         s.status = share_stays().into();
         return;
     }
-    if s.panes[p].loc != parent {
-        crate::navigate(s, p, parent.clone());
-    }
     let kept = accounts::keeps_deleted(&parent);
     let remote = parent.local_path(&item).is_some_and(|path| crate::network::is_remote(&path));
     if (parent.is_local() && s.settings.skip_recycle_bin) || (matches!(parent, Location::Server { .. }) && !kept) || remote {
-        s.dialog = Some(Dialog::Purge { pane: p, items: vec![item] });
+        s.dialog = Some(Dialog::Purge { loc: parent, items: vec![item] });
         return;
     }
-    s.dialog = Some(Dialog::Delete { pane: p, items: vec![item] });
+    s.dialog = Some(Dialog::Delete { pane: p, loc: parent, items: vec![item] });
 }
 
 /// Opens the Rename modal for a folder right-clicked in the navigation tree.
@@ -1181,15 +1197,12 @@ pub fn ask_rename_item(s: &mut State, p: usize, parent: Location, item: Entry) {
     s.dialog = Some(Dialog::Rename { pane: p, loc: parent, item, error: None });
 }
 
-/// Navigates pane `p` to `target` and opens the Nova pasta modal inside it.
-pub fn ask_new_folder_in(s: &mut State, p: usize, target: Location, tx: &mut Tx) {
+/// Opens Nova pasta for a folder right-clicked in the navigation tree; the pane stays where it is.
+pub fn ask_new_folder_in(s: &mut State, p: usize, target: Location, _: &mut Tx) {
     if !editable(&target) {
         return not_here(s, p);
     }
-    if s.panes[p].loc != target {
-        crate::navigate(s, p, target);
-    }
-    ask_new_folder(s, p, tx);
+    new_folder_dialog(s, p, target);
 }
 
 pub fn ask_delete(s: &mut State, p: usize) {
@@ -1199,7 +1212,7 @@ pub fn ask_delete(s: &mut State, p: usize) {
     }
     // In Lixeira, Del deletes for good, after asking.
     if in_trash(&s.panes[p].loc) {
-        s.dialog = Some(Dialog::Purge { pane: p, items });
+        s.dialog = Some(Dialog::Purge { loc: s.panes[p].loc.clone(), items });
         return;
     }
     if !items_editable(&s.panes[p].loc) {
@@ -1217,15 +1230,15 @@ pub fn ask_delete(s: &mut State, p: usize) {
     // doesn't.
     let kept = accounts::keeps_deleted(loc);
     if (loc.is_local() && s.settings.skip_recycle_bin) || (matches!(loc, Location::Server { .. }) && !kept) || items.iter().filter_map(|e| loc.local_path(e)).any(|path| crate::network::is_remote(&path)) {
-        s.dialog = Some(Dialog::Purge { pane: p, items });
+        s.dialog = Some(Dialog::Purge { loc: s.panes[p].loc.clone(), items });
         return;
     }
-    s.dialog = Some(Dialog::Delete { pane: p, items });
+    s.dialog = Some(Dialog::Delete { pane: p, loc: s.panes[p].loc.clone(), items });
 }
 
 pub fn delete(s: &mut State) {
-    let Some(Dialog::Delete { pane, items }) = s.dialog.take() else { return };
-    let loc = s.panes[pane].loc.clone();
+    let Some(Dialog::Delete { pane, loc, items }) = s.dialog.take() else { return };
+    leave_deleted(s, &loc, &items);
     let n = items.len();
     match &loc {
         Location::Local(_) | Location::Found(_) => {
@@ -1244,7 +1257,7 @@ pub fn delete(s: &mut State) {
         Location::Drive { email, .. } => {
             // Lixeira, if a pane shows it, gets the items too.
             let who = email.clone();
-            undo::drive_job(s, email, account_panes(s, email), to_the_drive_trash, move |d, rec| {
+            undo::drive_job(s, email, account_panes_and(s, email, &loc), to_the_drive_trash, move |d, rec| {
                 for e in items {
                     d.trash(&e.id)?;
                     rec.add([Step::DriveRestore { email: who.clone(), id: e.id, name: e.name, empty: false }]);
@@ -1297,14 +1310,14 @@ pub fn restore(s: &mut State, p: usize) {
 pub fn ask_purge(s: &mut State, p: usize) {
     let items = selected(s, p);
     if !items.is_empty() && in_trash(&s.panes[p].loc) {
-        s.dialog = Some(Dialog::Purge { pane: p, items });
+        s.dialog = Some(Dialog::Purge { loc: s.panes[p].loc.clone(), items });
     }
 }
 
 /// The confirmed Excluir permanentemente.
 pub fn purge(s: &mut State) {
-    let Some(Dialog::Purge { pane, items }) = s.dialog.take() else { return };
-    let loc = s.panes[pane].loc.clone();
+    let Some(Dialog::Purge { loc, items, .. }) = s.dialog.take() else { return };
+    leave_deleted(s, &loc, &items);
     let n = items.len();
     if loc.is_local() {
         let paths: Vec<PathBuf> = items.iter().filter_map(|e| loc.local_path(e)).collect();
@@ -1321,7 +1334,7 @@ pub fn purge(s: &mut State) {
         return;
     }
     let Some(email) = account(&loc) else { return };
-    drive_job(s, email, account_panes(s, email), move |d| {
+    drive_job(s, email, account_panes_and(s, email, &loc), move |d| {
         for (i, e) in items.iter().enumerate() {
             // Say how far it got: what went before an error is gone for good.
             d.delete_forever(&e.id).map_err(|err| if i == 0 { err } else { tr!("{err} (já excluídos para sempre: {})", "{err} (already deleted forever: {})", count(i)) })?;
@@ -1447,25 +1460,30 @@ pub fn ask_new_folder(s: &mut State, p: usize, _: &mut Tx) {
     if !editable(&s.panes[p].loc) {
         return not_here(s, p);
     }
+    let loc = s.panes[p].loc.clone();
+    new_folder_dialog(s, p, loc);
+}
+
+fn new_folder_dialog(s: &mut State, p: usize, loc: Location) {
     let name = t("Nova pasta", "New folder");
     let mut edit = TextEdit::new(name);
     edit.set_selection(0, name.len());
     s.name_edit = edit;
-    s.dialog = Some(Dialog::NewFolder { pane: p, error: None });
+    s.dialog = Some(Dialog::NewFolder { pane: p, loc, error: None });
 }
 
 /// Confirms Nova pasta or Renomear (from the tree) with the name typed.
 pub fn submit_name(s: &mut State) {
     let name = s.name_edit.text.trim().to_string();
     match &mut s.dialog {
-        Some(Dialog::NewFolder { pane, error }) => {
-            if let Some(why) = name_problem(&s.panes[*pane].loc, &name) {
+        Some(Dialog::NewFolder { pane, loc, error }) => {
+            if let Some(why) = name_problem(loc, &name) {
                 *error = Some(why);
                 return;
             }
-            let pane = *pane;
+            let (pane, loc) = (*pane, loc.clone());
             s.dialog = None;
-            apply_name(s, pane, None, name);
+            apply_name_in(s, pane, loc, None, name);
         }
         Some(Dialog::Rename { pane, loc, item, error }) => {
             if let Some(why) = name_problem(loc, &name) {
@@ -1495,6 +1513,14 @@ pub fn apply_name_in(s: &mut State, pane: usize, loc: Location, item: Option<Ent
     if item.as_ref().is_some_and(|i| shown(&i.name) == shown_name || i.name == name) {
         return;
     }
+    // A pane or a tab in a folder renamed follows it once the rename is done.
+    if let Some(dir) = item.as_ref().filter(|i| i.is_dir && !matches!(loc, Location::Mock(_) | Location::Found(_))) {
+        let from = crate::folder_in(&loc, dir);
+        if crate::tabs::any_inside(s, &from) {
+            let to = crate::folder_in(&loc, &Entry { name: name.clone(), ..dir.clone() });
+            s.renamed.push((loc.clone(), from, to));
+        }
+    }
     match (&loc, item) {
         (Location::Local(_) | Location::Found(_), Some(item)) => {
             let Some(from) = loc.local_path(&item) else { return };
@@ -1517,7 +1543,7 @@ pub fn apply_name_in(s: &mut State, pane: usize, loc: Location, item: Option<Ent
         (Location::Drive { email, .. }, Some(item)) => {
             let what = tr!("renomear “{}” para “{shown_name}”", "rename “{}” to “{shown_name}”", shown(&item.name));
             let who = email.clone();
-            undo::drive_job(s, email, account_panes(s, email), move |_| what, move |d, rec| {
+            undo::drive_job(s, email, account_panes_and(s, email, &loc), move |_| what, move |d, rec| {
                 let file = d.rename(&item.id, &name)?;
                 rec.add([Step::DriveRename { email: who, id: item.id, from: file.name, to: item.name }]);
                 Ok(tr!("Renomeado para \"{shown_name}\".", "Renamed to \"{shown_name}\"."))
@@ -1978,7 +2004,7 @@ sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa 
         s.panes[1].set_entries(Ok(vec![e]));
         s.panes[1].selected = ["a.txt".to_string()].into();
         ask_delete(&mut s, 1);
-        assert!(matches!(&s.dialog, Some(Dialog::Purge { pane: 1, .. })));
+        assert!(matches!(&s.dialog, Some(Dialog::Purge { loc, .. }) if *loc == s.panes[1].loc));
         s.dialog = None;
         ask_empty_trash(&mut s, 1);
         assert!(matches!(&s.dialog, Some(Dialog::EmptyTrash { email }) if email == "onedrive:b!x"));
@@ -1994,7 +2020,7 @@ sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa 
         s.panes[1].selected = ["a".to_string()].into();
         // Del in Lixeira opens Excluir permanentemente, not the move to the trash.
         ask_delete(&mut s, 1);
-        assert!(matches!(&s.dialog, Some(Dialog::Purge { pane: 1, items }) if items.len() == 1));
+        assert!(matches!(&s.dialog, Some(Dialog::Purge { loc, items }) if items.len() == 1 && *loc == s.panes[1].loc));
         s.dialog = None;
         ask_empty_trash(&mut s, 1);
         assert!(matches!(&s.dialog, Some(Dialog::EmptyTrash { email }) if email == "a@b"));
@@ -2034,6 +2060,42 @@ sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa 
             ask_rename(&mut s, 0, &mut Tx::default());
             assert!(s.renaming.is_none(), "{id}");
         }
+    }
+
+    /// The tree's menu works on the folder right-clicked, wherever the pane is, and leaves the
+    /// pane where it is.
+    #[test]
+    fn the_tree_menu_works_where_the_folder_is() {
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        s.settings.skip_recycle_bin = false;
+        let here = Location::Local(r"C:\A".into());
+        s.panes[0].go(here.clone());
+        let fotos = Location::Local(r"C:\B\Fotos".into());
+        let (parent, item) = parent_and_entry(&fotos).unwrap();
+        assert_eq!(parent, Location::Local(r"C:\B".into()));
+        // Propriedades shows, and renames in, the folder's own place.
+        properties_of(&mut s, 0, parent.clone(), vec![item.clone()]);
+        assert!(matches!(&s.dialog, Some(Dialog::Properties(p)) if p.loc == parent));
+        close_properties(&mut s);
+        // Excluir and Nova pasta ask without moving the pane.
+        ask_delete_item(&mut s, 0, parent.clone(), item.clone());
+        assert!(matches!(&s.dialog, Some(Dialog::Delete { loc, .. } | Dialog::Purge { loc, .. }) if *loc == parent));
+        assert_eq!(s.panes[0].loc, here);
+        s.dialog = None;
+        ask_new_folder_in(&mut s, 0, fotos.clone(), &mut Tx::default());
+        assert!(matches!(&s.dialog, Some(Dialog::NewFolder { loc, .. }) if *loc == fotos));
+        assert_eq!(s.panes[0].loc, here);
+        s.dialog = None;
+        // A pane in the folder being deleted goes up to the folder it was in.
+        s.panes[1].go(Location::Local(r"C:\B\Fotos\2024".into()));
+        leave_deleted(&mut s, &parent, std::slice::from_ref(&item));
+        assert_eq!(s.panes[1].loc, parent);
+        assert_eq!(s.panes[0].loc, here);
+        // Windows' folders for the user are special; their subfolders aren't.
+        s.places.user.push((r"C:\Users\ana\Documents".into(), "Documentos".into()));
+        assert!(s.places.is_special(std::path::Path::new(r"C:\Users\ana\Documents")));
+        assert!(!s.places.is_special(std::path::Path::new(r"C:\Users\ana\Documents\Notas")));
     }
 
     #[test]

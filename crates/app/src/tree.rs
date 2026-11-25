@@ -650,6 +650,20 @@ pub fn learn(s: &mut State, p: usize) {
     s.tree.version += 1;
 }
 
+/// The app changed what folder `loc` holds and no pane shows it (a folder made, renamed or
+/// deleted from the tree's menu): the tree, if it had read its folders, reads them again.
+pub fn reread(s: &mut State, loc: &Location) {
+    let Some(node) = chain(s, loc).pop() else { return };
+    if matches!(node.id, NodeId::Mock(_)) || !matches!(s.tree.kids.get(&node.id), Some(Kids::Ready(_) | Kids::Failed(_))) {
+        return;
+    }
+    s.tree.kids.remove(&node.id);
+    s.tree.version += 1;
+    if s.tree.open.iter().any(|open| open.contains(&node.id)) {
+        load(s, &node);
+    }
+}
+
 /// The folder a Drive entry opens: a shortcut's target, else itself.
 fn opened(e: &Entry) -> &str {
     e.target.as_deref().unwrap_or(&e.id)

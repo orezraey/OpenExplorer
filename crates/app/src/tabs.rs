@@ -328,6 +328,70 @@ pub fn purge_locations(s: &mut State, gone: impl Fn(&Location) -> bool, fallback
     }
 }
 
+/// Where `loc` goes when folder `from` is renamed to `to`, or deleted (`to` is `None`: up to the
+/// folder `from` was in). `None` when `loc` isn't `from` or a folder inside it.
+pub fn moved(loc: &Location, from: &Location, to: Option<&Location>) -> Option<Location> {
+    match (loc, from) {
+        (Location::Local(at), Location::Local(f)) => {
+            let rest = at.strip_prefix(f).ok()?;
+            match to {
+                Some(Location::Local(t)) => Some(Location::Local(t.join(rest))),
+                Some(_) => None,
+                None => Some(Location::Local(f.parent()?.to_path_buf())),
+            }
+        }
+        (Location::Server { server, path, find: None }, Location::Server { server: fs, path: fp, .. }) if !fp.is_empty() && server.id == fs.id && path.starts_with(fp) => match to {
+            Some(Location::Server { path: tp, .. }) => Some(Location::Server { server: server.clone(), path: tp.iter().chain(&path[fp.len()..]).cloned().collect(), find: None }),
+            Some(_) => None,
+            None => Some(Location::Server { server: server.clone(), path: fp[..fp.len() - 1].to_vec(), find: None }),
+        },
+        // Drive's folders by id: a renamed one keeps its id and changes its name.
+        (Location::Drive { email, space, path }, Location::Drive { email: fe, space: fs, path: fp })
+            if !fp.is_empty() && email == fe && space == fs && fp.len() <= path.len() && path.iter().zip(fp).all(|(a, b)| a.0 == b.0) =>
+        {
+            match to {
+                Some(Location::Drive { path: tp, .. }) => Some(Location::Drive { email: email.clone(), space: space.clone(), path: tp.iter().chain(&path[fp.len()..]).cloned().collect() }),
+                Some(_) => None,
+                None => Some(Location::Drive { email: email.clone(), space: space.clone(), path: fp[..fp.len() - 1].to_vec() }),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether a pane or a tab shows folder `from` or a folder inside it.
+pub fn any_inside(s: &State, from: &Location) -> bool {
+    (0..2).any(|p| {
+        (!s.tabs[p].is_picker() && moved(&s.panes[p].loc, from, None).is_some())
+            || s.tabs[p].items.iter().filter_map(|slot| slot.pane.as_ref()).any(|pane| moved(&pane.loc, from, None).is_some())
+    })
+}
+
+/// Moves the panes and tabs inside folder `from` to where [`moved`] says, so none shows a
+/// folder that was renamed or deleted.
+pub fn repoint(s: &mut State, from: &Location, to: Option<&Location>) {
+    for p in 0..2 {
+        if !s.tabs[p].is_picker()
+            && let Some(loc) = moved(&s.panes[p].loc, from, to)
+        {
+            if s.renaming.as_ref().is_some_and(|(rp, _)| *rp == p) {
+                s.renaming = None;
+            }
+            s.panes[p].go(loc);
+            crate::list(s, p, false);
+            crate::tree::follow(s, p);
+        }
+        for slot in &mut s.tabs[p].items {
+            if let Some(pane) = &mut slot.pane
+                && let Some(loc) = moved(&pane.loc, from, to)
+            {
+                pane.go(loc);
+                pane.loading = true;
+            }
+        }
+    }
+}
+
 /// Closes any open provider filter dropdown in the "+" picker.
 pub fn close_picker_filter(s: &mut State) {
     for p in 0..2 {
@@ -399,5 +463,37 @@ mod tests {
         close_tab(&mut s, 0, 0);
         assert_eq!(s.tabs[0].active, Some(1));
         assert_eq!(s.panes[0].loc, Location::Mock(vec!["2".into()]));
+    }
+
+    #[test]
+    fn panes_and_tabs_follow_a_folder_renamed_or_deleted() {
+        let local = |p: &str| Location::Local(p.into());
+        let from = local(r"C:\Fotos");
+        assert_eq!(moved(&local(r"C:\Fotos\2024"), &from, Some(&local(r"C:\Imagens"))), Some(local(r"C:\Imagens\2024")));
+        assert_eq!(moved(&local(r"C:\Fotos"), &from, None), Some(local(r"C:\")));
+        assert_eq!(moved(&local(r"C:\Fotos 2"), &from, None), None);
+        let drive = |path: &[(&str, &str)]| Location::Drive {
+            email: "a@b".into(),
+            space: crate::model::Space::MyDrive,
+            path: path.iter().map(|(id, name)| (id.to_string(), name.to_string())).collect(),
+        };
+        let from = drive(&[("1", "Fotos")]);
+        let inside = drive(&[("1", "Fotos"), ("2", "2024")]);
+        assert_eq!(moved(&inside, &from, Some(&drive(&[("1", "Imagens")]))), Some(drive(&[("1", "Imagens"), ("2", "2024")])));
+        assert_eq!(moved(&inside, &from, None), Some(drive(&[])));
+        assert_eq!(moved(&drive(&[("3", "Fotos")]), &from, None), None);
+
+        // A tab left in the folder, and the other pane in it, both move.
+        let mut s = State::placeholder();
+        s.tabs = [PaneTabs::initial(), PaneTabs::initial()];
+        s.panes[0] = Pane::new(local(r"C:\Fotos\2024"));
+        open_new_tab(&mut s, 0, Location::Mock(Vec::new()));
+        s.panes[1] = Pane::new(local(r"C:\Fotos"));
+        assert!(any_inside(&s, &local(r"C:\Fotos")));
+        assert!(!any_inside(&s, &local(r"C:\Outra")));
+        repoint(&mut s, &local(r"C:\Fotos"), Some(&local(r"C:\Imagens")));
+        assert_eq!(s.tabs[0].items[0].pane.as_ref().unwrap().loc, local(r"C:\Imagens\2024"));
+        assert_eq!(s.panes[1].loc, local(r"C:\Imagens"));
+        assert_eq!(s.panes[0].loc, Location::Mock(Vec::new()));
     }
 }
