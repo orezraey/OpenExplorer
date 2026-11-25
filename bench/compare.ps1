@@ -170,6 +170,21 @@ $Downloads = [ordered]@{
 $DownloadRoot = 'C:\OEBench'
 $DownloadTo = $null
 $Fresh = New-Object System.Collections.Generic.Queue[string]
+
+# Uploads: everything in a local folder under C:\OEBench\up (made with random bytes the first
+# time), selected with Ctrl+A in the left pane and copied with the arrow between the panes into
+# an empty Google Drive folder in the right one, under "Open Explorer benchmark/uploads". Timed
+# from the arrow until Drive holds every file (it shows a file once its upload has finished):
+# the upload_target example asks Drive every 200 ms, the same for both apps.
+$Uploads = [ordered]@{
+    'upload-large' = @{ Local = 'large'; Files = 1; Size = 100MB }
+    'upload-100-files' = @{ Local = 'small'; Files = 100; Size = 512KB }
+}
+$UploadRoot = 'C:\OEBench\up'
+$UploadTarget = Join-Path $PSScriptRoot '..\target\release\examples\upload_target.exe'
+# The Drive folders the uploads go to, made before each app starts (Air Explorer lists them
+# fresh then).
+$UpFolders = New-Object System.Collections.Generic.Queue[string]
 function Make-DownloadFolders([int] $n) {
     $Fresh.Clear()
     for ($k = 0; $k -lt $n; $k++) {
@@ -209,6 +224,11 @@ $Adapters = @{
         }
         # Puts the keyboard in pane `i`'s list.
         Focus = { param($win, $i) (& $Adapters.openexplorer.Pane $win $i).SetFocus() }
+        CopyRight = {
+            param($win)
+            $b = $win.FindFirst($Scope::Descendants, (Prop $A::AutomationIdProperty 'copy-right'))
+            $b.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+        }
         # The arrow between the panes that copies the right pane's selection to the left one.
         CopyLeft = {
             param($win)
@@ -337,6 +357,12 @@ $Adapters = @{
             param($win)
             $buttons = $win.FindAll($Scope::Descendants, (Prop $A::ClassNameProperty 'WindowsForms10.BUTTON.app.0.25bb5ff_r6_ad1'))
             $r = ($buttons | Sort-Object { $_.Current.BoundingRectangle.Y } | Select-Object -Last 1).Current.BoundingRectangle
+            [Win]::Click([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
+        }
+        CopyRight = {
+            param($win)
+            $buttons = $win.FindAll($Scope::Descendants, (Prop $A::ClassNameProperty 'WindowsForms10.BUTTON.app.0.25bb5ff_r6_ad1'))
+            $r = (@($buttons | Sort-Object { $_.Current.BoundingRectangle.Y }) | Select-Object -Last 2 | Select-Object -First 1).Current.BoundingRectangle
             [Win]::Click([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
         }
         Row = {
@@ -606,6 +632,51 @@ function Download($ad, $win, $d) {
     throw "$($ad.Name): download of $($d.Drive) not done in $Timeout s ($($t.files) files, $($t.dirs) folders, $($t.bytes) bytes)"
 }
 
+# The local files an upload sends, made once with random bytes (so nothing compresses them).
+function Make-UploadSources {
+    $rng = New-Object System.Random 7
+    foreach ($u in $Uploads.Values) {
+        $dir = Join-Path $UploadRoot $u.Local
+        New-Item -ItemType Directory -Force $dir | Out-Null
+        for ($k = 1; $k -le $u.Files; $k++) {
+            $path = Join-Path $dir ('{0}-{1:D3}.bin' -f $u.Local, $k)
+            if ((Test-Path $path) -and (Get-Item $path).Length -eq $u.Size) { continue }
+            $buf = New-Object byte[] ([Math]::Min($u.Size, 4MB))
+            $f = [System.IO.File]::Create($path)
+            for ($left = $u.Size; $left -gt 0; $left -= $buf.Length) { $rng.NextBytes($buf); $f.Write($buf, 0, [Math]::Min($left, $buf.Length)) }
+            $f.Close()
+        }
+    }
+}
+
+function Upload($ad, $win, $u) {
+    $target = $UpFolders.Dequeue()
+    & $ad.Ready $win 1
+    Open-Folder $ad $win 0 $UploadRoot 0 -least 1 | Out-Null
+    Open-Row $ad $win 0 $u.Local 0 -least 1 | Out-Null
+    Open-Folder $ad $win 1 (& $ad.CloudPath $win 'drive' "$Gd/uploads") 0 -least 1 | Out-Null
+    Open-Row $ad $win 1 $target 0 | Out-Null
+    $psi = New-Object System.Diagnostics.ProcessStartInfo $UploadTarget, "$($Google.email) wait $target $($u.Files) $($u.Files * $u.Size)"
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.CreateNoWindow = $true
+    $waiter = [System.Diagnostics.Process]::Start($psi)
+    if ($waiter.StandardOutput.ReadLine() -ne 'ready') { throw "upload_target couldn't watch $target" }
+    Focus-Window $win
+    & $ad.Focus $win 0
+    Start-Sleep -Milliseconds 200
+    [System.Windows.Forms.SendKeys]::SendWait('^a')
+    Start-Sleep -Milliseconds 300
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    & $ad.CopyRight $win
+    $line = $waiter.StandardOutput.ReadLineAsync()
+    while (-not $line.IsCompleted -and $sw.Elapsed.TotalSeconds -lt $Timeout) { Start-Sleep -Milliseconds 20 }
+    $t = $sw.Elapsed.TotalSeconds
+    if (-not $line.IsCompleted -or $line.Result -ne 'done') {
+        if (-not $waiter.HasExited) { $waiter.Kill() }
+        throw "$($ad.Name): upload of $($u.Local) into $target not done in $Timeout s"
+    }
+    $t
+}
+
 function Memory-Of($ad) {
     $root = Get-Process -Name $ad.Process | Select-Object -First 1
     $all = @(Get-CimInstance Win32_Process)
@@ -653,6 +724,13 @@ foreach ($key in $AppList) {
     if ($dlCount) {
         Close-App $ad
         Make-DownloadFolders ($dlCount * ($Runs + 1) + 2)
+    }
+    $upCount = @($Uploads.Keys | Where-Object { Want $_ }).Count
+    if ($upCount) {
+        Close-App $ad
+        Make-UploadSources
+        $UpFolders.Clear()
+        & $UploadTarget $Google.email make ($upCount * ($Runs + 1)) | ForEach-Object { $UpFolders.Enqueue($_) }
     }
     $exe = Get-Item $ad.Exe
     $version = $exe.VersionInfo.ProductVersion
@@ -726,6 +804,19 @@ foreach ($key in $AppList) {
         $r[$name] = @{ seconds = $times; median = (Median $times); files = $d.Files; folders = $d.Dirs; bytes = $d.Bytes }
     }
 
+    foreach ($name in $Uploads.Keys) {
+        if (-not (Want $name)) { continue }
+        $u = $Uploads[$name]
+        $times = @()
+        for ($k = 0; $k -le $Runs; $k++) {
+            $t = [math]::Round((Upload $ad $win $u), 3)
+            Write-Host ("    {0} run {1}: {2} s" -f $name, $k, $t)
+            if ($k -gt 0) { $times += $t }
+        }
+        Write-Host ("  {0,-20} median {1:N3} s  ({2})" -f $name, (Median $times), ($times -join ', '))
+        $r[$name] = @{ seconds = $times; median = (Median $times); files = $u.Files; bytes = $u.Files * $u.Size }
+    }
+
     # Start: from launch until the left pane shows its first folder whole (Air Explorer reopens
     # the last one, C:\Windows\Web; Open Explorer the desktop): the moment its count reached
     # the number it then kept for two seconds.
@@ -764,6 +855,8 @@ foreach ($key in $AppList) {
 
 foreach ($key in $AppList) { Close-App $Adapters[$key] }
 Get-ChildItem -LiteralPath $DownloadRoot -Directory -Filter 'dl-*' -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+# The uploads' Drive folders go for good, to give the account its room back.
+if (@($Uploads.Keys | Where-Object { Want $_ }).Count) { & $UploadTarget $Google.email clean | Out-Null }
 
 New-Item -ItemType Directory -Force (Split-Path $Out) | Out-Null
 $results | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 $Out
