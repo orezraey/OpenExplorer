@@ -957,67 +957,49 @@ fn queue_end(s: &State, k: &Kit, w: f32, end: &transfers::End) -> El {
     queue_cell(w).child(glyph).child(text(end.text.clone()).font(k.ty.text_xsmall).color(k.c.text_base).truncate().shrink().min_w(0.0).help_when_truncated(end.text.clone()))
 }
 
-/// The bar with its percentage over it, as in Air Explorer.
-fn queue_bar(k: &Kit, fraction: Option<f32>) -> El {
-    let label = fraction.map(|f| format!("{}%", (f * 100.0).floor())).unwrap_or_else(|| "…".into());
-    let fill = el().key("fill").h_full().fill(k.alpha(k.c.text_accent, 0.35));
+/// The bar with its percentage over it, as in Air Explorer: both live values of the row, so
+/// a transfer moving on redraws them without building the view again.
+fn queue_bar(k: &Kit, shown: &transfers::Shown) -> El {
+    let fill = el().key("fill").w_full().h_full().fill(k.alpha(k.c.text_accent, 0.35)).live_rect(&shown.fill);
     row()
         .key("bar")
         .role("progressbar")
-        .label(label.clone())
+        .label(t("Progresso", "Progress"))
+        .range_value(0.0, 0.0, 1.0)
+        .live_range_value(&shown.fraction)
         .w(0.0)
         .grow(1.0)
-        .max_w(120.0)
-        .h(15.0)
+        .max_w(transfers::BAR_MAX)
+        .h(transfers::BAR_H)
         .border(1.0, k.c.border_base)
         .fill(k.c.bg_base)
         .clip_soft(0.0)
-        .child(fill.w_frac(fraction.unwrap_or(0.0)))
-        .child(row().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).center().child(text(label).font(k.ty.text_xsmall).color(k.c.text_base)))
+        .child(fill)
+        .child(row().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).center().child(text(shown.percent.get().to_string()).w_full().align(Align::Center).font(k.ty.text_xsmall).color(k.c.text_base).live_text(&shown.percent)))
 }
 
 fn queue_row(s: &State, k: &Kit, t: &transfers::Transfer) -> El {
-    use std::sync::atomic::Ordering::Relaxed;
     let p = &t.progress;
     let w = s.layout.queue_cols;
     let muted = |t: String| text(t).font(k.ty.text_xsmall).color(k.c.text_base).truncate().shrink().min_w(0.0);
-    // `t` is the transfer here, so the words go through their full name.
-    use openexplorer_i18n::t as words;
-    let (state, dot) = match p.stage() {
-        Stage::Waiting if p.cancelled() => (words("Cancelando…", "Canceling…"), k.c.text_faint),
-        Stage::Waiting => (words("Aguardando", "Waiting"), k.c.text_faint),
-        Stage::Running if p.cancelled() => (words("Cancelando…", "Canceling…"), k.c.warning.fg),
-        Stage::Running => (words("Em andamento", "In progress"), k.c.success.fg),
-        Stage::Done => (words("Concluído", "Done"), k.c.text_accent),
-        Stage::Cancelled => (words("Cancelado", "Canceled"), k.c.warning.fg),
-        Stage::Failed => (words("Erro", "Error"), k.c.danger.fg),
+    // A live text paints inside the box it was laid out in: the cell's width, not its words'.
+    let live = |value: &rune::LiveText| muted(value.get().to_string()).w(0.0).grow(1.0).live_text(value);
+    let dot = match p.stage() {
+        Stage::Waiting => k.c.text_faint,
+        Stage::Running if p.cancelled() => k.c.warning.fg,
+        Stage::Running => k.c.success.fg,
+        Stage::Done => k.c.text_accent,
+        Stage::Cancelled => k.c.warning.fg,
+        Stage::Failed => k.c.danger.fg,
     };
-    // A folder's row counts its items while running: "Em andamento · 120 de 1.946".
-    let items = p.items.load(Relaxed);
     let failed = p.stage() == Stage::Failed;
-    // Telegram asked to wait: the row says for how long, rather than look stuck.
-    let waiting = (p.stage() == Stage::Running).then(|| crate::telegram::waiting_note(&t.from.text, &t.to.text)).flatten();
-    let state = if let Some(note) = waiting {
-        note
-    } else if p.stage() == Stage::Running && items > 1 {
-        let (done, items) = (ui_count(p.items_done.load(Relaxed) as usize), ui_count(items as usize));
-        tr!("{state} · {done} de {items}", "{state} · {done} of {items}")
-    } else if failed && !p.reason().is_empty() {
-        // The reason itself, not just "Erro": the whole message stays on hover.
-        p.reason()
-    } else {
-        state.to_string()
-    };
-    let label = muted(state.clone());
-    let label = if failed { label.color(k.c.danger.fg) } else { label.help_when_truncated(state) };
+    let label = live(&t.shown.state);
+    // On hover, the words as the row was last built: a failure's stay as they are.
+    let label = if failed { label.color(k.c.danger.fg) } else { label.help_when_truncated(t.state_text()) };
     let mut state_cell = queue_cell(w[3]).child(el().size(8.0, 8.0).radius(4.0).fill(dot)).child(label);
     if failed {
         state_cell = state_cell.help(p.error());
     }
-    let sized = p.sized.load(Relaxed);
-    let size = if sized { transfers::pair(p.bytes.load(Relaxed), p.total.load(Relaxed)) } else { String::new() };
-    let speed = t.speed().map(|v| format!("{}/s", format_size(v as u64))).unwrap_or_default();
-    let left = t.left().map(transfers::hms).unwrap_or_default();
     let (op_icon, op) = match t.op {
         transfers::Op::Copy => (&icons::M_COPY, t.op.label()),
         transfers::Op::Move => (&icons::M_CUT, t.op.label()),
@@ -1040,10 +1022,10 @@ fn queue_row(s: &State, k: &Kit, t: &transfers::Transfer) -> El {
         .child(queue_end(s, k, w[1], &t.from))
         .child(queue_end(s, k, w[2], &t.to))
         .child(state_cell)
-        .child(queue_cell(w[4]).child(muted(size)))
-        .child(queue_cell(w[5]).child(queue_bar(k, t.fraction())))
-        .child(queue_cell(w[6]).child(muted(speed)))
-        .child(queue_cell(w[7]).child(muted(left)))
+        .child(queue_cell(w[4]).child(live(&t.shown.size)))
+        .child(queue_cell(w[5]).child(queue_bar(k, &t.shown)))
+        .child(queue_cell(w[6]).child(live(&t.shown.speed)))
+        .child(queue_cell(w[7]).child(live(&t.shown.left)))
 }
 
 /// The transfer queue under the panes: a row per item being copied or moved. It shows only
@@ -1106,23 +1088,20 @@ fn transfers(s: &State, k: &Kit) -> El {
 /// The queue's foot while something is under way: "Total: 0,05 / 2,66 GB", a bar, and the
 /// speed of everything running.
 fn queue_totals(s: &State, k: &Kit) -> El {
-    use std::sync::atomic::Ordering::Relaxed;
-    let live: Vec<&transfers::Transfer> = s.transfers.iter().filter(|t| !t.progress.over()).collect();
-    if live.is_empty() {
+    if s.transfers_live == 0 {
         return el().key("totals");
     }
-    let done: u64 = live.iter().map(|t| t.progress.bytes.load(Relaxed)).sum();
-    let total: u64 = live.iter().map(|t| t.progress.total.load(Relaxed)).sum();
-    let speed: f64 = live.iter().filter_map(|t| t.speed()).sum();
-    let fraction = if total > 0 { (done as f64 / total as f64).min(1.0) as f32 } else { 0.0 };
-    let small = |t: String| text(t).font(k.ty.text_xsmall).color(k.c.text_muted);
+    let sums = &s.queue_totals;
+    // Live texts paint inside the box they were laid out in: wide enough for the most they say.
+    let small = |value: &rune::LiveText, w: f32| text(value.get().to_string()).w(w).align(Align::End).font(k.ty.text_xsmall).color(k.c.text_muted).live_text(value);
+    let (bar_w, bar_h) = transfers::TOTAL_BAR;
     row()
         .key("totals")
         .gap(8.0)
         .center_y()
-        .child(small(tr!("Total: {}", "Total: {}", transfers::pair(done, total))))
-        .child(row().w(80.0).h(10.0).border(1.0, k.c.border_base).child(el().h_full().w_frac(fraction).fill(k.alpha(k.c.text_accent, 0.5))))
-        .child(small(if speed > 0.0 { format!("{}/s", format_size(speed as u64)) } else { String::new() }))
+        .child(small(&sums.text, 190.0))
+        .child(row().w(bar_w).h(bar_h).border(1.0, k.c.border_base).child(el().w_full().h_full().fill(k.alpha(k.c.text_accent, 0.5)).live_rect(&sums.fill)))
+        .child(small(&sums.speed, 80.0))
 }
 
 /// The queue's right-click menu: on a row, or on the list as a whole.

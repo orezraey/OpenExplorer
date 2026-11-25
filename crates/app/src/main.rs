@@ -252,6 +252,11 @@ struct State {
     transfer_menu: Option<(Option<Arc<ops::Progress>>, rune::PointerPress)>,
     /// How many rows were still waiting or running at the last frame.
     transfers_live: usize,
+    /// The looks the transfer queue was last built with: while they stay, its live values
+    /// are enough (see [`transfers::refresh`]).
+    queue_looks: Vec<transfers::Look>,
+    /// The queue's foot, as live values.
+    queue_totals: transfers::Totals,
     /// Windows' own icons, as Explorer shows them.
     icons: sysicons::SysIcons,
     /// The listing version each pane's icons were last asked for.
@@ -368,6 +373,8 @@ impl State {
             transfers: Vec::new(),
             transfer_menu: None,
             transfers_live: 0,
+            queue_looks: Vec::new(),
+            queue_totals: Default::default(),
             icons: Default::default(),
             icons_for: [u64::MAX; 2],
             account_form: None,
@@ -545,6 +552,8 @@ fn init() -> State {
         transfers: Vec::new(),
         transfer_menu: None,
         transfers_live: 0,
+        queue_looks: Vec::new(),
+        queue_totals: Default::default(),
         icons: Default::default(),
         icons_for: [u64::MAX; 2],
         account_form: None,
@@ -769,8 +778,13 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     if gone {
         s.transfer_menu = None;
     }
+    // Rows moving on change only their live values; the queue is built again when a row comes,
+    // goes or changes stage.
     let live = s.transfers.iter().filter(|t| !t.progress.over()).count();
-    changed |= live > 0 || live != s.transfers_live || s.transfers.len() != rows;
+    let looks = transfers::looks(&s.transfers);
+    transfers::refresh(&s.transfers, &s.queue_totals, transfers::bar_width(s.layout.queue_cols[5]));
+    changed |= looks != s.queue_looks || live != s.transfers_live || s.transfers.len() != rows;
+    s.queue_looks = looks;
     s.transfers_live = live;
     changed |= actions::quit_question_done(s);
     while let Ok(msg) = s.inbox.try_recv() {
@@ -2705,6 +2719,47 @@ mod tests {
         drop(other);
         assert!(actions::quit_question_done(&mut s) && !s.quit_asked);
         assert_eq!(actions::close_requested(&mut s), rune::CloseResponse::Close);
+    }
+
+    /// What a running transfer queue costs the window: 40 downloads advancing, each tick
+    /// through `poll`, the view and a frame, as the real loop does (no GPU). Run it with
+    /// `cargo test --release -p openexplorer -- --ignored --nocapture queue_progress_cost`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn queue_progress_cost() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut s = init();
+        let end = |i: usize| transfers::End::local(std::path::Path::new(&format!(r"C:\Dados\Arquivo {i}.bin")));
+        let batch = transfers::queue(&mut s.transfers, None, transfers::Op::Download, (0..40).map(|i| (end(i), end(i))));
+        for t in &s.transfers {
+            t.progress.size(1 << 34);
+            t.progress.begin();
+        }
+        let rows: Vec<_> = s.transfers.iter().map(|t| t.progress.clone()).collect();
+        let mut rt = rune::Runtime::new(s, ui::view, (1600.0, 1000.0), rune::Env::new(false, 1.0));
+        let mut now = 0.0;
+        let mut tick = |rt: &mut rune::Runtime<State>| {
+            for p in &rows {
+                p.bytes.fetch_add(3 << 20, Relaxed);
+            }
+            now += 0.1;
+            rt.update_if(|s, tx| poll(s, now, tx));
+            rt.frame(0.1);
+        };
+        for _ in 0..50 {
+            tick(&mut rt);
+        }
+        let mut runs = Vec::new();
+        for _ in 0..9 {
+            let started = std::time::Instant::now();
+            for _ in 0..200 {
+                tick(&mut rt);
+            }
+            runs.push(started.elapsed().as_secs_f64() * 1e6 / 200.0);
+        }
+        runs.sort_by(f64::total_cmp);
+        println!("queue tick: {:.0} µs best, {:.0} µs median of 9 runs of 200", runs[0], runs[4]);
+        drop(batch);
     }
 
     /// The mouse's side buttons step through a pane's history as Voltar and Avançar do; the
