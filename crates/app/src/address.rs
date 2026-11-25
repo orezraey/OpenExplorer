@@ -346,6 +346,39 @@ pub fn reach_drive(d: &Drive, email: String, way: Way) -> Result<Reached, String
     }
 }
 
+/// Where a typed My Drive path leads, worked out from what this session already knows: the
+/// folders of `known` places (the panes', their history's and tabs': each names its folders by
+/// id), then the folder listings it holds. `None` when a step is in neither, and the path is
+/// then looked up in Drive ([`reach_drive`], one request a folder). A path to a folder opened
+/// before so opens at once, as Air Explorer's does from the folders it keeps.
+pub fn reach_cached<'a>(cache: &crate::cache::Cache, known: impl IntoIterator<Item = &'a Location>, email: &str, way: &Way) -> Option<Reached> {
+    let Way::Path { root: Root::MyDrive, names } = way else { return None };
+    // The longest start of the way a known place already went down.
+    let mut path: Vec<(String, String)> = Vec::new();
+    for loc in known {
+        let Location::Drive { email: e, space: Space::MyDrive, path: p } = loc else { continue };
+        if !e.eq_ignore_ascii_case(email) {
+            continue;
+        }
+        let same = p.iter().zip(names).take_while(|((_, name), typed)| names_for(typed).contains(name)).count();
+        if same > path.len() {
+            path = p[..same].to_vec();
+        }
+    }
+    for (i, name) in names.iter().enumerate().skip(path.len()) {
+        let here = Location::Drive { email: email.to_string(), space: Space::MyDrive, path: path.clone() };
+        let listing = cache.get(&crate::cache::key(&here)?)?;
+        let wanted = names_for(name);
+        let found = listing.entries.iter().find(|e| wanted.contains(&e.name))?;
+        if !found.is_dir {
+            // A file names the end of the way: its folder opens with it selected.
+            return (i + 1 == names.len()).then(|| Reached { loc: here, reveal: Some((found.id.clone(), found.name.clone())) });
+        }
+        path.push((found.target.clone().unwrap_or_else(|| found.id.clone()), found.name.clone()));
+    }
+    Some(Reached { loc: Location::Drive { email: email.to_string(), space: Space::MyDrive, path }, reveal: None })
+}
+
 fn reach_path(d: &Drive, email: String, root: Root, names: Vec<String>) -> Result<Reached, String> {
     let mut names = names.into_iter();
     // Where the first name is looked for: a folder (and its shared drive), or one of Drive's
@@ -445,6 +478,40 @@ fn folder_location(email: String, id: &str, place: Place) -> Location {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A My Drive path through folders whose listings the session holds opens without asking
+    /// Drive; a step it hasn't listed, or another space, is left to Drive.
+    #[test]
+    fn a_path_through_listed_folders_needs_no_request() {
+        use crate::cache::{Cache, Listing, key};
+        use crate::model::Entry;
+        let entry = |id: &str, name: &str, dir: bool| Entry { id: id.into(), name: name.into(), is_dir: dir, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let at = |path: Vec<(String, String)>| Location::Drive { email: "ana@gmail.com".into(), space: Space::MyDrive, path };
+        let mut cache = Cache::memory_only();
+        let listing = |entries: Vec<Entry>| Listing { entries: std::sync::Arc::new(entries), pos: None };
+        cache.keep(key(&at(vec![])).unwrap(), listing(vec![entry("f1", "Fotos", true), entry("n1", "notas.txt", false)]));
+        cache.keep(key(&at(vec![("f1".into(), "Fotos".into())])).unwrap(), listing(vec![entry("f2", "2024", true)]));
+        let path = |names: &[&str]| Way::Path { root: Root::MyDrive, names: names.iter().map(|n| n.to_string()).collect() };
+
+        let none: [&Location; 0] = [];
+        let to = reach_cached(&cache, none, "ana@gmail.com", &path(&["Fotos", "2024"])).expect("both folders listed");
+        assert_eq!(to.loc, at(vec![("f1".into(), "Fotos".into()), ("f2".into(), "2024".into())]));
+        assert!(to.reveal.is_none());
+        let to = reach_cached(&cache, none, "ana@gmail.com", &path(&["notas.txt"])).expect("a file at the top");
+        assert_eq!((to.loc, to.reveal), (at(vec![]), Some(("n1".into(), "notas.txt".into()))));
+        // 2024 was never listed, and a file isn't a folder to go through.
+        assert!(reach_cached(&cache, none, "ana@gmail.com", &path(&["Fotos", "2024", "Março"])).is_none());
+        assert!(reach_cached(&cache, none, "ana@gmail.com", &path(&["notas.txt", "x"])).is_none());
+        assert!(reach_cached(&cache, none, "ana@gmail.com", &Way::Path { root: Root::SharedDrives, names: vec!["Equipe".into()] }).is_none());
+
+        // A place a pane shows knows its folders' ids, top unlisted or not; from there, a listing.
+        let deep = at(vec![("f1".into(), "Fotos".into()), ("f2".into(), "2024".into())]);
+        let mut cache = Cache::memory_only();
+        cache.keep(key(&deep).unwrap(), listing(vec![entry("f3", "Março", true)]));
+        let to = reach_cached(&cache, [&deep], "ana@gmail.com", &path(&["Fotos", "2024", "Março"])).expect("from the pane's place");
+        assert_eq!(to.loc, at(vec![("f1".into(), "Fotos".into()), ("f2".into(), "2024".into()), ("f3".into(), "Março".into())]));
+        assert!(reach_cached(&cache, [&deep], "ana@gmail.com", &path(&["Outra", "2024"])).is_none());
+    }
 
     fn drive(space: Space, path: &[(&str, &str)]) -> Location {
         Location::Drive { email: "ana@gmail.com".into(), space, path: path.iter().map(|(i, n)| (i.to_string(), n.to_string())).collect() }
