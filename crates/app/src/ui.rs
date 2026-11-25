@@ -4513,8 +4513,8 @@ fn tree_line(s: &State, k: &Kit, p: usize, line: &crate::tree::Line) -> El {
             s.tree_menu = Some((p, (*ctx_node).clone(), open, empty, at));
         })
         .child(arrow)
-        .child(row().gap(6.0).center_y().grow(1.0).min_w(0.0).child(shell_icon(s, node.icon.as_ref(), node.fallback, 16.0)).child(
-            text(node.label.clone()).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0).help_when_truncated(node.label.clone()),
+        .child(row().gap(6.0).center_y().child(shell_icon(s, node.icon.as_ref(), node.fallback, 16.0)).child(
+            text(node.label.clone()).font(k.ty.text_small).color(k.c.text_base),
         ))
 }
 
@@ -4527,25 +4527,50 @@ pub(crate) fn tree_key(p: usize) -> String {
     format!("tree-scroll-{p}")
 }
 
+/// Estimates the horizontal width needed to show every row in `lines` without clipping, so the
+/// tree's horizontal scroll bar appears whenever nested folders or long account names overflow.
+fn tree_content_width(lines: &[crate::tree::Line]) -> f32 {
+    let mut widest: f32 = 0.0;
+    for line in lines {
+        let w = match line {
+            crate::tree::Line::Heading(h) => 20.0 + h.chars().count() as f32 * 7.2,
+            crate::tree::Line::Note { depth, text, .. } => {
+                4.0 + (*depth as f32) * 16.0 + 22.0 + text.chars().count() as f32 * 7.0 + 16.0
+            }
+            crate::tree::Line::Node { depth, node, .. } => {
+                4.0 + (*depth as f32) * 16.0 + 16.0 + 4.0 + 16.0 + 6.0 + node.label.chars().count() as f32 * 8.0 + 20.0
+            }
+        };
+        if w > widest {
+            widest = w;
+        }
+    }
+    widest
+}
+
 /// The tree beside pane `p` (see [`crate::tree`]): only the rows in view are built, so a node
 /// with thousands of folders opens at once. It's one Tab stop that keeps the keyboard itself
 /// (its rows come and go as it scrolls), naming the row the keyboard is on for screen readers.
 fn tree(s: &State, k: &Kit, p: usize) -> El {
     let lines = std::rc::Rc::new(crate::tree::lines(s, p));
-    let (keys, kit, n) = (lines.clone(), k.clone(), lines.len());
     let bar = bar_style(k);
+    let strip = bar.strip();
+    let min_w = tree_content_width(&lines);
+    let (keys, kit, n) = (lines.clone(), k.clone(), lines.len());
     let rows = col()
         .key("tree")
         .w_full()
-        .pb(8.0)
-        .pr(bar.strip())
+        .min_w(min_w)
+        .pb(strip + 6.0)
         .growth(GrowthSpec::default())
         .virtual_rows(n, ROW_H, move |_: &State, i| Cow::Owned(format!("t:{}", keys[i].key())), move |s: &State, i| tree_line(s, &kit, p, &lines[i]))
         .virtual_rows_version((s.tree.version, s.panes[p].moves, s.accounts.len(), s.servers.list.len()));
     let at = crate::tree::cursor(s, p).map(|c| format!("t:{c}")).unwrap_or_default();
+    let tree_bg = k.alpha(k.c.text_base, if k.dark { 0.02 } else { 0.015 });
     // Opening or closing a node lands at once, as in Explorer, rather than sliding its rows.
+    let key = tree_key(p);
     let viewport = col()
-        .key(tree_key(p))
+        .key(key.clone())
         .role("tree")
         .label(t("Pastas", "Folders"))
         .focusable(true)
@@ -4554,12 +4579,21 @@ fn tree(s: &State, k: &Kit, p: usize) -> El {
         .active_descendant(at)
         .on_key(move |s: &mut State, ev: &KeyEvent, tx: &mut Tx| crate::tree::key(s, p, ev, tx))
         .instant_changes()
+        .w_full()
+        .h_full()
+        .scroll_xy()
+        .child(rows);
+    let viewport = s.edges[p].tree.on(viewport);
+    // Reserve `strip` on the right for the vertical scrollbar so scrolled folder names clip
+    // cleanly before the bar instead of bleeding behind it.
+    col()
+        .key(format!("tree-wrap-{p}"))
         .w(s.layout.tree[p])
         .h_full()
-        .fill(k.alpha(k.c.text_base, if k.dark { 0.02 } else { 0.015 }))
-        .scroll(ScrollSpec { stick_bottom: false })
-        .child(rows);
-    s.edges[p].tree.on(viewport).scroll_bar_styled(bar)
+        .pr(strip)
+        .fill(tree_bg)
+        .clip_rounded(0.0)
+        .child(with_scroll_bars(k, &key, viewport, bar.track_offset(0.0, -strip), false))
 }
 // ---------------------------------------------------------------------------------------------
 // File list
@@ -4594,6 +4628,183 @@ fn grip(k: &Kit, key: &str, edge: f32, height: f32, size: impl Fn(&mut State) ->
 /// viewport's end edge: what it scrolls leaves [`ScrollBarStyle::strip`] of room there.
 fn bar_style(k: &Kit) -> ScrollBarStyle {
     ScrollBarStyle::from_kit(k).thumb(k.alpha(k.c.text_base, 0.3)).thumb_hover(k.alpha(k.c.text_base, 0.5)).width(8.0).hover_width(10.0)
+}
+
+/// Live state for a horizontal scrollbar overlaid at the bottom of a `scroll_xy()` viewport,
+/// appearing automatically only when the content overflows horizontally (`max[0] > 0.5`).
+struct HBar {
+    pos: std::cell::Cell<rune::ScrollPos>,
+    hover: std::cell::Cell<bool>,
+    drag: std::cell::Cell<Option<(f32, f32)>>,
+    rest_color: std::cell::Cell<Color>,
+    hover_color: std::cell::Cell<Color>,
+    v_strip: std::cell::Cell<f32>,
+    track: rune::Live<[f32; 4]>,
+    thumb: rune::Live<[f32; 4]>,
+    fill: rune::Live<Color>,
+    opacity: rune::Live<f32>,
+}
+
+impl HBar {
+    const STRIP: f32 = 12.0;
+    const THUMB: f32 = 4.0;
+    const THUMB_HOVER: f32 = 6.0;
+    const EDGE: f32 = 3.0;
+    const INSET: f32 = 4.0;
+    const MIN_THUMB: f32 = 28.0;
+
+    fn metrics(&self, at: rune::ScrollPos) -> Option<(f32, f32, f32, f32)> {
+        if at.max[0] <= 0.5 {
+            return None;
+        }
+        let right_clear = if at.max[1] > 0.5 { self.v_strip.get() } else { 0.0 };
+        let track_len = (at.viewport[0] - right_clear - 2.0 * Self::INSET).max(0.0);
+        if track_len < Self::MIN_THUMB {
+            return None;
+        }
+        let thumb_w = (track_len * at.viewport[0] / (at.viewport[0] + at.max[0]).max(1.0))
+            .max(Self::MIN_THUMB)
+            .min(track_len);
+        let travel = (track_len - thumb_w).max(0.0);
+        let thumb_x = if at.max[0] > 0.0 { travel * (at.offset[0] / at.max[0]).clamp(0.0, 1.0) } else { 0.0 };
+        Some((track_len, thumb_x, thumb_w, travel))
+    }
+
+    fn sync(&self) {
+        let at = self.pos.get();
+        let active = self.hover.get() || self.drag.get().is_some();
+        self.fill.set(if active { self.hover_color.get() } else { self.rest_color.get() });
+        if let Some((track_len, thumb_x, thumb_w, _)) = self.metrics(at) {
+            let thick = if active { Self::THUMB_HOVER } else { Self::THUMB };
+            self.track.set([Self::INSET, (at.viewport[1] - Self::STRIP).max(0.0), track_len, Self::STRIP]);
+            self.thumb.set([thumb_x, Self::STRIP - Self::EDGE - thick, thumb_w, thick]);
+            self.opacity.set(1.0);
+        } else {
+            self.track.set([0.0; 4]);
+            self.thumb.set([0.0; 4]);
+            self.opacity.set(0.0);
+        }
+    }
+
+    fn follow(&self, at: rune::ScrollPos) {
+        self.pos.set(at);
+        self.sync();
+    }
+
+    fn on_drag(&self, target: &str, d: &mut Drag, tx: &mut Tx) {
+        tx.live_only();
+        let at = self.pos.get();
+        let Some((_, thumb_x, thumb_w, travel)) = self.metrics(at) else {
+            self.drag.set(None);
+            return;
+        };
+        match d.phase {
+            Phase::Down => {
+                // Click on thumb: grab it; click on track: jump thumb center to pointer.
+                let start_off = if d.x >= thumb_x && d.x <= thumb_x + thumb_w {
+                    at.offset[0]
+                } else if travel > 0.0 {
+                    let next = ((d.x - thumb_w * 0.5) / travel * at.max[0]).clamp(0.0, at.max[0]);
+                    tx.scroll_to_instant(target, next, at.offset[1]);
+                    next
+                } else {
+                    at.offset[0]
+                };
+                self.drag.set(Some((d.x, start_off)));
+                self.sync();
+            }
+            Phase::Move => {
+                if let Some((start_x, start_off)) = self.drag.get()
+                    && travel > 0.0
+                {
+                    let next = (start_off + (d.x - start_x) / travel * at.max[0]).clamp(0.0, at.max[0]);
+                    tx.scroll_to_instant(target, next, at.offset[1]);
+                }
+            }
+            Phase::Up => {
+                self.drag.set(None);
+                self.sync();
+            }
+        }
+    }
+}
+
+fn kept_hbar(key: &str) -> std::rc::Rc<HBar> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+    thread_local! {
+        static HBARS: RefCell<HashMap<(u64, String), Rc<HBar>>> = RefCell::new(HashMap::new());
+    }
+    let id = (rune::current_runtime_id(), key.to_owned());
+    HBARS.with(|bars| {
+        let mut bars = bars.borrow_mut();
+        if bars.len() >= 64 && !bars.contains_key(&id) {
+            bars.clear();
+        }
+        bars.entry(id)
+            .or_insert_with(|| {
+                Rc::new(HBar {
+                    pos: std::cell::Cell::new(rune::ScrollPos::default()),
+                    hover: std::cell::Cell::new(false),
+                    drag: std::cell::Cell::new(None),
+                    rest_color: std::cell::Cell::new(Color::TRANSPARENT),
+                    hover_color: std::cell::Cell::new(Color::TRANSPARENT),
+                    v_strip: std::cell::Cell::new(14.0),
+                    track: rune::Live::new([0.0; 4]),
+                    thumb: rune::Live::new([0.0; 4]),
+                    fill: rune::Live::new(Color::TRANSPARENT),
+                    opacity: rune::Live::new(0.0),
+                })
+            })
+            .clone()
+    })
+}
+
+/// Attaches both the vertical `rune-kit` scrollbar and an automatic bottom horizontal scrollbar
+/// (visible only when content overflows sideways) to a `scroll_xy()` viewport keyed `key`.
+/// When `v_overlaps` is true, the horizontal track leaves room on the right for the vertical bar.
+fn with_scroll_bars(k: &Kit, key: &str, viewport: El, v_bar: ScrollBarStyle, v_overlaps: bool) -> El {
+    let hbar = kept_hbar(key);
+    hbar.rest_color.set(k.alpha(k.c.text_base, 0.34));
+    hbar.hover_color.set(k.alpha(k.c.text_base, 0.56));
+    hbar.v_strip.set(if v_overlaps { v_bar.strip() } else { 0.0 });
+    hbar.sync();
+
+    let (watch, hover_bar, drag_bar) = (hbar.clone(), hbar.clone(), hbar.clone());
+    let target = key.to_owned();
+    let viewport = viewport.chain_scroll_offset(move |at| watch.follow(at)).scroll_bar_styled(v_bar);
+
+    let thumb = el()
+        .key("h-thumb")
+        .absolute(0.0, 0.0)
+        .live_rect(&hbar.thumb)
+        .radius(HBar::THUMB_HOVER / 2.0)
+        .live_fill(&hbar.fill);
+
+    let track = el()
+        .key(format!("h-bar-{key}"))
+        .absolute(0.0, 0.0)
+        .live_rect(&hbar.track)
+        .live_opacity(&hbar.opacity)
+        .cursor(Cursor::Pointer)
+        .a11y_hidden()
+        .on_hover_change_any(move |inside, tx| {
+            tx.live_only();
+            hover_bar.hover.set(inside);
+            hover_bar.sync();
+        })
+        .on_drag_any(move |d: &mut Drag, tx: &mut Tx| drag_bar.on_drag(&target, d, tx))
+        .child(thumb);
+
+    col()
+        .key(format!("xy-bars-{key}"))
+        .w_full()
+        .h_full()
+        .min_w(0.0)
+        .min_h(0.0)
+        .child(viewport)
+        .child(track)
 }
 
 /// The scroll view of pane `p`'s file list.
@@ -4830,6 +5041,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let scrolled = s.views[p].scroll.clone();
     let viewport = col()
         .key(list_key(p))
+        .instant_changes()
         .w_full()
         .h_full()
         .scroll_xy()
@@ -4850,8 +5062,9 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         })
         .child(table);
     // The bar runs below the header, which stays put, as Explorer's does.
-    let viewport = s.edges[p].list.on(viewport).scroll_bar_styled(bar);
-    col().key("list").w(0.0).grow(1.0).h_full().min_w(0.0).child(viewport)
+    let key = list_key(p);
+    let viewport = s.edges[p].list.on(viewport);
+    col().key("list").w(0.0).grow(1.0).h_full().min_w(0.0).child(with_scroll_bars(k, &key, viewport, bar, true))
 }
 
 // ---------------------------------------------------------------------------------------------
