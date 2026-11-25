@@ -498,6 +498,10 @@ fn walk(roots: &[PathBuf], words: &[Vec<u8>], show_hidden: bool, alive: &dyn Fn(
     use std::collections::VecDeque;
     use std::sync::{Condvar, Mutex, mpsc};
     const READERS: usize = 8;
+    // A search left before it starts reads nothing.
+    if !alive() {
+        return Ok(());
+    }
     let mut failed = None;
     let roots: VecDeque<PathBuf> = roots.iter().filter(|r| std::fs::read_dir(r).map_err(|e| failed = Some(format!("{}: {e}", r.display()))).is_ok()).cloned().collect();
     if roots.is_empty() {
@@ -566,10 +570,13 @@ fn walk(roots: &[PathBuf], words: &[Vec<u8>], show_hidden: bool, alive: &dyn Fn(
             });
         }
         drop(tx);
-        // Every reader dropping its sender ends this.
+        // Every reader dropping its sender ends this. Once the search is left or full, what
+        // readers still send from the folder they were in is dropped, not shown.
+        let mut stopped = false;
         loop {
             match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(e) => pager.push(e),
+                Ok(e) if !stopped => pager.push(e),
+                Ok(_) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if !pager.buf.is_empty() && pager.since.elapsed() > Duration::from_millis(250) {
                         pager.flush(true);
@@ -577,7 +584,8 @@ fn walk(roots: &[PathBuf], words: &[Vec<u8>], show_hidden: bool, alive: &dyn Fn(
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            if !alive() || pager.full() {
+            if !stopped && (!alive() || pager.full()) {
+                stopped = true;
                 stop(&work);
             }
         }
@@ -703,10 +711,20 @@ mod tests {
         let mut names: Vec<&str> = all.iter().map(|e| e.name.as_str()).collect();
         names.sort();
         assert_eq!(names, [".relatorio", "Relatório final.pdf", "Relatórios", "relatorio.md", "relatorio.txt"]);
-        // A search left at once reads nothing more.
+        // A search left at once reads nothing.
         let mut left = Vec::new();
         search_elsewhere(&f, true, &|| false, &mut |page, _| left.extend(page)).ok();
-        assert!(left.len() <= 3);
+        assert!(left.is_empty());
+        // Left while running, it shows at most what came before the first check: what readers
+        // still send from the folders they were in is dropped.
+        let checks = std::cell::Cell::new(0);
+        let alive = || {
+            checks.set(checks.get() + 1);
+            checks.get() == 1
+        };
+        let mut left = Vec::new();
+        search_elsewhere(&f, true, &alive, &mut |page, _| left.extend(page)).ok();
+        assert!(left.len() <= 1, "{} results after the search was left", left.len());
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
