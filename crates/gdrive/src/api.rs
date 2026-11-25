@@ -472,6 +472,13 @@ impl Drive {
         self.file_call("POST", "/files", &[], &body, t("Criar pasta", "Create folder"))
     }
 
+    /// A shortcut named `name` in `parent` to the file or folder `target`. It takes no room in
+    /// the account's storage.
+    pub fn create_shortcut(&self, name: &str, target: &str, parent: &str) -> Result<DriveFile> {
+        let body = serde_json::json!({ "name": name, "mimeType": SHORTCUT_MIME, "parents": [parent], "shortcutDetails": { "targetId": checked(target)? } });
+        self.file_call("POST", "/files", &[], &body, t("Criar atalho", "Create shortcut"))
+    }
+
     pub fn rename(&self, id: &str, name: &str) -> Result<DriveFile> {
         self.file_call("PATCH", &format!("/files/{}", checked(id)?), &[], &serde_json::json!({ "name": name }), t("Renomear", "Rename"))
     }

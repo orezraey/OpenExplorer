@@ -67,6 +67,16 @@ $Folders = [ordered]@{
 # Where a pane goes between runs, so each run opens its folder anew.
 $Rest = 'C:\Windows\Web'
 
+# Downloads: everything in a Drive folder, selected with Ctrl+A in the right pane and copied with
+# the arrow between the panes into the left one, which shows an empty local folder. Timed from
+# the arrow until every file is on disk whole and no program still writes it.
+$Downloads = [ordered]@{
+    'download-large'        = @{ Drive = "$Gd/transfer/large"; Files = 1; Dirs = 0; Bytes = 524288000 }
+    # Air Explorer makes about one local folder every 2 s here, so 100 rather than 1,000.
+    'download-100-folders'  = @{ Drive = "$Gd/100 folders"; Files = 0; Dirs = 100; Bytes = 0 }
+}
+$DownloadTo = 'C:\OEBench\dl'
+
 # ------------------------------------------------------------------------------------------------
 # What differs between the apps: how to find their window, a pane's address bar, and the number
 # of items a pane shows once its folder has finished opening (-1 while it's still opening).
@@ -77,6 +87,20 @@ $Adapters = @{
         DrivePath = { param($p) "$Email/Meu Drive/$p" }
         # Any pane opens any place.
         DrivePane = 0
+        # Makes pane `i` a folder view: a pane on the "+" picker opens This PC in a new tab.
+        Ready = {
+            param($win, $i)
+            $pc = $win.FindFirst($Scope::Descendants, (Prop $A::AutomationIdProperty "tp-quick-pc-$i"))
+            if ($pc) { $pc.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke(); Start-Sleep -Milliseconds 500 }
+        }
+        # Puts the keyboard in pane `i`'s list.
+        Focus = { param($win, $i) (& $Adapters.openexplorer.Pane $win $i).SetFocus() }
+        # The arrow between the panes that copies the right pane's selection to the left one.
+        CopyLeft = {
+            param($win)
+            $b = $win.FindFirst($Scope::Descendants, (Prop $A::AutomationIdProperty 'copy-left'))
+            $b.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+        }
         Pane = { param($win, $i) $win.FindFirst($Scope::Descendants, (Prop $A::AutomationIdProperty "pane-$i")) }
         Address = {
             param($win, $i)
@@ -110,6 +134,23 @@ $Adapters = @{
         # Each tab belongs to one account: the left pane's is This PC, the right pane's the Google
         # account (set up so before running).
         DrivePane = 1
+        Ready = { param($win, $i) }
+        # A list view takes no focus through UI Automation: a click on its first row (on an
+        # empty list, its middle) does.
+        Focus = {
+            param($win, $i)
+            $r = ((& $Adapters.airexplorer.Lists $win)[$i]).Current.BoundingRectangle
+            $y = if ((& $Adapters.airexplorer.Count $win $i) -gt 0) { $r.Top + 52 } else { $r.Top + $r.Height / 2 }
+            [Win]::Click([int]($r.Left + 120), [int]$y)
+        }
+        # The arrows between the panes are unnamed buttons, top to bottom: link, sync, copy to
+        # the right, copy to the left.
+        CopyLeft = {
+            param($win)
+            $buttons = $win.FindAll($Scope::Descendants, (Prop $A::ClassNameProperty 'WindowsForms10.BUTTON.app.0.25bb5ff_r6_ad1'))
+            $r = ($buttons | Sort-Object { $_.Current.BoundingRectangle.Y } | Select-Object -Last 1).Current.BoundingRectangle
+            [Win]::Click([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
+        }
         # The pane's file list: a SysListView32, left to right.
         Lists = {
             param($win)
@@ -230,6 +271,49 @@ function Open-Folder($ad, $win, [int] $i, [string] $path, [int] $expected) {
     Wait-Count $ad $win $i $expected $sw
 }
 
+# Files, folders and bytes under `dir`, and whether every file can be opened alone (no program
+# still writes it).
+function Tree-Of([string] $dir) {
+    $files = @(Get-ChildItem -LiteralPath $dir -Recurse -File -Force -ErrorAction SilentlyContinue)
+    $dirs = @(Get-ChildItem -LiteralPath $dir -Recurse -Directory -Force -ErrorAction SilentlyContinue)
+    $bytes = ($files | Measure-Object Length -Sum).Sum
+    $free = $true
+    foreach ($f in $files) {
+        try { $s = [System.IO.File]::Open($f.FullName, 'Open', 'Read', 'None'); $s.Close() } catch { $free = $false; break }
+    }
+    @{ files = $files.Count; dirs = $dirs.Count; bytes = [long]$bytes; free = $free }
+}
+
+function Download($ad, $win, $d) {
+    if (Test-Path $DownloadTo) { Remove-Item -LiteralPath $DownloadTo -Recurse -Force }
+    New-Item -ItemType Directory -Force $DownloadTo | Out-Null
+    & $ad.Ready $win 1
+    Open-Folder $ad $win 0 $DownloadTo 0 | Out-Null
+    Open-Folder $ad $win 1 (& $ad.DrivePath $d.Drive) 0 | Out-Null
+    Focus-Window $win
+    & $ad.Focus $win 1
+    Start-Sleep -Milliseconds 200
+    [System.Windows.Forms.SendKeys]::SendWait('^a')
+    Start-Sleep -Milliseconds 300
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    & $ad.CopyLeft $win
+    $pasted = $false
+    while ($sw.Elapsed.TotalSeconds -lt $Timeout) {
+        Close-Popups $ad $win
+        $t = Tree-Of $DownloadTo
+        if ($t.files -gt 0 -or $t.dirs -gt 0) { $pasted = $true }
+        # Nothing arrived after a few seconds: the copy didn't start. The run starts over.
+        if (-not $pasted -and $sw.Elapsed.TotalSeconds -gt 8) {
+            Write-Host "    (the copy didn't start; trying again)"
+            return Download $ad $win $d
+        }
+        if ($t.files -eq $d.Files -and $t.dirs -eq $d.Dirs -and $t.bytes -eq $d.Bytes -and $t.free) { return $sw.Elapsed.TotalSeconds }
+        Start-Sleep -Milliseconds 50
+    }
+    $t = Tree-Of $DownloadTo
+    throw "$($ad.Name): download of $($d.Drive) not done in $Timeout s ($($t.files) files, $($t.dirs) folders, $($t.bytes) bytes)"
+}
+
 function Memory-Of($ad) {
     $root = Get-Process -Name $ad.Process | Select-Object -First 1
     $all = @(Get-CimInstance Win32_Process)
@@ -305,6 +389,19 @@ foreach ($key in $AppList) {
         }
         Write-Host ("  {0,-20} {1,6} items  median {2:N3} s  ({3})" -f $name, $expected, (Median $times), ($times -join ', '))
         $r[$name] = @{ items = $expected; seconds = $times; median = (Median $times) }
+    }
+
+    foreach ($name in $Downloads.Keys) {
+        if (-not (Want $name)) { continue }
+        $d = $Downloads[$name]
+        $times = @()
+        for ($k = 0; $k -le $Runs; $k++) {
+            $t = [math]::Round((Download $ad $win $d), 3)
+            Write-Host ("    {0} run {1}: {2} s" -f $name, $k, $t)
+            if ($k -gt 0) { $times += $t }
+        }
+        Write-Host ("  {0,-20} median {1:N3} s  ({2})" -f $name, (Median $times), ($times -join ', '))
+        $r[$name] = @{ seconds = $times; median = (Median $times); files = $d.Files; folders = $d.Dirs; bytes = $d.Bytes }
     }
 
     # Start: from launch until the left pane shows its first folder whole (Air Explorer reopens

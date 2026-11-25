@@ -10,7 +10,16 @@
 //! paces writes (a few a second per account); the client waits its rate limits out, so the
 //! first run takes a while.
 //!
-//! `cargo run -p openexplorer-gdrive --release --example bench_data -- [e-mail]`
+//! - `100 folders`: 100 empty folders, for downloading a tree of folders.
+//!
+//! With `--shortcuts`, for an account with no room left: `5000 files` gets 5,000 shortcuts to
+//! files already at the top of My Drive (a shortcut takes no storage and lists as a file; Drive
+//! refuses more than about 500 to one file, so they spread over several), and
+//! nothing is uploaded. For the big download, one of two copies of `openexplorer-speed-500.bin`
+//! at the top (left by the upload_speed example) moves into `transfer/large`, which takes no
+//! room either.
+//!
+//! `cargo run -p openexplorer-gdrive --release --example bench_data -- [e-mail] [--shortcuts]`
 //! (without an e-mail, the first connected account)
 
 use std::collections::HashSet;
@@ -28,7 +37,8 @@ const WORKERS: usize = 8;
 fn main() {
     let cfg = ClientConfig::load().expect("the app's Google client (google-client.json)");
     let accounts = store::accounts();
-    let account = match std::env::args().nth(1) {
+    let shortcuts = std::env::args().any(|a| a == "--shortcuts");
+    let account = match std::env::args().skip(1).find(|a| !a.starts_with("--")) {
         Some(email) => accounts.into_iter().find(|a| a.email.eq_ignore_ascii_case(&email)).expect("that account isn't connected"),
         None => accounts.into_iter().next().expect("a connected Google account"),
     };
@@ -43,12 +53,42 @@ fn main() {
     let transfer = folder(&drive, &root, "transfer");
     let small = folder(&drive, &transfer, "small");
 
-    let tiny = local_file("bench-1k.txt", 1 << 10);
     let names: Vec<String> = (1..=5000).map(|i| format!("file {i:04}.txt")).collect();
-    fill(&drive, &files, &names, |name| Job::Upload(tiny.clone(), name));
+    if shortcuts {
+        let targets: Vec<DriveFile> = children(&drive, "root").into_iter().filter(|f| !f.is_dir).collect();
+        assert!(targets.len() >= 12, "12 files at the top of My Drive to point shortcuts at");
+        // The first file already has about 500 from an earlier run: the rest go to the others,
+        // 450 each at most.
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        fill(&drive, &files, &names, |name| {
+            let n = next.fetch_add(1, Ordering::Relaxed);
+            Job::Shortcut(targets[1 + n / 450].id.clone(), name)
+        });
+    } else {
+        let tiny = local_file("bench-1k.txt", 1 << 10);
+        fill(&drive, &files, &names, |name| Job::Upload(tiny.clone(), name));
+    }
 
     let names: Vec<String> = (1..=1000).map(|i| format!("folder {i:04}")).collect();
     fill(&drive, &folders, &names, Job::Folder);
+    let hundred = folder(&drive, &root, "100 folders");
+    let names: Vec<String> = (1..=100).map(|i| format!("folder {i:03}")).collect();
+    fill(&drive, &hundred, &names, Job::Folder);
+    if shortcuts {
+        let large = folder(&drive, &transfer, "large");
+        if children(&drive, &large).is_empty() {
+            let copies: Vec<DriveFile> = children(&drive, "root").into_iter().filter(|f| f.name == "openexplorer-speed-500.bin").collect();
+            match copies.as_slice() {
+                [_, second, ..] => {
+                    drive.move_to(&second.id, "root", &large).expect("moving a copy into transfer/large");
+                    println!("moved a copy of {} into transfer/large", second.name);
+                }
+                _ => println!("transfer/large: no second copy of openexplorer-speed-500.bin to move"),
+            }
+        }
+        println!("done in {:.0} s (nothing uploaded)", started.elapsed().as_secs_f64());
+        return;
+    }
 
     let half_mb = local_file("bench-512k.bin", 512 << 10);
     let names: Vec<String> = (1..=200).map(|i| format!("small {i:03}.bin")).collect();
@@ -63,6 +103,8 @@ fn main() {
 enum Job {
     Folder(String),
     Upload(PathBuf, String),
+    /// A shortcut to the file with this id.
+    Shortcut(String, String),
 }
 
 /// The folder `name` in `parent`, made if it isn't there.
@@ -105,6 +147,7 @@ fn fill(drive: &Drive, parent: &str, names: &[String], job: impl Fn(String) -> J
                     let result = match &job {
                         Job::Folder(name) => drive.create_folder(name, parent).map(|_| ()),
                         Job::Upload(path, name) => drive.upload(path, parent, name, &mut |_| true).map(|_| ()),
+                        Job::Shortcut(target, name) => drive.create_shortcut(name, target, parent).map(|_| ()),
                     };
                     if let Err(e) = result {
                         failed.fetch_add(1, Ordering::Relaxed);
