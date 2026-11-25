@@ -18,7 +18,7 @@ use openexplorer_i18n::{t, tr};
 use serde_json::{Value, json};
 
 use crate::graph::{Body, Endpoints, Fail, Graph, Res, Sub, segment, transfer_agent};
-use crate::tree::{Ix, SELECT, Seen, Tree, Walk};
+use crate::tree::{Ix, LIST, SELECT, Seen, Tree, Walk};
 use crate::{PendingLogin, Result, cache, log, vault};
 
 pub use crate::tree::Changes;
@@ -424,7 +424,7 @@ impl Account {
         if ids.is_empty() {
             return;
         }
-        let subs: Vec<Sub> = ids.iter().map(|id| Sub { method: "GET", url: format!("/drives/{}/items/{}/children?$select={SELECT}&$top={PAGE}", segment(self.drive()), segment(id)), body: None }).collect();
+        let subs: Vec<Sub> = ids.iter().map(|id| Sub { method: "GET", url: format!("/drives/{}/items/{}/children?$select={LIST}&$top={PAGE}", segment(self.drive()), segment(id)), body: None }).collect();
         let answers = self.graph.batch(&subs, t("Listar a pasta", "List the folder"));
         let mut st = self.st();
         // Changes taken in meanwhile may make these listings out of date: an opening reads them.
@@ -437,7 +437,7 @@ impl Account {
             if v.get("@odata.nextLink").is_some() {
                 continue;
             }
-            let seen: Vec<Seen> = v.get("value").and_then(Value::as_array).into_iter().flatten().filter_map(Seen::of).collect();
+            let seen: Vec<Seen> = v.get("value").and_then(Value::as_array).into_iter().flatten().filter_map(Seen::listed).collect();
             if let Some(ix) = st.tree.find(id)
                 && st.tree.get(ix).is_dir
                 && st.tree.get(ix).children.is_none()
@@ -452,23 +452,161 @@ impl Account {
     // Finding and listing
 
     /// Every page of a listing at `url`.
+    #[cfg(test)]
     fn pages(&self, url: String, what: &str) -> Res<Vec<Seen>> {
+        Ok(self.pages_each(url, what, &mut |_, _| true)?.unwrap_or_default())
+    }
+
+    /// Every page of a listing at `url`, each given to `each` as it lands (with whether another
+    /// follows); `None` when `each` answered false and the rest wasn't read.
+    fn pages_each(&self, url: String, what: &str, each: &mut dyn FnMut(&[Seen], bool) -> bool) -> Res<Option<Vec<Seen>>> {
         let mut out = Vec::new();
         let mut next = Some(url);
         while let Some(u) = next {
             let v = self.graph.get(&u, what)?;
-            out.extend(v.get("value").and_then(Value::as_array).into_iter().flatten().filter_map(Seen::of));
+            let from = out.len();
+            out.extend(v.get("value").and_then(Value::as_array).into_iter().flatten().filter_map(Seen::listed));
             next = v.get("@odata.nextLink").and_then(Value::as_str).map(str::to_string);
+            if !each(&out[from..], next.is_some()) {
+                return Ok(None);
+            }
         }
-        Ok(out)
+        Ok(Some(out))
+    }
+
+    /// The items of the folder whose `children` address is `url`, each page given to `each` as
+    /// it lands. Graph sends a folder 1,000 items a page, each page about a second and only
+    /// after the one before (a page names the next), so a big folder is read from both ends at
+    /// once, by name up and by name down, and the reading ends when the two hold what the folder
+    /// holds: half the time. The way down starts at once when the folder is known to hold more
+    /// than a page (`kids`, 0 when unknown); else when its count of children, asked alongside
+    /// the first page (one item, quick), or the first page says so. A service that won't order
+    /// (`$orderby` refused) is read the plain way.
+    fn children_each(&self, url: &str, kids: u32, what: &str, each: &mut dyn FnMut(&[Seen], bool) -> bool) -> Res<Option<Vec<Seen>>> {
+        enum Got {
+            Page(bool, Res<Value>),
+            Count(u32),
+        }
+        let first = |order: &str| format!("{url}?$select={LIST}&$top={PAGE}&$orderby={order}");
+        let mut kids = kids as usize;
+        let stop = AtomicBool::new(false);
+        let (tx, rx) = std::sync::mpsc::channel::<Got>();
+        let mut out: Vec<Seen> = Vec::new();
+        let mut ids: HashSet<String> = HashSet::new();
+        let result = std::thread::scope(|scope| {
+            // Reads the pages from `start` on, until the last or `stop`; `down` names the end.
+            let read = |down: bool, start: String| {
+                let (tx, stop) = (tx.clone(), &stop);
+                scope.spawn(move || {
+                    let mut next = Some(start);
+                    while let Some(u) = next.take() {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let answer = self.graph.get(&u, what);
+                        let failed = answer.is_err();
+                        next = answer.as_ref().ok().and_then(|v| v.get("@odata.nextLink")).and_then(Value::as_str).map(str::to_string);
+                        if tx.send(Got::Page(down, answer)).is_err() || failed {
+                            break;
+                        }
+                    }
+                });
+            };
+            read(false, first("name"));
+            let mut down_started = kids > PAGE as usize;
+            if down_started {
+                read(true, first("name%20desc"));
+            } else if let Some(item) = url.strip_suffix("/children") {
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    if let Ok(v) = self.graph.get(&format!("{item}?$select=id,folder"), what)
+                        && let Some(n) = v.pointer("/folder/childCount").and_then(Value::as_u64)
+                    {
+                        let _ = tx.send(Got::Count(n.min(u32::MAX as u64) as u32));
+                    }
+                });
+            }
+            let mut up_pages = 0;
+            loop {
+                // The way up sends until its last page or a failure, either of which ends this.
+                let Ok(got) = rx.recv() else { break Ok(Some(())) };
+                let (down, answer) = match got {
+                    Got::Count(n) => {
+                        kids = n as usize;
+                        if kids > PAGE as usize && !down_started {
+                            down_started = true;
+                            read(true, first("name%20desc"));
+                        }
+                        // The pages already in hold it all.
+                        if kids > 0 && out.len() >= kids {
+                            break if each(&[], false) { Ok(Some(())) } else { Ok(None) };
+                        }
+                        continue;
+                    }
+                    Got::Page(down, answer) => (down, answer),
+                };
+                let v = match answer {
+                    Ok(v) => v,
+                    // The way down only halves the time: without it the way up reads it all.
+                    Err(_) if down => continue,
+                    // Ordering refused: read the plain way.
+                    Err(e) if up_pages == 0 && e.status == 400 => break Err(None),
+                    Err(e) => break Err(Some(e)),
+                };
+                let more = v.get("@odata.nextLink").is_some();
+                if !down {
+                    up_pages += 1;
+                    if more && !down_started {
+                        down_started = true;
+                        read(true, first("name%20desc"));
+                    }
+                }
+                let mut met = false;
+                let from = out.len();
+                for s in v.get("value").and_then(Value::as_array).into_iter().flatten().filter_map(Seen::listed) {
+                    if ids.insert(s.id.clone()) {
+                        out.push(s);
+                    } else {
+                        met = true;
+                    }
+                }
+                // Done when one way reached its end, or between them they hold what Graph said
+                // the folder holds (what arrives meanwhile comes with the change log), or, with
+                // no count to go by, the two met in the middle.
+                let done = !more || if kids > 0 { out.len() >= kids } else { met };
+                if !each(&out[from..], !done) {
+                    break Ok(None);
+                }
+                if done {
+                    break Ok(Some(()));
+                }
+            }
+            .inspect(|_| stop.store(true, Ordering::Relaxed))
+            .inspect_err(|_| stop.store(true, Ordering::Relaxed))
+        });
+        match result {
+            Ok(Some(())) => Ok(Some(out)),
+            Ok(None) => Ok(None),
+            Err(Some(e)) => Err(e),
+            Err(None) => self.pages_each(format!("{url}?$select={LIST}&$top={PAGE}"), what, each),
+        }
     }
 
     /// Lists this drive's folder `id` from Graph and keeps the listing, unless changes came in
     /// while it was read (then it's only returned).
     fn list_own(&self, id: &str) -> Res<Vec<Seen>> {
-        let epoch = self.st().epoch;
-        let url = format!("/drives/{}/items/{}/children?$select={SELECT}&$top={PAGE}", segment(self.drive()), segment(id));
-        let seen = self.pages(url, t("Listar a pasta", "List the folder"))?;
+        Ok(self.list_own_each(id, &mut |_, _| true)?.unwrap_or_default())
+    }
+
+    /// [`Self::list_own`], each page given to `each` as it lands; a listing stopped by `each`
+    /// isn't kept.
+    fn list_own_each(&self, id: &str, each: &mut dyn FnMut(&[Seen], bool) -> bool) -> Res<Option<Vec<Seen>>> {
+        let (epoch, kids) = {
+            let st = self.st();
+            (st.epoch, st.tree.find(id).map_or(0, |ix| st.tree.get(ix).kids))
+        };
+        let url = format!("/drives/{}/items/{}/children", segment(self.drive()), segment(id));
+        let Some(seen) = self.children_each(&url, kids, t("Listar a pasta", "List the folder"), each)? else { return Ok(None) };
         let mut st = self.st();
         if st.epoch == epoch
             && let Some(ix) = st.tree.find(id)
@@ -477,7 +615,7 @@ impl Account {
             st.tree.set_listing(ix, &seen);
             st.dirty = true;
         }
-        Ok(seen)
+        Ok(Some(seen))
     }
 
     fn own_loc(&self, tree: &Tree, ix: Ix) -> Loc {
@@ -590,32 +728,53 @@ impl Account {
 
     /// Folder `path`'s items.
     pub fn list(&self, path: &str) -> Result<Vec<Item>> {
+        let mut all = Vec::new();
+        self.list_paged(path, &mut |items, _| {
+            all.extend(items);
+            true
+        })?;
+        Ok(all)
+    }
+
+    /// Folder `path`'s items in pages, each given to `page` as Graph sends it (1,000 items),
+    /// with whether more follow, so a big folder shows as it comes; `page` answering false stops
+    /// the listing. A folder already kept comes in one page.
+    pub fn list_paged(&self, path: &str, page: &mut dyn FnMut(Vec<Item>, bool) -> bool) -> Result<()> {
         if let Some(rest) = self.in_bin(path) {
-            return self.bin_list_at(&rest);
+            page(self.bin_list_at(&rest)?, false);
+            return Ok(());
         }
         let loc = match self.locate(path)? {
-            Place::Top => return Ok(Area::of_kind(self.meta.kind).iter().map(|a| area_item(*a)).collect()),
+            Place::Top => {
+                page(Area::of_kind(self.meta.kind).iter().map(|a| area_item(*a)).collect(), false);
+                return Ok(());
+            }
             Place::Missing => return Err(not_found(path).into()),
             Place::Found(l) => l,
         };
         if !loc.item.is_dir {
             return Err(tr!("{path} não é uma pasta.", "{path} isn't a folder."));
         }
+        let mut each = |seen: &[Seen], more: bool| page(seen.iter().map(item_of).collect(), more);
         if loc.own {
             // Atualizar asked for this folder whole.
-            if self.stale.lock().unwrap_or_else(|e| e.into_inner()).remove(&loc.addr.id) {
-                return Ok(self.list_own(&loc.addr.id)?.iter().map(item_of).collect());
+            let fresh = self.stale.lock().unwrap_or_else(|e| e.into_inner()).remove(&loc.addr.id);
+            if !fresh {
+                // Found again by id: the tree may have changed since `locate` let it go.
+                let st = self.st();
+                if let Some(kids) = st.tree.find(&loc.addr.id).and_then(|ix| st.tree.children(ix)) {
+                    let items = kids.iter().map(|k| self.own_loc(&st.tree, *k).item).collect();
+                    drop(st);
+                    page(items, false);
+                    return Ok(());
+                }
             }
-            // Found again by id: the tree may have changed since `locate` let it go.
-            let st = self.st();
-            if let Some(kids) = st.tree.find(&loc.addr.id).and_then(|ix| st.tree.children(ix)) {
-                return Ok(kids.iter().map(|k| self.own_loc(&st.tree, *k).item).collect());
-            }
-            drop(st);
-            return Ok(self.list_own(&loc.addr.id)?.iter().map(item_of).collect());
+            self.list_own_each(&loc.addr.id, &mut each)?;
+            return Ok(());
         }
-        let url = format!("{}/children?$select={SELECT}&$top={PAGE}", loc.addr.url());
-        Ok(self.pages(url, t("Listar a pasta", "List the folder"))?.iter().map(item_of).collect())
+        let url = format!("{}/children", loc.addr.url());
+        self.children_each(&url, 0, t("Listar a pasta", "List the folder"), &mut each)?;
+        Ok(())
     }
 
     /// The item at `path`, if there's one.
@@ -1144,7 +1303,7 @@ impl Account {
 
     /// Folder `id`'s whole listing from Graph, not kept: what opening it costs without the tree.
     pub(crate) fn list_fresh(&self, id: &str) -> Vec<Item> {
-        let url = format!("/drives/{}/items/{}/children?$select={SELECT}&$top={PAGE}", segment(self.drive()), segment(id));
+        let url = format!("/drives/{}/items/{}/children?$select={LIST}&$top={PAGE}", segment(self.drive()), segment(id));
         self.pages(url, "listar").unwrap().iter().map(item_of).collect()
     }
 }
@@ -1171,6 +1330,39 @@ mod tests {
                 st.add(&sub, "x.txt", false, b"x");
             }
         });
+    }
+
+    /// A folder of 2,500 (Graph's pages hold 1,000): read from both ends at once, each page
+    /// passed on as it lands, every item once, and the last page the only one saying nothing
+    /// more follows. Listed without Graph's `folder` facet, a folder in it is still a folder.
+    #[test]
+    fn a_big_folder_is_read_from_both_ends() {
+        let fake = Fake::start();
+        fake.with(|st| {
+            let d = st.add(ROOT, "Fotos", true, &[]);
+            for i in 0..2499 {
+                st.add(&d, &format!("f{i:04}.txt"), false, b"x");
+            }
+            st.add(&d, "f2499", true, &[]);
+        });
+        let a = on(fake.ends(), Kind::Personal, None).unwrap();
+        // Listing the folder above gives its count: both ends start together.
+        a.list("/Meus arquivos").unwrap();
+        let mut pages = Vec::new();
+        a.list_paged("/Meus arquivos/Fotos", &mut |items, more| {
+            pages.push((items.into_iter().map(|i| i.name).collect::<Vec<_>>(), more));
+            true
+        })
+        .unwrap();
+        assert_eq!(pages[0].0.len(), 1000);
+        assert!(pages.iter().any(|(names, _)| names[0] == "f2499"), "read from the far end too");
+        let names: HashSet<&String> = pages.iter().flat_map(|(n, _)| n).collect();
+        assert_eq!((names.len(), pages.iter().map(|(n, _)| n.len()).sum::<usize>()), (2500, 2500));
+        assert!(pages.iter().rev().skip(1).all(|(_, more)| *more) && !pages.last().unwrap().1);
+        // Kept whole, the folder a folder.
+        let kept = a.list("/Meus arquivos/Fotos").unwrap();
+        assert_eq!(kept.len(), 2500);
+        assert!(kept.iter().all(|i| i.is_dir == (i.name == "f2499")));
     }
 
     #[test]
@@ -1204,10 +1396,11 @@ mod tests {
         assert_eq!(a.kept_list("/Meus arquivos/A").unwrap()[0].name, "sub");
         assert!(a.kept_list("/Lixeira").is_none() && a.kept_list("/").is_none());
         assert_eq!(fake.requests(), before);
-        // Atualizar: the feed and the folder itself.
+        // Atualizar: the feed, the folder itself and its count of children (asked alongside, in
+        // case it holds more than a page).
         a.forget("/Meus arquivos/A");
         a.list("/Meus arquivos/A").unwrap();
-        assert_eq!(fake.requests(), before + 2);
+        assert_eq!(fake.requests(), before + 3);
     }
 
     #[test]

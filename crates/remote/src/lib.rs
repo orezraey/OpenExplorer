@@ -365,6 +365,13 @@ pub(crate) fn onward_each(progress: &mut dyn FnMut(usize, u64) -> bool) -> impl 
 pub trait Conn: Send {
     /// The folder `dir`'s items, without `.` and `..`.
     fn list(&mut self, dir: &str) -> Result<Vec<Item>>;
+    /// [`Conn::list`] in pages, each given to `page` as it comes, with whether more follow, so a
+    /// big folder shows as it loads; `page` answering false stops. One page where the service
+    /// sends the folder whole.
+    fn list_pages(&mut self, dir: &str, page: &mut dyn FnMut(Vec<Item>, bool) -> bool) -> Result<()> {
+        page(self.list(dir)?, false);
+        Ok(())
+    }
     /// The item at `path`, or `None` when there's nothing there.
     fn stat(&mut self, path: &str) -> Result<Option<Item>>;
     fn mkdir(&mut self, path: &str) -> Result<()>;
