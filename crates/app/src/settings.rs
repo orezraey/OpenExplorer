@@ -270,6 +270,28 @@ pub struct Settings {
     /// Experimental: a search's matches in names marked as with a highlighter, rather than
     /// only coloured.
     pub search_marker: bool,
+    /// Experimental (Windows): the window's content keeps up with a drag of its left or top
+    /// edge (Rune's `ResizeSync::On`), from the next start.
+    pub resize_sync: bool,
+    /// Experimental (macOS, Linux): the window's background and its folder trees show the
+    /// system's sidebar material (macOS) or blur (Wayland), from the next start. Windows has its
+    /// Acrylic through `mica` and `material`.
+    pub acrylic: bool,
+}
+
+impl Settings {
+    /// Whether the window opens with the acrylic background: asked for, off Windows (there the
+    /// translucent background's Acrylic effect is it).
+    pub fn acrylic_window(&self) -> bool {
+        self.acrylic && !cfg!(windows)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn the_acrylic_background_only_off_windows() {
+    assert_eq!(Settings { acrylic: true, ..Settings::default() }.acrylic_window(), !cfg!(windows));
+    assert!(!Settings::default().acrylic_window());
 }
 
 impl Default for Settings {
@@ -292,6 +314,8 @@ impl Default for Settings {
             mica: false,
             material: Material::Mica,
             search_marker: false,
+            resize_sync: false,
+            acrylic: false,
         }
     }
 }
