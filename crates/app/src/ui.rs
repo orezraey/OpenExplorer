@@ -5900,8 +5900,11 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let bar = bar_style(k).track_offset(header_h, 0.0);
     let bar_strip = bar.strip();
 
+    // How the items are laid out, for the keyboard and its menu (`lasso::Flow`).
+    let flow = &s.views[p].flow;
     let rows = match mode {
         ViewMode::Details => {
+            flow.set(crate::lasso::Flow::default());
             let build = move |s: &State, i: usize| -> El {
                 let pane = &s.panes[p];
                 let e = &pane.entries[i];
@@ -5993,6 +5996,15 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                 let vp_h = s.views[p].rect[3];
                 let rows_per_col = if vp_h > 0.0 { list_rows_for(vp_h, bar_strip) } else { s.list_rows[p].max(1) };
                 let num_cols = n.div_ceil(rows_per_col);
+                flow.set(crate::lasso::Flow {
+                    per_line: rows_per_col,
+                    rows: false,
+                    origin: [4.0, 4.0],
+                    step: [LIST_COL_W + LIST_COL_GAP, ROW_H],
+                    item: [LIST_COL_W, ROW_H],
+                    header: 0.0,
+                    line_key: None,
+                });
                 let mut cols_row = row().key("rows-list").padding(4.0).pb(bar_strip + 4.0).gap(LIST_COL_GAP).items_start();
                 for c in 0..num_cols {
                     let start = c * rows_per_col;
@@ -6009,10 +6021,19 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                 let vp_w = s.views[p].rect[2];
                 let cols = if vp_w > 0.0 { grid_columns_for(vp_w, LIST_COL_W, bar_strip) } else { s.grid_cols[p].max(1) };
                 let vrows = n.div_ceil(cols);
+                flow.set(crate::lasso::Flow {
+                    per_line: cols,
+                    rows: true,
+                    origin: [4.0, 4.0],
+                    step: [LIST_COL_W + LIST_COL_GAP, ROW_H],
+                    item: [LIST_COL_W, ROW_H],
+                    header: 0.0,
+                    line_key: Some("lr-"),
+                });
                 let build = move |s: &State, row_idx: usize| -> El {
                     let start = row_idx * cols;
                     let end = (start + cols).min(s.panes[p].entries.len());
-                    let mut line = row().key(format!("lrow-{row_idx}")).w_full().h(ROW_H).px(4.0).gap(LIST_COL_GAP).center_y();
+                    let mut line = row().key(format!("lr-{row_idx}")).w_full().h(ROW_H).px(4.0).gap(LIST_COL_GAP).center_y();
                     for i in start..end {
                         line = line.child(make_item(s, i));
                     }
@@ -6034,13 +6055,22 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
             let vp_w = s.views[p].rect[2];
             let cols = if vp_w > 0.0 { grid_columns_for(vp_w, tile_w, bar_strip) } else { s.grid_cols[p].max(1) };
             let grid_rows = n.div_ceil(cols);
+            flow.set(crate::lasso::Flow {
+                per_line: cols,
+                rows: true,
+                origin: [GRID_PAD, GRID_PAD],
+                step: [tile_w + GRID_GAP, tile_h + GRID_GAP],
+                item: [tile_w, tile_h],
+                header: 0.0,
+                line_key: Some("gr-"),
+            });
             let row_h = tile_h + GRID_GAP;
             let radius = k.radius.sm;
             let build = move |s: &State, row_idx: usize| -> El {
                 let pane = &s.panes[p];
                 let start = row_idx * cols;
                 let end = (start + cols).min(pane.entries.len());
-                let mut line = row().key(format!("grow-{row_idx}")).w_full().h(row_h).px(GRID_PAD).gap(GRID_GAP).items_start();
+                let mut line = row().key(format!("gr-{row_idx}")).w_full().h(row_h).px(GRID_PAD).gap(GRID_GAP).items_start();
                 for i in start..end {
                     let e = &pane.entries[i];
                     let is_sel = pane.selected.contains(&e.id);
@@ -6197,7 +6227,9 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
             } else if mode == ViewMode::List {
                 let new_rows = list_rows_for(r[3], bar_strip);
                 let new_cols = grid_columns_for(r[2], LIST_COL_W, bar_strip);
-                s.page_rows[p] = new_rows;
+                // A page: a column's items, or past LIST_HORIZ_MAX, where the items run in rows,
+                // the rows in view.
+                s.page_rows[p] = if s.panes[p].entries.len() > LIST_HORIZ_MAX { new_rows * new_cols } else { new_rows };
                 let needs_relayout = s.list_rows[p] != new_rows || (s.panes[p].entries.len() > LIST_HORIZ_MAX && s.grid_cols[p] != new_cols);
                 s.list_rows[p] = new_rows;
                 if s.panes[p].entries.len() > LIST_HORIZ_MAX {

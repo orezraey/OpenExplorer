@@ -75,25 +75,30 @@ pub struct SysIcons {
     /// Lookups by type (quick, from the registry) and by path (a drive or a file, which can
     /// stall on an empty DVD drive or an offline share), on separate threads so a slow path
     /// never holds up the types.
-    by_type: Option<Sender<IconKey>>,
-    by_path: Option<Sender<IconKey>>,
+    by_type: Option<Sender<(IconKey, bool)>>,
+    by_path: Option<Sender<(IconKey, bool)>>,
     /// Drives and the home folder, which the tree always shows.
     fixed: HashSet<IconKey>,
     /// Icons handed to the image cache and still decoding.
     decoding: Vec<IconKey>,
+    /// Some pane shows Large or Extra large icons: lookups bring the 256 px icon too. It costs
+    /// 256 KB a key, so the other views go without it.
+    big: bool,
+    /// The keys asked for with the 256 px icon.
+    asked_big: HashSet<IconKey>,
 }
 
 /// A lookup thread; icons found land in `poll` as [`Msg::Icon`].
-fn worker(outbox: Sender<Msg>, wake: rune::Waker) -> Sender<IconKey> {
-    let (tx, rx) = channel::<IconKey>();
+fn worker(outbox: Sender<Msg>, wake: rune::Waker) -> Sender<(IconKey, bool)> {
+    let (tx, rx) = channel::<(IconKey, bool)>();
     std::thread::spawn(move || {
         #[cfg(windows)]
         // SAFETY: plain COM initialisation for this thread, which the shell's icon lookup needs.
         unsafe {
             windows_sys::Win32::System::Com::CoInitializeEx(std::ptr::null(), windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32);
         }
-        for key in rx {
-            let rgba = lookup(&key);
+        for (key, big) in rx {
+            let rgba = lookup(&key, big);
             if outbox.send(Msg::Icon { key, rgba }).is_err() {
                 break;
             }
@@ -120,10 +125,36 @@ impl SysIcons {
             if self.known.contains_key(&k) {
                 continue;
             }
-            let worker = if matches!(k, IconKey::Path(_) | IconKey::Dir(_)) { &self.by_path } else { &self.by_type };
-            let Some(worker) = worker else { return };
-            let _ = worker.send(k.clone());
+            if !self.ask(k.clone()) {
+                return;
+            }
             self.known.insert(k, None);
+        }
+    }
+
+    /// Sends `key` to its lookup thread, with the 256 px icon while `big`. False with no thread.
+    fn ask(&mut self, key: IconKey) -> bool {
+        let worker = if matches!(key, IconKey::Path(_) | IconKey::Dir(_)) { &self.by_path } else { &self.by_type };
+        let Some(worker) = worker else { return false };
+        if self.big {
+            self.asked_big.insert(key.clone());
+        }
+        let _ = worker.send((key, self.big));
+        true
+    }
+
+    /// Whether some pane shows Large or Extra large icons. Turned on, the icons known without
+    /// the 256 px one are asked for again with it; they keep showing meanwhile.
+    pub fn set_big(&mut self, big: bool) {
+        if big == self.big {
+            return;
+        }
+        self.big = big;
+        if big {
+            let again: Vec<IconKey> = self.known.keys().filter(|k| !self.asked_big.contains(*k)).cloned().collect();
+            for k in again {
+                self.ask(k);
+            }
         }
     }
 
@@ -133,6 +164,8 @@ impl SysIcons {
         let listed: HashSet<&IconKey> = keys.iter().collect();
         let fixed = &self.fixed;
         self.known.retain(|k, _| !matches!(k, IconKey::Path(_) | IconKey::Dir(_)) || fixed.contains(k) || listed.contains(k));
+        let known = &self.known;
+        self.asked_big.retain(|k| known.contains_key(k));
         self.want(keys);
     }
 
@@ -184,7 +217,7 @@ impl SysIcons {
 /// Explorer draws in Details view and the Navigation Tree) and `SHIL_EXTRALARGE` (48 px, for
 /// Propriedades).
 #[cfg(windows)]
-fn lookup(key: &IconKey) -> Option<IconBitmaps> {
+fn lookup(key: &IconKey, big: bool) -> Option<IconBitmaps> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::Controls::{HIMAGELIST, ImageList_GetIcon};
     use windows_sys::Win32::UI::Shell::{
@@ -222,7 +255,7 @@ fn lookup(key: &IconKey) -> Option<IconBitmaps> {
         };
         let small = from_list(small_list, false);
         let large = from_list(large_list, true);
-        let jumbo = from_list(jumbo_list, false).filter(has_jumbo_artwork);
+        let jumbo = if big { from_list(jumbo_list, false).filter(has_jumbo_artwork) } else { None };
         if let Some(small) = small {
             return Some(IconBitmaps { small, large, jumbo });
         }
@@ -305,7 +338,7 @@ fn trim_small((w, h, px): Rgba) -> Rgba {
 }
 
 #[cfg(not(windows))]
-fn lookup(_: &IconKey) -> Option<IconBitmaps> {
+fn lookup(_: &IconKey, _: bool) -> Option<IconBitmaps> {
     None
 }
 

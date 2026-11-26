@@ -355,8 +355,10 @@ fn every(items: usize) -> f64 {
 
 /// Reads again each pane's B2 folder whose turn came.
 pub fn tick(s: &mut State, now: f64) {
+    // A pane the layout hides isn't read: it is once it shows again.
+    let visible = s.settings.pane_layout.count();
     for p in 0..crate::layout::MAX_PANES {
-        let shows = matches!(&s.panes[p].loc, Location::Server { server, find: None, .. } if server.is_b2());
+        let shows = p < visible && matches!(&s.panes[p].loc, Location::Server { server, find: None, .. } if server.is_b2());
         if !shows {
             s.servers.b2_watch.panes[p] = None;
             continue;

@@ -25,6 +25,7 @@ pub const HEADER_H: f32 = 24.0;
 pub struct Scroll {
     pub x: f32,
     pub y: f32,
+    pub max_x: f32,
     pub max_y: f32,
     /// The viewport's height, header included.
     pub h: f32,
@@ -32,15 +33,76 @@ pub struct Scroll {
 
 impl From<ScrollPos> for Scroll {
     fn from(at: ScrollPos) -> Self {
-        Scroll { x: at.offset[0], y: at.offset[1], max_y: at.max[1], h: at.viewport[1] }
+        Scroll { x: at.offset[0], y: at.offset[1], max_x: at.max[0], max_y: at.max[1], h: at.viewport[1] }
     }
 }
 
-/// A pane's list viewport: its rect in window points (from `on_layout`) and its scroll.
+/// How the last view laid out a pane's items, in content points below the header: Details'
+/// rows, the icon views' tiles, List's columns. The keyboard steps through it and the
+/// keyboard's menu finds an item's place with it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Flow {
+    /// Items per line: per row when `rows`, else per column.
+    pub per_line: usize,
+    /// The lines are rows, filled left to right (Details, the icon views, a long List); else
+    /// columns filled top to bottom (List).
+    pub rows: bool,
+    /// The first item's top-left.
+    pub origin: [f32; 2],
+    /// From one item to its neighbour on the right and to the one below.
+    pub step: [f32; 2],
+    /// An item's size.
+    pub item: [f32; 2],
+    /// The column header above the items (Details only).
+    pub header: f32,
+    /// The key of each virtual line, followed by its number, where the lines and not the items
+    /// are the virtual rows (the icon views, a long List).
+    pub line_key: Option<&'static str>,
+}
+
+impl Default for Flow {
+    /// Details: one row per item under the header.
+    fn default() -> Flow {
+        Flow { per_line: 1, rows: true, origin: [0.0, 0.0], step: [0.0, ROW_H], item: [0.0, ROW_H], header: HEADER_H, line_key: None }
+    }
+}
+
+impl Flow {
+    /// Whether Left and Right move between items (not in Details, one item per row).
+    pub fn sideways(&self) -> bool {
+        !self.rows || self.per_line > 1
+    }
+
+    /// How far the arrows move the cursor: (Left/Right, Up/Down).
+    pub fn steps(&self) -> (isize, isize) {
+        let line = self.per_line.max(1) as isize;
+        if self.rows { (1, line) } else { (line, 1) }
+    }
+
+    /// Item `i`'s top-left.
+    pub fn at(&self, i: usize) -> [f32; 2] {
+        let per = self.per_line.max(1);
+        let (line, pos) = ((i / per) as f32, (i % per) as f32);
+        let (across, down) = if self.rows { (pos, line) } else { (line, pos) };
+        [self.origin[0] + across * self.step[0], self.origin[1] + down * self.step[1]]
+    }
+
+    /// The key that brings item `i` (key `row`) into view: its virtual line's, or its own.
+    pub fn reveal_key(&self, i: usize, row: String) -> String {
+        match self.line_key {
+            Some(prefix) => format!("{prefix}{}", i / self.per_line.max(1)),
+            None => row,
+        }
+    }
+}
+
+/// A pane's list viewport: its rect in window points (from `on_layout`), its scroll, and how
+/// the view last laid out its items.
 #[derive(Default)]
 pub struct Viewport {
     pub rect: [f32; 4],
     pub scroll: Rc<Cell<Scroll>>,
+    pub flow: Cell<Flow>,
 }
 
 /// A rectangle selection under way.
@@ -239,28 +301,35 @@ pub fn step(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     true
 }
 
-/// Where the menu the keyboard opens goes in a list viewport `view`: under row `row` (its
+/// Where the menu the keyboard opens goes in a list viewport `view`: under item `row` (its
 /// bottom-left, a little in, as Windows' keyboard menus open below what they're for), or at
-/// the top of the rows with none. Also the scroll that shows that row whole, when it isn't.
-pub fn menu_point(view: &Viewport, row: Option<usize>) -> (rune::PointerPress, Option<f32>) {
-    let [x, y, _, h] = view.rect;
+/// the top of the items with none. Also the scroll (x, y) that shows that item whole, when it
+/// isn't. The item's place comes from how the view laid them out (`Viewport::flow`).
+pub fn menu_point(view: &Viewport, row: Option<usize>) -> (rune::PointerPress, Option<[f32; 2]>) {
+    let [x, y, w, h] = view.rect;
+    let flow = view.flow.get();
     let scroll = view.scroll.get();
-    let rows_h = (h - HEADER_H).max(ROW_H);
-    let (at, to) = match row {
-        None => (0.0, None),
-        Some(i) => {
-            let top = i as f32 * ROW_H;
-            let to = if top < scroll.y {
-                Some(top)
-            } else if top + ROW_H > scroll.y + rows_h {
-                Some((top + ROW_H - rows_h).min(scroll.max_y.max(0.0)))
-            } else {
-                None
-            };
-            (top + ROW_H - to.unwrap_or(scroll.y), to)
+    let rows_h = (h - flow.header).max(ROW_H);
+    let Some(i) = row else { return (rune::PointerPress { x: x + 24.0, y: y + flow.header }, None) };
+    let [left, top] = flow.at(i);
+    let [item_w, item_h] = flow.item;
+    // The offset that shows `len` points from `start` in `room` points scrolled to `at`,
+    // moving as little as it takes.
+    let reveal = |start: f32, len: f32, at: f32, room: f32, max: f32| {
+        if start < at {
+            start
+        } else if start + len > at + room {
+            (start + len - room).min(max.max(0.0))
+        } else {
+            at
         }
     };
-    (rune::PointerPress { x: x + 24.0, y: y + HEADER_H + at.clamp(0.0, rows_h) }, to)
+    let to_y = reveal(top, item_h, scroll.y, rows_h, scroll.max_y);
+    // Details' rows span the columns: only the other views move sideways to an item.
+    let to_x = if flow.sideways() { reveal(left, item_w, scroll.x, w, scroll.max_x) } else { scroll.x };
+    let to = (to_y != scroll.y || to_x != scroll.x).then_some([to_x, to_y]);
+    let in_x = if flow.sideways() { (left - to_x).max(0.0) } else { 0.0 };
+    (rune::PointerPress { x: x + (in_x + 24.0).min(w), y: y + flow.header + (top + item_h - to_y).clamp(0.0, rows_h) }, to)
 }
 
 #[cfg(test)]
@@ -296,7 +365,7 @@ mod tests {
     /// viewport's row 2 after scrolling 10 rows down covers rows 3 to 12.
     #[test]
     fn the_rectangle_follows_the_scroll() {
-        let at_top = Scroll { x: 0.0, y: 0.0, max_y: 2000.0, h: 300.0 };
+        let at_top = Scroll { x: 0.0, y: 0.0, max_x: 0.0, max_y: 2000.0, h: 300.0 };
         let start = content([30.0, HEADER_H + 3.5 * ROW_H], at_top);
         let l = Lasso { pane: 0, start, pointer: [60.0, HEADER_H + 2.5 * ROW_H], toggle: false, before: HashSet::new(), anchor: None, cursor: None, moved: true, stepped: 0.0 };
         assert_eq!(hits(l.rect(at_top), 100, 400.0), 2..4);
@@ -337,7 +406,7 @@ mod tests {
         s.cache = crate::cache::Cache::memory_only();
         s.panes[1].set_entries(Ok((0..200).map(|i| crate::model::Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false }).collect()));
         s.panes[1].selected = ids(&["f150"]);
-        s.views[1].scroll.set(Scroll { x: 0.0, y: 0.0, max_y: 200.0 * ROW_H, h: 300.0 });
+        s.views[1].scroll.set(Scroll { x: 0.0, y: 0.0, max_x: 0.0, max_y: 200.0 * ROW_H, h: 300.0 });
         let mut tx = Tx::default();
         // Ctrl isn't held: the old selection goes.
         assert!(press(&mut s, 1, [30.0, HEADER_H + 1.5 * ROW_H], false));
@@ -372,7 +441,7 @@ mod tests {
         let mut s = crate::init();
         s.cache = crate::cache::Cache::memory_only();
         s.panes[1].set_entries(Ok((0..20).map(|i| crate::model::Entry { id: format!("f{i}"), name: format!("arquivo {i:02}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false }).collect()));
-        s.views[1].scroll.set(Scroll { x: 0.0, y: 0.0, max_y: 0.0, h: 600.0 });
+        s.views[1].scroll.set(Scroll { x: 0.0, y: 0.0, max_x: 0.0, max_y: 0.0, h: 600.0 });
         s.panes[1].cursor = Some("f15".into());
         press(&mut s, 1, [30.0, HEADER_H + 2.5 * ROW_H], false);
         moved(&mut s, 1, [60.0, HEADER_H + 5.5 * ROW_H]);
@@ -389,16 +458,44 @@ mod tests {
     /// it's out of it, or at the top of the rows when it's for the folder.
     #[test]
     fn the_keyboard_menu_opens_under_its_row() {
-        let view = Viewport { rect: [100.0, 50.0, 600.0, HEADER_H + 10.0 * ROW_H], scroll: Default::default() };
-        view.scroll.set(Scroll { x: 0.0, y: 3.0 * ROW_H, max_y: 90.0 * ROW_H, h: HEADER_H + 10.0 * ROW_H });
+        let view = Viewport { rect: [100.0, 50.0, 600.0, HEADER_H + 10.0 * ROW_H], ..Default::default() };
+        view.scroll.set(Scroll { x: 0.0, y: 3.0 * ROW_H, max_x: 0.0, max_y: 90.0 * ROW_H, h: HEADER_H + 10.0 * ROW_H });
         let top = 50.0 + HEADER_H;
         let at = |row| menu_point(&view, row);
         assert_eq!(at(None), (rune::PointerPress { x: 124.0, y: top }, None));
         // Row 5 shows as the third row from the top.
         assert_eq!(at(Some(5)), (rune::PointerPress { x: 124.0, y: top + 3.0 * ROW_H }, None));
         // Row 1 is above the view: it scrolls to the top and the menu goes under it.
-        assert_eq!(at(Some(1)), (rune::PointerPress { x: 124.0, y: top + ROW_H }, Some(ROW_H)));
+        assert_eq!(at(Some(1)), (rune::PointerPress { x: 124.0, y: top + ROW_H }, Some([0.0, ROW_H])));
         // Row 40 is below: it scrolls up to the bottom and the menu goes at the bottom edge.
-        assert_eq!(at(Some(40)), (rune::PointerPress { x: 124.0, y: top + 10.0 * ROW_H }, Some(31.0 * ROW_H)));
+        assert_eq!(at(Some(40)), (rune::PointerPress { x: 124.0, y: top + 10.0 * ROW_H }, Some([0.0, 31.0 * ROW_H])));
+    }
+
+    /// In the icon views and in List the arrows follow the tiles and columns, and the
+    /// keyboard's menu finds its item there, scrolling down or sideways to it.
+    #[test]
+    fn tiles_and_columns_step_and_open_the_menu_where_their_items_are() {
+        assert_eq!(Flow::default().steps(), (1, 1));
+        assert!(!Flow::default().sideways());
+
+        // Large icons, 4 tiles a row: Right goes to the next tile, Down a row down.
+        let tiles = Flow { per_line: 4, rows: true, origin: [8.0, 8.0], step: [136.0, 160.0], item: [128.0, 152.0], header: 0.0, line_key: Some("gr-") };
+        assert_eq!(tiles.steps(), (1, 4));
+        assert_eq!(tiles.at(9), [144.0, 328.0]);
+        assert_eq!(tiles.reveal_key(9, "r:x".into()), "gr-2");
+        let view = Viewport { rect: [100.0, 50.0, 600.0, 300.0], ..Default::default() };
+        view.flow.set(tiles);
+        view.scroll.set(Scroll { x: 0.0, y: 0.0, max_x: 0.0, max_y: 2000.0, h: 300.0 });
+        // Tile 9 ends at 480, below the 300 shown: it scrolls down 180 and the menu goes under it.
+        assert_eq!(menu_point(&view, Some(9)), (rune::PointerPress { x: 268.0, y: 350.0 }, Some([0.0, 180.0])));
+
+        // List, 10 items a column: Right goes a column over, Down to the next item.
+        let columns = Flow { per_line: 10, rows: false, origin: [4.0, 4.0], step: [238.0, ROW_H], item: [230.0, ROW_H], header: 0.0, line_key: None };
+        assert_eq!(columns.steps(), (10, 1));
+        assert_eq!(columns.reveal_key(25, "r:y".into()), "r:y");
+        view.flow.set(columns);
+        view.scroll.set(Scroll { x: 0.0, y: 0.0, max_x: 1000.0, max_y: 0.0, h: 300.0 });
+        // Item 25 is in the third column, past the right edge: it scrolls sideways 110.
+        assert_eq!(menu_point(&view, Some(25)), (rune::PointerPress { x: 494.0, y: 50.0 + 4.0 + 6.0 * ROW_H }, Some([110.0, 0.0])));
     }
 }

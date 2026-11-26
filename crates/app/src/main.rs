@@ -543,10 +543,16 @@ fn init() -> State {
     // run was is kept. The simulated drive stays in the tree, for trying things out.
     let places = places::places();
     let start = places.desktop.as_ref().map_or_else(Location::home, |(dir, _)| Location::Local(dir.clone()));
-    let mut panes: [Pane; MAX_PANES] = std::array::from_fn(|_| Pane::new(start.clone()));
-    for p in &mut panes {
-        p.load_now(&mock, settings.show_hidden);
-    }
+    // The folder is read once: every pane, shown or not, starts with that listing.
+    let mut first = Pane::new(start.clone());
+    first.load_now(&mock, settings.show_hidden);
+    let mut panes: [Pane; MAX_PANES] = std::array::from_fn(|_| {
+        let mut pane = Pane::new(start.clone());
+        pane.free = first.free;
+        pane.set_entries(first.error.clone().map_or_else(|| Ok(first.entries.clone()), Err));
+        pane
+    });
+    panes[0] = first;
     let accounts = store::accounts();
     let tree = tree::Tree::new(accounts.iter().map(|a| a.email.clone()));
     State {
@@ -824,6 +830,9 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             tree::learn(s, p);
         }
     }
+    // The 256 px icons only while a pane in view shows Large or Extra large icons.
+    let big = s.panes[..s.settings.pane_layout.count()].iter().any(|p| matches!(p.view_mode, model::ViewMode::LargeIcons | model::ViewMode::ExtraLargeIcons));
+    s.icons.set_big(big);
     let mut changed = std::mem::take(&mut s.main_dirty) | s.icons.settle();
     changed |= notice(s, now, &mut |text, how| tx.announce(text, how));
     // A rectangle selection held past the list's edge scrolls it.
@@ -1098,12 +1107,12 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         // Mostrar na pasta: the item is selected and brought into view once its folder lists it.
         let pane = &mut s.panes[p];
         let Some((id, name)) = pane.reveal.clone() else { continue };
-        if pane.entry(&id).is_some() {
+        if let Some(i) = pane.index_of(&id) {
             pane.reveal = None;
             pane.selected = [id.clone()].into();
             pane.cursor = Some(id.clone());
             pane.anchor = Some(id.clone());
-            tx.scroll_into_view_in(pane_key(p), row_key(&id));
+            tx.scroll_into_view_in(pane_key(p), s.views[p].flow.get().reveal_key(i, row_key(&id)));
             changed = true;
         } else if !pane.loading {
             pane.reveal = None;
@@ -1309,6 +1318,7 @@ pub(crate) fn set_main_tab(s: &mut State, tab: MainTab) {
 
 /// Switches between 1, 2, and 4 visible panes in `Explorar`, persisting the choice.
 pub(crate) fn set_pane_layout(s: &mut State, layout: settings::PaneLayout) {
+    let before = s.settings.pane_layout.count();
     s.settings.pane_layout = layout;
     s.settings.save();
     s.view_menu_open = false;
@@ -1319,6 +1329,12 @@ pub(crate) fn set_pane_layout(s: &mut State, layout: settings::PaneLayout) {
     let count = layout.count();
     if s.active >= count {
         s.active = 0;
+    }
+    // A pane shown again is read again: while hidden it wasn't watched (B2's polling skips it).
+    for p in before..count {
+        if !s.tabs[p].is_picker() {
+            load(s, p);
+        }
     }
     if s.renaming.as_ref().is_some_and(|(p, _)| *p >= count) {
         s.renaming = None;
@@ -1798,6 +1814,8 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         })
     };
     let page = keyboard::page(s.page_rows[p]) as isize;
+    let flow = s.views[p].flow.get();
+    let (across, down) = flow.steps();
     let owns = keyboard::list_has_keys(s, p, tx.focused());
     // Any other key ends a name being typed: Enter into a folder and a letter starts anew.
     let plain = !(ev.mods.cmd || ev.mods.ctrl || ev.mods.alt);
@@ -1879,7 +1897,7 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             if let Some(i) = keyboard::find(&s.panes[p].entries, at, query) {
                 let id = s.panes[p].entries[i].id.clone();
                 click(s, p, &id, Mods::default());
-                tx.scroll_into_view_in(pane_key(p), row_key(&id));
+                tx.scroll_into_view_in(pane_key(p), flow.reveal_key(i, row_key(&id)));
             }
             return true;
         }
@@ -1900,12 +1918,12 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             go_forward(s, p);
             return true;
         }
-        Key::Left if s.panes[p].view_mode.is_grid() => step(-1),
-        Key::Right if s.panes[p].view_mode.is_grid() => step(1),
-        Key::Left if s.panes[p].view_mode == model::ViewMode::List => step(-(s.list_rows[p].max(1) as isize)),
-        Key::Right if s.panes[p].view_mode == model::ViewMode::List => step(s.list_rows[p].max(1) as isize),
-        Key::Up => step(-(if s.panes[p].view_mode.is_grid() { s.grid_cols[p].max(1) as isize } else { 1 })),
-        Key::Down => step(if s.panes[p].view_mode.is_grid() { s.grid_cols[p].max(1) as isize } else { 1 }),
+        // The arrows follow the items as the view laid them out: tiles in rows, List's
+        // columns, Details' rows (where Left and Right don't move).
+        Key::Left if flow.sideways() => step(-across),
+        Key::Right if flow.sideways() => step(across),
+        Key::Up => step(-down),
+        Key::Down => step(down),
         Key::PageUp => step(-page),
         Key::PageDown => step(page),
         Key::Home => step(-(n as isize)),
@@ -1957,7 +1975,7 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         } else {
             click(s, p, &id, Mods { shift: ev.mods.shift, ..Mods::default() });
         }
-        tx.scroll_into_view_in(pane_key(p), row_key(&id));
+        tx.scroll_into_view_in(pane_key(p), flow.reveal_key(i, row_key(&id)));
     }
     true
 }
@@ -1983,8 +2001,8 @@ fn menu_from_keys(s: &mut State, p: usize, tx: &mut Tx) {
         cursor.or_else(|| pane.entries.iter().position(|e| pane.selected.contains(&e.id)))
     };
     let (at, scroll) = lasso::menu_point(&s.views[p], row);
-    if let Some(y) = scroll {
-        tx.scroll_to_instant(ui::list_key(p), s.views[p].scroll.get().x, y);
+    if let Some([x, y]) = scroll {
+        tx.scroll_to_instant(ui::list_key(p), x, y);
     }
     s.menu = Some((p, at));
 }
@@ -3249,7 +3267,7 @@ mod tests {
         s.panes[1].selected.clear();
         let h = lasso::HEADER_H + 10.0 * ROW_H;
         s.views[1].rect = [400.0, 100.0, 600.0, h];
-        s.views[1].scroll.set(lasso::Scroll { x: 0.0, y: 0.0, max_y: 40.0 * ROW_H + 2.0 * ROW_H, h });
+        s.views[1].scroll.set(lasso::Scroll { x: 0.0, y: 0.0, max_x: 0.0, max_y: 40.0 * ROW_H + 2.0 * ROW_H, h });
         let mut tx = Tx::default();
         let ev = |key, mods| KeyEvent { key, mods };
         let shift = Mods { shift: true, ..Mods::default() };
