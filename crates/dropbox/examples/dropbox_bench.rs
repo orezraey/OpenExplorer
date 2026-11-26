@@ -4,15 +4,28 @@
 //! - `1000 folders`: 1,000 empty folders.
 //! - `5000 files`: 5,000 files of 1 KB (5 MB in all).
 //! - `100 folders`: 100 empty folders, for downloading a tree of folders.
+//! - `transfer/large/large.bin`: one file of 500 MiB, for a big download.
 //!
 //! Run again, it adds only what's missing.
+//!
+//! The speed comparison's uploads go to folders under `uploads` there, which this also tends:
+//!
+//! - `make <n>`: makes `n` empty folders, one name a line. They're made before an app starts,
+//!   so it lists them fresh.
+//! - `wait <folder> <files> <bytes>`: prints `ready` once it can ask, then asks every 200 ms
+//!   until the folder holds `files` files of `bytes` in all (a file shows only once its upload
+//!   finished), and prints `done`. Gives up after 10 minutes.
+//! - `clean`: deletes every folder there.
+//! - `roundtrip`: sends a file of 100 MiB into a folder there, timed, reads it back (in segments
+//!   and in one stream, timed; each checks Dropbox's content hash) and deletes the folder.
 //!
 //! `cargo run -p openexplorer-dropbox --release --example dropbox_bench -- <e-mail>`
 
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::io::Write;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ROOT: &str = "/Open Explorer benchmark";
 const WORKERS: usize = 6;
@@ -20,10 +33,19 @@ const WORKERS: usize = 6;
 fn main() {
     let key = std::env::args().nth(1).expect("the account (e-mail)");
     let account = openexplorer_dropbox::reach(&key).unwrap_or_else(|e| panic!("reaching the account: {e}"));
+    let arg = |n: usize| std::env::args().nth(n).unwrap_or_else(|| panic!("make <n> | wait <folder> <files> <bytes> | clean"));
+    match std::env::args().nth(2).as_deref() {
+        Some("make") => return make(&account, arg(3).parse().expect("how many folders")),
+        Some("wait") => return wait(&account, &arg(3), arg(4).parse().expect("the number of files"), arg(5).parse().expect("the bytes in all")),
+        Some("clean") => return clean(&account),
+        Some("roundtrip") => return roundtrip(&account),
+        Some(other) => panic!("{other}? make <n> | wait <folder> <files> <bytes> | clean"),
+        None => {}
+    }
     println!("account {key}");
     let started = Instant::now();
     let names = |n: usize, what: &str| -> Vec<String> { (1..=n).map(|i| format!("{what} {i:04}")).collect() };
-    for folder in ["", "/1000 folders", "/5000 files", "/100 folders"] {
+    for folder in ["", "/1000 folders", "/5000 files", "/100 folders", "/transfer", "/transfer/large", "/uploads"] {
         let path = format!("{ROOT}{folder}");
         if !names_in(&account, parent_of(&path)).contains(name_of(&path)) {
             account.mkdir(&path).unwrap_or_else(|e| panic!("making {path}: {e}"));
@@ -32,7 +54,99 @@ fn main() {
     fill(&account, &format!("{ROOT}/1000 folders"), names(1000, "folder"), false);
     fill(&account, &format!("{ROOT}/100 folders"), names(100, "folder"), false);
     fill(&account, &format!("{ROOT}/5000 files"), names(5000, "file").into_iter().map(|n| format!("{n}.txt")).collect(), true);
+    let large = format!("{ROOT}/transfer/large");
+    if !names_in(&account, &large).contains("large.bin") {
+        println!("{large}: sending large.bin (500 MiB)");
+        account.upload(&format!("{large}/large.bin"), &mut Noise { left: LARGE, x: 0x9E37_79B9_7F4A_7C15 }, LARGE, &mut |_| true).unwrap_or_else(|e| panic!("sending large.bin: {e}"));
+    }
     println!("done in {:.0} s", started.elapsed().as_secs_f64());
+}
+
+const LARGE: u64 = 500 << 20;
+
+/// `left` bytes that don't repeat, so nothing on the way can shrink them.
+struct Noise {
+    left: u64,
+    x: u64,
+}
+
+impl std::io::Read for Noise {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = (buf.len() as u64).min(self.left) as usize;
+        for chunk in buf[..n].chunks_mut(8) {
+            self.x ^= self.x << 13;
+            self.x ^= self.x >> 7;
+            self.x ^= self.x << 17;
+            chunk.copy_from_slice(&self.x.to_le_bytes()[..chunk.len()]);
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
+/// A folder's items as they are now, not as kept: (name, folder, size).
+fn fresh(account: &openexplorer_dropbox::Account, path: &str) -> Vec<(String, bool, u64)> {
+    account.reload(path).unwrap_or_else(|e| panic!("listing {path}: {e}")).into_iter().map(|e| (e.name.to_string(), e.dir, e.size)).collect()
+}
+
+fn make(account: &openexplorer_dropbox::Account, n: usize) {
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+    for k in 0..n {
+        let name = format!("up-{stamp}-{k:02}");
+        account.mkdir(&format!("{ROOT}/uploads/{name}")).unwrap_or_else(|e| panic!("making {name}: {e}"));
+        println!("{name}");
+    }
+}
+
+fn wait(account: &openexplorer_dropbox::Account, name: &str, files: usize, bytes: u64) {
+    let path = format!("{ROOT}/uploads/{name}");
+    // The first ask warms the connection and the token, so `ready` means the next ones are as
+    // quick as they get.
+    fresh(account, &path);
+    println!("ready");
+    std::io::stdout().flush().unwrap();
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(600) {
+        let got: Vec<u64> = fresh(account, &path).into_iter().filter(|(_, dir, _)| !dir).map(|(_, _, size)| size).collect();
+        if got.len() == files && got.iter().sum::<u64>() == bytes {
+            println!("done");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    println!("timeout");
+    std::process::exit(1);
+}
+
+fn roundtrip(account: &openexplorer_dropbox::Account) {
+    let dir = format!("{ROOT}/uploads/rt-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
+    account.mkdir(&dir).unwrap_or_else(|e| panic!("making {dir}: {e}"));
+    let path = format!("{dir}/big.bin");
+    let size = 100u64 << 20;
+    let local = std::env::temp_dir().join("oe-dropbox-roundtrip.bin");
+    std::io::copy(&mut Noise { left: size, x: 0x5DEE_CE66 }, &mut std::fs::File::create(&local).unwrap()).unwrap();
+    let t = Instant::now();
+    account.upload_file(&path, &local, &mut |_| true).unwrap_or_else(|e| panic!("sending: {e}"));
+    println!("up {:.2} s", t.elapsed().as_secs_f64());
+    for segmented in [true, false] {
+        let _ = std::fs::remove_file(&local);
+        let file = std::fs::File::create_new(&local).unwrap();
+        let t = Instant::now();
+        account.download_file(&path, &file, segmented, &mut |_| true).unwrap_or_else(|e| panic!("reading back: {e}"));
+        println!("back {} {:.2} s, hash ok", if segmented { "in segments" } else { "in one stream" }, t.elapsed().as_secs_f64());
+    }
+    let _ = std::fs::remove_file(&local);
+    account.delete(&dir).unwrap_or_else(|e| panic!("deleting {dir}: {e}"));
+}
+
+fn clean(account: &openexplorer_dropbox::Account) {
+    for (name, dir, _) in fresh(account, &format!("{ROOT}/uploads")) {
+        if dir {
+            let path = format!("{ROOT}/uploads/{name}");
+            account.delete(&path).map(|_| ()).unwrap_or_else(|e| panic!("deleting {name}: {e}"));
+            println!("deleted {name}");
+        }
+    }
 }
 
 fn parent_of(path: &str) -> &str {

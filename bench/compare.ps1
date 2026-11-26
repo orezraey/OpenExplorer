@@ -158,15 +158,20 @@ foreach ($c in $Clouds.Keys) {
 # Where a pane goes between runs, so each run opens its folder anew.
 $Rest = 'C:\Windows\Web'
 
-# Downloads: everything in a Drive folder, selected with Ctrl+A in the right pane and copied with
+# Downloads: everything in a cloud folder, selected with Ctrl+A in the right pane and copied with
 # the arrow between the panes into the left one, which shows an empty local folder. Timed from
-# the arrow until every file is on disk whole and no program still writes it.
-$Downloads = [ordered]@{
-    'download-large'        = @{ Drive = "$Gd/transfer/large"; Files = 1; Dirs = 0; Bytes = 524288000 }
-    # Long enough (about 20 s at 1 Gbit/s) that the line's ups and downs average out.
-    'download-huge'         = @{ Drive = "$Gd/transfer/huge"; Files = 1; Dirs = 0; Bytes = 2147483648 }
+# the arrow until every file is on disk whole and no program still writes it. Google Drive's go
+# by their plain names, the other clouds' start with the cloud's ("onedrive-download-large").
+$Downloads = [ordered]@{}
+foreach ($c in $Clouds.Keys) {
+    $pre = if ($c -eq 'drive') { '' } else { "$c-" }
+    $Downloads["${pre}download-large"] = @{ Cloud = $c; Path = "$Gd/transfer/large"; Files = 1; Dirs = 0; Bytes = 524288000 }
+    if ($c -eq 'drive') {
+        # Long enough (about 20 s at 1 Gbit/s) that the line's ups and downs average out.
+        $Downloads['download-huge'] = @{ Cloud = $c; Path = "$Gd/transfer/huge"; Files = 1; Dirs = 0; Bytes = 2147483648 }
+    }
     # Air Explorer makes about one local folder every 2 s here, so 100 rather than 1,000.
-    'download-100-folders'  = @{ Drive = "$Gd/100 folders"; Files = 0; Dirs = 100; Bytes = 0 }
+    $Downloads["${pre}download-100-folders"] = @{ Cloud = $c; Path = "$Gd/100 folders"; Files = 0; Dirs = 100; Bytes = 0 }
 }
 # Each download goes to a folder of its own under this one, never emptied while an app may
 # still write there (a download still running would fail with "file not found"); they go at
@@ -178,18 +183,27 @@ $Fresh = New-Object System.Collections.Generic.Queue[string]
 
 # Uploads: everything in a local folder under C:\OEBench\up (made with random bytes the first
 # time), selected with Ctrl+A in the left pane and copied with the arrow between the panes into
-# an empty Google Drive folder in the right one, under "Open Explorer benchmark/uploads". Timed
-# from the arrow until Drive holds every file (it shows a file once its upload has finished):
-# the upload_target example asks Drive every 200 ms, the same for both apps.
-$Uploads = [ordered]@{
-    'upload-large' = @{ Local = 'large'; Files = 1; Size = 100MB }
-    'upload-100-files' = @{ Local = 'small'; Files = 100; Size = 512KB }
+# an empty cloud folder in the right one, under "Open Explorer benchmark/uploads". Timed from the
+# arrow until the cloud holds every file (it shows a file once its upload has finished): an
+# example asks the cloud every 200 ms, the same for both apps. Named like the downloads.
+$Uploads = [ordered]@{}
+foreach ($c in $Clouds.Keys) {
+    $pre = if ($c -eq 'drive') { '' } else { "$c-" }
+    $Uploads["${pre}upload-large"] = @{ Cloud = $c; Local = 'large'; Files = 1; Size = 100MB }
+    $Uploads["${pre}upload-100-files"] = @{ Cloud = $c; Local = 'small'; Files = 100; Size = 512KB }
 }
 $UploadRoot = 'C:\OEBench\up'
-$UploadTarget = Join-Path $PSScriptRoot '..\target\release\examples\upload_target.exe'
-# The Drive folders the uploads go to, made before each app starts (Air Explorer lists them
+# Each cloud's example that makes the uploads' folders, watches them fill and deletes them, and
+# the account it's given.
+$Examples = Join-Path $PSScriptRoot '..\target\release\examples'
+$Waiters = @{}
+if ($Google) { $Waiters['drive'] = @{ Exe = Join-Path $Examples 'upload_target.exe'; Key = $Google.email } }
+if ($OneDrive) { $Waiters['onedrive'] = @{ Exe = Join-Path $Examples 'onedrive_bench.exe'; Key = $OneDrive.id } }
+if ($Dropbox) { $Waiters['dropbox'] = @{ Exe = Join-Path $Examples 'dropbox_bench.exe'; Key = $Dropbox.email } }
+if ($Mega) { $Waiters['mega'] = @{ Exe = Join-Path $Examples 'mega_bench.exe'; Key = $Mega.email } }
+# Each cloud's folders the uploads go to, made before each app starts (Air Explorer lists them
 # fresh then).
-$UpFolders = New-Object System.Collections.Generic.Queue[string]
+$UpFolders = @{}
 function Make-DownloadFolders([int] $n) {
     $Fresh.Clear()
     for ($k = 0; $k -lt $n; $k++) {
@@ -564,6 +578,21 @@ function Open-Row($ad, $win, [int] $i, [string] $name, [int] $expected, [int] $l
     if (-not $at) { throw "$($ad.Name): no row '$name' in pane $i" }
     $sw = [Diagnostics.Stopwatch]::StartNew()
     [Win]::DoubleClick($at[0], $at[1])
+    # Into that folder for sure: a double click the app missed left Air Explorer's left pane in
+    # the folder above, and the copy then went there. Clicked again after 5 s. Only on the way
+    # to a transfer (no count expected), so a timed opening isn't slowed by the checks.
+    $clicked = 0
+    while ($expected -eq 0) {
+        $where = try { & $ad.Where $win $i } catch { '' }
+        if ($null -eq $where -or $where -eq $name) { break }
+        if ($sw.Elapsed.TotalSeconds - $clicked -gt 5) {
+            if ($clicked -gt 0) { throw "$($ad.Name): pane $i stayed at '$where' after a double click on '$name'" }
+            $at = try { & $ad.Row $win $i $name } catch { $at }
+            [Win]::DoubleClick($at[0], $at[1])
+            $clicked = $sw.Elapsed.TotalSeconds
+        }
+        Start-Sleep -Milliseconds 30
+    }
     Wait-Count $ad $win $i $expected $sw -least $least
 }
 
@@ -607,10 +636,10 @@ function Download($ad, $win, $d) {
     Open-Row $ad $win 0 (Split-Path $DownloadTo -Leaf) 0 | Out-Null
     # The folder above through the address bar, the folder itself by a double click (Air
     # Explorer's address bar stalls on a folder it hasn't listed yet).
-    $up = Split-Path $d.Drive -Parent
-    Open-Folder $ad $win 1 (& $ad.CloudPath $win 'drive' ($up -replace '\\', '/')) 0 -least 1 | Out-Null
-    Open-Row $ad $win 1 (Split-Path $d.Drive -Leaf) 0 -least 1 | Out-Null
-    Write-Host "      in $($d.Drive), copying"
+    $up = Split-Path $d.Path -Parent
+    Open-Folder $ad $win 1 (& $ad.CloudPath $win $d.Cloud ($up -replace '\\', '/')) 0 -least 1 | Out-Null
+    Open-Row $ad $win 1 (Split-Path $d.Path -Leaf) 0 -least 1 | Out-Null
+    Write-Host "      in $($d.Cloud) $($d.Path), copying"
     Focus-Window $win
     & $ad.Focus $win 1
     Start-Sleep -Milliseconds 200
@@ -627,14 +656,14 @@ function Download($ad, $win, $d) {
         # Nothing arrived for a long while: the copy didn't start. Stopped here rather than
         # started over: deleting the folder under a copy that was only slow to begin breaks it.
         if (-not $pasted -and $sw.Elapsed.TotalSeconds -gt 30) {
-            throw "$($ad.Name): nothing arrived in $DownloadTo 30 s after the copy of $($d.Drive)"
+            throw "$($ad.Name): nothing arrived in $DownloadTo 30 s after the copy of $($d.Cloud) $($d.Path)"
         }
         if ($pasted -and -not $first) { $first = $sw.Elapsed.TotalSeconds; Write-Host ("      first item on disk after {0:N2} s" -f $first) }
         if ($t.files -eq $d.Files -and $t.dirs -eq $d.Dirs -and $t.bytes -eq $d.Bytes -and $t.free) { return $sw.Elapsed.TotalSeconds }
         Start-Sleep -Milliseconds 50
     }
     $t = Tree-Of $DownloadTo
-    throw "$($ad.Name): download of $($d.Drive) not done in $Timeout s ($($t.files) files, $($t.dirs) folders, $($t.bytes) bytes)"
+    throw "$($ad.Name): download of $($d.Cloud) $($d.Path) not done in $Timeout s ($($t.files) files, $($t.dirs) folders, $($t.bytes) bytes)"
 }
 
 # The local files an upload sends, made once with random bytes (so nothing compresses them).
@@ -655,16 +684,17 @@ function Make-UploadSources {
 }
 
 function Upload($ad, $win, $u) {
-    $target = $UpFolders.Dequeue()
+    $target = $UpFolders[$u.Cloud].Dequeue()
+    $w = $Waiters[$u.Cloud]
     & $ad.Ready $win 1
     Open-Folder $ad $win 0 $UploadRoot 0 -least 1 | Out-Null
     Open-Row $ad $win 0 $u.Local 0 -least 1 | Out-Null
-    Open-Folder $ad $win 1 (& $ad.CloudPath $win 'drive' "$Gd/uploads") 0 -least 1 | Out-Null
+    Open-Folder $ad $win 1 (& $ad.CloudPath $win $u.Cloud "$Gd/uploads") 0 -least 1 | Out-Null
     Open-Row $ad $win 1 $target 0 | Out-Null
-    $psi = New-Object System.Diagnostics.ProcessStartInfo $UploadTarget, "$($Google.email) wait $target $($u.Files) $($u.Files * $u.Size)"
+    $psi = New-Object System.Diagnostics.ProcessStartInfo $w.Exe, "$($w.Key) wait $target $($u.Files) $($u.Files * $u.Size)"
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.CreateNoWindow = $true
     $waiter = [System.Diagnostics.Process]::Start($psi)
-    if ($waiter.StandardOutput.ReadLine() -ne 'ready') { throw "upload_target couldn't watch $target" }
+    if ($waiter.StandardOutput.ReadLine() -ne 'ready') { throw "$(Split-Path $w.Exe -Leaf) couldn't watch $target" }
     Focus-Window $win
     & $ad.Focus $win 0
     Start-Sleep -Milliseconds 200
@@ -677,7 +707,7 @@ function Upload($ad, $win, $u) {
     $t = $sw.Elapsed.TotalSeconds
     if (-not $line.IsCompleted -or $line.Result -ne 'done') {
         if (-not $waiter.HasExited) { $waiter.Kill() }
-        throw "$($ad.Name): upload of $($u.Local) into $target not done in $Timeout s"
+        throw "$($ad.Name): upload of $($u.Local) into $($u.Cloud) $target not done in $Timeout s"
     }
     $t
 }
@@ -751,8 +781,11 @@ foreach ($key in $AppList) {
     if ($upCount) {
         Close-App $ad
         Make-UploadSources
-        $UpFolders.Clear()
-        & $UploadTarget $Google.email make ($upCount * ($Runs + 1)) | ForEach-Object { $UpFolders.Enqueue($_) }
+        foreach ($c in $Waiters.Keys) {
+            $n = @($Uploads.Keys | Where-Object { (Want $_) -and $Uploads[$_].Cloud -eq $c }).Count
+            $UpFolders[$c] = New-Object System.Collections.Generic.Queue[string]
+            if ($n) { & $Waiters[$c].Exe $Waiters[$c].Key make ($n * ($Runs + 1)) | ForEach-Object { $UpFolders[$c].Enqueue($_) } }
+        }
     }
     $exe = Get-Item $ad.Exe
     $version = $exe.VersionInfo.ProductVersion
@@ -817,10 +850,17 @@ foreach ($key in $AppList) {
         if (-not (Want $name)) { continue }
         $d = $Downloads[$name]
         $times = @()
+        $failed = $null
         for ($k = 0; $k -le $Runs; $k++) {
-            $t = [math]::Round((Download $ad $win $d), 3)
+            # A run that fails is told and ends this measurement; the others go on.
+            try { $t = [math]::Round((Download $ad $win $d), 3) } catch { $failed = "$_"; break }
             Write-Host ("    {0} run {1}: {2} s" -f $name, $k, $t)
             if ($k -gt 0) { $times += $t }
+        }
+        if ($failed) {
+            Write-Host "  $name FAILED: $failed"
+            $r[$name] = @{ seconds = $times; error = $failed }
+            continue
         }
         Write-Host ("  {0,-20} median {1:N3} s  ({2})" -f $name, (Median $times), ($times -join ', '))
         $r[$name] = @{ seconds = $times; median = (Median $times); files = $d.Files; folders = $d.Dirs; bytes = $d.Bytes }
@@ -830,10 +870,17 @@ foreach ($key in $AppList) {
         if (-not (Want $name)) { continue }
         $u = $Uploads[$name]
         $times = @()
+        $failed = $null
         for ($k = 0; $k -le $Runs; $k++) {
-            $t = [math]::Round((Upload $ad $win $u), 3)
+            # A run that fails is told and ends this measurement; the others go on.
+            try { $t = [math]::Round((Upload $ad $win $u), 3) } catch { $failed = "$_"; break }
             Write-Host ("    {0} run {1}: {2} s" -f $name, $k, $t)
             if ($k -gt 0) { $times += $t }
+        }
+        if ($failed) {
+            Write-Host "  $name FAILED: $failed"
+            $r[$name] = @{ seconds = $times; error = $failed }
+            continue
         }
         Write-Host ("  {0,-20} median {1:N3} s  ({2})" -f $name, (Median $times), ($times -join ', '))
         $r[$name] = @{ seconds = $times; median = (Median $times); files = $u.Files; bytes = $u.Files * $u.Size }
@@ -878,8 +925,10 @@ foreach ($key in $AppList) {
 foreach ($key in $AppList) { Close-App $Adapters[$key] }
 if ($null -ne $SettingsBefore) { [System.IO.File]::WriteAllText($SettingsFile, $SettingsBefore) }
 Get-ChildItem -LiteralPath $DownloadRoot -Directory -Filter 'dl-*' -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-# The uploads' Drive folders go for good, to give the account its room back.
-if (@($Uploads.Keys | Where-Object { Want $_ }).Count) { & $UploadTarget $Google.email clean | Out-Null }
+# The uploads' cloud folders go, to give the accounts their room back (Drive's for good).
+foreach ($c in $Waiters.Keys) {
+    if (@($Uploads.Keys | Where-Object { (Want $_) -and $Uploads[$_].Cloud -eq $c }).Count) { & $Waiters[$c].Exe $Waiters[$c].Key clean | Out-Null }
+}
 
 New-Item -ItemType Directory -Force (Split-Path $Out) | Out-Null
 $results | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 $Out
