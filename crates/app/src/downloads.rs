@@ -22,7 +22,7 @@ use openexplorer_gdrive::{Drive, DriveFile};
 
 use crate::ops::{self, CANCELLED, Progress, Stage};
 use crate::transfers::Batch;
-use crate::work::Queue;
+use crate::work::{Queue, Slots};
 
 /// One piece of work of a row.
 enum Work {
@@ -84,6 +84,7 @@ impl Names {
 /// fetched at the same time, big ones in segments when `segmented`. A row whose files all
 /// arrived then runs `finish` with its index and the path it made (the original goes to the
 /// Drive trash after Recortar, the file opens after Abrir).
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     d: &Drive,
     batch: &Batch,
@@ -91,6 +92,7 @@ pub fn run(
     dst: &Path,
     at_once: usize,
     segmented: bool,
+    slots: &Slots,
     finish: &(dyn Fn(usize, &Path) -> Result<(), String> + Sync),
 ) -> Result<String, String> {
     let rows = batch.rows();
@@ -118,12 +120,13 @@ pub fn run(
         for _ in 0..at_once.max(1) {
             scope.spawn(|| {
                 while let Some((work, _finished)) = queue.next() {
+                    let skip = |row: usize| rows[row].cancelled() || state[row].error.lock().map(|e| e.is_some()).unwrap_or(true);
+                    let _slot = (!skip(work.row())).then(|| slots.acquire());
                     // Other folders waiting are read with this one, in one listing.
                     let mut group = vec![work];
-                    if matches!(group[0], Work::Folder { .. }) {
+                    if _slot.is_some() && matches!(group[0], Work::Folder { .. }) {
                         group.extend(queue.take(MANY - 1, |w| matches!(w, Work::Folder { .. })));
                     }
-                    let skip = |row: usize| rows[row].cancelled() || state[row].error.lock().map(|e| e.is_some()).unwrap_or(true);
                     let mut to_read = Vec::new();
                     for (k, w) in group.iter().enumerate() {
                         if let Work::Folder { row, id, dir } = w
@@ -343,7 +346,7 @@ mod tests {
         let mut rows = Vec::new();
         let end = crate::transfers::End::local(&dst);
         let batch = crate::transfers::queue(&mut rows, None, crate::transfers::Op::Download, [(end.clone(), end)]);
-        let out = run(&d, &batch, std::slice::from_ref(&folder), &dst, 4, true, &|_, _| Ok(()));
+        let out = run(&d, &batch, std::slice::from_ref(&folder), &dst, 4, true, &Slots::new(4), &|_, _| Ok(()));
         println!("{out:?}");
         let made: Vec<PathBuf> = walk(&dst);
         let p = &rows[0].progress;

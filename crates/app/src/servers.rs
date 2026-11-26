@@ -303,6 +303,7 @@ fn transfer<P: Send + Sync + 'static>(
     server: &Server,
     reload: Vec<Location>,
     at_once: usize,
+    slots: Arc<crate::work::Slots>,
     batch: transfers::Batch,
     prepare: impl FnOnce(&mut dyn Conn, &transfers::Batch) -> Result<P, String> + Send + 'static,
     joins: impl Fn(&P, usize) -> bool + Send + Sync + 'static,
@@ -317,7 +318,16 @@ fn transfer<P: Send + Sync + 'static>(
             let failed = std::sync::Mutex::new(None);
             std::thread::scope(|scope| {
                 for _ in 0..workers {
+                    let slots = &slots;
                     scope.spawn(|| {
+                        let done = || next.load(std::sync::atomic::Ordering::Relaxed) >= batch.rows().len() || batch.rows().iter().all(|p| p.over());
+                        if done() {
+                            return;
+                        }
+                        let _slot = slots.acquire();
+                        if done() {
+                            return;
+                        }
                         let ran = with(&pool, &server, |c| {
                             let most = c.batches().0.max(1);
                             // A row taken that doesn't join the run before it starts the next.
@@ -363,6 +373,8 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
     let to = End::local(&dst);
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Download, items.iter().map(|e| (end(from, Some(&e.name)), to.clone())));
     let at_once = usize::from(s.settings.downloads);
+    s.download_slots.set_limit(at_once);
+    let slots = s.download_slots.clone();
     let sizes: Vec<(bool, Option<u64>, String)> = items.iter().zip(&paths).map(|(e, p)| (e.is_dir, e.size, p.clone())).collect();
     let prepare = move |c: &mut dyn Conn, batch: &transfers::Batch| {
         for (p, (is_dir, size, path)) in batch.rows().iter().zip(&sizes) {
@@ -395,7 +407,7 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
         }
     };
     let step = move |c: &mut dyn Conn, shared: &(std::sync::Mutex<HashSet<PathBuf>>, Vec<String>), rows: &[(usize, &Progress)]| rows.iter().map(|(i, p)| one(c, shared, *i, p)).collect();
-    transfer(s, server, reload, at_once, batch, prepare, |_, _| false, step);
+    transfer(s, server, reload, at_once, slots, batch, prepare, |_, _| false, step);
 }
 
 /// A file or a folder and all it holds, from `path` on the server to `local`, `depth` folders
@@ -449,6 +461,8 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
     let dest = end(to, None);
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Upload, sources.iter().map(|p| (End::local(p), dest.clone())));
     let at_once = usize::from(s.settings.uploads);
+    s.upload_slots.set_limit(at_once);
+    let slots = s.upload_slots.clone();
     let measured = sources.clone();
     let listed = dir.clone();
     let prepare = move |c: &mut dyn Conn, batch: &transfers::Batch| {
@@ -512,7 +526,7 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
             })
             .collect()
     };
-    transfer(s, &server, reload, at_once, batch, prepare, |(_, small): &(_, Vec<bool>), i| small[i], step);
+    transfer(s, &server, reload, at_once, slots, batch, prepare, |(_, small): &(_, Vec<bool>), i| small[i], step);
 }
 
 /// `name`, or the first "nome (2).ext" whose lowercase isn't in `taken` (lowercased names).

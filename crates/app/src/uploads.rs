@@ -23,7 +23,7 @@ use openexplorer_gdrive::{Drive, DriveFile};
 use crate::model::Entry;
 use crate::ops::{self, CANCELLED, Progress, Stage};
 use crate::transfers::Batch;
-use crate::work::Queue;
+use crate::work::{Queue, Slots};
 
 /// What to do with a file whose name is already in the Drive folder it goes into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,7 +189,7 @@ struct Row {
 /// `at_once` folders made and files sent at the same time. With `remove`, a row whose files all
 /// arrived then goes to the Recycle Bin (Recortar and Colar). An item to skip ends its row
 /// at once.
-pub fn run(d: &Drive, batch: &Batch, items: &[Item], parent: &str, remove: bool, at_once: usize) -> Result<String, String> {
+pub fn run(d: &Drive, batch: &Batch, items: &[Item], parent: &str, remove: bool, at_once: usize, slots: &Slots) -> Result<String, String> {
     let rows = batch.rows();
     for (p, item) in rows.iter().zip(items) {
         p.size(ops::measure(&item.path, &|| p.cancelled()));
@@ -212,7 +212,9 @@ pub fn run(d: &Drive, batch: &Batch, items: &[Item], parent: &str, remove: bool,
                 while let Some((work, _finished)) = queue.next() {
                     let row = work.row();
                     let (p, st) = (&rows[row], &state[row]);
-                    if p.cancelled() || st.error.lock().map(|e| e.is_some()).unwrap_or(true) {
+                    let skip = || p.cancelled() || st.error.lock().map(|e| e.is_some()).unwrap_or(true);
+                    let _slot = (!skip()).then(|| slots.acquire());
+                    if skip() {
                         st.skipped.store(true, Ordering::Relaxed);
                     } else {
                         if p.stage() == Stage::Waiting {
@@ -432,7 +434,7 @@ mod tests {
             let items: Vec<Item> = resolve(&local, &existing, |_| clash).into_iter().zip(&sources).filter(|(put, _)| *put != Put::Skip).map(|(put, p)| Item { path: p.clone(), put, clash }).collect();
             let mut list = Vec::new();
             let batch = queue(&mut list, None, Op::Upload, items.iter().map(|it| (End::local(&it.path), End::local(&it.path))));
-            run(&d, &batch, &items, &root.id, false, 4).unwrap()
+            run(&d, &batch, &items, &root.id, false, 4, &Slots::new(4)).unwrap()
         };
         let folder = |list: &[(String, String, Option<String>)]| -> String {
             let pastas: Vec<_> = list.iter().filter(|(n, ..)| n == "Pasta").collect();

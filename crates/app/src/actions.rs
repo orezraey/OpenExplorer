@@ -1012,9 +1012,11 @@ fn start_upload(s: &mut State, up: Upload, existing: &[Existing], choices: &[(us
     let dest = End::drive(&up.to, None);
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Upload, items.iter().map(|it| (End::local(&it.path), dest.clone())));
     let at_once = s.settings.uploads.into();
+    s.upload_slots.set_limit(at_once);
+    let slots = s.upload_slots.clone();
     let (parent, remove) = (up.parent, up.remove);
     drive_job(s, &up.email, up.reload, move |d| {
-        let summary = crate::uploads::run(d, &batch, &items, &parent, remove, at_once);
+        let summary = crate::uploads::run(d, &batch, &items, &parent, remove, at_once, &slots);
         match summary {
             Ok(line) if skipped > 0 => Ok(tr!("{line} Pulados (já existiam): {skipped}.", "{line} Skipped (already there): {skipped}.")),
             other => other,
@@ -1058,6 +1060,8 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Download, items.iter().map(|e| (End::drive(from, Some(&e.name)), to.clone())));
     let files: Vec<DriveFile> = items.iter().map(drive_file).collect();
     let (at_once, segmented) = (s.settings.downloads.into(), s.settings.segmented_downloads);
+    s.download_slots.set_limit(at_once);
+    let slots = s.download_slots.clone();
     // Desfazer sends what arrived to the Recycle Bin (not where there's none), and after
     // Recortar takes the originals out of the Drive trash. Abrir isn't kept.
     let recyclable = undo::has_recycle_bin(&dst);
@@ -1082,7 +1086,7 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
                 Then::Open => ops::open(path),
             }
         };
-        crate::downloads::run(d, &batch, &files, &dst, at_once, segmented, &finish)
+        crate::downloads::run(d, &batch, &files, &dst, at_once, segmented, &slots, &finish)
     });
 }
 

@@ -71,6 +71,53 @@ impl<W> Drop for Finished<'_, W> {
     }
 }
 
+/// A shared limit on how many transfers run at the same time across all batches (uploads or
+/// downloads), so starting a second batch while one is under way still honours the cap in
+/// Opções instead of multiplying it.
+pub struct Slots {
+    state: Mutex<(usize, usize)>,
+    ready: Condvar,
+}
+
+impl Slots {
+    pub fn new(limit: usize) -> Slots {
+        Slots { state: Mutex::new((0, limit.max(1))), ready: Condvar::new() }
+    }
+
+    /// Updates the cap (from Opções). Raising it wakes waiting workers at once; lowering it
+    /// lets those already running finish before more start.
+    pub fn set_limit(&self, limit: usize) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.1 = limit.max(1);
+        self.ready.notify_all();
+    }
+
+    /// Waits until a slot is free and takes it. Drop the returned [`Slot`] when the work ends.
+    pub fn acquire(&self) -> Slot<'_> {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while s.0 >= s.1 {
+            s = self.ready.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+        s.0 += 1;
+        Slot(self)
+    }
+
+    fn release(&self) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.0 -= 1;
+        self.ready.notify_one();
+    }
+}
+
+/// Releases a slot taken from [`Slots`] however the work ends, a panic included.
+pub struct Slot<'a>(&'a Slots);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +162,57 @@ mod tests {
             }
         });
         assert_eq!(taken.load(Ordering::Relaxed), 1 + 3 + 4 * 5);
+    }
+
+    /// Two concurrent batches sharing `Slots` never exceed the total cap (e.g. 2 × 4 workers
+    /// on 2 × 10 items still run at most 4 at once), and raising the limit wakes waiting workers.
+    #[test]
+    fn slots_cap_concurrency_across_batches_and_update_live() {
+        let slots = Slots::new(4);
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let done = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let (slots, active, peak, done) = (&slots, &active, &peak, &done);
+            for _ in 0..2 {
+                let queue = Queue::new(0..10);
+                scope.spawn(move || {
+                    std::thread::scope(|inner| {
+                        for _ in 0..4 {
+                            inner.spawn(|| {
+                                while let Some((_, _finished)) = queue.next() {
+                                    let _slot = slots.acquire();
+                                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                                    peak.fetch_max(now, Ordering::SeqCst);
+                                    std::thread::sleep(std::time::Duration::from_millis(15));
+                                    active.fetch_sub(1, Ordering::SeqCst);
+                                    done.fetch_add(1, Ordering::SeqCst);
+                                }
+                            });
+                        }
+                    });
+                });
+            }
+        });
+        assert_eq!(done.load(Ordering::SeqCst), 20);
+        assert!(peak.load(Ordering::SeqCst) <= 4, "peak was {}", peak.load(Ordering::SeqCst));
+        assert_eq!(peak.load(Ordering::SeqCst), 4);
+
+        // Raising the limit wakes a blocked acquirer.
+        let live = Slots::new(1);
+        let first = live.acquire();
+        let acquired = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _second = live.acquire();
+                acquired.store(1, Ordering::SeqCst);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert_eq!(acquired.load(Ordering::SeqCst), 0);
+            live.set_limit(2);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert_eq!(acquired.load(Ordering::SeqCst), 1);
+            drop(first);
+        });
     }
 }

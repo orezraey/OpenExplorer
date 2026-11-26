@@ -844,9 +844,12 @@ fn resume_upload(s: &mut State, id: &str) {
     let reload = panes_on(s, &server.id);
     let batch = crate::transfers::queue(&mut s.transfers, s.waker.clone(), crate::transfers::Op::Upload, [(crate::transfers::End::local(&local), crate::servers::end(&into, Some(&file)))]);
     let (pool, path) = (s.servers.pool.clone(), format!("/{bucket}/{name}"));
+    s.upload_slots.set_limit(usize::from(s.settings.uploads));
+    let slots = s.upload_slots.clone();
     background(s, move |emit| {
         let result = catch_panic(t("retomar o envio", "resume the upload"), || {
             batch.rows()[0].size(size);
+            let _slot = (!batch.rows()[0].over()).then(|| slots.acquire());
             batch.run(|_, p| {
                 crate::servers::with(&pool, &server, |c| {
                     let mut last = 0;
