@@ -70,6 +70,8 @@ pub enum Dialog {
     OneDriveLink(Box<crate::onedrive::MakeLink>),
     /// Envios inacabados of a B2 bucket.
     B2Unfinished(Box<crate::b2::Unfinished>),
+    /// Built-in update dialog (release info, download progress, restart to update).
+    Update,
 }
 
 /// The main window's close button, Alt+F4 or the taskbar's Fechar janela: with transfers still
@@ -114,6 +116,11 @@ pub fn keep_running(s: &mut State) {
     s.quit_asked = false;
     crate::RESTART.store(false, Ordering::Relaxed);
     crate::updater::cancel_handoff();
+}
+
+/// Opens the built-in update modal.
+pub fn open_update_dialog(s: &mut State) {
+    s.dialog = Some(Dialog::Update);
 }
 
 /// Checks GitHub Releases for a newer version on a background thread.

@@ -2666,6 +2666,54 @@ fn main() {
                 accounts_hub_scene(s);
                 s.settings.theme = settings::Theme::Light;
             }),
+            ("update-available", |s| {
+                s.updater.support = Ok(updater::InstallKind::WindowsInstalled { install_dir: PathBuf::from(r"C:\Program Files\OpenExplorer") });
+                s.updater.release = Some(updater::Release {
+                    version: "0.5.0".into(),
+                    url: "https://github.com/orezraey/OpenExplorer/releases/tag/v0.5.0".into(),
+                    notes: "- Atualização integrada no aplicativo\n- Melhorias de desempenho na listagem".into(),
+                    asset_name: "OpenExplorer-0.5.0-windows-x64-setup.exe".into(),
+                    download_url: "https://example.invalid/setup.exe".into(),
+                    size: 18_400_000,
+                    sha256: None,
+                });
+                s.updater.download = updater::DownloadState::Idle;
+                s.dialog = Some(actions::Dialog::Update);
+            }),
+            ("update-downloading", |s| {
+                s.updater.support = Ok(updater::InstallKind::WindowsInstalled { install_dir: PathBuf::from(r"C:\Program Files\OpenExplorer") });
+                s.updater.release = Some(updater::Release {
+                    version: "0.5.0".into(),
+                    url: "https://github.com/orezraey/OpenExplorer/releases/tag/v0.5.0".into(),
+                    notes: String::new(),
+                    asset_name: "OpenExplorer-0.5.0-windows-x64-setup.exe".into(),
+                    download_url: "https://example.invalid/setup.exe".into(),
+                    size: 18_400_000,
+                    sha256: None,
+                });
+                s.updater.download = updater::DownloadState::Downloading { received: 11_200_000, total: 18_400_000 };
+                s.dialog = Some(actions::Dialog::Update);
+            }),
+            ("update-ready", |s| {
+                s.updater.support = Ok(updater::InstallKind::WindowsInstalled { install_dir: PathBuf::from(r"C:\Program Files\OpenExplorer") });
+                s.updater.release = Some(updater::Release {
+                    version: "0.5.0".into(),
+                    url: "https://github.com/orezraey/OpenExplorer/releases/tag/v0.5.0".into(),
+                    notes: "- Atualização integrada no aplicativo\n- Melhorias de desempenho na listagem".into(),
+                    asset_name: "OpenExplorer-0.5.0-windows-x64-setup.exe".into(),
+                    download_url: "https://example.invalid/setup.exe".into(),
+                    size: 18_400_000,
+                    sha256: None,
+                });
+                s.updater.download = updater::DownloadState::Ready(updater::Staged {
+                    version: "0.5.0".into(),
+                    file_path: PathBuf::from("staged.exe"),
+                    sha256: "0".repeat(64),
+                    install_kind: updater::InstallKind::WindowsInstalled { install_dir: PathBuf::from(r"C:\Program Files\OpenExplorer") },
+                    release_url: "https://github.com/orezraey/OpenExplorer/releases/tag/v0.5.0".into(),
+                });
+                s.dialog = Some(actions::Dialog::Update);
+            }),
         ],
         ..AppSpec::new("Open Explorer", (1280.0, 760.0), init, ui::view)
     };

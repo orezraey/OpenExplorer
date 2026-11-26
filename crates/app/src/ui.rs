@@ -528,6 +528,61 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                     |s| change_settings(s, |c| c.skip_recycle_bin = !c.skip_recycle_bin),
                 ));
 
+            let update_desc = if s.updater.checking {
+                t("Verificando novas versões no GitHub…", "Checking GitHub for new versions…").to_string()
+            } else if let Some(rel) = &s.updater.release {
+                if s.updater.is_ready() {
+                    tr!("Versão {} baixada e pronta para instalar.", "Version {} downloaded and ready to install.", rel.version)
+                } else {
+                    tr!("Nova versão {} disponível.", "New version {} available.", rel.version)
+                }
+            } else if let Some(err) = &s.updater.check_error {
+                err.clone()
+            } else if s.updater.checked_once {
+                t("Você já está na versão mais recente.", "You're already on the latest version.").to_string()
+            } else {
+                t("Verifica lançamentos oficiais no GitHub.", "Checks official releases on GitHub.").to_string()
+            };
+            let update_btn = if s.updater.release.is_some() {
+                Button::new(if s.updater.is_ready() {
+                    t("Reiniciar para atualizar", "Restart to update")
+                } else {
+                    t("Ver atualização", "View update")
+                })
+                .variant(ButtonVariant::Submit)
+                .on_press(actions::open_update_dialog)
+                .build(k)
+                .cursor(Cursor::Pointer)
+                .key("opt-open-update")
+            } else {
+                Button::new(if s.updater.checking {
+                    t("Verificando…", "Checking…")
+                } else {
+                    t("Verificar atualizações", "Check for updates")
+                })
+                .variant(ButtonVariant::Neutral)
+                .disabled(s.updater.checking)
+                .on_press(|s: &mut State| actions::check_updates(s, true))
+                .build(k)
+                .cursor(Cursor::Pointer)
+                .key("opt-check-updates")
+            };
+            let version_title = tr!("Open Explorer v{}", "Open Explorer v{}", crate::updater::VERSION);
+            let updates_card = card_box("card-updates")
+                .child(switch_row(
+                    "opt-auto-update",
+                    t("Atualizar automaticamente", "Update automatically"),
+                    t(
+                        "Baixa novas versões em segundo plano e instala na próxima vez que o Open Explorer abrir.",
+                        "Downloads new versions in the background and installs them the next time Open Explorer starts.",
+                    ),
+                    None,
+                    st.auto_update,
+                    |s| change_settings(s, |c| c.auto_update = !c.auto_update),
+                ))
+                .child(divider())
+                .child(control_row("row-update-check", &version_title, &update_desc, update_btn));
+
             col()
                 .key("page-general")
                 .w_full()
@@ -535,6 +590,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .child(section_head(t("Geral", "General"), t("Aparência, fonte da interface e comportamento de arquivos e transferências.", "Appearance, interface font, and how files and transfers behave.")))
                 .child(appearance)
                 .child(files_card)
+                .child(updates_card)
         }
         OptionsTab::Experimental => {
             let banner = row()
@@ -1709,7 +1765,199 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, backdrop: bool, layer: &mut
         Dialog::DropboxDeleted(v) => crate::dropbox::deleted_dialog(k, v, layer),
         Dialog::OneDriveLink(m) => crate::onedrive::link_dialog(k, m, layer),
         Dialog::B2Unfinished(d) => crate::b2::unfinished_dialog(k, d, layer),
+        Dialog::Update => update_dialog(s, k, layer),
     }
+}
+
+fn update_dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
+    use crate::updater::{DownloadState, Offer};
+
+    let Some(rel) = &s.updater.release else { return };
+    let pad = |e: El| col().key("content").w_full().px(16.0).pb(16.0).child(e);
+    let version_line = text(format!("v{} → v{}", crate::updater::VERSION, rel.version))
+        .font(k.ty.text_small_medium)
+        .color(k.c.text_muted);
+
+    let mut body = col().w_full().gap(12.0).child(version_line);
+
+    if !rel.notes.is_empty() {
+        let notes_box = col()
+            .key("update-notes")
+            .w_full()
+            .max_h(150.0)
+            .scroll(ScrollSpec { stick_bottom: false })
+            .px(12.0)
+            .py(10.0)
+            .radius(k.radius.md)
+            .fill(k.alpha(k.c.text_base, if k.dark { 0.04 } else { 0.03 }))
+            .border(1.0, k.c.border_weak)
+            .child(text(rel.notes.clone()).font(k.ty.caption()).color(k.c.text_muted).wrap().w_full().min_w(0.0));
+        body = body.child(notes_box);
+    }
+
+    let mut primary: Option<El> = None;
+    match &s.updater.download {
+        DownloadState::Downloading { received, total } => {
+            let checking = *total > 0 && received >= total;
+            let status_label = if checking {
+                t("Verificando download…", "Checking download…")
+            } else {
+                t("Baixando atualização…", "Downloading update…")
+            };
+            let frac = if *total > 0 { (*received as f32 / *total as f32).clamp(0.0, 1.0) } else { 0.0 };
+            let track = row()
+                .w_full()
+                .h(6.0)
+                .radius(3.0)
+                .fill(k.alpha(k.c.text_base, if k.dark { 0.14 } else { 0.10 }))
+                .child(el().w(frac * 412.0).h(6.0).radius(3.0).fill(k.c.text_accent));
+            let mut progress_col = col()
+                .w_full()
+                .gap(6.0)
+                .child(text(status_label).font(k.ty.text_small_medium).color(k.c.text_base))
+                .child(track);
+            if *total > 0 {
+                let rec_mb = format!("{:.1}", *received as f64 / 1_000_000.0);
+                let tot_mb = format!("{:.1}", *total as f64 / 1_000_000.0);
+                progress_col = progress_col.child(
+                    text(tr!("{rec_mb} de {tot_mb} MB", "{rec_mb} of {tot_mb} MB"))
+                        .font(k.ty.caption())
+                        .color(k.c.text_muted),
+                );
+            }
+            body = body.child(progress_col);
+        }
+        DownloadState::Ready(_) => {
+            let mut ready_col = col()
+                .w_full()
+                .gap(4.0)
+                .child(text(t("Pronto para instalar", "Ready to install")).font(k.ty.text_small_medium).color(k.c.text_base));
+            if s.updater.offer(s.settings.auto_update) == Some(Offer::Automatic) {
+                ready_col = ready_col.child(
+                    text(t(
+                        "Se você não reiniciar agora, a atualização será instalada na próxima vez que o Open Explorer abrir.",
+                        "If you don't restart now, the update will install the next time Open Explorer starts.",
+                    ))
+                    .font(k.ty.caption())
+                    .color(k.c.text_muted)
+                    .wrap()
+                    .w_full()
+                    .min_w(0.0),
+                );
+            }
+            body = body.child(ready_col);
+            primary = Some(
+                Button::new(t("Reiniciar para atualizar", "Restart to update"))
+                    .variant(ButtonVariant::Submit)
+                    .on_press_tx(actions::install_update)
+                    .build(k)
+                    .cursor(Cursor::Pointer)
+                    .key("update-restart"),
+            );
+        }
+        DownloadState::Installing => {
+            body = body.child(
+                text(t("Preparando para reiniciar…", "Preparing to restart…"))
+                    .font(k.ty.text_small)
+                    .color(k.c.text_muted),
+            );
+        }
+        DownloadState::Idle | DownloadState::Failed(_) => {
+            if let DownloadState::Failed(err) = &s.updater.download {
+                body = body.child(
+                    text(err.clone())
+                        .font(k.ty.text_small)
+                        .color(k.c.danger.fg)
+                        .wrap()
+                        .w_full()
+                        .min_w(0.0),
+                );
+            }
+            match &s.updater.support {
+                Ok(_) => {
+                    let label = if matches!(s.updater.download, DownloadState::Failed(_)) {
+                        t("Tentar novamente", "Retry download")
+                    } else {
+                        t("Baixar atualização", "Download update")
+                    };
+                    primary = Some(
+                        Button::new(label)
+                            .variant(ButtonVariant::Submit)
+                            .on_press(actions::download_update)
+                            .build(k)
+                            .cursor(Cursor::Pointer)
+                            .key("update-download"),
+                    );
+                }
+                Err(reason) => {
+                    body = body.child(
+                        text(reason.clone())
+                            .font(k.ty.text_small)
+                            .color(k.c.text_muted)
+                            .wrap()
+                            .w_full()
+                            .min_w(0.0),
+                    );
+                    let gh_url = rel.url.clone();
+                    primary = Some(
+                        Button::new(t("Baixar no GitHub", "Download from GitHub"))
+                            .variant(ButtonVariant::Submit)
+                            .on_press_tx(move |_: &mut State, tx: &mut Tx| {
+                                let _ = tx.open_url(&gh_url);
+                            })
+                            .build(k)
+                            .cursor(Cursor::Pointer)
+                            .key("update-open-github"),
+                    );
+                }
+            }
+        }
+    }
+
+    let notes_url = rel.url.clone();
+    let notes_link = k
+        .interactive(
+            row()
+                .key("update-release-notes")
+                .role("button")
+                .label(t("Notas da versão", "Release notes"))
+                .focusable(true)
+                .focus_ring(2.0, 1.0, k.c.border_focus)
+                .h(28.0)
+                .px(8.0)
+                .gap(5.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .hover(k.c.hover)
+                .cursor(Cursor::Pointer),
+        )
+        .on_press_tx(move |_: &mut State, tx: &mut Tx| {
+            let _ = tx.open_url(&notes_url);
+        })
+        .child(icon(&icons::EXTERNAL_LINK, 13.0).color(k.c.text_muted))
+        .child(text(t("Notas da versão", "Release notes")).font(k.ty.text_small).color(k.c.text_muted));
+
+    let mut footer = row().w_full().center_y().gap(8.0).child(notes_link).child(el().grow(1.0));
+    footer = footer.child(
+        Button::new(t("Fechar", "Close"))
+            .variant(ButtonVariant::Neutral)
+            .on_press(close)
+            .build(k)
+            .cursor(Cursor::Pointer)
+            .key("update-close"),
+    );
+    if let Some(btn) = primary {
+        footer = footer.child(btn);
+    }
+    body = body.child(footer);
+
+    Modal::new("update", t("Atualizar o Open Explorer", "Update Open Explorer"))
+        .open(true)
+        .child(pad(body))
+        .width(444.0)
+        .fit()
+        .on_close(close)
+        .build(k, layer);
 }
 
 /// A certificate's fingerprint, which has no spaces to wrap at, as two halves on two lines.
@@ -3378,10 +3626,46 @@ fn toolbar(s: &State, k: &Kit) -> El {
             .help(refresh_help),
         )
         .child(el().grow(1.0))
+        .child(update_toolbar_pill(s, k))
         .child(tool(k, "options", &icons::SETTINGS, t("Opções", "Options"), true, |s: &mut State, _| {
             s.dialog = Some(Dialog::Options(Box::new(crate::settings::OptionsView::open(crate::settings::OptionsTab::General))));
         }))
         .child(text("Open Explorer").font(k.ty.text_small_medium).color(k.c.text_faint).mx(8.0))
+}
+
+fn update_toolbar_pill(s: &State, k: &Kit) -> El {
+    let Some(rel) = &s.updater.release else {
+        return el();
+    };
+    let label = if s.updater.is_ready() {
+        t("Reiniciar para atualizar", "Restart to update").to_string()
+    } else {
+        tr!("Atualizar v{}", "Update v{}", rel.version)
+    };
+    let fill = k.alpha(k.c.text_accent, if k.dark { 0.22 } else { 0.12 });
+    let hover = k.alpha(k.c.text_accent, if k.dark { 0.30 } else { 0.18 });
+    let border = k.alpha(k.c.text_accent, 0.45);
+    k.interactive(
+        row()
+            .key("toolbar-update")
+            .role("button")
+            .label(label.clone())
+            .focusable(true)
+            .focus_ring(2.0, 1.0, k.c.border_focus)
+            .h(26.0)
+            .px(10.0)
+            .mr(4.0)
+            .gap(6.0)
+            .center_y()
+            .radius(13.0)
+            .fill(fill)
+            .hover(hover)
+            .border(1.0, border)
+            .cursor(Cursor::Pointer),
+    )
+    .on_press(actions::open_update_dialog)
+    .child(icon(&icons::DOWNLOAD, 13.0).color(k.c.text_accent))
+    .child(text(label).font(k.ty.caption()).color(k.c.text_accent))
 }
 
 // ---------------------------------------------------------------------------------------------
