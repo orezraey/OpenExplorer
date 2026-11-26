@@ -35,6 +35,7 @@ mod sharing;
 mod places;
 mod relay;
 mod servers;
+mod services;
 mod sysicons;
 mod tabs;
 mod telegram;

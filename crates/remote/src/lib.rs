@@ -129,21 +129,73 @@ impl Protocol {
 }
 
 /// A known cloud/NAS software preset running on top of a server protocol (such as WebDAV),
-/// kept so the tree and edit dialog show its own icon and defaults.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// kept so the tree and edit dialog show its own icon and defaults. The cloud services are the
+/// WebDAV ones offered ready-made in "Registrar conta" (the app's `services.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Brand {
     Nextcloud,
     OwnCloud,
+    Koofr,
+    InfiniCloud,
+    MagentaCloud,
+    MailRu,
+    Yandex,
+    Stack,
+    Onlime,
+    HiDrive,
+    HiDriveIonos,
+    KDrive,
+    PCloud,
+    PCloudEu,
+    MailCom,
 }
 
+impl Brand {
+    pub const ALL: [Brand; 15] = [
+        Brand::Nextcloud,
+        Brand::OwnCloud,
+        Brand::Koofr,
+        Brand::InfiniCloud,
+        Brand::MagentaCloud,
+        Brand::MailRu,
+        Brand::Yandex,
+        Brand::Stack,
+        Brand::Onlime,
+        Brand::HiDrive,
+        Brand::HiDriveIonos,
+        Brand::KDrive,
+        Brand::PCloud,
+        Brand::PCloudEu,
+        Brand::MailCom,
+    ];
+
+    /// How `servers.json` names it (serde's lowercase name).
+    pub fn key(self) -> &'static str {
+        match self {
+            Brand::Nextcloud => "nextcloud",
+            Brand::OwnCloud => "owncloud",
+            Brand::Koofr => "koofr",
+            Brand::InfiniCloud => "infinicloud",
+            Brand::MagentaCloud => "magentacloud",
+            Brand::MailRu => "mailru",
+            Brand::Yandex => "yandex",
+            Brand::Stack => "stack",
+            Brand::Onlime => "onlime",
+            Brand::HiDrive => "hidrive",
+            Brand::HiDriveIonos => "hidriveionos",
+            Brand::KDrive => "kdrive",
+            Brand::PCloud => "pcloud",
+            Brand::PCloudEu => "pcloudeu",
+            Brand::MailCom => "mailcom",
+        }
+    }
+}
+
+/// A brand this version doesn't know (a newer one's) reads as none: the server stays plain.
 fn deserialize_brand<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Brand>, D::Error> {
     let raw = Option::<String>::deserialize(d)?;
-    Ok(match raw.as_deref() {
-        Some("nextcloud") => Some(Brand::Nextcloud),
-        Some("owncloud") => Some(Brand::OwnCloud),
-        _ => None,
-    })
+    Ok(raw.and_then(|r| Brand::ALL.into_iter().find(|b| b.key() == r)))
 }
 
 /// A server the user added. Its password, if any, is in the credential store under `id`.
@@ -881,6 +933,19 @@ mod tests {
 
     /// A list saved before servers had certificates, a connection limit or implicit FTPS
     /// still loads, with the usual values.
+    #[test]
+    fn brands_are_written_and_read_by_their_key() {
+        for b in Brand::ALL {
+            assert_eq!(serde_json::to_string(&b).unwrap(), format!("\"{}\"", b.key()));
+        }
+        let mut sv = server(Protocol::Davs, 443);
+        sv.brand = Some(Brand::KDrive);
+        let back: Server = serde_json::from_str(&serde_json::to_string(&sv).unwrap()).unwrap();
+        assert_eq!(back.brand, Some(Brand::KDrive));
+        let text = serde_json::to_string(&sv).unwrap().replace("\"kdrive\"", "\"some-future-cloud\"");
+        assert_eq!(serde_json::from_str::<Server>(&text).unwrap().brand, None);
+    }
+
     #[test]
     fn an_older_server_list_still_loads() {
         let old = r#"[{"id":"s1","name":"NAS","protocol":"ftps","host":"nas","port":21,"user":"ana","root":"/"},{"id":"s2","name":"Futuro","protocol":"davs","brand":"synology","host":"nas","port":443,"user":"ana","root":"/"}]"#;

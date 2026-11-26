@@ -75,6 +75,10 @@ Cada medição, com como foi feita, está em
 * Backblaze B2: buckets e pastas, envios grandes em partes paralelas (e retomados), versões
   escondidas com desfazer.
 * SFTP, FTP/FTPS, WebDAV, Nextcloud e ownCloud.
+* Prontos para adicionar via WebDAV: Koofr, pCloud, Yandex Disk, Mail.ru Cloud, MagentaCLOUD,
+  HiDrive (STRATO e IONOS), kDrive, Stack, InfiniCLOUD, Mail.com Cloud e Onlime limeDRIVE.
+  Escolha o serviço e digite o seu login: o servidor e a pasta já vêm preenchidos, e o
+  formulário diz qual senha usar (vários pedem uma senha de app criada no site deles).
 * Copiar e mover entre qualquer um deles, com fila de transferências.
 * Pesquisa instantânea por nome nos discos NTFS locais, parecida com o Everything. Também dá para
   pesquisar no Drive, no MEGA e nos servidores.
