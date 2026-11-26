@@ -30,9 +30,9 @@ pub use share::{Access, Permission, Role, Sharing};
 /// language (see `openexplorer_i18n`).
 pub type Result<T> = std::result::Result<T, String>;
 
-/// The OAuth client the app logs in with. Google only lets an app reach every file in a Drive
-/// (the `drive` scope) once it passes a security review, so until then each person creates their
-/// own client in Google Cloud and points the app at it.
+/// The OAuth client the app logs in with: a saved file, runtime environment variables, or the
+/// client baked into the binary at build time (via `OPENEXPLORER_GOOGLE_CLIENT_ID` and
+/// `OPENEXPLORER_GOOGLE_CLIENT_SECRET`).
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct ClientConfig {
     pub client_id: String,
@@ -47,19 +47,44 @@ impl std::fmt::Debug for ClientConfig {
 
 impl ClientConfig {
     /// Reads the client from [`client_file`] when saved, else from `OPENEXPLORER_GOOGLE_CLIENT_ID`
-    /// and `OPENEXPLORER_GOOGLE_CLIENT_SECRET`: either the JSON Google Cloud downloads for a desktop
-    /// client (`{"installed": {...}}`) or `{"client_id": .., "client_secret": ..}`.
+    /// and `OPENEXPLORER_GOOGLE_CLIENT_SECRET` at runtime, else from the credentials baked into the
+    /// binary at build time ([`Self::built_in`]).
+    ///
+    /// Either the JSON Google Cloud downloads for a desktop client (`{"installed": {...}}`) or
+    /// `{"client_id": .., "client_secret": ..}`.
     pub fn load() -> Result<ClientConfig> {
         let path = client_file();
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            return ClientConfig::parse(&text).map_err(|e| format!("{}: {e}", path.display()));
-        }
+        let from_file = std::fs::read_to_string(&path).ok().map(|text| ClientConfig::parse(&text).map_err(|e| format!("{}: {e}", path.display())));
         let env_non_empty = |k| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-        match (env_non_empty("OPENEXPLORER_GOOGLE_CLIENT_ID"), env_non_empty("OPENEXPLORER_GOOGLE_CLIENT_SECRET")) {
+        let from_env = (env_non_empty("OPENEXPLORER_GOOGLE_CLIENT_ID"), env_non_empty("OPENEXPLORER_GOOGLE_CLIENT_SECRET"));
+        Self::resolve(from_file, from_env, Self::built_in(), &path)
+    }
+
+    /// OAuth client baked into the binary at compile time when `OPENEXPLORER_GOOGLE_CLIENT_ID` and
+    /// `OPENEXPLORER_GOOGLE_CLIENT_SECRET` were both set during the build.
+    pub fn built_in() -> Option<ClientConfig> {
+        let id = option_env!("OPENEXPLORER_GOOGLE_CLIENT_ID").map(str::trim).filter(|v| !v.is_empty())?;
+        let secret = option_env!("OPENEXPLORER_GOOGLE_CLIENT_SECRET").map(str::trim).filter(|v| !v.is_empty())?;
+        Some(ClientConfig { client_id: id.into(), client_secret: secret.into() })
+    }
+
+    fn resolve(
+        from_file: Option<Result<ClientConfig>>,
+        from_env: (Option<String>, Option<String>),
+        built_in: Option<ClientConfig>,
+        path: &std::path::Path,
+    ) -> Result<ClientConfig> {
+        if let Some(res) = from_file {
+            return res;
+        }
+        match from_env {
             (Some(id), Some(secret)) => return Ok(ClientConfig { client_id: id, client_secret: secret }),
             (Some(_), None) => return Err(t("OPENEXPLORER_GOOGLE_CLIENT_ID está definida, mas falta OPENEXPLORER_GOOGLE_CLIENT_SECRET.", "OPENEXPLORER_GOOGLE_CLIENT_ID is set, but OPENEXPLORER_GOOGLE_CLIENT_SECRET is missing.").into()),
             (None, Some(_)) => return Err(t("OPENEXPLORER_GOOGLE_CLIENT_SECRET está definida, mas falta OPENEXPLORER_GOOGLE_CLIENT_ID.", "OPENEXPLORER_GOOGLE_CLIENT_SECRET is set, but OPENEXPLORER_GOOGLE_CLIENT_ID is missing.").into()),
             (None, None) => {}
+        }
+        if let Some(cfg) = built_in {
+            return Ok(cfg);
         }
         Err(tr!(
             "Credenciais do Google não encontradas. Salve o JSON do cliente OAuth (tipo \"App para computador\") em {}",
@@ -252,5 +277,42 @@ mod tests {
     fn google_errors_read_as_their_message() {
         assert_eq!(google_reason(r#"{"error":"invalid_grant","error_description":"Bad Request"}"#), "Bad Request");
         assert_eq!(google_reason(r#"{"error":{"code":403,"message":"Drive API has not been used"}}"#), "Drive API has not been used");
+    }
+
+    #[test]
+    fn client_resolution_prefers_file_then_env_then_built_in() {
+        let path = std::path::Path::new("google-client.json");
+        let file_cfg = ClientConfig { client_id: "file-id".into(), client_secret: "file-sec".into() };
+        let built_in = ClientConfig { client_id: "built-id".into(), client_secret: "built-sec".into() };
+
+        // File beats env and built-in.
+        let r = ClientConfig::resolve(
+            Some(Ok(file_cfg.clone())),
+            (Some("env-id".into()), Some("env-sec".into())),
+            Some(built_in.clone()),
+            path,
+        );
+        assert_eq!(r.unwrap(), file_cfg);
+
+        // Runtime env beats built-in.
+        let r = ClientConfig::resolve(
+            None,
+            (Some("env-id".into()), Some("env-sec".into())),
+            Some(built_in.clone()),
+            path,
+        );
+        assert_eq!(r.unwrap().client_id, "env-id");
+
+        // Half-configured runtime env still reports an error instead of silently falling back.
+        let r = ClientConfig::resolve(None, (Some("env-id".into()), None), Some(built_in.clone()), path);
+        assert!(r.is_err());
+
+        // Built-in is used when neither file nor runtime env is set.
+        let r = ClientConfig::resolve(None, (None, None), Some(built_in.clone()), path);
+        assert_eq!(r.unwrap(), built_in);
+
+        // Missing everywhere returns an error pointing to the file.
+        let r = ClientConfig::resolve(None, (None, None), None, path);
+        assert!(r.unwrap_err().contains("google-client.json"));
     }
 }
