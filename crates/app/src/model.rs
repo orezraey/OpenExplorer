@@ -236,6 +236,73 @@ pub enum SortCol {
     Kind,
 }
 
+/// How a pane displays its folder's entries, as in Windows Explorer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ViewMode {
+    ExtraLargeIcons,
+    LargeIcons,
+    MediumIcons,
+    List,
+    #[default]
+    #[serde(other)]
+    Details,
+}
+
+impl ViewMode {
+    pub const ALL: [ViewMode; 5] = [
+        ViewMode::ExtraLargeIcons,
+        ViewMode::LargeIcons,
+        ViewMode::MediumIcons,
+        ViewMode::List,
+        ViewMode::Details,
+    ];
+
+    /// Advances directly to the next view mode (clicking the main icon half of the split button).
+    pub fn next(self) -> ViewMode {
+        match self {
+            ViewMode::ExtraLargeIcons => ViewMode::LargeIcons,
+            ViewMode::LargeIcons => ViewMode::MediumIcons,
+            ViewMode::MediumIcons => ViewMode::List,
+            ViewMode::List => ViewMode::Details,
+            ViewMode::Details => ViewMode::ExtraLargeIcons,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewMode::ExtraLargeIcons => t("Ícones extra grandes", "Extra large icons"),
+            ViewMode::LargeIcons => t("Ícones grandes", "Large icons"),
+            ViewMode::MediumIcons => t("Ícones médios", "Medium icons"),
+            ViewMode::List => t("Lista", "List"),
+            ViewMode::Details => t("Detalhes", "Details"),
+        }
+    }
+
+    pub fn icon(self) -> &'static rune::Icon {
+        match self {
+            ViewMode::ExtraLargeIcons => &crate::icons::VM_EXTRA_LARGE,
+            ViewMode::LargeIcons => &crate::icons::VM_LARGE,
+            ViewMode::MediumIcons => &crate::icons::VM_MEDIUM,
+            ViewMode::List => &crate::icons::VM_LIST,
+            ViewMode::Details => &crate::icons::VM_DETAILS,
+        }
+    }
+
+    pub fn is_grid(self) -> bool {
+        matches!(self, ViewMode::ExtraLargeIcons | ViewMode::LargeIcons | ViewMode::MediumIcons)
+    }
+
+    /// `(tile_w, tile_h, icon_size)` for grid modes, sized to match Windows Explorer.
+    pub fn tile_metrics(self) -> (f32, f32, f32) {
+        match self {
+            ViewMode::ExtraLargeIcons => (236.0, 268.0, 200.0),
+            ViewMode::LargeIcons => (128.0, 152.0, 96.0),
+            ViewMode::MediumIcons => (96.0, 102.0, 48.0),
+            ViewMode::List | ViewMode::Details => (0.0, 0.0, 16.0),
+        }
+    }
+}
+
 pub struct Pane {
     pub loc: Location,
     pub entries: Vec<Entry>,
@@ -244,6 +311,7 @@ pub struct Pane {
     pub anchor: Option<String>,
     pub cursor: Option<String>,
     pub sort: (SortCol, bool),
+    pub view_mode: ViewMode,
     /// Bumped whenever `entries` change, so the virtual list skips re-reading 50,000 keys.
     pub version: u64,
     pub drop_over: bool,
@@ -301,6 +369,7 @@ impl Pane {
             anchor: None,
             cursor: None,
             sort: (SortCol::Name, true),
+            view_mode: ViewMode::Details,
             version: 0,
             drop_over: false,
             error: None,
@@ -1017,5 +1086,22 @@ mod tests {
         assert_eq!(names(false), ["visivel.txt"]);
         assert_eq!(names(true), [".oculto", ".segredo", "visivel.txt"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn view_mode_cycles_through_all_five_modes() {
+        let mut m = ViewMode::default();
+        assert_eq!(m, ViewMode::Details);
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            m = m.next();
+            seen.push(m);
+        }
+        assert_eq!(seen, ViewMode::ALL);
+        assert!(ViewMode::ExtraLargeIcons.is_grid());
+        assert!(ViewMode::LargeIcons.is_grid());
+        assert!(ViewMode::MediumIcons.is_grid());
+        assert!(!ViewMode::List.is_grid());
+        assert!(!ViewMode::Details.is_grid());
     }
 }

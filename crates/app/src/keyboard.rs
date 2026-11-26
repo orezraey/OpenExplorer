@@ -231,6 +231,29 @@ mod tests {
         assert_eq!(cursor(&s), Some("f010"));
     }
 
+    /// In the icon views the arrows follow the tiles: Right to the next, Down a row down; in
+    /// List's columns Right goes a column over. Details' Left and Right don't move.
+    #[test]
+    fn the_arrows_follow_tiles_and_columns() {
+        let list: Vec<String> = (0..30).map(|i| format!("f{i:02}")).collect();
+        let mut s = state(&list.iter().map(String::as_str).collect::<Vec<_>>());
+        press(&mut s, Key::Home, Mods::default());
+        press(&mut s, Key::Right, Mods::default());
+        assert_eq!(cursor(&s), Some("f00"));
+        let tiles = crate::lasso::Flow { per_line: 4, rows: true, line_key: Some("gr-"), ..Default::default() };
+        s.views[0].flow.set(tiles);
+        press(&mut s, Key::Right, Mods::default());
+        assert_eq!(cursor(&s), Some("f01"));
+        press(&mut s, Key::Down, Mods::default());
+        assert_eq!(cursor(&s), Some("f05"));
+        let columns = crate::lasso::Flow { per_line: 10, rows: false, ..Default::default() };
+        s.views[0].flow.set(columns);
+        press(&mut s, Key::Right, Mods::default());
+        assert_eq!(cursor(&s), Some("f15"));
+        press(&mut s, Key::Up, Mods::default());
+        assert_eq!(cursor(&s), Some("f14"));
+    }
+
     /// Esc empties the selection and keeps the cursor; Ctrl with an arrow moves only the
     /// cursor, Ctrl+Space then adds or takes away the item under it.
     #[test]

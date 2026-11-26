@@ -326,7 +326,7 @@ pub fn close_active_tab(s: &mut State, p: usize) {
 
 /// Cleans up inactive tabs whose location or history references a removed account or server.
 pub fn purge_locations(s: &mut State, gone: impl Fn(&Location) -> bool, fallback: &Location) {
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         for slot in &mut s.tabs[p].items {
             if let Some(pane) = &mut slot.pane {
                 pane.back.retain(|l| !gone(l));
@@ -374,7 +374,7 @@ pub fn moved(loc: &Location, from: &Location, to: Option<&Location>) -> Option<L
 /// Whether a pane or a tab shows folder `from` or a folder inside it.
 pub fn any_inside(s: &State, from: &Location) -> bool {
     let inside = |pane: &Pane| pane.back.iter().chain(&pane.forward).chain([&pane.loc]).any(|l| moved(l, from, None).is_some());
-    (0..2).any(|p| (!s.tabs[p].is_picker() && inside(&s.panes[p])) || s.tabs[p].items.iter().filter_map(|slot| slot.pane.as_ref()).any(inside))
+    (0..crate::layout::MAX_PANES).any(|p| (!s.tabs[p].is_picker() && inside(&s.panes[p])) || s.tabs[p].items.iter().filter_map(|slot| slot.pane.as_ref()).any(inside))
 }
 
 /// Voltar's and Avançar's steps inside folder `from` follow it to `to`, or go when it's
@@ -397,7 +397,7 @@ fn remap_history(pane: &mut Pane, from: &Location, to: Option<&Location>) {
 /// Moves the panes and tabs inside folder `from` to where [`moved`] says, and their history
 /// with them, so none shows or goes back to a folder that was renamed or deleted.
 pub fn repoint(s: &mut State, from: &Location, to: Option<&Location>) {
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         remap_history(&mut s.panes[p], from, to);
         for pane in s.tabs[p].items.iter_mut().filter_map(|slot| slot.pane.as_mut()) {
             remap_history(pane, from, to);
@@ -437,7 +437,7 @@ pub fn changed(s: &mut State, reload: &[Location]) {
 
 /// Closes any open provider filter dropdown in the "+" picker.
 pub fn close_picker_filter(s: &mut State) {
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         s.tabs[p].picker.filter_open = false;
     }
 }
@@ -556,7 +556,7 @@ mod tests {
 
         // A tab left in the folder, and the other pane in it, both move.
         let mut s = State::placeholder();
-        s.tabs = [PaneTabs::initial(), PaneTabs::initial()];
+        s.tabs = std::array::from_fn(|_| PaneTabs::initial());
         s.panes[0] = Pane::new(local(r"C:\Fotos\2024"));
         s.panes[0].back = vec![local(r"C:\"), local(r"C:\Fotos")];
         open_new_tab(&mut s, 0, Location::Mock(Vec::new()));
