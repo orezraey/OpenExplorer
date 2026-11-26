@@ -841,7 +841,24 @@ fn transfer_to(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>,
                         ClipMode::Copy if src == dst => copy(&tr!("Cópia de {}", "Copy of {}", e.name)),
                         ClipMode::Copy => copy(&e.name),
                         ClipMode::Cut if src == dst => Ok(()),
-                        ClipMode::Cut if src.is_empty() => Err(t("Recortar precisa da pasta de origem.", "Cut needs the source folder.").into()),
+                        // Picked up from a view or a search (Com estrela, Recentes, the results of
+                        // one account or of all): the item's folder isn't known here, so Drive
+                        // says where it is now, and it moves from there.
+                        ClipMode::Cut if src.is_empty() => {
+                            let Some(from) = d.status(&e.id)?.parents.into_iter().next() else {
+                                return Err(t(
+                                    "Este item não está numa pasta desta conta (foi compartilhado com ela): use Copiar.",
+                                    "This item isn't in a folder of this account (it was shared with it): use Copy.",
+                                )
+                                .into());
+                            };
+                            if from == dst {
+                                return Ok(());
+                            }
+                            d.move_to(&e.id, &from, &dst)?;
+                            rec.add([Step::DriveMove { email: who.clone(), id: e.id.clone(), name: e.name.clone(), from: dst.clone(), to: from }]);
+                            Ok(())
+                        }
                         ClipMode::Cut => {
                             d.move_to(&e.id, &src, &dst)?;
                             rec.add([Step::DriveMove { email: who.clone(), id: e.id.clone(), name: e.name.clone(), from: dst.clone(), to: src.clone() }]);
