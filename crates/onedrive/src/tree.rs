@@ -39,6 +39,9 @@ pub struct Node {
     /// A folder's children, once listed.
     pub children: Option<Vec<Ix>>,
     pub remote: Option<Box<Remote>>,
+    /// How many children Graph last said the folder has (0 when it didn't say). Kept in memory
+    /// only: it tells a listing whether to read from both ends at once.
+    pub kids: u32,
 }
 
 /// An item as Graph describes it (a listing's, a delta's, an operation's answer).
@@ -53,16 +56,33 @@ pub struct Seen {
     pub deleted: bool,
     pub root: bool,
     pub remote: Option<Remote>,
+    /// A folder's `childCount`; 0 when not given.
+    pub kids: u32,
 }
 
-/// The fields every listing and delta asks for.
+/// The fields the delta and single items ask for.
 pub const SELECT: &str = "id,name,size,lastModifiedDateTime,folder,parentReference,deleted,root,remoteItem,package";
+
+/// The fields a folder's listing asks for: `file` instead of `folder`, whose count of children
+/// Graph works out for every folder listed (about 8 s for a page of 1,000 folders, against under
+/// 2 without). An item listed with neither `file` nor `package` is a folder ([`Seen::listed`]).
+pub const LIST: &str = "id,name,size,lastModifiedDateTime,parentReference,deleted,root,remoteItem,package,file";
 
 fn time(v: Option<&Value>) -> i64 {
     v.and_then(Value::as_str).and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|d| d.timestamp()).unwrap_or(0)
 }
 
 impl Seen {
+    /// Reads a driveItem from a listing asked with [`LIST`]: one with neither `file` nor
+    /// `package` is a folder (a shortcut to another drive's item says what that is).
+    pub fn listed(v: &Value) -> Option<Seen> {
+        let mut s = Seen::of(v)?;
+        if s.remote.is_none() && !s.root {
+            s.is_dir = v.get("folder").is_some() || (v.get("file").is_none() && v.get("package").is_none());
+        }
+        Some(s)
+    }
+
     /// Reads a driveItem; `None` for one without an id.
     pub fn of(v: &Value) -> Option<Seen> {
         let id = v.get("id")?.as_str()?.to_string();
@@ -82,6 +102,7 @@ impl Seen {
             deleted: v.get("deleted").is_some(),
             root: v.get("root").is_some(),
             remote: remote.map(|(r, _)| r),
+            kids: v.pointer("/folder/childCount").or_else(|| v.pointer("/remoteItem/folder/childCount")).and_then(Value::as_u64).map_or(0, |n| n.min(u32::MAX as u64) as u32),
         })
     }
 }
@@ -209,7 +230,7 @@ impl Tree {
             n.modified = s.modified;
             return r;
         }
-        let ix = self.alloc(Node { id: s.id.as_str().into(), parent: None, name: "".into(), size: 0, modified: s.modified, is_dir: true, children: None, remote: None });
+        let ix = self.alloc(Node { id: s.id.as_str().into(), parent: None, name: "".into(), size: 0, modified: s.modified, is_dir: true, children: None, remote: None, kids: 0 });
         self.root = Some(ix);
         ix
     }
@@ -288,6 +309,7 @@ impl Tree {
                 }
                 n.size = s.size;
                 n.modified = s.modified;
+                n.kids = s.kids;
                 if n.is_dir != s.is_dir || n.remote.as_deref() != s.remote.as_ref() {
                     n.is_dir = s.is_dir;
                     n.remote = s.remote.clone().map(Box::new);
@@ -312,6 +334,7 @@ impl Tree {
                     is_dir: s.is_dir,
                     children: None,
                     remote: s.remote.clone().map(Box::new),
+                    kids: s.kids,
                 });
                 self.get_mut(p).children.as_mut().expect("a listed parent").push(ix);
                 note(self, p);
@@ -403,7 +426,7 @@ impl Tree {
             if t.by_id.contains_key(rec.i.as_str()) {
                 return None;
             }
-            let ix = t.alloc(Node { id: rec.i.into(), parent, name: rec.n.into(), size: rec.s, modified: rec.m, is_dir: rec.d, children: rec.l.then(Vec::new), remote: rec.r.map(Box::new) });
+            let ix = t.alloc(Node { id: rec.i.into(), parent, name: rec.n.into(), size: rec.s, modified: rec.m, is_dir: rec.d, children: rec.l.then(Vec::new), remote: rec.r.map(Box::new), kids: 0 });
             match parent {
                 Some(p) => t.get_mut(p).children.as_mut()?.push(ix),
                 None => t.root = Some(ix),
@@ -440,7 +463,7 @@ pub(crate) mod tests {
     use serde_json::json;
 
     pub fn file(id: &str, parent: &str, name: &str) -> Seen {
-        Seen { id: id.into(), parent: Some(parent.into()), name: Some(name.into()), size: 10, modified: 1, is_dir: false, deleted: false, root: false, remote: None }
+        Seen { id: id.into(), parent: Some(parent.into()), name: Some(name.into()), size: 10, modified: 1, is_dir: false, deleted: false, root: false, remote: None, kids: 0 }
     }
 
     pub fn dir(id: &str, parent: &str, name: &str) -> Seen {

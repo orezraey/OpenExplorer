@@ -73,6 +73,8 @@ pub struct State {
     pub sp_page: usize,
     /// `$orderby` and `$top` refused (400).
     pub sp_no_orderby: bool,
+    /// Pages of folder listings (`/children`) asked.
+    pub children_asked: usize,
     /// `$orderby` taken but not followed: the bin comes oldest first (`$top` still cuts it).
     pub sp_ignore_orderby: bool,
     /// After this many more `$batch` requests, the next one gets no answer (the connection
@@ -500,12 +502,35 @@ fn route(req: &Req, st: &mut State, base: &str) -> Resp {
             let Some(t) = target.filter(|t| alive(st, t)) else { return Resp::error(404, "itemNotFound") };
             let top: usize = req.query.get("$top").and_then(|t| t.parse().ok()).unwrap_or(200);
             let skip: usize = req.query.get("$skiptoken").and_then(|t| t.parse().ok()).unwrap_or(0);
-            let kids = st.kids(&t);
-            let page: Vec<Value> = kids.iter().skip(skip).take(top).map(|k| st.json(k, full, base)).collect();
+            st.children_asked += 1;
+            let mut kids = st.kids(&t);
+            // By name (Graph's own order here); "name desc" from the other end.
+            let order = req.query.get("$orderby").cloned();
+            if order.as_deref() == Some("name desc") {
+                kids.reverse();
+            }
+            // Only the facets asked for, as Graph: a listing asking `file` and not `folder`.
+            let asked = |f: &str| req.query.get("$select").is_none_or(|s| s.split(',').any(|x| x == f));
+            let page: Vec<Value> = kids
+                .iter()
+                .skip(skip)
+                .take(top)
+                .map(|k| {
+                    let mut v = st.json(k, full, base);
+                    if !asked("folder") && let Some(o) = v.as_object_mut() {
+                        o.remove("folder");
+                    }
+                    if asked("file") && !k.is_dir && v.get("file").is_none() {
+                        v["file"] = json!({ "mimeType": "application/octet-stream" });
+                    }
+                    v
+                })
+                .collect();
             let mut v = json!({ "value": page });
             if skip + top < kids.len() {
                 let sel = req.query.get("$select").map(|s| format!("&$select={s}")).unwrap_or_default();
-                v["@odata.nextLink"] = format!("{base}/drives/{DRIVE}/items/{t}/children?$top={top}&$skiptoken={}{sel}", skip + top).into();
+                let order = order.map(|o| format!("&$orderby={}", o.replace(' ', "%20"))).unwrap_or_default();
+                v["@odata.nextLink"] = format!("{base}/drives/{DRIVE}/items/{t}/children?$top={top}&$skiptoken={}{sel}{order}", skip + top).into();
             }
             Resp::json(200, v)
         }

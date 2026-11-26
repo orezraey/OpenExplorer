@@ -185,6 +185,37 @@ pub(crate) enum Body<'a> {
     /// callback hears how many went in this try, and stops the call with [`crate::CANCELLED`]
     /// by answering `false`.
     Bytes(&'a [u8], Option<&'a mut dyn FnMut(usize) -> bool>),
+    /// The first bytes of a file on this computer, read again from its start for each try, so
+    /// a big one needn't be held in memory; the callback as for [`Body::Bytes`].
+    File(&'a std::fs::File, u64, Option<&'a mut dyn FnMut(usize) -> bool>),
+}
+
+/// Reads a [`Body::File`] out for one try, as [`Sending`] does.
+struct FromFile<'a, 'b> {
+    file: &'a std::fs::File,
+    len: u64,
+    at: u64,
+    told: Option<&'a mut (dyn FnMut(usize) -> bool + 'b)>,
+    stopped: bool,
+}
+
+impl Read for FromFile<'_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let want = ((self.len - self.at) as usize).min(buf.len()).min(256 << 10);
+        if want == 0 {
+            return Ok(0);
+        }
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_read(self.file, &mut buf[..want], self.at)?;
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::read_at(self.file, &mut buf[..want], self.at)?;
+        self.at += n as u64;
+        if n > 0 && let Some(told) = self.told.as_mut() && !told(self.at as usize) {
+            self.stopped = true;
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, crate::CANCELLED));
+        }
+        Ok(n)
+    }
 }
 
 /// Reads a [`Body::Bytes`] out for one try, telling its callback how far it got.
@@ -365,6 +396,12 @@ impl Api {
                 Body::Bytes(data, told) => {
                     let mut sending = Sending { data, at: 0, told: told.as_deref_mut(), stopped: false };
                     let sent = req.header("Content-Type", "application/octet-stream").header("Content-Length", &data.len().to_string()).send(ureq::SendBody::from_reader(&mut sending));
+                    stopped = sending.stopped;
+                    sent
+                }
+                Body::File(file, len, told) => {
+                    let mut sending = FromFile { file, len: *len, at: 0, told: told.as_deref_mut(), stopped: false };
+                    let sent = req.header("Content-Type", "application/octet-stream").header("Content-Length", &len.to_string()).send(ureq::SendBody::from_reader(&mut sending));
                     stopped = sending.stopped;
                     sent
                 }

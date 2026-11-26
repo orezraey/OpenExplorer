@@ -4,6 +4,7 @@
 //! folders whose listing would now differ are read again.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use openexplorer_gdrive::Change;
 use openexplorer_i18n::t;
@@ -32,6 +33,39 @@ pub struct Watch {
     /// Per pane, the place it was still listing when changes came: its listing may have
     /// fetched the changed folder before they happened, so it's read again once done there.
     redo: [Option<Location>; 2],
+    /// When this unbroken run of the change log began (its first token), and when it was last
+    /// read: what changed in between is all in `touched`.
+    began: Option<Instant>,
+    read: Option<Instant>,
+    /// Every file and folder the log named since `began`, and the folders holding them.
+    touched: HashSet<String>,
+}
+
+/// How recently the change log must have been read for [`Watch::vouches`]: two of its rounds and
+/// a little, so it holds while a pane shows the account, and not once none has for a while.
+const VOUCH: Duration = Duration::from_secs(2 * EVERY as u64 + 5);
+
+impl Watch {
+    /// Whether the change log vouches that nothing among `ids` (files and folders) changed since
+    /// `seen`, when a listing was read or confirmed: it has been read without a break since
+    /// before then, lately, and named none of them since it began. A listing kept from before,
+    /// or one the log can't account for, isn't vouched for; it's then read again.
+    pub fn vouches(&self, seen: Option<Instant>, ids: &[&str]) -> bool {
+        let (Some(seen), Some(began), Some(read)) = (seen, self.began, self.read) else { return false };
+        began <= seen && read.elapsed() <= VOUCH && !ids.iter().any(|id| self.touched.contains(*id))
+    }
+
+    /// Meu Drive's real top folder id, once the log was first read.
+    pub fn root(&self) -> Option<&str> {
+        self.root.as_deref()
+    }
+
+    /// A log begun now and just read, which named `touched`.
+    #[cfg(test)]
+    pub fn reading(root: &str, touched: &[&str]) -> Watch {
+        let now = Some(Instant::now());
+        Watch { root: Some(root.into()), began: now, read: now, touched: touched.iter().map(|t| t.to_string()).collect(), ..Watch::default() }
+    }
 }
 
 /// What an ask brought.
@@ -101,6 +135,7 @@ pub fn arrived(s: &mut State, email: String, result: Result<Fetched, String>, no
             if ["HTTP 400", "HTTP 404", "HTTP 410"].iter().any(|code| e.contains(code)) {
                 w.token = None;
                 w.resync = true;
+                w.began = None;
             }
             w.next = now + RETRY;
             wake_in(s, RETRY);
@@ -109,10 +144,19 @@ pub fn arrived(s: &mut State, email: String, result: Result<Fetched, String>, no
         Ok(Fetched::Start { token, root }) => {
             (w.token, w.root) = (Some(token), Some(root));
             resync = std::mem::take(&mut w.resync);
+            // The token was asked for when the ask went out: anything read from Drive after that
+            // is accounted for by the log from here.
+            (w.began, w.read) = (Some(Instant::now()), Some(Instant::now()));
+            w.touched.clear();
             Vec::new()
         }
         Ok(Fetched::Changes { changes, token }) => {
             w.token = Some(token);
+            w.read = Some(Instant::now());
+            for c in &changes {
+                w.touched.insert(c.file_id.clone());
+                w.touched.extend(c.parents.iter().cloned());
+            }
             changes
         }
     };
@@ -338,6 +382,7 @@ mod tests {
         crate::cache::Listing {
             entries: std::sync::Arc::new(files.iter().cloned().map(entry_of).collect()),
             pos: token.map(|t| crate::cache::Pos { token: t.into(), fetched }),
+            seen: None,
         }
     }
 

@@ -143,7 +143,8 @@ pub(crate) fn child(dir: &str, name: &str) -> String {
 // ---------------------------------------------------------------------------------------------
 // Listing and searching
 
-/// Lists pane `p`'s server folder, or searches it, on a thread; search results come in pages.
+/// Lists pane `p`'s server folder, or searches it, on a thread. Both come in pages: a big
+/// folder shows as the service sends it (OneDrive's 1,000 items at a time).
 pub fn load(s: &mut State, p: usize, request: u64) {
     let Location::Server { server, path, find } = s.panes[p].loc.clone() else { return };
     let show_hidden = s.settings.show_hidden;
@@ -156,14 +157,24 @@ pub fn load(s: &mut State, p: usize, request: u64) {
     background(s, move |emit| {
         let listed = |part, result| Msg::Listed { pane: p, request, part, result, at: None };
         let dir = server.path(&path);
-        let Some(text) = find else {
-            let result = catch_panic(t("listar", "list"), || {
-                with(&pool, &server, |c| c.list(&dir)).map(|v| v.into_iter().filter(|i| show_hidden || !i.name.starts_with('.')).map(entry).collect())
-            });
-            return emit(listed(Part::WHOLE, result));
-        };
         let alive = || live.load(Ordering::Relaxed) == request;
         let mut first = true;
+        let Some(text) = find else {
+            let result = catch_panic(t("listar", "list"), || {
+                with(&pool, &server, |c| {
+                    c.list_pages(&dir, &mut |items, more| {
+                        let entries = items.into_iter().filter(|i| show_hidden || !i.name.starts_with('.')).map(entry).collect();
+                        emit(listed(Part::Page { first, more }, Ok(entries)));
+                        first = false;
+                        alive()
+                    })
+                })
+            });
+            if let Err(e) = result {
+                emit(listed(Part::Page { first, more: false }, Err(e)));
+            }
+            return;
+        };
         let result = catch_panic(t("pesquisar", "search"), || {
             with(&pool, &server, |c| {
                 search(c, &dir, &text, show_hidden, &alive, &mut |entries, more| {
@@ -266,7 +277,11 @@ pub(crate) fn measure(c: &mut dyn Conn, path: &str, stop: &dyn Fn() -> bool) -> 
         if stop() {
             break;
         }
-        for it in c.list(&dir).unwrap_or_default() {
+        let items = c.list(&dir).unwrap_or_default();
+        if items.iter().any(|it| it.is_dir) {
+            c.read_ahead(&dir);
+        }
+        for it in items {
             match it.is_dir {
                 true if depth < DEEPEST && !c.passed_over(&child(&dir, &it.name)) => todo.push((child(&dir, &it.name), depth + 1)),
                 true => {}

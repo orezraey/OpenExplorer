@@ -42,6 +42,46 @@ impl Hasher {
     }
 }
 
+/// The block digests of a run of bytes that starts where a block does, as they go by: a part of
+/// a file fetched on its own, whose digests [`joined`] with the other parts' give the hash.
+#[derive(Default)]
+pub struct Blocks {
+    digests: Vec<[u8; 32]>,
+    block: Sha256,
+    in_block: usize,
+}
+
+impl Blocks {
+    pub fn update(&mut self, mut data: &[u8]) {
+        while !data.is_empty() {
+            let take = (BLOCK - self.in_block).min(data.len());
+            self.block.update(&data[..take]);
+            self.in_block += take;
+            data = &data[take..];
+            if self.in_block == BLOCK {
+                self.digests.push(std::mem::take(&mut self.block).finalize().into());
+                self.in_block = 0;
+            }
+        }
+    }
+
+    pub fn finish(mut self) -> Vec<[u8; 32]> {
+        if self.in_block > 0 {
+            self.digests.push(std::mem::take(&mut self.block).finalize().into());
+        }
+        self.digests
+    }
+}
+
+/// The hash of a file from its blocks' digests, in order.
+pub fn joined(digests: impl IntoIterator<Item = [u8; 32]>) -> String {
+    let mut whole = Sha256::new();
+    for d in digests {
+        whole.update(d);
+    }
+    whole.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The hash of what `src` reads, to its end. `stop` is asked between blocks.
 pub fn of_reader(src: &mut dyn Read, stop: &dyn Fn() -> bool) -> std::io::Result<String> {
     let mut h = Hasher::default();

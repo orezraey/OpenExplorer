@@ -502,6 +502,14 @@ pub fn go_to_address(s: &mut State, p: usize, typed: &str) -> bool {
             background(s, move |emit| emit(Msg::Reached { pane: p, moves, result: crate::catch_panic(t("abrir o endereço", "open the address"), || address::reach_local(&path)) }));
         }
         Target::Drive { email, way } => {
+            // Through folders this session has listed, at once; else Drive looks each step up.
+            let known = s.panes.iter().flat_map(|pane| pane.back.iter().chain(&pane.forward).chain([&pane.loc]));
+            let tabs = s.tabs.iter().flat_map(|t| t.items.iter().filter_map(|slot| slot.pane.as_ref())).flat_map(|pane| pane.back.iter().chain(&pane.forward).chain([&pane.loc]));
+            if let Some(to) = address::reach_cached(&s.cache, known.chain(tabs), &email, &way, s.watch.get(&email)) {
+                s.history.reached(p, s.panes[p].moves, true);
+                arrive(s, p, to);
+                return true;
+            }
             let account = email.clone();
             reach(s, p, &email, t("abrir o endereço", "open the address"), move |d| address::reach_drive(d, account, way));
         }

@@ -365,6 +365,13 @@ pub(crate) fn onward_each(progress: &mut dyn FnMut(usize, u64) -> bool) -> impl 
 pub trait Conn: Send {
     /// The folder `dir`'s items, without `.` and `..`.
     fn list(&mut self, dir: &str) -> Result<Vec<Item>>;
+    /// [`Conn::list`] in pages, each given to `page` as it comes, with whether more follow, so a
+    /// big folder shows as it loads; `page` answering false stops. One page where the service
+    /// sends the folder whole.
+    fn list_pages(&mut self, dir: &str, page: &mut dyn FnMut(Vec<Item>, bool) -> bool) -> Result<()> {
+        page(self.list(dir)?, false);
+        Ok(())
+    }
     /// The item at `path`, or `None` when there's nothing there.
     fn stat(&mut self, path: &str) -> Result<Option<Item>>;
     fn mkdir(&mut self, path: &str) -> Result<()>;
@@ -395,6 +402,11 @@ pub trait Conn: Send {
     fn passed_over(&mut self, _path: &str) -> bool {
         false
     }
+
+    /// Before a walk through folder `dir` (already listed) and the folders in it: reads those
+    /// folders ahead, many in a request, where the server allows it, so listing them each
+    /// costs nothing. Nothing by default.
+    fn read_ahead(&mut self, _dir: &str) {}
 
     /// Copies a file or a whole folder within the server, on the server's side; `false` when
     /// the protocol has no such command (FTP, SFTP), and the bytes have to go through the app.

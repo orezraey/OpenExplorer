@@ -7,6 +7,8 @@
 //!   twice.
 //! - **Big files** (from [`SEGMENT_MIN`], when the caller asks for it) come in [`SEGMENTS`]
 //!   parallel `Range` requests into one preallocated file, each segment resuming on its own.
+//!   A segment done with its part takes over the rest of the one that would finish last, on a
+//!   new connection, so a slow or stalled connection doesn't hold the end of the download.
 //! - **Google's own formats** (Docs, Sheets, Slides, Drawings) hold no bytes to fetch: they're
 //!   converted by `files.export` to the format [`export_format`] picks, up to Google's 10 MB.
 //!
@@ -18,6 +20,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use openexplorer_i18n::tr;
@@ -28,8 +31,120 @@ use crate::{CANCELLED, Result};
 /// Files from this size are fetched in parallel segments, when asked to.
 pub const SEGMENT_MIN: u64 = 64 * 1024 * 1024;
 
-/// How many segments a big file is fetched in.
-pub const SEGMENTS: usize = 4;
+/// How many segments a big file is fetched in. Measured on a 500 MiB file (example
+/// download_speed, median of 3): 1 segment 10.4 s, 4 segments 6.1 s, 8 segments 5.8 s.
+pub const SEGMENTS: usize = 8;
+
+/// How segments take over each other's rest: `ask` is how long a new request waits for its
+/// first byte (about 0.6 s from Brazil to Google), `after` how long a request must have been
+/// receiving before its speed is trusted, and `min` the least worth a request of its own.
+/// A segment's answer that brings no byte for `stall` (three times that for its first) is left
+/// behind and asked again from where it got to: Google's answer stalled now and then for the
+/// whole 120 s a read may wait, and asking again costs under a second. From half of that without
+/// a byte, the others take over its rest.
+#[derive(Clone, Copy)]
+struct Split {
+    ask: f64,
+    after: f64,
+    min: u64,
+    stall: Duration,
+}
+
+const SPLIT: Split = Split { ask: 0.7, after: 0.5, min: 256 * 1024, stall: Duration::from_secs(2) };
+
+/// A segment: where it is and where it ends (`None`: the stream's end), and its current
+/// request: when it went out, when its first and its last byte came, from where. Only its own
+/// fetch moves `at`; a segment done with its part may pull `until` back to take over the rest.
+struct Seg {
+    at: u64,
+    until: Option<u64>,
+    asked: Instant,
+    first: Option<Instant>,
+    last: Instant,
+    from: u64,
+}
+
+impl Seg {
+    fn new(at: u64, until: Option<u64>) -> Self {
+        let now = Instant::now();
+        Seg { at, until, asked: now, first: None, last: now, from: at }
+    }
+
+    fn left(&self) -> u64 {
+        self.until.map_or(0, |u| u - self.at)
+    }
+
+    /// Bytes a second since its first byte came, once that's long enough to tell; 0 when no
+    /// byte came for a while (a stalled answer).
+    fn speed(&self, split: Split) -> Option<f64> {
+        if self.first.is_some() && self.last.elapsed() >= split.stall / 2 {
+            return Some(0.0);
+        }
+        match self.first {
+            Some(t) if t.elapsed().as_secs_f64() >= split.after => Some((self.at - self.from) as f64 / t.elapsed().as_secs_f64()),
+            Some(_) => None,
+            None if self.asked.elapsed().as_secs_f64() >= split.ask * 3.0 => Some(0.0),
+            None => None,
+        }
+    }
+}
+
+type Span = Mutex<Seg>;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What a segment done with its part does next.
+#[derive(PartialEq, Debug)]
+enum Next {
+    /// It took over part of another's rest, now its own span.
+    Took,
+    /// Others still run, none worth splitting yet.
+    Wait,
+    /// Every segment is done.
+    Done,
+}
+
+/// Gives segment `idle`, done with its part, the end of the segment that would finish last at
+/// its speed: as much as makes both end together, counting the new request's wait. A slow
+/// segment keeps only what it writes meanwhile; a stalled one keeps nothing.
+fn take_over(spans: &[Span], idle: usize, split: Split) -> Next {
+    let (mut last, mut fastest, mut busy) = (None::<(usize, f64)>, 0f64, false);
+    for (j, span) in spans.iter().enumerate().filter(|&(j, _)| j != idle) {
+        let s = lock(span);
+        if s.left() == 0 {
+            continue;
+        }
+        busy = true;
+        let Some(v) = s.speed(split) else { continue };
+        fastest = fastest.max(v);
+        let eta = s.left() as f64 / v.max(1.0);
+        if last.is_none_or(|(_, e)| eta > e) {
+            last = Some((j, eta));
+        }
+    }
+    if !busy {
+        return Next::Done;
+    }
+    let Some((j, _)) = last else { return Next::Wait };
+    let (mid, end) = {
+        let mut s = lock(&spans[j]);
+        let (Some(rv), Some(end)) = (s.speed(split), s.until) else { return Next::Wait };
+        // The slow one keeps x, the taker the rest: x / rv = ask + (rest - x) / rt.
+        let rest = s.left() as f64;
+        let rt = fastest.max(rv).max(1.0);
+        let x = (rv * (split.ask * rt + rest) / (rt + rv)).min(rest) as u64;
+        if s.left() - x < split.min {
+            return Next::Wait;
+        }
+        let mid = s.at + x;
+        s.until = Some(mid);
+        (mid, end)
+    };
+    *lock(&spans[idle]) = Seg::new(mid, Some(end));
+    Next::Took
+}
 
 /// Times a failed request is tried again in a row without progress (with 1, 2, 4, 8, 16, 32 s
 /// between), for dropped connections, 5xx, 429 and Drive's rate limits.
@@ -63,11 +178,14 @@ pub fn local_name(file: &DriveFile) -> String {
 }
 
 /// Where a download is written until it's complete.
-pub fn part_path(to: &Path) -> PathBuf {
+pub fn part_path(to: &Path, n: u64) -> PathBuf {
     let mut name = to.file_name().unwrap_or_default().to_os_string();
-    name.push(".openexplorer-part");
+    name.push(format!(".{}-{n}.openexplorer-part", std::process::id()));
     to.with_file_name(name)
 }
+
+/// Numbers each download's part file in this process (see [`part_path`]).
+static PARTS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether an answer is worth trying again: Google busy or limiting the rate.
 fn transient(status: u16, body: &str) -> bool {
@@ -117,7 +235,12 @@ impl Drive {
     }
 
     /// [`Drive::download`] in `pieces` parallel segments (1 for one stream).
-    pub(crate) fn download_in(&self, file: &DriveFile, to: &Path, pieces: usize, got: &mut dyn FnMut(u64) -> bool) -> Result<u64> {
+    pub fn download_in(&self, file: &DriveFile, to: &Path, pieces: usize, got: &mut dyn FnMut(u64) -> bool) -> Result<u64> {
+        self.download_split(file, to, pieces, SPLIT, got)
+    }
+
+    /// [`Drive::download_in`], segments taking over each other's rest as `split` says.
+    fn download_split(&self, file: &DriveFile, to: &Path, pieces: usize, split: Split, got: &mut dyn FnMut(u64) -> bool) -> Result<u64> {
         let what = tr!("Baixar \"{}\"", "Download \"{}\"", file.name);
         if file.is_dir || file.mime == FOLDER_MIME {
             return Err(tr!("{what}: é uma pasta.", "{what}: it's a folder."));
@@ -129,9 +252,12 @@ impl Drive {
             return Err(tr!("Id inválido: {}", "Invalid id: {}", file.id));
         }
         let (url, size) = self.media_url(file, &what)?;
-        let part = part_path(to);
+        // A part file of this download's own: two downloads to one place (a copy asked twice)
+        // each write theirs, and the last to finish names the file. With one name for both, the
+        // first renamed it away under the second, which failed with "file not found".
+        let part = part_path(to, PARTS.fetch_add(1, Ordering::Relaxed));
         let started = Instant::now();
-        let out = self.fetch_to(&url, &part, size, pieces, got, &what).and_then(|written| {
+        let out = self.fetch_to(&url, &part, size, pieces, split, got, &what).and_then(|written| {
             if let Some(t) = file.modified {
                 // The copy dates from when the file changed in Drive, as Explorer's copies do.
                 let f = OpenOptions::new().write(true).open(&part).map_err(|e| format!("{what}: {e}"))?;
@@ -205,14 +331,15 @@ impl Drive {
 
     /// Fetches `url` into `part`: `size` bytes in `pieces` segments when known, else one stream
     /// to its end.
-    fn fetch_to(&self, url: &str, part: &Path, size: Option<u64>, pieces: usize, got: &mut dyn FnMut(u64) -> bool, what: &str) -> Result<u64> {
+    #[allow(clippy::too_many_arguments)]
+    fn fetch_to(&self, url: &str, part: &Path, size: Option<u64>, pieces: usize, split: Split, got: &mut dyn FnMut(u64) -> bool, what: &str) -> Result<u64> {
         let file = File::create(part).map_err(|e| tr!("{what}: não consegui criar o arquivo: {e}", "{what}: couldn't create the file: {e}"))?;
         let Some(size) = size.filter(|_| pieces > 1) else {
             drop(file);
             let mut total = 0u64;
             // To the end of what Google sends, checked against the size after: no Range on the
             // first request, as a plain download asks.
-            let end = self.fetch(url, part, 0, None, &mut |n| {
+            let end = self.fetch(url, part, &Mutex::new(Seg::new(0, None)), None, &mut |n| {
                 total += n;
                 got(total)
             }, what)?;
@@ -228,21 +355,33 @@ impl Drive {
         let stop = AtomicBool::new(false);
         let step = size.div_ceil(pieces as u64);
         let ranges: Vec<(u64, u64)> = (0..pieces as u64).map(|i| (i * step, ((i + 1) * step).min(size))).filter(|(a, b)| a < b).collect();
+        let spans: Vec<Span> = ranges.iter().map(|&(from, until)| Mutex::new(Seg::new(from, Some(until)))).collect();
         let results: Vec<Result<u64>> = std::thread::scope(|scope| {
-            let runs: Vec<_> = ranges
-                .iter()
-                .map(|&(from, until)| {
-                    let (total, stop) = (&total, &stop);
+            let runs: Vec<_> = (0..spans.len())
+                .map(|i| {
+                    let (total, stop, spans) = (&total, &stop, &spans);
                     scope.spawn(move || {
-                        let out = self.fetch(url, part, from, Some(until), &mut |n| {
-                            total.fetch_add(n, Ordering::Relaxed);
-                            !stop.load(Ordering::Relaxed)
-                        }, what);
-                        // One segment failing for good stops the others: the file can't be whole.
-                        if out.is_err() {
-                            stop.store(true, Ordering::Relaxed);
+                        loop {
+                            let out = self.fetch(url, part, &spans[i], Some(split.stall), &mut |n| {
+                                total.fetch_add(n, Ordering::Relaxed);
+                                !stop.load(Ordering::Relaxed)
+                            }, what);
+                            // One segment failing for good stops the others: the file can't be whole.
+                            if out.is_err() {
+                                stop.store(true, Ordering::Relaxed);
+                            }
+                            // Done with its part, it helps whichever would finish last, until all are.
+                            loop {
+                                if out.is_err() || stop.load(Ordering::Relaxed) {
+                                    return out;
+                                }
+                                match take_over(spans, i, split) {
+                                    Next::Took => break,
+                                    Next::Done => return out,
+                                    Next::Wait => std::thread::sleep(Duration::from_millis(50)),
+                                }
+                            }
                         }
-                        out
                     })
                 })
                 .collect();
@@ -266,24 +405,29 @@ impl Drive {
         Ok(size)
     }
 
-    /// Fetches bytes `from..until` of `url` (to its end when `until` is `None`) into the same
-    /// place in the file at `path`, asking again from the last byte written after a drop.
-    /// `moved` hears each batch of bytes written (and 0 while waiting); `false` stops it.
-    /// Returns where the written bytes end.
-    fn fetch(&self, url: &str, path: &Path, from: u64, until: Option<u64>, moved: &mut dyn FnMut(u64) -> bool, what: &str) -> Result<u64> {
+    /// Fetches the bytes of `url` that `span` holds (to its end when it has none) into the same
+    /// place in the file at `path`, asking again from the last byte written after a drop, and
+    /// stopping where the span ends when another segment pulled its end back. With `stall`, an
+    /// answer that brings nothing for that long is left behind and asked again. `moved` hears each
+    /// batch of bytes written (and 0 while waiting); `false` stops it. Returns where the written
+    /// bytes end.
+    ///
+    /// Each request is read on a thread of its own ([`ask`]), so a segment whose rest the others
+    /// took over returns at once instead of waiting out a stalled read.
+    fn fetch(&self, url: &str, path: &Path, span: &Span, stall: Option<Duration>, moved: &mut dyn FnMut(u64) -> bool, what: &str) -> Result<u64> {
         let mut file = OpenOptions::new().write(true).open(path).map_err(|e| format!("{what}: {e}"))?;
-        let mut at = from;
+        let mut at = lock(span).at;
+        let until = || lock(span).until;
         let mut failures = 0u32;
-        let mut buf = vec![0u8; 256 * 1024];
         loop {
-            if until == Some(at) {
+            if until() == Some(at) {
                 return Ok(at);
             }
             if !moved(0) {
                 return Err(CANCELLED.into());
             }
             let before = at;
-            let range = match until {
+            let range = match until() {
                 Some(u) => Some(format!("bytes={at}-{}", u - 1)),
                 None if at > 0 => Some(format!("bytes={at}-")),
                 None => None,
@@ -297,72 +441,151 @@ impl Drive {
             if let Some(r) = &range {
                 req = req.header("Range", r);
             }
-            let failed = match req.call() {
-                Ok(mut r) => match r.status().as_u16() {
-                    s @ (200 | 206) => {
-                        let mut body = r.body_mut().as_reader();
-                        // A whole file where a part was asked (an export takes no Range): skip
-                        // what's already written; a drop while skipping is a drop like any other.
-                        let mut dropped = s == 200 && at > 0 && !matches!(std::io::copy(&mut (&mut body).take(at), &mut std::io::sink()), Ok(n) if n == at);
-                        file.seek(SeekFrom::Start(at)).map_err(|e| format!("{what}: {e}"))?;
-                        while !dropped {
-                            let room = until.map_or(buf.len() as u64, |u| (u - at).min(buf.len() as u64)) as usize;
-                            if room == 0 {
-                                break;
-                            }
-                            match body.read(&mut buf[..room]) {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    file.write_all(&buf[..n]).map_err(|e| tr!("{what}: não consegui gravar no disco: {e}", "{what}: couldn't write to the disk: {e}"))?;
-                                    at += n as u64;
-                                    if !moved(n as u64) {
-                                        return Err(CANCELLED.into());
-                                    }
-                                }
-                                Err(_) => dropped = true,
-                            }
-                        }
-                        // The body ended early when a known end wasn't reached.
-                        if !dropped && until.is_none_or(|u| at >= u) {
-                            return Ok(at);
-                        }
-                        true
-                    }
-                    // Asked from past the end: everything is here.
-                    416 if until.is_none() && at > 0 => return Ok(at),
-                    401 => {
-                        self.forget_token();
-                        true
-                    }
-                    s => {
-                        let text = r.body_mut().read_to_string().unwrap_or_default();
-                        if !transient(s, &text) {
-                            return Err(refused(what, s, &text));
-                        }
-                        if failures >= RETRIES {
-                            return Err(format!("{what}: HTTP {s}: {}", crate::google_reason(&text)));
-                        }
-                        true
-                    }
-                },
-                Err(e) if failures >= RETRIES => return Err(tr!("{what}: sem conexão com o Google: {e}", "{what}: no connection to Google: {e}")),
-                Err(_) => true,
-            };
-            if failed {
-                // Only drops that get nowhere add up to giving up.
-                if at > before {
-                    failures = 0;
+            if let Some(stall) = stall {
+                // So a request left behind ends soon after, and lets its connection go.
+                req = req.config().timeout_recv_response(Some(stall * 3)).timeout_per_read(Some(stall)).build();
+            }
+            let asked = Instant::now();
+            {
+                let mut s = lock(span);
+                (s.asked, s.first, s.from) = (asked, None, at);
+            }
+            let answer = ask(req, at);
+            let mut last = asked;
+            let mut started = false;
+            // Why this request is asked again, for the log; empty while it goes on.
+            let why = loop {
+                if until() == Some(at) {
+                    return Ok(at);
                 }
-                if failures >= RETRIES {
-                    return Err(tr!("{what}: a conexão caiu várias vezes; tente de novo.", "{what}: the connection dropped several times; try again."));
-                }
-                if !backoff(failures, moved) {
+                if !moved(0) {
                     return Err(CANCELLED.into());
                 }
-                failures += 1;
+                let quiet = last.elapsed();
+                if let Some(stall) = stall
+                    && quiet >= if started { stall } else { stall * 3 }
+                {
+                    break format!("nothing for {:.1} s", quiet.as_secs_f64());
+                }
+                let got = match answer.recv_timeout(Duration::from_millis(50)) {
+                    Ok(got) => got,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break "the request ended".into(),
+                };
+                last = Instant::now();
+                match got {
+                    Got::Head(200 | 206, _) => {
+                        started = true;
+                        file.seek(SeekFrom::Start(at)).map_err(|e| format!("{what}: {e}"))?;
+                    }
+                    // Asked from past the end: everything is here.
+                    Got::Head(416, _) if until().is_none() && at > 0 => return Ok(at),
+                    Got::Head(401, _) => {
+                        self.forget_token();
+                        break "HTTP 401".into();
+                    }
+                    Got::Head(status, text) => {
+                        if !transient(status, &text) {
+                            return Err(refused(what, status, &text));
+                        }
+                        if failures >= RETRIES {
+                            return Err(format!("{what}: HTTP {status}: {}", crate::google_reason(&text)));
+                        }
+                        break format!("HTTP {status}");
+                    }
+                    Got::Bytes(bytes) => {
+                        // What's still this segment's: its end may have moved back while it
+                        // read, and the bytes past it are another's now.
+                        let keep = {
+                            let mut s = lock(span);
+                            let keep = s.until.map_or(bytes.len() as u64, |u| (bytes.len() as u64).min(u - s.at));
+                            s.at += keep;
+                            s.last = last;
+                            s.first.get_or_insert(last);
+                            keep as usize
+                        };
+                        file.write_all(&bytes[..keep]).map_err(|e| tr!("{what}: não consegui gravar no disco: {e}", "{what}: couldn't write to the disk: {e}"))?;
+                        at += keep as u64;
+                        if !moved(keep as u64) {
+                            return Err(CANCELLED.into());
+                        }
+                    }
+                    // The body ended early when a known end wasn't reached.
+                    Got::End if until().is_none_or(|u| at >= u) => return Ok(at),
+                    Got::End => break "the answer ended early".into(),
+                    Got::Failed(e) if failures >= RETRIES && at == before => return Err(tr!("{what}: sem conexão com o Google: {e}", "{what}: no connection to Google: {e}")),
+                    Got::Failed(e) => break e,
+                }
+            };
+            crate::log(&format!("download {at}..{:?}: {why} after {:.1} s and {} bytes; asking again", until(), asked.elapsed().as_secs_f64(), at - before));
+            // A dropped connection that brought bytes is asked again at once; only drops that
+            // get nowhere wait, and add up to giving up. A segment whose rest others took over
+            // meanwhile is done.
+            if at > before || until() == Some(at) {
+                failures = 0;
+                continue;
             }
+            if failures >= RETRIES {
+                return Err(tr!("{what}: a conexão caiu várias vezes; tente de novo.", "{what}: the connection dropped several times; try again."));
+            }
+            if !backoff(failures, moved) {
+                return Err(CANCELLED.into());
+            }
+            failures += 1;
         }
     }
+}
+
+/// What a request read on its own thread brings, in order: its status (with the body, for an
+/// error), then its bytes, then how it ended.
+enum Got {
+    Head(u16, String),
+    Bytes(Vec<u8>),
+    End,
+    Failed(String),
+}
+
+/// Sends `req` on a thread of its own, which hands over what comes back as it comes; it stops
+/// when the receiver is dropped. A whole file where a part from `at` was asked (an export takes
+/// no Range) comes without its first `at` bytes.
+fn ask(req: ureq::RequestBuilder<ureq::typestate::WithoutBody>, at: u64) -> std::sync::mpsc::Receiver<Got> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(16);
+    std::thread::spawn(move || {
+        let mut r = match req.call() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(Got::Failed(e.to_string()));
+                return;
+            }
+        };
+        let status = r.status().as_u16();
+        if !matches!(status, 200 | 206) {
+            let text = r.body_mut().read_to_string().unwrap_or_default();
+            let _ = tx.send(Got::Head(status, text));
+            return;
+        }
+        if tx.send(Got::Head(status, String::new())).is_err() {
+            return;
+        }
+        let mut body = r.into_body().into_reader();
+        if status == 200 && at > 0 && !matches!(std::io::copy(&mut (&mut body).take(at), &mut std::io::sink()), Ok(n) if n == at) {
+            let _ = tx.send(Got::Failed("dropped while skipping to where it was".into()));
+            return;
+        }
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let got = match body.read(&mut buf) {
+                Ok(0) => Got::End,
+                Ok(n) => Got::Bytes(buf[..n].to_vec()),
+                Err(e) => Got::Failed(e.to_string()),
+            };
+            let last = !matches!(got, Got::Bytes(_));
+            if tx.send(got).is_err() || last {
+                return;
+            }
+        }
+    });
+    rx
 }
 
 #[cfg(test)]
@@ -411,6 +634,52 @@ mod tests {
 
     fn content(n: usize) -> Vec<u8> {
         (0..n as u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect()
+    }
+
+    /// Whether no download left a part file in `dir`.
+    fn no_parts(dir: &Path) -> bool {
+        std::fs::read_dir(dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".openexplorer-part"))
+    }
+
+    /// The same file asked twice into one folder at once (a copy started twice): both downloads
+    /// finish, the file is whole, and no part file is left.
+    #[test]
+    fn two_downloads_to_one_place_both_finish() {
+        let data = content(2 * 1024 * 1024 + 5);
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let served = data.clone();
+        let fake = std::thread::spawn(move || {
+            let conns: Vec<_> = (0..2).map(|_| server.accept().unwrap().0).collect();
+            let feeds: Vec<_> = conns
+                .into_iter()
+                .map(|c| {
+                    let served = served.clone();
+                    std::thread::spawn(move || {
+                        let mut s = BufReader::new(c);
+                        request(&mut s);
+                        answer(&mut s, "200 OK", "", &served, served.len(), None);
+                    })
+                })
+                .collect();
+            feeds.into_iter().for_each(|f| f.join().unwrap());
+        });
+        let dir = scratch("twice");
+        let to = dir.join("a.bin");
+        let file = drive_file("ab", "a.bin", Some(data.len() as u64), "application/octet-stream");
+        let runs: Vec<_> = (0..2)
+            .map(|_| {
+                let (d, file, to) = (Drive::for_tests(format!("{base}/")), file.clone(), to.clone());
+                std::thread::spawn(move || d.download(&file, &to, false, &mut |_| true))
+            })
+            .collect();
+        for r in runs {
+            assert_eq!(r.join().unwrap().unwrap(), data.len() as u64);
+        }
+        fake.join().unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), data);
+        assert!(no_parts(&dir));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn scratch(tag: &str) -> PathBuf {
@@ -468,7 +737,7 @@ mod tests {
         fake.join().unwrap();
         assert_eq!(n.unwrap(), data.len() as u64);
         assert_eq!(std::fs::read(&to).unwrap(), data);
-        assert!(!part_path(&to).exists(), "the part file took the final name");
+        assert!(no_parts(&dir), "the part file took the final name");
         // The bar only went forward: the resumed part continued from 1 MB.
         assert!(seen.windows(2).all(|w| w[0] <= w[1]));
         assert!(seen.contains(&(1 << 20)));
@@ -528,6 +797,106 @@ mod tests {
     }
 
     #[test]
+    fn a_slow_segment_hands_the_rest_of_its_part_to_the_others() {
+        let data = content(4 * 1024 * 1024 + 3);
+        let size = data.len() as u64;
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let asked: std::sync::Arc<Mutex<Vec<(u64, u64)>>> = Default::default();
+        let (served, log) = (data.clone(), asked.clone());
+        std::thread::spawn(move || {
+            for conn in server.incoming() {
+                let mut s = BufReader::new(conn.unwrap());
+                let (_, h) = request(&mut s);
+                let (a, b) = parse_range(header(&h, "range").unwrap(), size);
+                log.lock().unwrap().push((a, b));
+                let part = served[a as usize..b as usize].to_vec();
+                std::thread::spawn(move || {
+                    let head = format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {a}-{}/{size}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", b - 1, part.len());
+                    let w = s.get_mut();
+                    let _ = w.write_all(head.as_bytes());
+                    // The first segment's first answer trickles; the client may hang up on it.
+                    for chunk in part.chunks(if a == 0 { 8 * 1024 } else { part.len() }) {
+                        if a == 0 {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        if w.write_all(chunk).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let dir = scratch("split");
+        let to = dir.join("grande.iso");
+        let d = Drive::for_tests(format!("{base}/"));
+        let file = drive_file("big", "grande.iso", Some(size), "application/octet-stream");
+        let started = Instant::now();
+        let mut last = 0;
+        let split = Split { ask: 0.05, after: 0.05, min: 64 * 1024, stall: Duration::from_secs(5) };
+        let n = d.download_split(&file, &to, 4, split, &mut |n| {
+            last = n;
+            true
+        });
+        assert_eq!(n.unwrap(), size);
+        assert_eq!(last, size, "each byte counted once");
+        assert_eq!(std::fs::read(&to).unwrap(), data);
+        let asked = asked.lock().unwrap().clone();
+        let step = size.div_ceil(4);
+        assert!(asked.iter().any(|&(a, _)| a > 0 && a < step), "the slow first segment was taken over: {asked:?}");
+        // Alone, the first segment trickles for over half a second (128 chunks, 5 ms each).
+        assert!(started.elapsed() < Duration::from_millis(400), "{:?}", started.elapsed());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_stalled_segment_is_asked_again_and_its_rest_taken_over() {
+        let data = content(4 * 1024 * 1024 + 3);
+        let size = data.len() as u64;
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let served = data.clone();
+        std::thread::spawn(move || {
+            let mut stalled = false;
+            for conn in server.incoming() {
+                let mut s = BufReader::new(conn.unwrap());
+                let (_, h) = request(&mut s);
+                let (a, b) = parse_range(header(&h, "range").unwrap(), size);
+                let part = served[a as usize..b as usize].to_vec();
+                // The first segment's first answer sends a little, then nothing for 10 s.
+                let stall = a == 0 && !std::mem::replace(&mut stalled, true);
+                std::thread::spawn(move || {
+                    let head = format!("HTTP/1.1 206 Partial Content
+Content-Range: bytes {a}-{}/{size}
+Content-Length: {}
+Connection: close
+
+", b - 1, part.len());
+                    let w = s.get_mut();
+                    let _ = w.write_all(head.as_bytes());
+                    if stall {
+                        let _ = w.write_all(&part[..64 * 1024]);
+                        let _ = w.flush();
+                        std::thread::sleep(Duration::from_secs(10));
+                    }
+                    let _ = w.write_all(&part);
+                });
+            }
+        });
+        let dir = scratch("stall");
+        let to = dir.join("grande.iso");
+        let d = Drive::for_tests(format!("{base}/"));
+        let file = drive_file("big", "grande.iso", Some(size), "application/octet-stream");
+        let started = Instant::now();
+        let split = Split { ask: 0.05, after: 0.05, min: 64 * 1024, stall: Duration::from_millis(300) };
+        let n = d.download_split(&file, &to, 4, split, &mut |_| true);
+        assert_eq!(n.unwrap(), size);
+        assert_eq!(std::fs::read(&to).unwrap(), data);
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn cancelling_stops_the_download_and_leaves_no_part_file() {
         let data = content(2 * 1024 * 1024);
         let server = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -545,7 +914,7 @@ mod tests {
         let file = drive_file("c", "a.bin", Some(data.len() as u64), "application/zip");
         let out = d.download(&file, &to, false, &mut |n| n < 300_000);
         assert_eq!(out.unwrap_err(), CANCELLED);
-        assert!(!to.exists() && !part_path(&to).exists());
+        assert!(!to.exists() && no_parts(&dir));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -587,6 +956,6 @@ mod tests {
         assert_eq!(f("Nota.docx", "application/vnd.google-apps.document"), "Nota.docx");
         assert_eq!(f("foto.jpg", "image/jpeg"), "foto.jpg");
         assert_eq!(export_format("application/vnd.google-apps.form"), None);
-        assert_eq!(part_path(Path::new(r"C:\a\b.txt")), Path::new(r"C:\a\b.txt.openexplorer-part"));
+        assert_eq!(part_path(Path::new(r"C:\a\b.txt"), 7), PathBuf::from(format!(r"C:\a\b.txt.{}-7.openexplorer-part", std::process::id())));
     }
 }

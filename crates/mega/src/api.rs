@@ -112,6 +112,28 @@ impl Default for Api {
 
 /// An agent that hands back error statuses instead of failing, so the 402 challenge and MEGA's
 /// bodies can be read.
+/// The one agent every upload and download shares, so their connections to MEGA's storage
+/// servers are kept and used again (a file often goes to a server an earlier one went to):
+/// each transfer opening its own, a file of 512 KiB took 2 s to send, against 0.65 s over a
+/// connection already open.
+pub(crate) fn transfers() -> ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .timeout_connect(Some(Duration::from_secs(30)))
+                .timeout_recv_response(Some(Duration::from_secs(120)))
+                .timeout_per_read(Some(Duration::from_secs(120)))
+                .max_idle_connections(64)
+                .max_idle_connections_per_host(16)
+                .user_agent("OpenExplorer")
+                .build()
+                .into()
+        })
+        .clone()
+}
+
 pub(crate) fn agent(read: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)

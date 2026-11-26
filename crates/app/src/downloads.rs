@@ -2,7 +2,8 @@
 //!
 //! Each row is one selected item. Workers (Downloads simultâneos in Opções, 4 unless changed)
 //! share one list of work: reading a Drive folder, which makes its subfolders on the computer
-//! and adds them and its files to the list, and fetching a file. Files start arriving as soon
+//! and adds them and its files to the list, and fetching a file. A worker reads up to
+//! [`openexplorer_gdrive::api::MANY`] queued folders at once, in one listing. Files start arriving as soon
 //! as their folder is read, so a big tree shows progress at once. A folder row's size grows as
 //! its folders are read; its state counts items done.
 //!
@@ -15,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use openexplorer_gdrive::api::FOLDER_MIME;
+use openexplorer_gdrive::api::{FOLDER_MIME, MANY};
 use openexplorer_gdrive::download::{export_format, local_name};
 use openexplorer_gdrive::{Drive, DriveFile};
 
@@ -117,58 +118,79 @@ pub fn run(
         for _ in 0..at_once.max(1) {
             scope.spawn(|| {
                 while let Some((work, _finished)) = queue.next() {
-                    let row = work.row();
-                    let (p, st) = (&rows[row], &state[row]);
-                    if p.cancelled() || st.error.lock().map(|e| e.is_some()).unwrap_or(true) {
-                        st.skipped.store(true, Ordering::Relaxed);
-                    } else {
-                        if p.stage() == Stage::Waiting {
-                            p.begin();
-                        }
-                        let result = match &work {
-                            Work::Folder { row, id, dir } => {
-                                let fresh = visited.lock().unwrap().insert((*row, id.clone()));
-                                if fresh { read_folder(d, *row, id, dir, &names) } else { Ok(Vec::new()) }.map(|more| {
-                                    // The folder's contents join the row before this item counts
-                                    // as done, so the row can't end in between.
-                                    let bytes: u64 = more.iter().map(|w| if let Work::File { file, .. } = w { known_size(file) } else { 0 }).sum();
-                                    p.size(st.total.fetch_add(bytes, Ordering::Relaxed) + bytes);
-                                    st.left.fetch_add(more.len(), Ordering::Relaxed);
-                                    p.add_items(more.len() as u64);
-                                    queue.add(more);
-                                })
-                            }
-                            Work::File { file, to, .. } => fetch(d, file, to, segmented, p).map(|n| {
-                                // An export's size is known only now.
-                                if known_size(file) == 0 && n > 0 {
-                                    p.size(st.total.fetch_add(n, Ordering::Relaxed) + n);
-                                }
-                            }),
-                        };
-                        match result {
-                            Ok(()) => {}
-                            Err(e) if e == CANCELLED => st.skipped.store(true, Ordering::Relaxed),
-                            Err(e) => {
-                                if let Ok(mut first) = st.error.lock() {
-                                    first.get_or_insert(e);
-                                }
-                            }
+                    // Other folders waiting are read with this one, in one listing.
+                    let mut group = vec![work];
+                    if matches!(group[0], Work::Folder { .. }) {
+                        group.extend(queue.take(MANY - 1, |w| matches!(w, Work::Folder { .. })));
+                    }
+                    let skip = |row: usize| rows[row].cancelled() || state[row].error.lock().map(|e| e.is_some()).unwrap_or(true);
+                    let mut to_read = Vec::new();
+                    for (k, w) in group.iter().enumerate() {
+                        if let Work::Folder { row, id, dir } = w
+                            && !skip(*row)
+                            && visited.lock().unwrap().insert((*row, id.clone()))
+                        {
+                            to_read.push((k, *row, id.as_str(), dir.as_path()));
                         }
                     }
-                    p.item_done();
-                    // The row's last piece of work ends it.
-                    if st.left.fetch_sub(1, Ordering::Relaxed) == 1 {
-                        let error = st.error.lock().ok().and_then(|e| e.clone());
-                        p.end(match error {
-                            Some(e) => Err(e),
-                            None if st.skipped.load(Ordering::Relaxed) => {
-                                // A cancelled row takes away what it made, as a cancelled copy
-                                // does: what's left in the destination is only whole items.
-                                let _ = if st.made.is_dir() { std::fs::remove_dir_all(&st.made) } else { std::fs::remove_file(&st.made) };
-                                Err(CANCELLED.into())
+                    let mut read: Vec<Option<Result<Vec<Work>, String>>> = (0..group.len()).map(|_| None).collect();
+                    for ((k, ..), r) in to_read.iter().zip(read_folders(d, &to_read, &names)) {
+                        read[*k] = Some(r);
+                    }
+                    for (work, listed) in group.into_iter().zip(read) {
+                        let row = work.row();
+                        let (p, st) = (&rows[row], &state[row]);
+                        if skip(row) {
+                            st.skipped.store(true, Ordering::Relaxed);
+                        } else {
+                            if p.stage() == Stage::Waiting {
+                                p.begin();
                             }
-                            None => finish(row, &st.made),
-                        });
+                            let result = match &work {
+                                Work::Folder { .. } => {
+                                    // Not read: it was read already in this row (a shortcut back up).
+                                    listed.unwrap_or(Ok(Vec::new())).map(|more| {
+                                        // The folder's contents join the row before this item counts
+                                        // as done, so the row can't end in between.
+                                        let bytes: u64 = more.iter().map(|w| if let Work::File { file, .. } = w { known_size(file) } else { 0 }).sum();
+                                        p.size(st.total.fetch_add(bytes, Ordering::Relaxed) + bytes);
+                                        st.left.fetch_add(more.len(), Ordering::Relaxed);
+                                        p.add_items(more.len() as u64);
+                                        queue.add(more);
+                                    })
+                                }
+                                Work::File { file, to, .. } => fetch(d, file, to, segmented, p).map(|n| {
+                                    // An export's size is known only now.
+                                    if known_size(file) == 0 && n > 0 {
+                                        p.size(st.total.fetch_add(n, Ordering::Relaxed) + n);
+                                    }
+                                }),
+                            };
+                            match result {
+                                Ok(()) => {}
+                                Err(e) if e == CANCELLED => st.skipped.store(true, Ordering::Relaxed),
+                                Err(e) => {
+                                    if let Ok(mut first) = st.error.lock() {
+                                        first.get_or_insert(e);
+                                    }
+                                }
+                            }
+                        }
+                        p.item_done();
+                        // The row's last piece of work ends it.
+                        if st.left.fetch_sub(1, Ordering::Relaxed) == 1 {
+                            let error = st.error.lock().ok().and_then(|e| e.clone());
+                            p.end(match error {
+                                Some(e) => Err(e),
+                                None if st.skipped.load(Ordering::Relaxed) => {
+                                    // A cancelled row takes away what it made, as a cancelled copy
+                                    // does: what's left in the destination is only whole items.
+                                    let _ = if st.made.is_dir() { std::fs::remove_dir_all(&st.made) } else { std::fs::remove_file(&st.made) };
+                                    Err(CANCELLED.into())
+                                }
+                                None => finish(row, &st.made),
+                            });
+                        }
                     }
                 }
             });
@@ -177,16 +199,43 @@ pub fn run(
     batch.summary()
 }
 
+/// Reads the Drive folders `list` (each `(_, row, id, local folder)`): one listing for all of
+/// them, or one each if Drive refuses that one. Gives each folder's work, in `list`'s order.
+fn read_folders(d: &Drive, list: &[(usize, usize, &str, &Path)], names: &Names) -> Vec<Result<Vec<Work>, String>> {
+    if list.len() > 1 {
+        let ids: Vec<&str> = list.iter().map(|(_, _, id, _)| *id).collect();
+        let mut children: std::collections::HashMap<String, Vec<DriveFile>> = ids.iter().map(|id| (id.to_string(), Vec::new())).collect();
+        let together = d.list_many(&ids, |page| {
+            for (parent, f) in page {
+                children.entry(parent).or_default().push(f);
+            }
+            true
+        });
+        match together {
+            // Cloned, not taken: one folder may be here twice (a folder and a shortcut to it,
+            // both selected), and each of its rows gets its contents.
+            Ok(()) => return list.iter().map(|(_, row, id, dir)| works_in(*row, dir, children.get(*id).cloned().unwrap_or_default(), names)).collect(),
+            Err(e) => openexplorer_gdrive::log(&format!("download: {} pastas numa listagem só não deu ({e}); uma a uma", list.len())),
+        }
+    }
+    list.iter().map(|(_, row, id, dir)| read_folder(d, *row, id, dir, names)).collect()
+}
+
 /// Lists Drive folder `id`, makes its subfolders in `dir`, and gives the work for what's in it.
-/// Shortcuts to files and Google's formats that can't be exported (Forms, Sites) stay out:
-/// there's nothing to fetch.
 fn read_folder(d: &Drive, row: usize, id: &str, dir: &Path, names: &Names) -> Result<Vec<Work>, String> {
-    std::fs::create_dir_all(dir).map_err(|e| openexplorer_i18n::tr!("Não consegui criar a pasta \"{}\": {e}", "Couldn't create the folder \"{}\": {e}", dir.display()))?;
     let mut children = Vec::new();
     d.list(id, None, |page, _| {
         children.extend(page);
         true
     })?;
+    works_in(row, dir, children, names)
+}
+
+/// Makes local folder `dir` and the subfolders of `children` (a Drive folder's contents) in it,
+/// and gives the work for what's in it. Shortcuts to files and Google's formats that can't be
+/// exported (Forms, Sites) stay out: there's nothing to fetch.
+fn works_in(row: usize, dir: &Path, children: Vec<DriveFile>, names: &Names) -> Result<Vec<Work>, String> {
+    std::fs::create_dir_all(dir).map_err(|e| openexplorer_i18n::tr!("Não consegui criar a pasta \"{}\": {e}", "Couldn't create the folder \"{}\": {e}", dir.display()))?;
     let mut work = Vec::new();
     for f in children {
         if !f.is_dir && google(&f) && export_format(&f.mime).is_none() {

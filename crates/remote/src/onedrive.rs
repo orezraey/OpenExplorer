@@ -37,6 +37,14 @@ impl Conn for OneDrive {
         Ok(self.account.list(dir)?.into_iter().map(item).collect())
     }
 
+    fn read_ahead(&mut self, dir: &str) {
+        self.account.read_ahead(dir);
+    }
+
+    fn list_pages(&mut self, dir: &str, page: &mut dyn FnMut(Vec<Item>, bool) -> bool) -> Result<()> {
+        self.account.list_paged(dir, &mut |items, more| page(items.into_iter().map(item).collect(), more))
+    }
+
     fn stat(&mut self, path: &str) -> Result<Option<Item>> {
         Ok(self.account.stat(path)?.map(item))
     }

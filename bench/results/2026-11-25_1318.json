@@ -1,0 +1,126 @@
+﻿{
+    "date":  "2026-11-25T13:18:24",
+    "machine":  {
+                    "ram_gb":  31,
+                    "cpu":  "AMD Ryzen 7 9700X 8-Core Processor",
+                    "build":  "10.0.26300.0",
+                    "os":  "Microsoft Windows 11 Pro"
+                },
+    "runs":  5,
+    "apps":  {
+                 "openexplorer":  {
+                                      "version":  "0.4.0 (8c1d8dc)",
+                                      "exe_mb":  50.9,
+                                      "system32":  {
+                                                       "median":  0.034,
+                                                       "seconds":  [
+                                                                       0.033,
+                                                                       0.034,
+                                                                       0.034,
+                                                                       0.039,
+                                                                       0.033
+                                                                   ],
+                                                       "items":  5040
+                                                   },
+                                      "winsxs":  {
+                                                     "median":  0.172,
+                                                     "seconds":  [
+                                                                     0.158,
+                                                                     0.159,
+                                                                     0.176,
+                                                                     0.175,
+                                                                     0.172
+                                                                 ],
+                                                     "items":  28491
+                                                 },
+                                      "drive-1000-folders":  {
+                                                                 "median":  0.033,
+                                                                 "seconds":  [
+                                                                                 0.033,
+                                                                                 0.033,
+                                                                                 0.033,
+                                                                                 0.033,
+                                                                                 0.033
+                                                                             ],
+                                                                 "items":  1000
+                                                             },
+                                      "start":  {
+                                                    "median":  0.128,
+                                                    "seconds":  [
+                                                                    0.126,
+                                                                    0.181,
+                                                                    0.172,
+                                                                    0.126,
+                                                                    0.128
+                                                                ]
+                                                },
+                                      "memory_idle":  {
+                                                          "processes":  1,
+                                                          "working_set_mb":  156.6,
+                                                          "private_mb":  163.6
+                                                      },
+                                      "memory_1000_folders":  {
+                                                                  "processes":  1,
+                                                                  "working_set_mb":  173.5,
+                                                                  "private_mb":  174.6
+                                                              }
+                                  },
+                 "airexplorer":  {
+                                     "version":  "6.0.0.0",
+                                     "exe_mb":  10.4,
+                                     "system32":  {
+                                                      "median":  0.152,
+                                                      "seconds":  [
+                                                                      0.152,
+                                                                      0.152,
+                                                                      0.155,
+                                                                      0.151,
+                                                                      0.143
+                                                                  ],
+                                                      "items":  5040
+                                                  },
+                                     "winsxs":  {
+                                                    "median":  1.069,
+                                                    "seconds":  [
+                                                                    1.03,
+                                                                    1.069,
+                                                                    1.041,
+                                                                    1.075,
+                                                                    1.071
+                                                                ],
+                                                    "items":  28491
+                                                },
+                                     "drive-1000-folders":  {
+                                                                "median":  0.103,
+                                                                "seconds":  [
+                                                                                0.103,
+                                                                                0.103,
+                                                                                0.109,
+                                                                                0.098,
+                                                                                0.101
+                                                                            ],
+                                                                "items":  1000
+                                                            },
+                                     "start":  {
+                                                   "median":  2.585,
+                                                   "seconds":  [
+                                                                   2.585,
+                                                                   2.61,
+                                                                   2.585,
+                                                                   2.606,
+                                                                   2.577
+                                                               ]
+                                               },
+                                     "memory_idle":  {
+                                                         "processes":  1,
+                                                         "working_set_mb":  230.8,
+                                                         "private_mb":  197.5
+                                                     },
+                                     "memory_1000_folders":  {
+                                                                 "processes":  1,
+                                                                 "working_set_mb":  240,
+                                                                 "private_mb":  201.9
+                                                             }
+                                 }
+             }
+}
