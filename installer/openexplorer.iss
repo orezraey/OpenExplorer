@@ -32,6 +32,7 @@ SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayIcon={app}\openexplorer.exe
 UninstallDisplayName=Open Explorer
+SetupIconFile=..\crates\app\assets\icon.ico
 ; An update closes a running copy first.
 CloseApplications=yes
 RestartApplications=no

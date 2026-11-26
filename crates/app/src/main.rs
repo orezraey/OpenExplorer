@@ -41,6 +41,7 @@ mod sysicons;
 mod tabs;
 mod telegram;
 mod transfers;
+mod tray;
 mod tree;
 mod undo;
 mod updater;
@@ -312,6 +313,7 @@ struct State {
     account_form: Option<Box<servers::Form>>,
     account_win: Option<rune::AppHandle<State>>,
     main_win: Option<rune::AppHandle<State>>,
+    tray: Option<rune::Tray>,
     account_dirty: bool,
     /// Whether the account window was last asked to show (and not closed since).
     account_shown: bool,
@@ -479,6 +481,7 @@ impl State {
             account_form: None,
             account_win: None,
             main_win: None,
+            tray: None,
             account_dirty: false,
             account_shown: false,
             account_closes: 0,
@@ -684,6 +687,7 @@ fn init() -> State {
         account_form: None,
         account_win: None,
         main_win: None,
+        tray: None,
         account_dirty: false,
         account_shown: false,
         account_closes: 0,
@@ -2669,6 +2673,14 @@ fn main() {
     // Rune's own words (a text field's menu, the window buttons' names for screen readers) in
     // the app's language.
     rune::set_labels(rune_labels);
+    if !rune::is_headless() {
+        #[cfg(target_os = "windows")]
+        rune::set_app_icon_resource(1);
+        // macOS: the Dock and the app switcher. Linux: each window's icon (X11, and Wayland where
+        // the compositor takes one), for title bars and switchers when no desktop entry matches.
+        #[cfg(not(target_os = "windows"))]
+        let _ = rune::set_app_icon(include_bytes!("../assets/icon.png").as_slice());
+    }
     // Apply an update downloaded in an earlier run before opening the window. Not when this start
     // is the helper reporting that installing it failed: trying again at once would bring the
     // same refusal (a declined UAC prompt, a locked file) back at every start, the window never
@@ -3266,7 +3278,8 @@ fn main() {
         .init(move || {
             let mut s = init();
             s.account_win = Some(account_handle);
-            s.main_win = Some(main_handle);
+            s.main_win = Some(main_handle.clone());
+            s.tray = tray::start(main_handle);
             s
         })
         .run();
