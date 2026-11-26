@@ -16,9 +16,10 @@ pub fn menu() -> Vec<rune::TrayItem> {
     ]
 }
 
-/// Starts the system tray icon on supported platforms when not running headless.
+/// Starts the system tray icon on Windows and Linux when not running headless. Not on macOS,
+/// where a menu bar icon is the exception and Cmd+Q already quits.
 pub fn start(main_win: rune::AppHandle<State>) -> Option<rune::Tray> {
-    if rune::is_headless() {
+    if rune::is_headless() || cfg!(target_os = "macos") {
         return None;
     }
     let spec = rune::TraySpec::new(

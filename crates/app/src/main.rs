@@ -2669,7 +2669,9 @@ fn main() {
     if !rune::is_headless() {
         #[cfg(target_os = "windows")]
         rune::set_app_icon_resource(1);
-        #[cfg(target_os = "macos")]
+        // macOS: the Dock and the app switcher. Linux: each window's icon (X11, and Wayland where
+        // the compositor takes one), for title bars and switchers when no desktop entry matches.
+        #[cfg(not(target_os = "windows"))]
         let _ = rune::set_app_icon(include_bytes!("../assets/icon.png").as_slice());
     }
     // Apply an update downloaded in an earlier run before opening the window. Not when this start

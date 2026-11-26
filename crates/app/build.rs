@@ -1,6 +1,6 @@
 //! Embeds `assets/icon.ico` as the Windows executable's application icon resource (ID 1).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/icon.ico");
@@ -98,6 +98,5 @@ fn build_win32_res(ico: &[u8]) -> Vec<u8> {
 
     // RT_GROUP_ICON = 14, resource ID = 1
     push_res_entry(&mut out, 14, 1, 0x1030, 0x0409, &grp);
-    let _ = Path::new("");
     out
 }
