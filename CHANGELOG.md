@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.6.0 - 2026-11-26
+
+### Added
+
+* When a file with the same name is already where a copy, move, download or upload goes, a
+  window asks what to do: replace it, leave it, keep both (it shows the new name, as
+  `file (2).ext`), or copy only the files that are newer. It shows both files' size and date,
+  marks the newer one, and Apply to all conflicts answers once for the rest. Cancel stops the
+  items not yet started. It works between the computer, Google Drive, the other clouds and the
+  servers, in every direction. Rows left out show Skipped in the transfer queue.
+* A folder that already exists at the destination is merged with the one that arrives, instead
+  of a second copy beside it. On the computer and on servers, a replaced file is written in full
+  before the old one goes, so a cancel or a dropped connection leaves the old one.
+* Google Drive search can look in the current folder, in the whole account (My Drive, Shared
+  with me and every shared drive), or in all your Google accounts at once, from a menu in the
+  search bar. Results come in as each account answers, and an account that fails doesn't stop
+  the others. The Location column says where each item is, with its account when the search
+  covers several.
+* Open Explorer has its own icon in the window, the taskbar, the installer and the macOS app.
+  On Windows and Linux an icon in the notification area opens the window or quits; Quit asks
+  first while transfers run.
+* The transfer queue has Clear finished.
+
+### Changed
+
+* Finished transfers stay in the queue until you clear them. Clear finished automatically moved
+  from Options › General to Options › Transfers and is off unless you turn it on.
+
+### Fixed
+
+* Cut from Starred, Recent, Shared with me or a search, then paste, moves the items from their
+  own folder. Before, each row failed and the items stayed where they were. An item only shared
+  with the account, in none of its folders, can't be moved, and the row suggests Copy.
+* Restore defaults in Options also resets the limits of transfers already running.
+
 ## 0.5.1 - 2026-11-26
 
 ### Fixed
