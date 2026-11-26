@@ -148,7 +148,12 @@ pub fn drag(s: &mut State, p: usize, d: &mut Drag, tx: &mut Tx) {
                 tx.wake_after(std::time::Duration::from_millis(16));
             }
         }
-        Phase::Up => released(s, p, d.cancelled()),
+        Phase::Up => {
+            released(s, p, d.cancelled());
+            if s.lasso_fade.is_some() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+        }
     }
 }
 
@@ -157,6 +162,8 @@ pub fn drag(s: &mut State, p: usize, d: &mut Drag, tx: &mut Tx) {
 /// (which doesn't run under this one) would make it. True when it started a lasso.
 pub fn press(s: &mut State, p: usize, at: [f32; 2], ctrl: bool) -> bool {
     s.active = p;
+    s.kbd_sel[p].stop();
+    s.lasso_fade = None;
     if at[1] < HEADER_H {
         return false;
     }
@@ -193,6 +200,9 @@ pub fn moved(s: &mut State, p: usize, at: [f32; 2]) -> bool {
 pub fn released(s: &mut State, p: usize, cancelled: bool) {
     let Some(l) = s.lasso.take_if(|l| l.pane == p) else { return };
     let scroll = s.views[p].scroll.get();
+    if l.moved && s.settings.selection_animated() {
+        s.lasso_fade = Some(crate::anim::LassoFade { pane: p, rect: l.rect(scroll), started: s.now });
+    }
     let row_h = s.zoom[p].row_height();
     let pane = &mut s.panes[p];
     if cancelled {

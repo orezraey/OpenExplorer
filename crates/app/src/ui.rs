@@ -5320,6 +5320,15 @@ fn tree_line(s: &State, k: &Kit, p: usize, line: &crate::tree::Line) -> El {
     };
     let arrow = if node.opens && !empty {
         let n = node.clone();
+        let chevron = if s.settings.selection_animated() {
+            icon(&icons::CHEVRON, 12.0)
+                .color(k.c.icon_faint)
+                .origin(0.5, 0.5)
+                .rotate(if open { std::f32::consts::FRAC_PI_2 } else { 0.0 })
+                .rotate_motion(crate::anim::ui_spring())
+        } else {
+            icon(if open { &icons::CHEVRON_DOWN } else { &icons::CHEVRON }, 12.0).color(k.c.icon_faint)
+        };
         row()
             .key("arrow")
             .size(16.0, 16.0)
@@ -5328,7 +5337,7 @@ fn tree_line(s: &State, k: &Kit, p: usize, line: &crate::tree::Line) -> El {
             .hover(k.alpha(k.c.text_base, 0.08))
             .cursor(Cursor::Pointer)
             .on_press(move |s: &mut State| crate::tree::toggle(s, p, &n))
-            .child(icon(if open { &icons::CHEVRON_DOWN } else { &icons::CHEVRON }, 12.0).color(k.c.icon_faint))
+            .child(chevron)
     } else {
         el().size(16.0, 16.0)
     };
@@ -5686,38 +5695,79 @@ fn searched_words(loc: &Location) -> Vec<Vec<u8>> {
 }
 
 /// The rectangle a lasso in pane `p` draws, in the list's content (so it scrolls with the
-/// rows), cut to what the viewport shows.
+/// rows), cut to what the viewport shows. Also draws the smooth fade-out on release.
 fn lasso_rect(s: &State, k: &Kit, p: usize) -> Option<El> {
-    let l = s.lasso.as_ref().filter(|l| l.pane == p && l.moved)?;
     let view = &s.views[p];
     let scroll = view.scroll.get();
-    let [x0, y0, x1, y1] = l.rect(scroll);
+    let (rect, alpha) = if let Some(l) = s.lasso.as_ref().filter(|l| l.pane == p && l.moved) {
+        (l.rect(scroll), 1.0)
+    } else if let Some(fade) = s.lasso_fade.filter(|f| f.pane == p) {
+        let a = fade.opacity(s.now);
+        if a <= 0.01 {
+            return None;
+        }
+        (fade.rect, a)
+    } else {
+        return None;
+    };
+    let [x0, y0, x1, y1] = rect;
     // Before the first layout says how big the viewport is, nothing is cut.
     let known = |size: f32, minus: f32| if size > 0.0 { (size - minus).max(0.0) } else { f32::MAX / 4.0 };
     let (left, right) = (scroll.x, scroll.x + known(view.rect[2], 0.0));
     let (top, bottom) = (scroll.y, scroll.y + known(scroll.h, HEADER_H));
     let (x0, x1) = (x0.clamp(left, right), x1.clamp(left, right));
     let (y0, y1) = (y0.clamp(top, bottom), y1.clamp(top, bottom));
-    Some(el().key("lasso").absolute(x0, HEADER_H + y0).size(x1 - x0, y1 - y0).fill(k.alpha(k.c.text_accent, 0.14)).border(1.0, k.alpha(k.c.text_accent, 0.7)))
+    Some(
+        el().key("lasso")
+            .absolute(x0, HEADER_H + y0)
+            .size(x1 - x0, y1 - y0)
+            .radius(2.0)
+            .fill(k.alpha(k.c.text_accent, 0.14 * alpha))
+            .border(1.0, k.alpha(k.c.text_accent, 0.7 * alpha)),
+    )
 }
 
 fn list(s: &State, k: &Kit, p: usize) -> El {
     let pane = &s.panes[p];
     let w = s.layout.columns[p];
     let total: f32 = w.iter().sum();
-    let arrow = |c: SortCol| if pane.sort.0 == c { if pane.sort.1 { "  ▲" } else { "  ▼" } } else { "" };
+
+    let row_h = s.zoom[p].row_height();
+    let icon_sz = s.zoom[p].icon_size();
+    let hover_glides = s.settings.hover_animated();
+    let sel_anim = s.settings.selection_animated();
+    let clip_anim = s.settings.clipboard_animated();
+    let zebra = s.settings.zebra_stripes;
+
     let head = |i: usize, key: &str, label: &str, c: SortCol, end: bool| {
         let mut h = row()
             .key(key.to_string())
             .w(w[i])
             .h_full()
             .px(8.0)
+            .gap(4.0)
             .center_y()
             .hover(k.c.hover)
             .cursor(Cursor::Pointer)
-            .on_press(move |s: &mut State| set_sort(s, p, c))
-            .child(text(format!("{label}{}", arrow(c))).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0))
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                set_sort(s, p, c);
+                if s.row_reorder[p].is_active() {
+                    tx.wake_at(s.now + 1.0 / 60.0);
+                }
+            })
+            .child(text(label.to_string()).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0))
             .border_sides([0.0, 1.0, 0.0, 0.0], k.c.border_weak);
+        if pane.sort.0 == c {
+            let angle = if pane.sort.1 { -std::f32::consts::FRAC_PI_2 } else { std::f32::consts::FRAC_PI_2 };
+            let chev = icon(&icons::CHEVRON, 10.0)
+                .key(format!("sort-chev-{c:?}"))
+                .animated_changes()
+                .color(k.c.text_muted)
+                .origin(0.5, 0.5)
+                .rotate(angle)
+                .rotate_motion(if sel_anim { crate::anim::hover_curve() } else { Anim::INSTANT });
+            h = h.child(chev);
+        }
         if end {
             h = h.justify_end();
         }
@@ -5738,14 +5788,14 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .child(head(3, "h-kind", if let Some(c) = crate::onedrive::bin_columns(&pane.loc) { c.1 } else if pane.loc.finds() { t("Pasta", "Folder") } else { t("Tipo", "Type") }, SortCol::Kind, false))
         .children(grips);
 
-    let row_h = s.zoom[p].row_height();
-    let icon_sz = s.zoom[p].icon_size();
-    let hover_glides = s.settings.hover_animated();
-    let clip_anim = s.settings.clipboard_animated();
-
     let selected = k.alpha(k.c.text_accent, if k.dark { 0.26 } else { 0.18 });
     let hover = k.alpha(k.c.text_base, if k.dark { 0.065 } else { 0.05 });
+    let zebra_bg = k.alpha(k.c.text_base, if k.dark { 0.028 } else { 0.024 });
     let ring = k.c.border_focus;
+    let kbd_sel_active = sel_anim
+        && s.kbd_sel[p].is_active()
+        && pane.selected.len() == 1
+        && pane.entries.get(s.kbd_sel[p].target_row()).is_some_and(|e| pane.selected.contains(&e.id));
     let (text_c, muted_c) = (k.c.text_base, k.c.text_muted);
     let mut font = k.ty.text_small;
     font.size = s.zoom[p].font_size(font.size);
@@ -5765,20 +5815,29 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         let is_cut = clip_match.is_some_and(|c| c.mode == ClipMode::Cut);
         // As wide as the columns: past them is empty space, where a drag draws a rectangle.
         let mut r = row().key(row_key(&e.id)).role("row").label(shown(&e.name)).focus_selected(is_sel).w(total).h(row_h).center_y();
-        if clip_anim {
+        if sel_anim {
+            r = r.radius(4.0).animated_changes().motion(crate::anim::ui_spring());
+        } else if clip_anim {
             r = r.animated_changes();
         }
-        r = if is_sel {
+        let stripe = if zebra && i % 2 == 1 { zebra_bg } else { Color::TRANSPARENT };
+        r = if is_sel && !kbd_sel_active {
             r.fill(selected)
         } else if hover_glides {
-            r.fill(Color::TRANSPARENT)
+            r.fill(stripe)
         } else {
-            r.hover(hover)
+            r.fill(stripe).hover(hover)
         };
         if clip_anim {
             r = r.opacity(if is_cut { 0.55 } else { 1.0 }).opacity_motion(crate::anim::hover_curve());
         } else if is_cut {
             r = r.opacity(0.55);
+        }
+        if s.row_reorder[p].is_active() {
+            let dy = s.row_reorder[p].offset_px(&e.id, row_h);
+            if dy.abs() > 0.25 {
+                r = r.offset(0.0, dy).offset_motion(Anim::INSTANT);
+            }
         }
         // The keyboard's row is outlined only when it isn't selected (Ctrl+arrows moved it
         // alone): a selected row already shows, and an outline on the end of a Shift range
@@ -5936,10 +5995,23 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
             .opacity(if active.is_some() { 1.0 } else { 0.0 })
             .opacity_motion(curve)
     });
+    // Gliding keyboard selection pill (Cubic Hermite glide on ↑/↓/PageUp/PageDown/Home/End).
+    let kbd_sel_pill = kbd_sel_active.then(|| {
+        let y = s.kbd_sel[p].presented_row() * row_h;
+        el().key("kbd-sel-pill").absolute(0.0, HEADER_H + y).size(total, row_h).radius(4.0).fill(selected)
+    });
     // One viewport scrolls both ways: sideways when the columns are wider than the pane,
     // header and rows together, and up and down with the header stuck to the top. Its
     // vertical bar sits on the pane's right edge, wherever the columns end.
-    let table = col().key("table").w_full().min_w(total + bar.strip()).children(hover_pill).child(header).child(body).children(lasso_rect(s, k, p));
+    let table = col()
+        .key("table")
+        .w_full()
+        .min_w(total + bar.strip())
+        .children(hover_pill)
+        .children(kbd_sel_pill)
+        .child(header)
+        .child(body)
+        .children(lasso_rect(s, k, p));
     // A right click on empty space opens the folder's menu (Colar, Nova pasta); a drag there
     // selects with a rectangle (see `crate::lasso`), which needs where the viewport is.
     // Its key is the pane's own: the scroll bar keeps its state, and finds the viewport it
