@@ -169,6 +169,15 @@ struct State {
     /// The window was asked to close while transfers ran: Fechar o Open Explorer? shows over
     /// everything, the dialog under it untouched (see [`actions::close_requested`]).
     quit_asked: bool,
+    /// The question came from quitting the whole app (macOS: ⌘Q, Encerrar in the Dock, logging
+    /// out), not from closing the window: Fechar mesmo assim then quits it.
+    quit_app: bool,
+    /// Linux: a menu Rune asks for (a text field's Recortar, Copiar, Colar), drawn in the window
+    /// as the system draws none there.
+    popup: Option<rune::PopupMenuRequest>,
+    /// The window opened with the Acrylic background (Opções > Experimental): its page and the
+    /// panes' folder trees show the material. Set at start, as the window's transparency is.
+    acrylic: bool,
     /// Uploads whose clash dialog waits for the one open (or another dialog) to close.
     clash_waiting: std::collections::VecDeque<actions::ClashAsk>,
     /// The name typed in Renomear or Nova pasta, or the e-mail typed in Compartilhar.
@@ -344,6 +353,9 @@ impl State {
             views: Default::default(),
             dialog: None,
             quit_asked: false,
+            quit_app: false,
+            popup: None,
+            acrylic: false,
             clash_waiting: Default::default(),
             name_edit: rune::TextEdit::new(""),
             renaming: None,
@@ -551,6 +563,9 @@ fn init() -> State {
         views: Default::default(),
         dialog: None,
         quit_asked: false,
+        quit_app: false,
+        popup: None,
+        acrylic: settings.acrylic_window(),
         clash_waiting: Default::default(),
         name_edit: rune::TextEdit::new(""),
         renaming: None,
@@ -2239,6 +2254,49 @@ fn view_sample() -> Vec<Entry> {
     ]
 }
 
+/// Rune's own labels in Portuguese while the interface is; English keeps Rune's.
+fn rune_labels(label: rune::Label<'_>) -> Option<String> {
+    use rune::Label as L;
+    if openexplorer_i18n::english() {
+        return None;
+    }
+    Some(match label {
+        L::Cut => "Recortar".into(),
+        L::Copy => "Copiar".into(),
+        L::Paste => "Colar".into(),
+        L::SelectAll => "Selecionar tudo".into(),
+        L::Undo => "Desfazer".into(),
+        L::Redo => "Refazer".into(),
+        L::LearnSpelling => "Aprender ortografia".into(),
+        L::NoGuesses => "Nenhuma sugestão".into(),
+        L::Spellcheck => "Verificação ortográfica".into(),
+        L::SpellcheckLanguages => "Idiomas da verificação ortográfica".into(),
+        L::Minimize => "Minimizar".into(),
+        L::Maximize => "Maximizar".into(),
+        L::Restore => "Restaurar".into(),
+        L::Zoom => "Zoom".into(),
+        L::Close => "Fechar".into(),
+        L::BringAllToFront => "Trazer tudo para a frente".into(),
+        L::StartDictation => "Iniciar ditado…".into(),
+        L::EmojiAndSymbols => "Emoji e símbolos".into(),
+        L::About(app) => format!("Sobre o {app}"),
+        L::Services => "Serviços".into(),
+        L::Hide(app) => format!("Ocultar {app}"),
+        L::HideOthers => "Ocultar outros".into(),
+        L::ShowAll => "Mostrar tudo".into(),
+        L::Quit(app) => format!("Encerrar {app}"),
+        L::MoreNestedLines(1) => "mais 1 linha aninhada".into(),
+        L::MoreNestedLines(n) => format!("mais {n} linhas aninhadas"),
+        L::OpenLink => "Abrir link".into(),
+        L::CopyLink => "Copiar link".into(),
+        L::SaveImageAs => "Salvar imagem como…".into(),
+        L::CopyImage => "Copiar imagem".into(),
+        L::CopyImageAddress => "Copiar endereço da imagem".into(),
+        // A dictionary's or a menu's own name, and labels Rune adds later: as Rune has them.
+        _ => return None,
+    })
+}
+
 fn main() {
     // `openexplorer index …`: this executable as the search service (Windows starts it so), no
     // window at all.
@@ -2259,6 +2317,9 @@ fn main() {
         });
     }
     let initial = settings::Settings::load();
+    // Rune's own words (a text field's menu, the window buttons' names for screen readers) in
+    // the app's language.
+    rune::set_labels(rune_labels);
     accounts::start();
     let main_spec = AppSpec::<State> {
         min_size: Some((900.0, 420.0)),
@@ -2376,6 +2437,9 @@ fn main() {
                 found_scene(s, true);
             }),
             ("found-missing", |s| found_scene(s, false)),
+            // The Acrylic background where the system draws none (a headless run): Rune's
+            // near-opaque neutral tint shows around the panes and through the folder trees.
+            ("acrylic", |s| s.acrylic = true),
             // An upload whose names are taken in the Drive folder: all at once, or the second
             // of three asked on its own.
             ("clash", |s| clash_scene(s, true)),
@@ -2718,6 +2782,10 @@ fn main() {
             if s.is_placeholder {
                 PENDING_MAIN_FOCUS.with(|c| c.set(Some(focused)));
             } else {
+                // Rune dismisses a Linux in-window menu when the window loses focus: it goes.
+                if !focused {
+                    s.popup = None;
+                }
                 accounts::window_focus(s, focused, tx);
             }
         })
@@ -2730,6 +2798,10 @@ fn main() {
             }
         })
         .on_close_request(|s, _| actions::close_requested(s))
+        // macOS: ⌘Q, Encerrar in the Dock, logging out. Elsewhere Rune never calls it.
+        .on_quit_request(actions::quit_requested)
+        // Linux has no system pop-up menu: a text field's is drawn in the window.
+        .on_popup_menu(|s, request, _| s.popup = Some(request))
         // It opens where it was closed, as Explorer's does.
         .on_window(window_place::created)
         .on_window_geometry(|_, _, _| {
@@ -2742,15 +2814,22 @@ fn main() {
     let mica = initial.mica && cfg!(windows);
     STARTED_WITH_MICA.store(mica, Ordering::Relaxed);
     MICA_ASKED.with(|a| a.set(mica.then_some(initial.material)));
-    if place.is_some() || mica {
+    // Experimental too, off Windows: the system's material behind the page and the folder
+    // trees, which also needs a transparent window.
+    let acrylic = initial.acrylic_window();
+    if place.is_some() || mica || acrylic {
         let maximized = place.is_some() && initial.window.is_some_and(|w| w.maximized);
-        main_app = main_app.window_options(rune::WindowOptions { transparent: mica, ..place.unwrap_or_default() }).maximized(maximized);
+        main_app = main_app.window_options(rune::WindowOptions { transparent: mica || acrylic, ..place.unwrap_or_default() }).maximized(maximized);
     }
     if mica {
-        main_app = main_app.window_backdrop(initial.material.backdrop()).color_scheme(initial.theme.color_scheme());
+        main_app = main_app.window_backdrop(initial.material.backdrop());
+    }
+    // The material's tint follows the app's theme, not the system's.
+    if mica || acrylic {
+        main_app = main_app.color_scheme(initial.theme.color_scheme());
     }
     // Experimental: content that keeps up with a drag of the left or top edge. Rune ignores it
-    // in a transparent window, so not with Mica.
+    // in a transparent window, so not with Mica or Acrylic.
     if initial.resize_sync && cfg!(windows) {
         main_app = main_app.resize_sync(rune::ResizeSync::On);
     }
@@ -2881,6 +2960,48 @@ mod tests {
         assert!(s.quit_asked && actions::restarting());
         drop(last);
         assert!(actions::quit_question_done(&mut s) && !actions::restarting());
+    }
+
+    #[test]
+    fn quitting_the_app_asks_like_closing() {
+        let mut s = init();
+        let mut tx = Tx::default();
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Quit);
+        let end = || transfers::End::local(std::path::Path::new(r"C:\x"));
+        let batch = transfers::queue(&mut s.transfers, None, transfers::Op::Copy, [(end(), end())]);
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Defer);
+        assert!(s.quit_asked && s.quit_app);
+        actions::keep_running(&mut s);
+        assert!(!s.quit_asked && !s.quit_app);
+
+        // Asked by a quit, answered with Fechar mesmo assim: the transfers stop.
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Defer);
+        actions::quit_anyway(&mut s, &mut tx);
+        assert!(!s.quit_asked && !s.quit_app && !actions::transfers_running(&s));
+        drop(batch);
+
+        // A quit asked again while the question shows quits; a window's close asking after a
+        // quit did is a close again.
+        let other = transfers::queue(&mut s.transfers, None, transfers::Op::Copy, [(end(), end())]);
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Defer);
+        assert_eq!(actions::close_requested(&mut s), rune::CloseResponse::Close);
+        assert!(!s.quit_app);
+        drop(other);
+        let last = transfers::queue(&mut s.transfers, None, transfers::Op::Copy, [(end(), end())]);
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Defer);
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Quit);
+        assert!(!s.quit_asked && !s.quit_app && !actions::transfers_running(&s));
+        drop(last);
+    }
+
+    #[test]
+    fn runes_words_in_portuguese() {
+        // Tests run in Portuguese (`openexplorer_i18n`); English keeps Rune's own words.
+        assert_eq!(rune_labels(rune::Label::Cut).as_deref(), Some("Recortar"));
+        assert_eq!(rune_labels(rune::Label::SelectAll).as_deref(), Some("Selecionar tudo"));
+        assert_eq!(rune_labels(rune::Label::Quit("Open Explorer")).as_deref(), Some("Encerrar Open Explorer"));
+        assert_eq!(rune_labels(rune::Label::MoreNestedLines(3)).as_deref(), Some("mais 3 linhas aninhadas"));
+        assert_eq!(rune_labels(rune::Label::Language("pt-BR")), None);
     }
 
     /// What a running transfer queue costs the window: 40 downloads advancing, each tick

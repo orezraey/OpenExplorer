@@ -38,10 +38,12 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         crate::MICA_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let backdrop = active && s.settings.mica;
+    // The acrylic background (Experimental, off Windows) shows through the same parts.
+    let see_through = backdrop || s.acrylic;
     let titlebar = rune_kit::WindowTitlebar::from_insets(cx.chrome_insets())
         .key("main-titlebar")
         .leading_padding(12.0)
-        .fill(if backdrop { Color::TRANSPARENT } else { k.c.bg_base })
+        .fill(if see_through { Color::TRANSPARENT } else { k.c.bg_base })
         .leading(title_leading)
         .build(&k);
     // Menus and dialogs draw in a layer above everything.
@@ -55,6 +57,16 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let window_h = s.dialog.is_some().then(|| cx.layout_with("window", |r| r[3])).flatten();
     dialog(s, &k, window_h, backdrop, &mut layer);
     quit_question(s, &k, &mut layer);
+    // Linux: a menu Rune asks for (a text field's Recortar, Copiar, Colar), as the system draws
+    // none there.
+    if let Some(request) = &s.popup {
+        rune_kit::Menu::from_popup_menu("popup-fallback", request, |s: &mut State, picked, tx: &mut Tx| {
+            s.popup = None;
+            tx.resolve_popup_menu(picked);
+        })
+        .label(t("Menu de contexto", "Context menu"))
+        .build(&k, &mut layer);
+    }
     // What the last action said, for a few seconds at the bottom right.
     if !s.status.is_empty() && s.now < s.status_until {
         let close = |s: &mut State| s.status_until = 0.0;
@@ -67,14 +79,14 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         layer.push(ToastRegion::new().toast(toast.build(&k).live_region(LiveRegion::Off)).build(&k));
     }
     let main_content = match s.main_tab {
-        MainTab::Explore => panes(s, &k, backdrop, &mut layer),
+        MainTab::Explore => panes(s, &k, see_through, &mut layer),
         MainTab::Accounts => accounts_hub(s, &k),
     };
     let body = col()
         .key("window")
         .w_full()
         .h_full()
-        .fill(if backdrop { Color::TRANSPARENT } else { k.c.page })
+        .fill(if see_through { Color::TRANSPARENT } else { k.c.page })
         .child(titlebar)
         .child(toolbar(s, &k))
         .child(main_content)
@@ -103,6 +115,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             }
             false
         });
+    // Experimental, off Windows: the system's material behind the page, showing around the
+    // panes and through their folder trees. Unfilled, it takes the material's own tint; where
+    // the system draws none, Rune paints a near-opaque neutral one.
+    let body = if s.acrylic { body.system_material(rune::SystemMaterial::Sidebar) } else { body };
     rune_kit::root(body, layer)
 }
 
@@ -170,8 +186,9 @@ fn reset_settings(s: &mut State, tx: &mut Tx) {
     let (was_hidden, had_mica) = (s.settings.show_hidden, s.settings.mica);
     // Where the window was isn't an option: it stays.
     s.settings = crate::settings::Settings { window: s.settings.window, ..Default::default() };
-    // The window stays transparent until it opens again: Mica's tint follows the theme back.
-    if had_mica {
+    // The window stays transparent until it opens again: the material's tint follows the
+    // theme back.
+    if had_mica || s.acrylic {
         tx.set_color_scheme(s.settings.theme.color_scheme());
     }
     s.settings.save();
@@ -456,7 +473,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                     )
                     .on_press_tx(move |s: &mut State, tx: &mut Tx| {
                         change_settings(s, |c| c.theme = th);
-                        if s.settings.mica {
+                        if s.settings.mica || s.acrylic {
                             tx.set_color_scheme(th.color_scheme());
                         }
                     })
@@ -651,14 +668,31 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                     st.search_marker,
                     |s| change_settings(s, |c| c.search_marker = !c.search_marker),
                 ));
+            // Off Windows, where the translucent background above is Windows 11's: the system's
+            // own material behind the window. On Windows that background's Acrylic effect is it.
+            let exp_card = if cfg!(windows) {
+                exp_card
+            } else {
+                exp_card.child(divider()).child(switch_row(
+                    "opt-acrylic",
+                    t("Fundo em acrílico", "Acrylic background"),
+                    t(
+                        "O fundo da janela e a árvore de pastas ficam translúcidos e desfocam o que está atrás da janela: no macOS, o material da barra lateral; no Linux, o desfoque do KDE ou do Hyprland. Vale ao abrir o Open Explorer de novo.",
+                        "The window's background and the folder tree turn translucent and blur what is behind the window: on macOS, the sidebar material; on Linux, KDE's or Hyprland's blur. Takes effect the next time Open Explorer opens.",
+                    ),
+                    None,
+                    st.acrylic,
+                    |s| change_settings(s, |c| c.acrylic = !c.acrylic),
+                ))
+            };
             // Rune does it only on Windows.
             let exp_card = if cfg!(windows) {
                 exp_card.child(divider()).child(switch_row(
                     "opt-resize-sync",
                     t("Redimensionar sem atraso", "Resize without lag"),
                     t(
-                        "Ao arrastar a borda esquerda ou de cima da janela, o conteúdo acompanha a borda em vez de tremer. Não vale com o fundo Mica ligado. Vale ao abrir o Open Explorer de novo.",
-                        "Dragging the window's left or top edge, the content keeps up with the edge instead of shaking. Not with the Mica background on. Takes effect the next time Open Explorer opens.",
+                        "Ao arrastar a borda esquerda ou de cima da janela, o conteúdo acompanha a borda em vez de tremer. Não vale com o fundo Mica ou em acrílico. Vale ao abrir o Open Explorer de novo.",
+                        "Dragging the window's left or top edge, the content keeps up with the edge instead of shaking. Not with the Mica or Acrylic background. Takes effect the next time Open Explorer opens.",
                     ),
                     None,
                     st.resize_sync,
