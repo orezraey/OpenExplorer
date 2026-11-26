@@ -403,6 +403,11 @@ pub trait Conn: Send {
         false
     }
 
+    /// Before a walk through folder `dir` (already listed) and the folders in it: reads those
+    /// folders ahead, many in a request, where the server allows it, so listing them each
+    /// costs nothing. Nothing by default.
+    fn read_ahead(&mut self, _dir: &str) {}
+
     /// Copies a file or a whole folder within the server, on the server's side; `false` when
     /// the protocol has no such command (FTP, SFTP), and the bytes have to go through the app.
     /// Fails if `to` exists.

@@ -3,7 +3,7 @@
 //! A download reads the item's pre-authenticated address and fetches it with no token, asking
 //! again from where it stopped (`Range`) when the connection drops, with a fresh address (they
 //! expire). An upload of up to 4 MiB goes in one request; a bigger one in an upload session, in
-//! parts of 10 MiB (a multiple of 320 KiB, as Graph asks), each part held in memory so it can be
+//! parts of 56.25 MiB (a multiple of 320 KiB, as Graph asks), each part held in memory so it can be
 //! sent again from the byte the session says it's missing. Both check the QuickXorHash Graph
 //! gives against the bytes that went through. Both report progress as the bytes go, and
 //! Cancelar cuts the body short, so what wasn't all sent is never made; what was is kept.
@@ -23,8 +23,11 @@ use crate::{CANCELLED, Result, log};
 
 /// Files up to this go in one request.
 pub const SIMPLE: u64 = 4 * 1024 * 1024;
-/// An upload session's part: 32 × 320 KiB.
-pub const PART: usize = 32 * 320 * 1024;
+/// An upload session's part: 180 × 320 KiB (56.25 MiB), near the 60 MiB Graph takes at most in
+/// one request ("less than 60 MiB"). The parts go one after the other, as Graph asks, each
+/// waiting for its answer: in parts of 10 MiB, 100 MiB took 12.9 s, about a second of it each
+/// waiting.
+pub const PART: usize = 180 * 320 * 1024;
 /// How many times a dropped transfer is taken up again.
 const RETRIES: u32 = 5;
 
@@ -169,7 +172,7 @@ impl Account {
         let cancel = |agent: &ureq::Agent| {
             let _ = agent.delete(&up).call();
         };
-        let mut part = vec![0u8; PART];
+        let mut part = vec![0u8; PART.min(len as usize)];
         let mut offset = 0u64;
         loop {
             let want = (len - offset).min(PART as u64) as usize;

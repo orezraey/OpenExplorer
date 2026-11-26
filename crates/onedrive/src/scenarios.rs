@@ -132,6 +132,28 @@ fn folders_opened_at_once_ask_the_delta_feed_once() {
 }
 
 #[test]
+fn a_walk_reads_the_folders_inside_ahead_in_batches() {
+    let (fake, a, _, _) = setup(Kind::Personal);
+    fake.with(|st| {
+        let big = st.add(ROOT, "Big", true, &[]);
+        for i in 0..45 {
+            let f = st.add(&big, &format!("f{i:02}"), true, &[]);
+            st.add(&f, "x.txt", false, b"x");
+        }
+    });
+    names(&a, "/Meus arquivos/Big");
+    let before = fake.requests();
+    a.read_ahead("/Meus arquivos/Big");
+    assert_eq!(fake.requests() - before, 3, "45 folders in 3 $batches");
+    let before = fake.requests();
+    for i in 0..45 {
+        assert_eq!(names(&a, &format!("/Meus arquivos/Big/f{i:02}")), ["x.txt"]);
+    }
+    // At most a look at the delta feed: each folder comes from the tree.
+    assert!(fake.requests() - before <= 1, "{} requests", fake.requests() - before);
+}
+
+#[test]
 fn several_items_go_to_the_bin_and_back_in_one_batch() {
     let (fake, a, _, _) = setup(Kind::Personal);
     names(&a, "/Meus arquivos/Docs");
@@ -588,7 +610,7 @@ fn uploads_go_whole_or_in_session_parts_that_resume() {
     let (fake, a, docs, _) = setup(Kind::Personal);
     let small = data(1000);
     a.upload("/Meus arquivos/Docs/p.bin", &mut &small[..], 1000, &mut |_| true).unwrap();
-    // Bigger than 4 MiB: a session in parts of 10 MiB, one of which fails halfway.
+    // Bigger than 4 MiB: a session in parts of 56.25 MiB, one of which fails halfway.
     let big = data(crate::transfer::PART + 3_000_000);
     fake.with(|st| st.cut_upload = true);
     let mut seen = Vec::new();

@@ -31,6 +31,10 @@ const FRESH: Duration = Duration::from_secs(3);
 const WATCHED: Duration = Duration::from_secs(20);
 /// Folders read ahead at most after one opens (see [`Account::prefetch`]): one `$batch` of 20.
 const AHEAD: usize = 20;
+/// Requests in one `$batch`, as Graph takes at most.
+const BATCH: usize = 20;
+/// `$batch`es sent at once by [`Account::read_ahead`].
+const BATCHES: usize = 4;
 /// More pages of changes than this and the listings are read again instead.
 const MOST_PAGES: usize = 20;
 /// How often a tree that changed is written down while the account is used.
@@ -404,6 +408,17 @@ impl Account {
     /// in one `$batch`, so opening one of them shows it at once. Nothing when the tree holds
     /// them all, and no error: an opening reads what this couldn't.
     pub fn prefetch(&self, path: &str) {
+        self.read_ahead_up_to(path, AHEAD);
+    }
+
+    /// Reads every folder inside folder `path` not listed yet, [`BATCH`] to a `$batch` and
+    /// [`BATCHES`] of those at once, for a walk through the whole folder (a download, its size):
+    /// one by one, a hundred folders took over 30 s. No error: the walk reads what this couldn't.
+    pub fn read_ahead(&self, path: &str) {
+        self.read_ahead_up_to(path, usize::MAX);
+    }
+
+    fn read_ahead_up_to(&self, path: &str, most: usize) {
         let segs = parts(path);
         if segs.first().and_then(|f| self.area(f)) != Some(Area::Files) {
             return;
@@ -416,14 +431,23 @@ impl Account {
                 .iter()
                 .map(|k| st.tree.get(*k))
                 .filter(|n| n.is_dir && n.remote.is_none() && n.children.is_none())
-                .take(AHEAD)
+                .take(most)
                 .map(|n| n.id.to_string())
                 .collect();
             (st.epoch, ids)
         };
-        if ids.is_empty() {
-            return;
+        let chunks: Vec<&[String]> = ids.chunks(BATCH).collect();
+        for wave in chunks.chunks(BATCHES) {
+            std::thread::scope(|scope| {
+                for ids in wave {
+                    scope.spawn(move || self.list_batch(ids, epoch));
+                }
+            });
         }
+    }
+
+    /// Lists the folders `ids` in one `$batch` into the tree, unless it changed since `epoch`.
+    fn list_batch(&self, ids: &[String], epoch: u64) {
         let subs: Vec<Sub> = ids.iter().map(|id| Sub { method: "GET", url: format!("/drives/{}/items/{}/children?$select={LIST}&$top={PAGE}", segment(self.drive()), segment(id)), body: None }).collect();
         let answers = self.graph.batch(&subs, t("Listar a pasta", "List the folder"));
         let mut st = self.st();

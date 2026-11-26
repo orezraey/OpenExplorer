@@ -277,7 +277,11 @@ pub(crate) fn measure(c: &mut dyn Conn, path: &str, stop: &dyn Fn() -> bool) -> 
         if stop() {
             break;
         }
-        for it in c.list(&dir).unwrap_or_default() {
+        let items = c.list(&dir).unwrap_or_default();
+        if items.iter().any(|it| it.is_dir) {
+            c.read_ahead(&dir);
+        }
+        for it in items {
             match it.is_dir {
                 true if depth < DEEPEST && !c.passed_over(&child(&dir, &it.name)) => todo.push((child(&dir, &it.name), depth + 1)),
                 true => {}
