@@ -13,6 +13,7 @@ mod actions;
 mod address;
 mod autoscroll;
 mod b2;
+mod batch_rename;
 mod cache;
 mod caches;
 mod downloads;
@@ -286,6 +287,14 @@ struct State {
     main_dirty: bool,
     account_synced_font: Option<settings::TextFont>,
     account_synced_render: Option<settings::TextRender>,
+    /// State of the independent "Renomear em massa" window when open.
+    batch_rename: Option<Box<batch_rename::BatchRename>>,
+    batch_rename_win: Option<rune::AppHandle<State>>,
+    batch_rename_dirty: bool,
+    batch_rename_shown: bool,
+    batch_rename_closes: u32,
+    batch_rename_synced_font: Option<settings::TextFont>,
+    batch_rename_synced_render: Option<settings::TextRender>,
     is_placeholder: bool,
 }
 
@@ -318,6 +327,7 @@ thread_local! {
     static MICA_ASKED: std::cell::Cell<Option<settings::Material>> = const { std::cell::Cell::new(None) };
 }
 static ACCOUNT_WAKER: std::sync::LazyLock<std::sync::Mutex<Option<Waker>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+static BATCH_RENAME_WAKER: std::sync::LazyLock<std::sync::Mutex<Option<Waker>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 thread_local! {
     static SHARED_STATE: std::cell::RefCell<Option<State>> = const { std::cell::RefCell::new(None) };
@@ -429,6 +439,13 @@ impl State {
             main_dirty: false,
             account_synced_font: None,
             account_synced_render: None,
+            batch_rename: None,
+            batch_rename_win: None,
+            batch_rename_dirty: false,
+            batch_rename_shown: false,
+            batch_rename_closes: 0,
+            batch_rename_synced_font: None,
+            batch_rename_synced_render: None,
             is_placeholder: true,
         }
     }
@@ -490,6 +507,38 @@ impl State {
         if let Some(w) = &self.account_win {
             w.wake();
         }
+    }
+
+    /// Shows `br` in the independent "Renomear em massa" window (movable and resizable).
+    pub fn open_batch_rename(&mut self, br: batch_rename::BatchRename) {
+        self.batch_rename = Some(Box::new(br));
+        self.batch_rename_dirty = true;
+        if let Some(w) = &self.batch_rename_win {
+            self.batch_rename_shown = true;
+            w.open();
+            w.wake();
+        }
+    }
+
+    /// Drops the batch rename state and closes its window.
+    pub fn close_batch_rename(&mut self) {
+        self.batch_rename = None;
+        self.batch_rename_dirty = true;
+        if let Some(w) = &self.batch_rename_win
+            && std::mem::take(&mut self.batch_rename_shown)
+        {
+            self.batch_rename_closes += 1;
+            w.close();
+        }
+    }
+
+    fn batch_rename_window_closed(&mut self) {
+        if self.batch_rename_closes > 0 {
+            self.batch_rename_closes -= 1;
+            return;
+        }
+        self.batch_rename_shown = false;
+        self.batch_rename = None;
     }
 }
 
@@ -612,6 +661,13 @@ fn init() -> State {
         main_dirty: false,
         account_synced_font: None,
         account_synced_render: None,
+        batch_rename: None,
+        batch_rename_win: None,
+        batch_rename_dirty: false,
+        batch_rename_shown: false,
+        batch_rename_closes: 0,
+        batch_rename_synced_font: None,
+        batch_rename_synced_render: None,
         is_placeholder: false,
     }
 }
@@ -623,6 +679,9 @@ fn setup(s: &mut State, waker: Waker) {
         waker();
         if let Some(aw) = ACCOUNT_WAKER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             aw();
+        }
+        if let Some(bw) = BATCH_RENAME_WAKER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            bw();
         }
     });
     s.waker = Some(combined);
@@ -690,7 +749,40 @@ fn account_window_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
     false
 }
 
-/// Runs `f`, turning a panic into an error that names it (and logging it), so background work
+fn init_batch_rename_window() -> State {
+    State::placeholder()
+}
+
+fn setup_batch_rename_window(_: &mut State, waker: Waker) {
+    *BATCH_RENAME_WAKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker);
+}
+
+fn poll_batch_rename_window(s: &mut State, _now: f64, tx: &mut Tx) -> bool {
+    if s.is_placeholder {
+        return false;
+    }
+    if s.batch_rename_synced_font != Some(s.settings.font) {
+        s.batch_rename_synced_font = Some(s.settings.font);
+        let (sans, mono) = s.settings.font.families();
+        tx.set_font_families(sans, mono);
+    }
+    if s.batch_rename_synced_render != Some(s.settings.text_render) {
+        s.batch_rename_synced_render = Some(s.settings.text_render);
+        tx.set_font_smoothing(s.settings.text_render.smoothing());
+    }
+    std::mem::take(&mut s.batch_rename_dirty)
+}
+
+fn batch_rename_window_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
+    if s.is_placeholder {
+        return false;
+    }
+    if ev.key == Key::Escape && ev.mods == Mods::default() {
+        s.close_batch_rename();
+        return true;
+    }
+    false
+}
 /// that hits a bug still ends with a message instead of never answering. `doing` says what it
 /// was ("listar", "conectar").
 fn catch_panic<T>(doing: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
@@ -2749,12 +2841,32 @@ fn main() {
         main_app = main_app.window_backdrop(initial.material.backdrop()).color_scheme(initial.theme.color_scheme());
     }
 
+    let batch_rename_app = rune::App::new(AppSpec::<State> {
+        min_size: Some((540.0, 380.0)),
+        families: initial.font.families(),
+        setup: Some(setup_batch_rename_window),
+        poll: Some(poll_batch_rename_window),
+        on_key: Some(batch_rename_window_key),
+        ..AppSpec::new(batch_rename::window_title(), (740.0, 520.0), init_batch_rename_window, batch_rename::batch_rename_window_view)
+    })
+    .windowless()
+    .titlebar(rune::Titlebar::new(36.0))
+    .font_smoothing(initial.text_render.smoothing())
+    .turn_scope(enter_turn, leave_turn)
+    .on_close(|s, _| {
+        if !s.is_placeholder {
+            s.batch_rename_window_closed();
+        }
+    });
+
     let (account_handle, _) = main_app.window(rune::windows::WindowSpec::from_app("add-account", account_app));
+    let (batch_rename_handle, _) = main_app.window(rune::windows::WindowSpec::from_app("batch-rename", batch_rename_app));
     let main_handle = main_app.handle();
     main_app
         .init(move || {
             let mut s = init();
             s.account_win = Some(account_handle);
+            s.batch_rename_win = Some(batch_rename_handle);
             s.main_win = Some(main_handle);
             s
         })

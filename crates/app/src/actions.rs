@@ -287,7 +287,7 @@ fn account_panes(s: &State, email: &str) -> Vec<Location> {
 
 /// [`account_panes`] and `loc`, the folder changed: the tree's menu works in folders no pane
 /// shows, and the tree reads those again.
-fn account_panes_and(s: &State, email: &str, loc: &Location) -> Vec<Location> {
+pub(crate) fn account_panes_and(s: &State, email: &str, loc: &Location) -> Vec<Location> {
     let mut out = account_panes(s, email);
     if !out.contains(loc) {
         out.push(loc.clone());
@@ -1423,7 +1423,9 @@ pub fn star(s: &mut State, p: usize) {
 /// with the part before the extension selected. Enter or a click elsewhere renames, Esc cancels.
 pub fn ask_rename(s: &mut State, p: usize, tx: &mut Tx) {
     let items = selected(s, p);
-    let [item] = items.as_slice() else { return };
+    if items.is_empty() {
+        return;
+    }
     if !items_editable(&s.panes[p].loc) {
         return not_here(s, p);
     }
@@ -1431,9 +1433,13 @@ pub fn ask_rename(s: &mut State, p: usize, tx: &mut Tx) {
         s.status = share_stays().into();
         return;
     }
-    s.name_edit = name_field(item);
-    s.renaming = Some((p, item.clone()));
-    tx.scroll_into_view_in(crate::pane_key(p), crate::row_key(&item.id));
+    if let [item] = items.as_slice() {
+        s.name_edit = name_field(item);
+        s.renaming = Some((p, item.clone()));
+        tx.scroll_into_view_in(crate::pane_key(p), crate::row_key(&item.id));
+    } else {
+        crate::batch_rename::open(s, p, items);
+    }
 }
 
 /// The field Renomear (and Propriedades' name) starts with: the name as shown, its stem
@@ -1457,7 +1463,7 @@ fn stem_len(name: &str, is_dir: bool) -> usize {
 
 /// Why `name` can't name an item in `loc`, or `None`. Windows refuses characters such as `:`
 /// and `?` that Google Drive accepts, so its rules apply only on the local disk.
-fn name_problem(loc: &Location, name: &str) -> Option<String> {
+pub(crate) fn name_problem(loc: &Location, name: &str) -> Option<String> {
     match loc {
         Location::Local(_) | Location::Found(_) => ops::invalid_name(name),
         Location::Server { .. } if name.contains('/') => Some(t("O nome não pode ter /.", "The name can't have /.").into()),

@@ -3300,6 +3300,7 @@ dependencies = [
  "openexplorer-onedrive",
  "openexplorer-remote",
  "openexplorer-telegram",
+ "regex",
  "rune",
  "rune-kit",
  "serde",
