@@ -229,6 +229,9 @@ pub struct Settings {
     /// Experimental: a search's matches in names marked as with a highlighter, rather than
     /// only coloured.
     pub search_marker: bool,
+    /// Download newer stable releases on the same major version in the background and install
+    /// them on the next start (or when clicking "Restart to update").
+    pub auto_update: bool,
 }
 
 impl Default for Settings {
@@ -250,6 +253,7 @@ impl Default for Settings {
             mica: false,
             material: Material::Mica,
             search_marker: false,
+            auto_update: true,
         }
     }
 }
