@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use rune::{Align, Anim, Color, Cursor, Cx, Drag, DragOutcome, El, GrowthSpec, Icon, KeyEvent, LiveRegion, Phase, ScrollSpec, Span, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, ScrollBar, ScrollBarStyle, Toast, ToastRegion, context_menu};
 
-use crate::model::{Kind, Location, SortCol, Space, crumbs, format_bytes, format_long, format_size, format_time, shown};
+use crate::model::{Kind, Location, SortCol, Space, ViewMode, crumbs, format_bytes, format_long, format_size, format_time, shown};
 use crate::actions::{self, ClipMode, Dialog};
 use crate::{MainTab, State, click, drag_item, dragged_ids, dropped, go_back, go_forward, go_up, key, load, navigate, open, pane_key, paths_for, refresh, row_key, set_sort};
 use crate::icons;
@@ -91,8 +91,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         // 100 ms fade on leaving left a trail of lit rows behind a fast pointer.
         .hover_motion_within(Anim::INSTANT, Anim::INSTANT)
         .on_key(|s: &mut State, ev: &KeyEvent, _: &mut Tx| {
-            if ev.key == rune::Key::Escape && s.view_menu_open {
+            if ev.key == rune::Key::Escape && (s.view_menu_open || s.view_mode_menu.is_some()) {
                 s.view_menu_open = false;
+                s.view_mode_menu = None;
                 return true;
             }
             if ev.key == rune::Key::Function(5) {
@@ -3403,6 +3404,7 @@ fn toolbar(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             s.menu = None;
             s.tree_menu = None;
             s.address_menu = None;
+            s.view_mode_menu = None;
             s.view_menu_open = next;
         })
         .child(icon(&icons::VIEW_MONITOR, 16.0).color(k.c.text_base))
@@ -4931,7 +4933,7 @@ fn pane(s: &State, k: &Kit, p: usize, backdrop: bool, layer: &mut Vec<El>) -> El
                 crate::autoscroll::moved(&mut s.autoscroll, p, (at.window_x, at.window_y), tx.clock(), tx)
             })
             .child(solid(navbar(s, k, p)))
-            .child(solid(pane_actions(s, k, p)))
+            .child(solid(pane_actions(s, k, p, layer)))
             .child(solid(search_bar(s, k, p)))
             .child({
                 let mut body = row().key("body").instant_changes().w_full().grow(1.0).min_h(0.0);
@@ -4958,9 +4960,111 @@ fn pane(s: &State, k: &Kit, p: usize, backdrop: bool, layer: &mut Vec<El>) -> El
         .child(card)
 }
 
-/// Action strip directly beneath the navigation bar: toggle folder tree visibility and create
-/// a new folder in pane `p`.
-fn pane_actions(s: &State, k: &Kit, p: usize) -> El {
+/// Action strip directly beneath the navigation bar: split view-mode button (click icon to cycle,
+/// click chevron to pick exact mode), toggle folder tree visibility, and create a new folder.
+fn pane_actions(s: &State, k: &Kit, p: usize, layer: &mut Vec<El>) -> El {
+    let cur_mode = s.panes[p].view_mode;
+    let menu_open = s.view_mode_menu == Some(p);
+    let split_anchor = format!("view-mode-split-{p}");
+    let cycle_help = tr!(
+        "Alterar visualização (atual: {})",
+        "Switch view mode (current: {})",
+        cur_mode.label()
+    );
+    let pick_help = t("Escolher modo de visualização", "Choose view mode");
+
+    let split_bg = if menu_open {
+        k.c.hover
+    } else if k.dark {
+        k.alpha(k.c.white, 0.04)
+    } else {
+        k.alpha(k.c.black, 0.03)
+    };
+    let view_cycle_btn = row()
+        .key(format!("view-mode-cycle-{p}"))
+        .role("button")
+        .label(cycle_help.clone())
+        .help(cycle_help)
+        .w(24.0)
+        .h_full()
+        .center()
+        .corners([k.radius.sm, 0.0, 0.0, k.radius.sm])
+        .hover(k.c.hover)
+        .press(k.c.pressed)
+        .cursor(Cursor::Pointer)
+        .on_press(move |s: &mut State| crate::cycle_view_mode(s, p))
+        .child(icon(cur_mode.icon(), 15.0).color(k.c.text_base));
+
+    let view_drop_btn = row()
+        .key(format!("view-mode-drop-{p}"))
+        .role("button")
+        .label(pick_help.to_string())
+        .help(pick_help.to_string())
+        .w(16.0)
+        .h_full()
+        .center()
+        .corners([0.0, k.radius.sm, k.radius.sm, 0.0])
+        .hover(k.c.hover)
+        .press(k.c.pressed)
+        .cursor(Cursor::Pointer)
+        .on_press(move |s: &mut State| {
+            let next = if s.view_mode_menu == Some(p) { None } else { Some(p) };
+            s.active = p;
+            s.view_menu_open = false;
+            crate::tabs::close_picker_filter(s);
+            s.menu = None;
+            s.tree_menu = None;
+            s.address_menu = None;
+            s.view_mode_menu = next;
+        })
+        .child(icon(&icons::CHEVRON_DOWN, 10.0).color(k.c.icon_muted));
+
+    let view_split = row()
+        .key(split_anchor.clone())
+        .h(24.0)
+        .radius(k.radius.sm)
+        .fill(split_bg)
+        .border(1.0, k.c.border_weak)
+        .child(view_cycle_btn)
+        .child(el().w(1.0).h(14.0).fill(k.c.border_weak))
+        .child(view_drop_btn);
+
+    if menu_open {
+        layer.push(rune_kit::scrim("view-mode-scrim", |s: &mut State| s.view_mode_menu = None));
+        let dropdown_bg = if k.dark { rune::oklch(0.22, 0.008, 255.0) } else { k.c.bg_base };
+        let mut menu = col().key(format!("view-mode-menu-{p}")).w(210.0).padding(4.0).gap(2.0);
+        for mode in ViewMode::ALL {
+            if mode == ViewMode::List {
+                menu = menu.child(el().w_full().h(1.0).my(3.0).fill(k.c.border_weak));
+            }
+            let selected = cur_mode == mode;
+            let item = row()
+                .key(format!("vm-opt-{p}-{mode:?}"))
+                .role("menuitem")
+                .label(mode.label())
+                .checked(selected)
+                .w_full()
+                .h(30.0)
+                .px(10.0)
+                .gap(10.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .fill(if selected { k.alpha(k.c.text_accent, if k.dark { 0.20 } else { 0.10 }) } else { Color::TRANSPARENT })
+                .hover(k.c.hover)
+                .cursor(Cursor::Pointer)
+                .on_press(move |s: &mut State| crate::set_view_mode(s, p, mode))
+                .child(icon(mode.icon(), 16.0).color(if selected { k.c.text_accent } else { k.c.icon_muted }))
+                .child(text(mode.label()).font(if selected { k.ty.text_small_medium } else { k.ty.text_small }).color(k.c.text_base).grow(1.0));
+            menu = menu.child(item);
+        }
+        let surface = menu
+            .radius(k.radius.md)
+            .fill(dropdown_bg)
+            .border(1.0, k.c.border_weak)
+            .box_shadow(rune::Shadow { y: 6.0, blur: 18.0, color: k.dark_a(0.32), ..Default::default() });
+        layer.push(rune_kit::popover::anchored(k, surface, &split_anchor, rune_kit::Placement::BottomEnd, 4.0));
+    }
+
     let tree_on = s.show_tree[p];
     let tree_help = if tree_on {
         t("Ocultar árvore", "Hide tree")
@@ -5028,6 +5132,8 @@ fn pane_actions(s: &State, k: &Kit, p: usize) -> El {
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
         .child(tree_btn)
         .child(new_btn)
+        .child(el().grow(1.0))
+        .child(view_split)
 }
 
 /// A square icon button for the navigation bar.
