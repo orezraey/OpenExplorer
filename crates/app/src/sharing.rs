@@ -71,24 +71,26 @@ pub struct LinkAnswer {
 fn target(s: &mut State, p: usize) -> Option<(String, Entry)> {
     let items = selected(s, p);
     let loc = &s.panes[p].loc;
-    let ([item], Location::Drive { email, space, path }) = (items.as_slice(), loc) else {
+    let [item] = items.as_slice() else {
         if items.len() > 1 {
             s.status = t("Selecione um item só para compartilhar.", "Select just one item to share.").into();
         }
         return None;
     };
-    // Any item can be shared, wherever it's listed (Com estrela, Recentes...), except the
-    // shared drives themselves and what's in Lixeira.
-    match space {
-        Space::SharedDrives if path.is_empty() => {
-            s.status = t("Os drives compartilhados são compartilhados no site do Google Drive.", "Shared drives are shared on the Google Drive website.").into();
-            None
-        }
-        Space::Trash => {
-            s.status = t("Restaure o item da Lixeira antes de compartilhar.", "Restore the item from the Trash before sharing it.").into();
-            None
-        }
-        _ => Some((email.clone(), item.clone())),
+    match loc {
+        Location::Drive { email, space, path } => match space {
+            Space::SharedDrives if path.is_empty() => {
+                s.status = t("Os drives compartilhados são compartilhados no site do Google Drive.", "Shared drives are shared on the Google Drive website.").into();
+                None
+            }
+            Space::Trash => {
+                s.status = t("Restaure o item da Lixeira antes de compartilhar.", "Restore the item from the Trash before sharing it.").into();
+                None
+            }
+            _ => Some((email.clone(), item.clone())),
+        },
+        Location::DriveSearch(_) => crate::actions::item_account(loc, item).map(|e| (e.to_string(), item.clone())),
+        _ => None,
     }
 }
 
@@ -436,7 +438,7 @@ mod tests {
     }
 
     fn item() -> Entry {
-        Entry { id: "f1".into(), name: "nota.txt".into(), is_dir: false, size: Some(2), modified: None, target: None, mime: None, md5: None, starred: false }
+        Entry { id: "f1".into(), name: "nota.txt".into(), is_dir: false, size: Some(2), modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }
     }
 
     #[test]

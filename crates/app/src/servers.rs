@@ -75,7 +75,7 @@ impl Servers {
 }
 
 pub fn entry(item: Item) -> Entry {
-    Entry { id: item.name.clone(), name: item.name, is_dir: item.is_dir, size: item.size, modified: item.modified, target: None, mime: None, md5: None, starred: false }
+    Entry { id: item.name.clone(), name: item.name, is_dir: item.is_dir, size: item.size, modified: item.modified, target: None, mime: None, md5: None, starred: false, drive_origin: None }
 }
 
 /// A server's folder: the location at `path` under its root.
@@ -2344,7 +2344,7 @@ pub(crate) mod tests {
     fn results_open_where_they_were_found() {
         let sv = server(Protocol::Ftp, "nas", "/srv");
         let found = Location::Server { server: Box::new(sv.clone()), path: vec!["a".into()], find: Some("x".into()) };
-        let e = |id: &str| Entry { id: id.into(), name: id.rsplit('/').next().unwrap().into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let e = |id: &str| Entry { id: id.into(), name: id.rsplit('/').next().unwrap().into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         assert_eq!(path_of(&found, &e("b/c/x.txt")).as_deref(), Some("/srv/a/b/c/x.txt"));
         assert_eq!(path_of(&folder(&sv, vec!["a".into()]), &e("x.txt")).as_deref(), Some("/srv/a/x.txt"));
         assert!(target(&found).is_none());
@@ -2935,7 +2935,7 @@ mod real {
         let store = Store::at(base.join("servers.json"));
         store.save(server.clone(), Some("s3nh@")).unwrap();
         let pool = std::sync::Arc::new(Pool::default());
-        let fotos = Entry { id: "Fotos".into(), name: "Fotos".into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let fotos = Entry { id: "Fotos".into(), name: "Fotos".into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         let files = crate::relay::ServerFiles { pool, server: server.clone(), top: vec![("/Fotos".into(), fotos)] };
         let list = files.list(&std::sync::atomic::AtomicBool::new(false)).unwrap();
         let mut paths: Vec<&str> = list.iter().map(|v| v.path.as_str()).collect();

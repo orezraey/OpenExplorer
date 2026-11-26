@@ -92,8 +92,8 @@ struct FolderId {
 
 /// What a result needs to list. `parents` is asked for only when a folder search needs it:
 /// with it, Drive sends at most 460 files a page instead of a thousand.
-const FIELDS: &str = "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,starred,shortcutDetails(targetId,targetMimeType))";
-const FIELDS_WITH_PARENTS: &str = "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,starred,parents,shortcutDetails(targetId,targetMimeType))";
+const FIELDS: &str = "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,starred,driveId,ownedByMe,shortcutDetails(targetId,targetMimeType))";
+const FIELDS_WITH_PARENTS: &str = "nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,starred,driveId,ownedByMe,parents,shortcutDetails(targetId,targetMimeType))";
 
 /// Which of Drive's indexes a query runs on: `corpora=user` (the account's files and those
 /// shared with it), `allDrives` (that and every shared drive), or one shared drive.
@@ -164,7 +164,12 @@ fn cut(s: &Stretch, last: &str, parts: usize, now: i64) -> Option<Vec<Stretch>> 
 impl Drive {
     /// Files and folders whose name has every word of `text`, in `within`, handed to `each` a
     /// page at a time like [`Drive::list`]; `false` from `each` stops it.
-    pub fn search(&self, text: &str, within: &Within, mut each: impl FnMut(Vec<DriveFile>, bool) -> bool) -> Result<()> {
+    pub fn search(&self, text: &str, within: &Within, each: impl FnMut(Vec<DriveFile>, bool) -> bool) -> Result<()> {
+        self.search_with_workers(text, within, SEARCHERS, each)
+    }
+
+    /// Like [`Drive::search`], capping parallel date-stretch workers at `max_workers`.
+    pub fn search_with_workers(&self, text: &str, within: &Within, max_workers: usize, mut each: impl FnMut(Vec<DriveFile>, bool) -> bool) -> Result<()> {
         let Some(mut q) = query(text) else {
             each(Vec::new(), false);
             return Ok(());
@@ -186,7 +191,7 @@ impl Drive {
         let start = Stretch { corpus, from: None, to: None };
         let Within::Folder { id, shared_drive } = within else {
             let mut seen = HashSet::new();
-            return self.search_all(&q, FIELDS, start, &AtomicBool::new(false), |hits, more| each(hits.into_iter().filter(|h| seen.insert(h.file.id.clone())).map(|h| h.file.into()).collect(), more));
+            return self.search_all(&q, FIELDS, start, max_workers, &AtomicBool::new(false), |hits, more| each(hits.into_iter().filter(|h| seen.insert(h.file.id.clone())).map(|h| h.file.into()).collect(), more));
         };
         if !valid_id(id) {
             return Err(tr!("Id de pasta inválido: {id}", "Invalid folder id: {id}"));
@@ -212,7 +217,7 @@ impl Drive {
             let mut seen = HashSet::new();
             // Results whose folder isn't known to be in the tree yet.
             let mut waiting: Vec<Hit> = Vec::new();
-            let searched = self.search_all(&q, FIELDS_WITH_PARENTS, start, &stop, |hits, more| {
+            let searched = self.search_all(&q, FIELDS_WITH_PARENTS, start, max_workers, &stop, |hits, more| {
                 let known = tree.lock().unwrap();
                 let complete = walked.load(Ordering::Acquire);
                 let mut now = Vec::new();
@@ -269,13 +274,13 @@ impl Drive {
         })
     }
 
-    /// Runs `q` over the `start` stretch with [`SEARCHERS`] workers, cutting busy stretches for idle
+    /// Runs `q` over the `start` stretch with up to `max_workers` workers, cutting busy stretches for idle
     /// ones (see [`cut`]), and hands every page to `each` on this thread as it lands, `more`
     /// until the last; `false` from `each`, or `stop` set from outside, stops it (with no last
     /// page). Files on a cut can come twice: `each` drops repeats.
-    fn search_all(&self, q: &str, fields: &str, start: Stretch, stop: &AtomicBool, mut each: impl FnMut(Vec<Hit>, bool) -> bool) -> Result<()> {
+    fn search_all(&self, q: &str, fields: &str, start: Stretch, max_workers: usize, stop: &AtomicBool, mut each: impl FnMut(Vec<Hit>, bool) -> bool) -> Result<()> {
         // OE_SEARCHERS: a test switch, to time other counts.
-        let searchers = std::env::var("OE_SEARCHERS").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or(SEARCHERS);
+        let searchers = std::env::var("OE_SEARCHERS").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or_else(|| max_workers.max(1));
         let pool = Mutex::new(Pool { jobs: VecDeque::from([start]), busy: 0 });
         let ready = Condvar::new();
         let (tx, rx) = channel::<Result<Vec<Hit>>>();
@@ -572,5 +577,23 @@ mod tests {
         assert_eq!(cut(&open, "ontem", 4, now), None);
         // A last page dated after now leaves nothing to cut in an open stretch.
         assert_eq!(cut(&open, "2030-01-01T00:00:00.000Z", 4, now), None);
+    }
+
+    #[test]
+    fn search_fields_include_drive_origin_without_slowing_general_pages_with_parents() {
+        assert!(FIELDS.contains("driveId"));
+        assert!(FIELDS.contains("ownedByMe"));
+        assert!(!FIELDS.contains("parents"));
+        assert!(FIELDS_WITH_PARENTS.contains("driveId"));
+        assert!(FIELDS_WITH_PARENTS.contains("ownedByMe"));
+        assert!(FIELDS_WITH_PARENTS.contains("parents"));
+
+        let raw: crate::api::RawFile = serde_json::from_str(
+            r#"{"id":"f1","name":"ep1.mkv","mimeType":"video/x-matroska","driveId":"0AA","ownedByMe":false}"#,
+        )
+        .unwrap();
+        let file: DriveFile = raw.into();
+        assert_eq!(file.drive_id.as_deref(), Some("0AA"));
+        assert_eq!(file.owned_by_me, Some(false));
     }
 }

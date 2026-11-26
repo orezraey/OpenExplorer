@@ -1107,7 +1107,7 @@ mod tests {
     fn deleting_in_a_bucket_hides_and_the_top_holds_still() {
         let mut s = crate::init();
         s.cache = crate::cache::Cache::memory_only();
-        let e = |id: &str| Entry { id: id.into(), name: id.into(), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false };
+        let e = |id: &str| Entry { id: id.into(), name: id.into(), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         for path in [&["fotos"][..], &["fotos", "2024"]] {
             s.dialog = None;
             s.panes[1].go(at_path(path));
@@ -1126,7 +1126,7 @@ mod tests {
     }
 
     fn file(name: &str) -> Entry {
-        Entry { id: name.into(), name: name.into(), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false }
+        Entry { id: name.into(), name: name.into(), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }
     }
 
     fn item(name: &str) -> b2::Item {

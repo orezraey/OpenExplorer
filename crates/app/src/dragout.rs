@@ -864,7 +864,7 @@ mod tests {
     use super::*;
 
     fn file(name: &str, size: Option<u64>, mime: &str) -> File {
-        let f = DriveFile { id: "x".into(), name: name.into(), is_dir: false, size, modified: None, mime: mime.into(), target: None, md5: None, starred: false };
+        let f = DriveFile { id: "x".into(), name: name.into(), is_dir: false, size, modified: None, mime: mime.into(), target: None, md5: None, starred: false, drive_id: None, owned_by_me: None };
         let size = if export_format(&f.mime).is_some() { None } else { f.size };
         File { name: local_name(&f), size, modified: None, fetch: Fetch::Drive(f) }
     }

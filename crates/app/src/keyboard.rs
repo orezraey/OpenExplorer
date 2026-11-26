@@ -98,7 +98,7 @@ mod tests {
     use rune::{Key, KeyEvent, Tx};
 
     fn entry(name: &str) -> Entry {
-        Entry { id: name.to_string(), name: name.to_string(), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false }
+        Entry { id: name.to_string(), name: name.to_string(), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }
     }
 
     fn names(list: &[&str]) -> Vec<Entry> {
