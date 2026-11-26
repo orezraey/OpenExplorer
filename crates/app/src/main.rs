@@ -16,6 +16,7 @@ mod autoscroll;
 mod b2;
 mod cache;
 mod caches;
+mod conflict;
 mod downloads;
 mod dropbox;
 #[cfg(windows)]
@@ -91,8 +92,8 @@ enum Msg {
     Prop { id: u64, update: actions::PropUpdate },
     /// Windows' icon for a file type, a folder or a drive.
     Icon { key: sysicons::IconKey, rgba: Option<sysicons::IconBitmaps> },
-    /// What the Drive folder an upload goes into holds, to check its names against.
-    Clashes { up: actions::Upload, result: Result<Vec<Entry>, String> },
+    /// A transfer worker hit an existing destination item and is waiting for the user's choice.
+    Conflict(Box<conflict::Prompt>),
     /// An account's storage, for the status bar.
     Quota { email: String, result: Result<Quota, String> },
     /// What changed in `email`'s Drive since it was last asked (see [`watch`]).
@@ -202,8 +203,8 @@ struct State {
     /// The window opened with the Acrylic background (Opções > Experimental): its page and the
     /// panes' folder trees show the material. Set at start, as the window's transparency is.
     acrylic: bool,
-    /// Uploads whose clash dialog waits for the one open (or another dialog) to close.
-    clash_waiting: std::collections::VecDeque<actions::ClashAsk>,
+    /// Transfer conflict prompts waiting for the active dialog to close.
+    conflict_waiting: std::collections::VecDeque<conflict::Prompt>,
     /// The name typed in Renomear or Nova pasta, or the e-mail typed in Compartilhar.
     name_edit: rune::TextEdit,
     /// The item being renamed in place, and its pane.
@@ -398,7 +399,7 @@ impl State {
             popup: None,
             account_popup: None,
             acrylic: false,
-            clash_waiting: Default::default(),
+            conflict_waiting: Default::default(),
             name_edit: rune::TextEdit::new(""),
             renaming: None,
             search: std::array::from_fn(|_| rune::TextEdit::new("")),
@@ -627,7 +628,7 @@ fn init() -> State {
         popup: None,
         account_popup: None,
         acrylic: settings.acrylic_window(),
-        clash_waiting: Default::default(),
+        conflict_waiting: Default::default(),
         name_edit: rune::TextEdit::new(""),
         renaming: None,
         search: std::array::from_fn(|_| rune::TextEdit::new("")),
@@ -994,7 +995,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     // A redraw is due while any row moves, and once more when the last one stops.
     let rows = s.transfers.len();
     if s.settings.clear_completed {
-        s.transfers.retain(|t| t.progress.stage() != ops::Stage::Done);
+        s.transfers.retain(|t| !matches!(t.progress.stage(), ops::Stage::Done | ops::Stage::Skipped));
     }
     // The queue's menu goes with its row, and with the queue when that empties and hides.
     let gone = match &s.transfer_menu {
@@ -1175,7 +1176,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
             Msg::Prop { id, update } => actions::props_update(s, id, update),
             Msg::Icon { key, rgba } => s.icons.arrived(key, rgba),
-            Msg::Clashes { up, result } => actions::clashes_listed(s, up, result),
+            Msg::Conflict(prompt) => actions::enqueue_conflict(s, *prompt),
             Msg::LoggedIn { pane, attempt, result } => {
                 let current = s.login == Some(attempt);
                 if current {
@@ -1331,9 +1332,14 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     // A drag of files held near the edge of a list or tree scrolls it.
     autoscroll::tick(&mut s.autoscroll, &s.edges, |p| (ui::list_key(p), ui::tree_key(p)), ui::HEADER_H, now, tx);
-    // An upload's clash dialog waiting for another dialog to close.
-    if s.dialog.is_none() && !s.clash_waiting.is_empty() {
-        actions::next_clash(s);
+    // Dismiss a conflict dialog if its worker was cancelled externally.
+    if matches!(&s.dialog, Some(actions::Dialog::Conflict(p)) if p.is_stale()) {
+        s.dialog = None;
+        changed = true;
+    }
+    // A transfer conflict prompt waiting for another dialog to close.
+    if s.dialog.is_none() && !s.conflict_waiting.is_empty() {
+        actions::next_conflict(s);
         changed = true;
     }
     changed
@@ -2463,15 +2469,11 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
             return;
         }
         Location::Local(dir) => {
-            // Files and folders from Explorer copy in the background with a bar; ones already
-            // here are left alone.
-            let fresh: Vec<PathBuf> = files.iter().filter(|f| f.parent() != Some(dir.as_path()) && f.file_name().is_some_and(|n| !dir.join(n).exists())).cloned().collect();
-            let skipped = files.len() - fresh.len();
-            if !fresh.is_empty() {
-                actions::local_transfer(s, transfers::Op::Copy, fresh, dir.clone(), vec![loc.clone()]);
-            }
-            if skipped > 0 {
-                s.status = tr!("Ignorados (já estão aqui): {skipped}.", "Skipped (already here): {skipped}.");
+            // Files and folders from Explorer (or the other pane) copy in the background with a
+            // bar; collisions prompt the user just like Copiar + Colar.
+            let sources: Vec<PathBuf> = files.iter().filter(|f| f.parent() != Some(dir.as_path())).cloned().collect();
+            if !sources.is_empty() {
+                actions::local_transfer(s, transfers::Op::Copy, sources, dir.clone(), vec![loc.clone()]);
             }
             return;
         }
@@ -2505,34 +2507,50 @@ fn nothing_to_upload() -> String {
     t("Nada para enviar: arraste arquivos ou pastas do computador.", "Nothing to upload: drag files or folders from the computer.").into()
 }
 
-/// The clash dialog over a fake account's Drive folder, for sample files in %TEMP%.
-fn clash_scene(s: &mut State, all: bool) {
+/// The conflict dialog over a Drive-to-local download of a video file, matching the Air Explorer layout.
+fn clash_scene(s: &mut State, many: bool) {
     let dir = std::env::temp_dir().join("openexplorer-clash-scene");
-    let _ = std::fs::create_dir_all(dir.join("Projetos"));
-    for name in ["Relatório.pdf", "foto.jpg", "notas.txt"] {
-        let _ = std::fs::write(dir.join(name), name);
-    }
-    let to = Location::Drive { email: "voce@gmail.com".into(), space: Space::MyDrive, path: vec![("x".into(), "Trabalho".into())] };
+    let _ = std::fs::create_dir_all(&dir);
+    let local_file = dir.join("100.Code.S01E12.1080p.AMZN.WEB-DL.DD2.0.H.264.DUAL-alfaHD-Dinho.mp4");
+    let _ = std::fs::write(&local_file, "video");
+    let to = Location::Drive {
+        email: "voce@gmail.com".into(),
+        space: Space::MyDrive,
+        path: vec![("x".into(), "SERIES 0-G".into()), ("y".into(), "S01".into())],
+    };
     s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
     switch(s, 0, Location::Local(dir.clone()));
-    s.panes[1].go(to.clone());
-    let e = |id: &str, name: &str, mime: &str| Entry {
-        id: id.into(),
+    s.panes[1].go(to);
+    let now = SystemTime::now();
+    let older = now - std::time::Duration::from_secs(3 * 3600);
+    let name = "100.Code.S01E12.1080p.AMZN.WEB-DL.DD2.0.H.264.DUAL-alfaHD-Dinho.mp4";
+    let bytes = 846_544_896; // 807,33 MB
+    let src = conflict::FileInfo {
         name: name.into(),
-        is_dir: mime == openexplorer_gdrive::api::FOLDER_MIME,
-        size: Some(120_000),
-        modified: Some(SystemTime::now()),
-        target: None,
-        mime: Some(mime.into()),
-        md5: None,
-        starred: false,
+        place: "Drive [SERIES 0-G]\\SERIES\\0-9\\100 Code (2015)\\S01".into(),
+        is_dir: false,
+        size: Some(bytes),
+        modified: Some(now),
+        kind: model::Kind::Video,
     };
-    let existing = vec![e("a", "Relatório.pdf", "application/pdf"), e("b", "foto.jpg", "image/jpeg"), e("c", "Projetos", openexplorer_gdrive::api::FOLDER_MIME)];
-    s.panes[1].set_entries(Ok(existing.clone()));
-    let sources = ["Projetos", "Relatório.pdf", "foto.jpg", "notas.txt"].map(|n| dir.join(n)).to_vec();
-    let up = actions::Upload { email: "voce@gmail.com".into(), parent: "x".into(), to: to.clone(), sources, remove: false, reload: vec![to] };
-    let chosen = if all { Vec::new() } else { vec![uploads::Clash::KeepBoth] };
-    s.dialog = Some(actions::Dialog::Clash(Box::new(actions::ClashAsk { up, existing, clashes: vec![0, 1, 2], chosen, all })));
+    let dst = conflict::FileInfo {
+        name: name.into(),
+        place: dir.display().to_string(),
+        is_dir: false,
+        size: Some(bytes),
+        modified: Some(older),
+        kind: model::Kind::Video,
+    };
+    s.dialog = Some(actions::Dialog::Conflict(Box::new(conflict::Prompt {
+        op: transfers::Op::Download,
+        src,
+        dst,
+        renamed: "100.Code.S01E12.1080p.AMZN.WEB-DL.DD2.0.H.264.DUAL-alfaHD-Dinho (2).mp4".into(),
+        may_have_more: many,
+        apply_all: false,
+        reply: None,
+        live: None,
+    })));
 }
 
 /// Opções open on Cache, its sizes fixed, then `then` applied to the page.
@@ -3746,32 +3764,73 @@ mod tests {
         println!("hover, one row a frame: {best:.0} µs best, {median:.0} µs median of 9 runs of 300");
     }
 
-    /// Dropping items whose names the Drive folder already has asks first, one by one once
-    /// Aplicar a todos is off; Cancelar drops the upload, and skipping everything sends nothing.
+    /// Transferring local files into a folder with collisions prompts via Dialog::Conflict,
+    /// supports Replace, Skip, KeepBoth, ReplaceNewer, Apply-to-all, and Cancel.
     #[test]
-    fn an_upload_into_taken_names_asks_before_starting() {
+    fn a_transfer_into_existing_files_prompts_and_honours_choices() {
         let mut s = init();
         s.cache = cache::Cache::memory_only();
+        let root = std::env::temp_dir().join(format!("oe-conflict-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src_dir = root.join("src");
+        let dst_dir = root.join("dst");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dst_dir).unwrap();
+        std::fs::write(src_dir.join("a.txt"), "new-a").unwrap();
+        std::fs::write(src_dir.join("b.txt"), "new-b").unwrap();
+        std::fs::write(dst_dir.join("a.txt"), "old-a").unwrap();
+        std::fs::write(dst_dir.join("b.txt"), "old-b").unwrap();
+
+        let sources = vec![src_dir.join("a.txt"), src_dir.join("b.txt")];
+        actions::local_transfer(&mut s, transfers::Op::Copy, sources, dst_dir.clone(), vec![]);
+
+        let start = std::time::Instant::now();
+        let mut prompts = 0usize;
+        while start.elapsed() < std::time::Duration::from_secs(10) {
+            poll(&mut s, 0.0, &mut Tx::default());
+            if matches!(&s.dialog, Some(actions::Dialog::Conflict(_))) {
+                prompts += 1;
+                if prompts == 1 {
+                    actions::answer_conflict(&mut s, Some(conflict::Choice::Skip));
+                } else {
+                    actions::answer_conflict(&mut s, Some(conflict::Choice::KeepBoth));
+                }
+            }
+            if !actions::transfers_running(&s) && s.dialog.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(prompts, 2);
+        assert_eq!(std::fs::read_to_string(dst_dir.join("a.txt")).unwrap(), "old-a");
+        assert_eq!(std::fs::read_to_string(dst_dir.join("b.txt")).unwrap(), "old-b");
+        assert_eq!(std::fs::read_to_string(dst_dir.join("b (2).txt")).unwrap(), "new-b");
+
+        // Cancel from the conflict dialog aborts remaining items cleanly.
         clash_scene(&mut s, true);
-        let Some(actions::Dialog::Clash(ask)) = s.dialog.take() else { panic!("no clash dialog") };
-        let (to, sources) = (ask.up.to.clone(), ask.up.sources.clone());
-        // The same upload as a drop on the Drive pane: checked against its listing.
-        dropped(&mut s, 1, &sources);
-        let Some(actions::Dialog::Clash(ask)) = &s.dialog else { panic!("no clash dialog") };
-        assert_eq!(ask.clashes, [0, 1, 2]);
-        assert!(ask.all);
-        actions::toggle_clash_all(&mut s);
-        actions::answer_clash(&mut s, Some(uploads::Clash::Skip));
-        let Some(actions::Dialog::Clash(ask)) = &s.dialog else { panic!("the dialog should ask about the next one") };
-        assert_eq!(ask.up.sources[ask.current()].file_name().unwrap(), "Relatório.pdf");
-        actions::answer_clash(&mut s, None);
-        assert!(s.dialog.is_none() && s.transfers.is_empty());
-        // Every name taken, and all skipped: nothing is queued.
-        let only_taken: Vec<PathBuf> = sources.iter().filter(|p| !p.ends_with("notas.txt") && !p.is_dir()).cloned().collect();
-        actions::upload(&mut s, only_taken, &to, false, vec![]);
-        actions::answer_clash(&mut s, Some(uploads::Clash::Skip));
-        assert!(s.dialog.is_none() && s.transfers.is_empty());
-        assert!(s.status.starts_with("Nada enviado"), "{}", s.status);
+        assert!(matches!(&s.dialog, Some(actions::Dialog::Conflict(p)) if p.may_have_more && !p.apply_all));
+        actions::toggle_conflict_all(&mut s);
+        assert!(matches!(&s.dialog, Some(actions::Dialog::Conflict(p)) if p.apply_all));
+        actions::answer_conflict(&mut s, None);
+        assert!(s.dialog.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn conflict_dialog_lays_out_in_light_and_dark_themes() {
+        for dark in [false, true] {
+            let mut s = init();
+            s.settings.theme = if dark { settings::Theme::Dark } else { settings::Theme::Light };
+            clash_scene(&mut s, true);
+            let mut rt = rune::Runtime::new(s, ui::view, (1400.0, 900.0), rune::Env::new(dark, 1.0));
+            for _ in 0..3 {
+                rt.frame(1.0 / 60.0);
+            }
+            for key in ["conflict-replace", "conflict-skip", "conflict-keep-both", "conflict-replace-newer", "conflict-cancel"] {
+                let found = rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key)).unwrap_or_else(|| panic!("missing {key} (dark={dark})"));
+                assert!(found.rect[2] > 0.0 && found.rect[3] > 0.0, "{key} has empty rect: {:?}", found.rect);
+            }
+        }
     }
 
     #[test]

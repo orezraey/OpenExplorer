@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use rune::{Align, Anim, Color, Cursor, Cx, Drag, DragOutcome, El, GrowthSpec, Icon, KeyEvent, LiveRegion, Phase, ScrollSpec, Span, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, ScrollBar, ScrollBarStyle, Toast, ToastRegion, context_menu};
 
-use crate::model::{Kind, Location, SortCol, Space, ViewMode, crumbs, format_bytes, format_long, format_size, format_time, shown};
+use crate::conflict::{self, Choice};
+use crate::model::{Kind, Location, SortCol, Space, ViewMode, crumbs, format_bytes, format_long, format_size, format_size_exact, format_time, format_time_secs, shown};
 use crate::actions::{self, ClipMode, Dialog};
 use crate::{MainTab, State, click, drag_item, dragged_ids, dropped, go_back, go_forward, go_up, key, load, navigate, open, pane_key, paths_for, refresh, row_key, set_sort};
 use crate::icons;
@@ -183,7 +184,7 @@ fn toggle_show_hidden(s: &mut State) {
 fn toggle_clear_completed(s: &mut State) {
     change_settings(s, |c| c.clear_completed = !c.clear_completed);
     if s.settings.clear_completed {
-        s.transfers.retain(|t| t.progress.stage() != Stage::Done);
+        s.transfers.retain(|t| !matches!(t.progress.stage(), Stage::Done | Stage::Skipped));
     }
 }
 
@@ -205,7 +206,7 @@ fn reset_settings(s: &mut State, tx: &mut Tx) {
         reload_hidden_views(s);
     }
     if s.settings.clear_completed {
-        s.transfers.retain(|t| t.progress.stage() != Stage::Done);
+        s.transfers.retain(|t| !matches!(t.progress.stage(), Stage::Done | Stage::Skipped));
     }
     s.status = t("Opções restauradas para os valores padrão.", "Options restored to their defaults.").into();
 }
@@ -1323,6 +1324,7 @@ fn queue_row(s: &State, k: &Kit, t: &transfers::Transfer) -> El {
         Stage::Done => k.c.text_accent,
         Stage::Cancelled => k.c.warning.fg,
         Stage::Failed => k.c.danger.fg,
+        Stage::Skipped => k.c.text_muted,
     };
     let failed = p.stage() == Stage::Failed;
     let label = live(&t.shown.state);
@@ -1924,7 +1926,7 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, backdrop: bool, layer: &mut
         }
         Dialog::Properties(p) => props_dialog(s, k, p, layer),
         Dialog::Options(opt) => options_dialog(s, k, opt, window_h, backdrop, layer),
-        Dialog::Clash(ask) => clash_dialog(s, k, ask, layer),
+        Dialog::Conflict(prompt) => conflict_dialog(k, prompt, layer),
         Dialog::Share(sh) => crate::sharing::share_dialog(s, k, sh, layer),
         Dialog::MakePublic(m) => crate::sharing::public_dialog(k, m, layer),
         Dialog::MegaLink(m) => crate::mega::link_dialog(k, m, layer),
@@ -3221,75 +3223,183 @@ fn account_configure_body(
         .child(centered_footer)
 }
 
-/// Names an upload would repeat in its Drive folder, as Air Explorer asks: all at once with
-/// Aplicar a todos ticked, else one by one ("2 de 3"). Closing it cancels the upload.
-fn clash_dialog(s: &State, k: &Kit, ask: &actions::ClashAsk, layer: &mut Vec<El>) {
-    let n = ask.clashes.len();
-    let name_of = |i: usize| ask.up.sources[i].file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-    let place = crumbs(&ask.up.to).last().map(|c| c.label.clone()).unwrap_or_default();
-    let all = ask.all && n > 1;
-    let shown: Vec<usize> = if all { ask.clashes.clone() } else { vec![ask.current()] };
-    let current = name_of(shown[0]);
-    let title = match (n, all) {
-        (1, _) => tr!("\"{current}\" já existe", "\"{current}\" already exists"),
-        (_, true) => tr!("{n} itens já existem", "{n} items already exist"),
-        (_, false) => tr!("\"{current}\" já existe ({} de {n})", "\"{current}\" already exists ({} of {n})", ask.chosen.len() + 1),
+/// Unified Air Explorer-style destination conflict prompt, styled in OpenExplorer's Rune Kit
+/// card aesthetic. Clicking any option card resolves the item (or batch); Cancel aborts the batch.
+fn conflict_dialog(k: &Kit, prompt: &conflict::Prompt, layer: &mut Vec<El>) {
+    let modal_title = match prompt.op {
+        transfers::Op::Copy => t("Copiar arquivo", "Copy file"),
+        transfers::Op::Move => t("Mover arquivo", "Move file"),
+        transfers::Op::Download => t("Baixar arquivo", "Download file"),
+        transfers::Op::Upload => t("Enviar arquivo", "Upload file"),
     };
-    // A folder meeting a folder is merged; the choice is for the files in it.
-    let merged = |i: usize| ask.up.sources[i].is_dir() && ask.there(&name_of(i)).is_some_and(|e| e.is_dir && e.target.is_none() && e.mime.as_deref().is_none_or(|m| m == openexplorer_gdrive::api::FOLDER_MIME));
-    let muted = |t: String| text(t).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0);
-    let lead = if shown.len() == 1 {
-        tr!("Já existe um item com esse nome em \"{place}\".", "An item with this name already exists in \"{place}\".")
+    let (replace_title, skip_title, keep_title, newer_title) = match prompt.op {
+        transfers::Op::Copy => (
+            t("Copiar e substituir", "Copy and replace"),
+            t("Não copiar", "Don't copy"),
+            t("Copiar, mas manter ambos os arquivos", "Copy, but keep both files"),
+            t("Copiar arquivos mais recentes da origem para o destino", "Copy newer files from origin to destination"),
+        ),
+        transfers::Op::Move => (
+            t("Mover e substituir", "Move and replace"),
+            t("Não mover", "Don't move"),
+            t("Mover, mas manter ambos os arquivos", "Move, but keep both files"),
+            t("Mover arquivos mais recentes da origem para o destino", "Move newer files from origin to destination"),
+        ),
+        transfers::Op::Download => (
+            t("Baixar e substituir", "Download and replace"),
+            t("Não baixar", "Don't download"),
+            t("Baixar, mas manter ambos os arquivos", "Download, but keep both files"),
+            t("Baixar arquivos mais recentes da origem para o destino", "Download newer files from origin to destination"),
+        ),
+        transfers::Op::Upload => (
+            t("Enviar e substituir", "Upload and replace"),
+            t("Não enviar", "Don't upload"),
+            t("Enviar, mas manter ambos os arquivos", "Upload, but keep both files"),
+            t("Enviar arquivos mais recentes da origem para o destino", "Upload newer files from origin to destination"),
+        ),
+    };
+
+    let lead_title = if prompt.src.is_dir || prompt.dst.is_dir {
+        t("Esta pasta já contém um item com o mesmo nome", "This folder already contains an item with the same name")
     } else {
-        tr!("Já existem itens com estes nomes em \"{place}\".", "Items with these names already exist in \"{place}\".")
+        t("Esta pasta já contém um arquivo com o mesmo nome", "This folder already contains a file with the same name")
     };
-    let mut list = col().key("items").w_full().gap(4.0);
-    for &i in shown.iter().take(6) {
-        let name = name_of(i);
-        let glyph = ask.there(&name).map_or_else(|| el().w(16.0), |e| entry_icon(s, &ask.up.to, e, 16.0));
-        let mut line = row().key(format!("item-{i}")).w_full().gap(6.0).center_y().child(glyph).child(text(name).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0));
-        if merged(i) {
-            line = line.child(el().grow(1.0)).child(text(t("pasta: juntar conteúdo", "folder: merge contents")).font(k.ty.text_xsmall).color(k.c.text_muted));
-        }
-        list = list.child(line);
-    }
-    if shown.len() > 6 {
-        list = list.child(text(tr!("e mais {}", "and {} more", ui_count(shown.len() - 6))).font(k.ty.text_small).color(k.c.text_muted));
-    }
-    let mut body = col().w_full().gap(12.0).child(muted(lead)).child(list);
-    if shown.iter().any(|&i| merged(i)) {
-        body = body.child(muted(
-            t(
-                "Uma pasta que já existe recebe o conteúdo enviado; a escolha vale para os arquivos dentro dela que já existirem.",
-                "A folder that already exists receives the uploaded contents; the choice applies to the files inside it that already exist.",
-            )
-            .into(),
-        ));
-    }
-    body = body.child(muted(
-        t(
-            "Substituir envia o arquivo como nova versão do que está no Drive (a anterior fica no histórico de versões). Manter os dois envia com outro nome, como \"nome (2).ext\".",
-            "Replace uploads the file as a new version of the one in Drive (the previous one stays in the version history). Keep both uploads it under another name, like \"name (2).ext\".",
-        )
-        .into(),
-    ));
-    if n > 1 {
-        body = body.child(rune_kit::Checkbox::new(ask.all).label(t("Aplicar a todos", "Apply to all")).on_toggle(actions::toggle_clash_all).build(k));
-    }
-    let choice = |label: &str, c: crate::uploads::Clash, variant: ButtonVariant| Button::new(label).variant(variant).on_press(move |s: &mut State| actions::answer_clash(s, Some(c))).build(k).cursor(Cursor::Pointer);
-    let buttons = row()
-        .key("actions")
+    let header = col()
+        .key("lead")
         .w_full()
-        .pt(4.0)
+        .gap(2.0)
+        .child(text(lead_title).font(k.ty.body_medium).color(k.c.text_base).wrap().w_full().min_w(0.0))
+        .child(text(t("Clique no arquivo que deseja manter", "Click on the file you want to keep")).font(k.ty.text_small).color(k.c.text_muted).wrap().w_full().min_w(0.0));
+
+    let option_card = |key: &'static str, title: &str, choice: Choice, detail: El| {
+        let arrow_badge = row()
+            .mt(1.0)
+            .size(24.0, 24.0)
+            .radius(12.0)
+            .center()
+            .fill(k.alpha(k.c.text_accent, if k.dark { 0.18 } else { 0.12 }))
+            .child(icon(&icons::FORWARD, 13.0).color(k.c.text_accent));
+        let content = col()
+            .grow(1.0)
+            .w(0.0)
+            .min_w(0.0)
+            .gap(4.0)
+            .child(text(title.to_string()).font(k.ty.text_small_medium).color(k.c.text_base).wrap().w_full().min_w(0.0))
+            .child(detail);
+        k.interactive(
+            row()
+                .key(key)
+                .role("button")
+                .label(title.to_string())
+                .focusable(true)
+                .focus_ring(2.0, 1.0, k.c.border_focus)
+                .w_full()
+                .px(12.0)
+                .py(10.0)
+                .gap(10.0)
+                .radius(k.radius.lg)
+                .fill(k.alpha(k.c.text_base, if k.dark { 0.035 } else { 0.025 }))
+                .border(1.0, k.c.border_weak)
+                .hover(k.alpha(k.c.text_accent, if k.dark { 0.12 } else { 0.07 }))
+                .cursor(Cursor::Pointer),
+        )
+        .on_press(move |s: &mut State| actions::answer_conflict(s, Some(choice)))
+        .child(arrow_badge)
+        .child(content)
+    };
+
+    let file_block = |info: &conflict::FileInfo, newer: bool| {
+        let mut block = col().w_full().gap(2.0);
+        let name = shown(&info.name);
+        let name_row = row()
+            .w_full()
+            .gap(6.0)
+            .center_y()
+            .child(icon(kind_icon(info.kind), 15.0))
+            .child(text(name.clone()).font(k.ty.text_small).color(k.c.text_base).truncate().shrink().min_w(0.0).help_when_truncated(name));
+        block = block.child(name_row);
+        if !info.place.is_empty() {
+            block = block.child(
+                text(info.place.clone())
+                    .font(k.ty.caption())
+                    .color(k.c.text_muted)
+                    .truncate()
+                    .w_full()
+                    .min_w(0.0)
+                    .help_when_truncated(info.place.clone()),
+            );
+        }
+        let mut meta = row().w_full().gap(10.0).center_y();
+        let mut has_meta = false;
+        if let Some(size) = info.size {
+            has_meta = true;
+            meta = meta.child(text(tr!("Tamanho: {}", "Size: {}", format_size_exact(size))).font(k.ty.caption()).color(k.c.text_muted));
+        }
+        if let Some(modified) = info.modified {
+            has_meta = true;
+            meta = meta.child(text(tr!("Data: {}", "Date: {}", format_time_secs(modified))).font(k.ty.caption()).color(k.c.text_muted));
+        }
+        if newer {
+            has_meta = true;
+            meta = meta.child(rune_kit::Badge::new(t("mais recente", "newer")).variant(rune_kit::BadgeVariant::Accent).build(k));
+        }
+        if has_meta {
+            block = block.child(meta);
+        }
+        block
+    };
+
+    let src_newer = conflict::is_newer(prompt.src.modified, prompt.dst.modified);
+    let dst_newer = conflict::is_newer(prompt.dst.modified, prompt.src.modified);
+    let keep_desc = col()
+        .w_full()
+        .gap(1.0)
+        .child(text(tr!("O arquivo será renomeado para {}", "The file will be renamed to {}", shown(&prompt.renamed))).font(k.ty.caption()).color(k.c.text_muted).wrap().w_full().min_w(0.0));
+    let newer_desc = text(t(
+        "Arquivos com a mesma data ou mais antigos serão ignorados",
+        "Files with the same date or older will be skipped",
+    ))
+    .font(k.ty.caption())
+    .color(k.c.text_muted)
+    .wrap()
+    .w_full()
+    .min_w(0.0);
+
+    let options = col()
+        .key("options")
+        .w_full()
         .gap(8.0)
-        .justify_end()
-        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(|s: &mut State| actions::answer_clash(s, None)).build(k).cursor(Cursor::Pointer))
-        .child(el().grow(1.0))
-        .child(choice(t("Pular", "Skip"), crate::uploads::Clash::Skip, ButtonVariant::Neutral))
-        .child(choice(t("Manter os dois", "Keep both"), crate::uploads::Clash::KeepBoth, ButtonVariant::Neutral))
-        .child(choice(t("Substituir", "Replace"), crate::uploads::Clash::Replace, ButtonVariant::Submit));
-    let body = col().key("content").w_full().px(16.0).pb(16.0).child(body.child(buttons));
-    Modal::new("clash", title).open(true).child(body).width(520.0).fit().on_close(|s: &mut State| actions::answer_clash(s, None)).build(k, layer);
+        .child(option_card("conflict-replace", replace_title, Choice::Replace, file_block(&prompt.src, src_newer)))
+        .child(option_card("conflict-skip", skip_title, Choice::Skip, file_block(&prompt.dst, dst_newer)))
+        .child(option_card("conflict-keep-both", keep_title, Choice::KeepBoth, keep_desc))
+        .child(option_card("conflict-replace-newer", newer_title, Choice::ReplaceNewer, newer_desc));
+
+    let mut footer = row().key("actions").w_full().pt(4.0).center_y().gap(8.0);
+    if prompt.may_have_more {
+        footer = footer.child(
+            rune_kit::Checkbox::new(prompt.apply_all)
+                .label(t("Aplicar a todos os conflitos", "Apply to all conflicts"))
+                .on_toggle(actions::toggle_conflict_all)
+                .build(k),
+        );
+    }
+    footer = footer.child(el().grow(1.0)).child(
+        Button::new(t("Cancelar", "Cancel"))
+            .variant(ButtonVariant::Neutral)
+            .on_press(|s: &mut State| actions::answer_conflict(s, None))
+            .build(k)
+            .cursor(Cursor::Pointer)
+            .key("conflict-cancel"),
+    );
+
+    let body = col().key("content").w_full().px(16.0).pb(16.0).gap(12.0).child(header).child(options).child(footer);
+    Modal::new("conflict", modal_title)
+        .open(true)
+        .child(body)
+        .width(540.0)
+        .fit()
+        .on_close(|s: &mut State| actions::answer_conflict(s, None))
+        .build(k, layer);
 }
 
 /// The first few items a dialog acts on, with "e mais N" for the rest.

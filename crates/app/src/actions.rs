@@ -13,10 +13,10 @@ use rune::{TextEdit, Tx};
 
 use crate::accounts;
 use crate::address::{self, Reached, Target};
+use crate::conflict::{self, Choice, Prompt, Reply, Resolver};
 use crate::model::{Entry, Location, Space, shown, typed};
 use crate::transfers::{self, End, Op};
 use crate::undo::{self, Step};
-use crate::uploads::{Clash, Existing, Item, Put};
 use crate::{Msg, State, background, drive_task, open as open_entry, ops};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,8 +58,8 @@ pub enum Dialog {
     Properties(Box<Props>),
     /// Opções: appearance, file behaviour, transfers and logs, applied as they change.
     Options(Box<crate::settings::OptionsView>),
-    /// Names an upload would repeat in its Drive folder: Substituir, Pular or Manter os dois.
-    Clash(Box<ClashAsk>),
+    /// File/folder destination conflict prompt during any transfer.
+    Conflict(Box<Prompt>),
     /// Compartilhar: who has access to a Drive item.
     Share(Box<crate::sharing::Share>),
     /// Copiar link on a private item: open it to anyone with the link first?
@@ -784,27 +784,102 @@ fn transfer_to(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>,
                     p.size(size);
                 }
             }
+            let may_have_more = items.len() > 1 || items.iter().any(|e| e.is_dir);
+            let resolver = (src != dst).then(|| make_resolver(s, op, may_have_more, &batch));
+            let src_place = End::drive(&from, None).text;
+            let dst_place = End::drive(&to, None).text;
             let who = email.clone();
             undo::drive_job(s, &email, reload, move |n| transfer_words(op, n), move |d, rec| {
-                batch.run(|i, _| {
+                let mut existing: std::collections::HashMap<String, DriveFile> = std::collections::HashMap::new();
+                let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+                if src != dst {
+                    d.list(&dst, None, |page, _| {
+                        for f in page {
+                            taken.insert(f.name.clone());
+                            existing.entry(f.name.clone()).or_insert(f);
+                        }
+                        true
+                    })?;
+                }
+                batch.run(|i, p| {
                     let e = &items[i];
                     // Shortcuts are copied as shortcuts, not followed into their target.
                     let file = DriveFile { is_dir: e.is_dir && e.target.is_none(), target: None, ..drive_file(e) };
-                    // Desfazer sends a copy to the trash, as Explorer sends one to the Recycle Bin.
                     let copy = |name: &str| {
                         let made = d.copy(&file, &dst, name)?;
                         rec.add([Step::DriveTrash { email: who.clone(), id: made.id, name: made.name, empty: false }]);
                         Ok(())
                     };
-                    match mode {
-                        ClipMode::Copy if src == dst => copy(&tr!("Cópia de {}", "Copy of {}", e.name)),
-                        ClipMode::Copy => copy(&e.name),
-                        ClipMode::Cut if src == dst => Ok(()),
-                        ClipMode::Cut if src.is_empty() => Err(t("Recortar precisa da pasta de origem.", "Cut needs the source folder.").into()),
-                        ClipMode::Cut => {
-                            d.move_to(&e.id, &src, &dst)?;
-                            rec.add([Step::DriveMove { email: who.clone(), id: e.id.clone(), name: e.name.clone(), from: dst.clone(), to: src.clone() }]);
+                    if src == dst {
+                        return match mode {
+                            ClipMode::Copy => copy(&tr!("Cópia de {}", "Copy of {}", e.name)),
+                            ClipMode::Cut => Ok(()),
+                        };
+                    }
+                    if mode == ClipMode::Cut && src.is_empty() {
+                        return Err(t("Recortar precisa da pasta de origem.", "Cut needs the source folder.").into());
+                    }
+                    let Some(ex) = existing.get(&e.name).cloned() else {
+                        taken.insert(e.name.clone());
+                        return match mode {
+                            ClipMode::Copy => copy(&e.name),
+                            ClipMode::Cut => {
+                                d.move_to(&e.id, &src, &dst)?;
+                                rec.add([Step::DriveMove { email: who.clone(), id: e.id.clone(), name: e.name.clone(), from: dst.clone(), to: src.clone() }]);
+                                Ok(())
+                            }
+                        };
+                    };
+                    if file.is_dir && ex.is_dir {
+                        let res = resolver.as_ref().expect("resolver when src != dst");
+                        let mut kept = false;
+                        merge_drive_into(d, &who, &file.id, &ex.id, mode == ClipMode::Cut, &src_place, &dst_place, res, rec, &|| p.cancelled(), &mut kept)?;
+                        if mode == ClipMode::Cut && !kept {
+                            d.trash(&file.id)?;
+                            rec.add([Step::DriveRestore { email: who.clone(), id: file.id.clone(), name: file.name.clone(), empty: false }]);
+                        }
+                        return Ok(());
+                    }
+                    let res = resolver.as_ref().expect("resolver when src != dst");
+                    let free = conflict::numbered_name(&e.name, file.is_dir, |n| taken.contains(n));
+                    let decision = res.resolve(
+                        conflict::FileInfo::entry(e, src_place.clone()),
+                        conflict::FileInfo::drive(&ex, dst_place.clone()),
+                        free.clone(),
+                        || p.cancelled(),
+                    );
+                    match decision {
+                        conflict::Decision::Cancel => Err(ops::CANCELLED.into()),
+                        conflict::Decision::Skip => {
+                            p.skip();
                             Ok(())
+                        }
+                        conflict::Decision::Replace if !file.is_dir && !ex.is_dir => {
+                            match mode {
+                                ClipMode::Copy => {
+                                    copy(&e.name)?;
+                                }
+                                ClipMode::Cut => {
+                                    d.move_to(&e.id, &src, &dst)?;
+                                    rec.add([Step::DriveMove { email: who.clone(), id: e.id.clone(), name: e.name.clone(), from: dst.clone(), to: src.clone() }]);
+                                }
+                            }
+                            d.trash(&ex.id)?;
+                            rec.add([Step::DriveRestore { email: who.clone(), id: ex.id, name: ex.name, empty: false }]);
+                            Ok(())
+                        }
+                        conflict::Decision::KeepBoth | conflict::Decision::Replace => {
+                            let free = conflict::numbered_name(&e.name, file.is_dir, |n| taken.contains(n));
+                            taken.insert(free.clone());
+                            match mode {
+                                ClipMode::Copy => copy(&free),
+                                ClipMode::Cut => {
+                                    d.move_to(&e.id, &src, &dst)?;
+                                    d.rename(&e.id, &free)?;
+                                    rec.add([Step::DriveMove { email: who.clone(), id: e.id.clone(), name: free, from: dst.clone(), to: src.clone() }]);
+                                    Ok(())
+                                }
+                            }
                         }
                     }
                 })
@@ -818,6 +893,8 @@ fn transfer_to(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>,
 pub fn local_transfer(s: &mut State, op: Op, sources: Vec<PathBuf>, dst: PathBuf, reload: Vec<Location>) {
     let to = End::local(&dst);
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, sources.iter().map(|p| (End::local(p), to.clone())));
+    let may_have_more = sources.len() > 1 || sources.iter().any(|p| p.is_dir());
+    let resolver = make_resolver(s, op, may_have_more, &batch);
     // Copies where there's no Recycle Bin (a shared folder, WSL, a USB stick) aren't kept for Desfazer,
     // which would have to delete them for good.
     let recyclable = undo::has_recycle_bin(&dst);
@@ -827,20 +904,15 @@ pub fn local_transfer(s: &mut State, op: Op, sources: Vec<PathBuf>, dst: PathBuf
         }
         batch.run(|i, p| {
             let src = &sources[i];
-            match op {
-                Op::Copy | Op::Upload | Op::Download => {
-                    let made = ops::copy_into(src, &dst, p)?;
-                    if recyclable {
-                        rec.add([Step::Recycle { path: made }]);
-                    }
+            let move_item = op == Op::Move;
+            match ops::transfer_local(src, &dst, move_item, p, Some(&resolver))? {
+                ops::TransferOutcome::Copied { made, replaced: false } if recyclable => {
+                    rec.add([Step::Recycle { path: made }]);
                 }
-                Op::Move => {
-                    let to = ops::move_into(src, &dst, p)?;
-                    // Already there: nothing moved.
-                    if to != *src {
-                        rec.add([Step::Move { from: to, to: src.clone() }]);
-                    }
+                ops::TransferOutcome::Moved { from, to, replaced: false } if to != from => {
+                    rec.add([Step::Move { from: to, to: from }]);
                 }
+                _ => {}
             }
             Ok(())
         })
@@ -855,173 +927,210 @@ fn transfer_words(op: Op, n: usize) -> String {
     }
 }
 
-/// An upload waiting for its names to be checked against the Drive folder it goes into.
-pub struct Upload {
-    pub email: String,
-    /// The Drive folder's id, and where it is.
-    pub parent: String,
-    pub to: Location,
-    pub sources: Vec<PathBuf>,
-    pub remove: bool,
-    pub reload: Vec<Location>,
+/// Builds a batch-scoped conflict [`Resolver`] that prompts via [`Msg::Conflict`] and cancels
+/// every row in `batch` if the user cancels the dialog.
+pub fn make_resolver(s: &State, op: Op, may_have_more: bool, batch: &transfers::Batch) -> Resolver {
+    let out = s.outbox.clone();
+    let wake = s.waker.clone();
+    let rows: Vec<Arc<ops::Progress>> = batch.rows().to_vec();
+    Resolver::new(
+        op,
+        may_have_more,
+        Arc::new(move |prompt| {
+            let _ = out.send(Msg::Conflict(Box::new(prompt)));
+            if let Some(w) = &wake {
+                w();
+            }
+        }),
+        Some(Arc::new(move || {
+            for r in &rows {
+                r.cancel();
+            }
+        })),
+    )
+}
+
+/// Shows a conflict prompt immediately if no dialog is open, else queues it.
+pub fn enqueue_conflict(s: &mut State, prompt: Prompt) {
+    if prompt.is_stale() {
+        return;
+    }
+    if s.dialog.is_none() {
+        s.dialog = Some(Dialog::Conflict(Box::new(prompt)));
+    } else {
+        s.conflict_waiting.push_back(prompt);
+    }
+}
+
+/// Toggles "Aplicar a todos os conflitos" on the open conflict dialog.
+pub fn toggle_conflict_all(s: &mut State) {
+    if let Some(Dialog::Conflict(prompt)) = &mut s.dialog {
+        prompt.apply_all = !prompt.apply_all;
+    }
+}
+
+/// Delivers the user's choice (or `None` to cancel the batch) to the waiting worker thread.
+pub fn answer_conflict(s: &mut State, choice: Option<Choice>) {
+    let Some(Dialog::Conflict(mut prompt)) = s.dialog.take() else { return };
+    if let Some(tx) = prompt.reply.take() {
+        let reply = match choice {
+            Some(c) => Reply::Choose { choice: c, apply_all: prompt.apply_all },
+            None => Reply::Cancel,
+        };
+        let _ = tx.send(reply);
+    }
+    next_conflict(s);
+}
+
+/// Opens the next queued conflict prompt once no dialog is open (skipping stale ones).
+pub fn next_conflict(s: &mut State) {
+    while s.dialog.is_none() {
+        let Some(prompt) = s.conflict_waiting.pop_front() else { break };
+        if !prompt.is_stale() {
+            s.dialog = Some(Dialog::Conflict(Box::new(prompt)));
+        }
+    }
 }
 
 /// Uploads `sources` (files and folders on the computer) into the Drive folder `to` shows, a
 /// row each in the queue. With `remove` (Recortar), each original goes to the Recycle Bin once
 /// all of it arrived.
-///
-/// Names are checked first against what the folder holds: the listing a pane shows of it
-/// when it's complete, else a fresh one. When any is taken, the clash dialog asks what to do
-/// before anything starts.
 pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool, reload: Vec<Location>) {
     let Some((email, parent)) = drive_folder(to) else {
         s.status = open_drive_folder();
         return;
     };
-    let up = Upload { email: email.clone(), parent: parent.clone(), to: to.clone(), sources, remove, reload };
-    if let Some(pane) = s.panes.iter().find(|p| p.loc == *to && !p.loading && p.error.is_none()) {
-        let existing = pane.entries.clone();
-        return ask_clashes(s, up, existing);
-    }
-    let list = move |d: &Drive| {
-        let mut out = Vec::new();
-        d.list(&parent, None, |page, _| {
-            out.extend(page.into_iter().map(crate::entry_of));
-            true
-        })?;
-        Ok(out)
-    };
-    drive_task(s, &email, t("listar a pasta", "list the folder"), list, move |result| Msg::Clashes { up, result });
-}
-
-/// The Drive folder's listing for an upload arrived.
-pub fn clashes_listed(s: &mut State, up: Upload, result: Result<Vec<Entry>, String>) {
-    match result {
-        Ok(existing) => ask_clashes(s, up, existing),
-        Err(e) => crate::fail(s, tr!("Não consegui ver o que já existe no destino: {e}", "Couldn't see what's already in the destination: {e}")),
-    }
-}
-
-/// An upload whose names are taken in its Drive folder, waiting for Substituir, Pular or
-/// Manter os dois.
-pub struct ClashAsk {
-    pub up: Upload,
-    /// What the folder holds.
-    pub existing: Vec<Entry>,
-    /// The sources whose names are taken, by position.
-    pub clashes: Vec<usize>,
-    /// The choices made so far, for the first of `clashes`.
-    pub chosen: Vec<Clash>,
-    /// Aplicar a todos: the next choice goes for every clash left.
-    pub all: bool,
-}
-
-impl ClashAsk {
-    /// The source the dialog asks about now, by position.
-    pub fn current(&self) -> usize {
-        self.clashes[self.chosen.len().min(self.clashes.len() - 1)]
-    }
-
-    /// What's already in the folder under `name`.
-    pub fn there(&self, name: &str) -> Option<&Entry> {
-        self.existing.iter().find(|e| e.name == name)
-    }
-}
-
-fn file_name(p: &std::path::Path) -> String {
-    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-}
-
-/// Starts `up` at once if none of its names is taken in `existing`, else asks: in the clash
-/// dialog, or after the one open now.
-fn ask_clashes(s: &mut State, up: Upload, existing: Vec<Entry>) {
-    let names: Vec<String> = up.sources.iter().map(|p| file_name(p)).collect();
-    let found: Vec<Existing> = existing.iter().map(Existing::of_entry).collect();
-    let clashes = crate::uploads::clashes(&names, &found);
-    if clashes.is_empty() {
-        return start_upload(s, up, &found, &[]);
-    }
-    let ask = ClashAsk { up, existing, clashes, chosen: Vec::new(), all: true };
-    if s.dialog.is_none() {
-        s.dialog = Some(Dialog::Clash(Box::new(ask)));
-    } else {
-        s.clash_waiting.push_back(ask);
-    }
-}
-
-/// Aplicar a todos, ticked or not.
-pub fn toggle_clash_all(s: &mut State) {
-    if let Some(Dialog::Clash(ask)) = &mut s.dialog {
-        ask.all = !ask.all;
-    }
-}
-
-/// An answer in the clash dialog: a choice for the item it asks about (for all left, with
-/// Aplicar a todos), or `None` for Cancelar, which drops the whole upload. Once every clash
-/// has its choice the upload starts.
-pub fn answer_clash(s: &mut State, choice: Option<Clash>) {
-    let Some(Dialog::Clash(mut ask)) = s.dialog.take() else { return };
-    let Some(c) = choice else {
-        s.status = t("Envio cancelado.", "Upload cancelled.").into();
-        return next_clash(s);
-    };
-    let n = if ask.all { ask.clashes.len() - ask.chosen.len() } else { 1 };
-    ask.chosen.extend(std::iter::repeat_n(c, n));
-    if ask.chosen.len() < ask.clashes.len() {
-        s.dialog = Some(Dialog::Clash(ask));
-        return;
-    }
-    let found: Vec<Existing> = ask.existing.iter().map(Existing::of_entry).collect();
-    let choices: Vec<(usize, Clash)> = ask.clashes.iter().copied().zip(ask.chosen.iter().copied()).collect();
-    start_upload(s, ask.up, &found, &choices);
-    next_clash(s);
-}
-
-/// Opens the clash dialog of the next upload waiting for one, if the window has no dialog.
-pub fn next_clash(s: &mut State) {
-    if s.dialog.is_none()
-        && let Some(ask) = s.clash_waiting.pop_front()
-    {
-        s.dialog = Some(Dialog::Clash(Box::new(ask)));
-    }
-}
-
-/// Queues `up`'s rows and starts it, each taken name settled by its entry in `choices`
-/// (source position, choice). Items skipped get no row.
-fn start_upload(s: &mut State, up: Upload, existing: &[Existing], choices: &[(usize, Clash)]) {
-    let choice = |i: usize| choices.iter().find(|(j, _)| *j == i).map_or(Clash::KeepBoth, |(_, c)| *c);
-    let local: Vec<(String, bool)> = up.sources.iter().map(|p| (file_name(p), p.is_dir())).collect();
-    let puts = crate::uploads::resolve(&local, existing, choice);
-    let mut items = Vec::new();
-    let mut skipped = 0;
-    for (i, (path, put)) in up.sources.into_iter().zip(puts).enumerate() {
-        if put == Put::Skip {
-            skipped += 1;
-        } else {
-            items.push(Item { path, put, clash: choice(i) });
-        }
-    }
-    if items.is_empty() {
-        s.status = if skipped == 1 {
-            t("Nada enviado: 1 item já existe no destino.", "Nothing uploaded: 1 item already exists in the destination.").into()
-        } else {
-            tr!("Nada enviado: {skipped} itens já existem no destino.", "Nothing uploaded: {skipped} items already exist in the destination.")
-        };
-        return;
-    }
-    let dest = End::drive(&up.to, None);
-    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Upload, items.iter().map(|it| (End::local(&it.path), dest.clone())));
+    let initial_existing = s
+        .panes
+        .iter()
+        .find(|p| p.loc == *to && !p.loading && p.error.is_none())
+        .map(|p| p.entries.iter().map(crate::uploads::Existing::of_entry).collect::<Vec<_>>());
+    let dest = End::drive(to, None);
+    let op = if remove { Op::Move } else { Op::Upload };
+    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, sources.iter().map(|p| (End::local(p), dest.clone())));
     let at_once = s.settings.uploads.into();
     s.upload_slots.set_limit(at_once);
     let slots = s.upload_slots.clone();
-    let (parent, remove) = (up.parent, up.remove);
-    drive_job(s, &up.email, up.reload, move |d| {
-        let summary = crate::uploads::run(d, &batch, &items, &parent, remove, at_once, &slots);
-        match summary {
-            Ok(line) if skipped > 0 => Ok(tr!("{line} Pulados (já existiam): {skipped}.", "{line} Skipped (already there): {skipped}.")),
-            other => other,
-        }
+    let may_have_more = sources.len() > 1 || sources.iter().any(|p| p.is_dir());
+    let resolver = make_resolver(s, op, may_have_more, &batch);
+    let dst_place = dest.text;
+    drive_job(s, &email, reload, move |d| {
+        crate::uploads::run_with_conflict(d, &batch, &sources, &parent, &dst_place, initial_existing, remove, at_once, &slots, Some(&resolver))
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_drive_into(
+    d: &Drive,
+    who: &str,
+    src_folder: &str,
+    dst_folder: &str,
+    move_item: bool,
+    src_place: &str,
+    dst_place: &str,
+    resolver: &Resolver,
+    rec: &undo::Rec,
+    cancelled: &dyn Fn() -> bool,
+    kept: &mut bool,
+) -> Result<(), String> {
+    let mut src_kids = Vec::new();
+    d.list(src_folder, None, |page, _| {
+        src_kids.extend(page);
+        true
+    })?;
+    let mut existing: std::collections::HashMap<String, DriveFile> = std::collections::HashMap::new();
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    d.list(dst_folder, None, |page, _| {
+        for f in page {
+            taken.insert(f.name.clone());
+            existing.entry(f.name.clone()).or_insert(f);
+        }
+        true
+    })?;
+    for child in src_kids {
+        if cancelled() {
+            return Err(ops::CANCELLED.into());
+        }
+        let Some(ex) = existing.get(&child.name).cloned() else {
+            taken.insert(child.name.clone());
+            if move_item {
+                d.move_to(&child.id, src_folder, dst_folder)?;
+                rec.add([Step::DriveMove {
+                    email: who.to_string(),
+                    id: child.id,
+                    name: child.name,
+                    from: dst_folder.to_string(),
+                    to: src_folder.to_string(),
+                }]);
+            } else {
+                let made = d.copy(&child, dst_folder, &child.name)?;
+                rec.add([Step::DriveTrash { email: who.to_string(), id: made.id, name: made.name, empty: false }]);
+            }
+            continue;
+        };
+        if child.is_dir && child.target.is_none() && ex.is_dir && ex.target.is_none() {
+            let child_src = if src_place.is_empty() { shown(&child.name) } else { format!("{src_place}\\{}", shown(&child.name)) };
+            let child_dst = if dst_place.is_empty() { shown(&ex.name) } else { format!("{dst_place}\\{}", shown(&ex.name)) };
+            let mut sub_kept = false;
+            merge_drive_into(d, who, &child.id, &ex.id, move_item, &child_src, &child_dst, resolver, rec, cancelled, &mut sub_kept)?;
+            if sub_kept {
+                *kept = true;
+            } else if move_item {
+                d.trash(&child.id)?;
+                rec.add([Step::DriveRestore { email: who.to_string(), id: child.id, name: child.name, empty: false }]);
+            }
+            continue;
+        }
+        let free = conflict::numbered_name(&child.name, child.is_dir, |n| taken.contains(n));
+        let decision = resolver.resolve(
+            conflict::FileInfo::drive(&child, src_place.to_string()),
+            conflict::FileInfo::drive(&ex, dst_place.to_string()),
+            free,
+            cancelled,
+        );
+        match decision {
+            conflict::Decision::Cancel => return Err(ops::CANCELLED.into()),
+            conflict::Decision::Skip => {
+                *kept = true;
+            }
+            conflict::Decision::Replace if !child.is_dir && !ex.is_dir => {
+                if move_item {
+                    d.move_to(&child.id, src_folder, dst_folder)?;
+                    rec.add([Step::DriveMove {
+                        email: who.to_string(),
+                        id: child.id,
+                        name: child.name,
+                        from: dst_folder.to_string(),
+                        to: src_folder.to_string(),
+                    }]);
+                } else {
+                    let made = d.copy(&child, dst_folder, &child.name)?;
+                    rec.add([Step::DriveTrash { email: who.to_string(), id: made.id, name: made.name, empty: false }]);
+                }
+                d.trash(&ex.id)?;
+                rec.add([Step::DriveRestore { email: who.to_string(), id: ex.id, name: ex.name, empty: false }]);
+            }
+            conflict::Decision::KeepBoth | conflict::Decision::Replace => {
+                let free = conflict::numbered_name(&child.name, child.is_dir, |n| taken.contains(n));
+                taken.insert(free.clone());
+                if move_item {
+                    d.move_to(&child.id, src_folder, dst_folder)?;
+                    d.rename(&child.id, &free)?;
+                    rec.add([Step::DriveMove {
+                        email: who.to_string(),
+                        id: child.id,
+                        name: free,
+                        from: dst_folder.to_string(),
+                        to: src_folder.to_string(),
+                    }]);
+                } else {
+                    let made = d.copy(&child, dst_folder, &free)?;
+                    rec.add([Step::DriveTrash { email: who.to_string(), id: made.id, name: made.name, empty: false }]);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A listed Drive item as the Drive client takes it.
@@ -1066,11 +1175,14 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
     // Recortar takes the originals out of the Drive trash. Abrir isn't kept.
     let recyclable = undo::has_recycle_bin(&dst);
     let op = if then == Then::Trash { Op::Move } else { Op::Copy };
+    let may_have_more = items.len() > 1 || items.iter().any(|e| e.is_dir);
+    let resolver = (then != Then::Open).then(|| make_resolver(s, Op::Download, may_have_more, &batch));
+    let src_root = End::drive(from, None).text;
     let who = email.clone();
     undo::drive_job(s, &email, reload, move |n| transfer_words(op, n), move |d, rec| {
-        let finish = |i: usize, path: &std::path::Path| {
+        let finish = |i: usize, path: &std::path::Path, created: bool, kept: bool| {
             let f = &files[i];
-            let arrived = recyclable.then(|| Step::Recycle { path: path.to_path_buf() });
+            let arrived = (created && recyclable).then(|| Step::Recycle { path: path.to_path_buf() });
             match then {
                 Then::Nothing => {
                     if let Some(step) = arrived {
@@ -1079,14 +1191,18 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
                     Ok(())
                 }
                 Then::Trash => {
-                    d.trash(&f.id)?;
-                    rec.add(arrived.into_iter().chain([Step::DriveRestore { email: who.clone(), id: f.id.clone(), name: f.name.clone(), empty: false }]));
+                    if !kept {
+                        d.trash(&f.id)?;
+                        rec.add(arrived.into_iter().chain([Step::DriveRestore { email: who.clone(), id: f.id.clone(), name: f.name.clone(), empty: false }]));
+                    } else if let Some(step) = arrived {
+                        rec.add([step]);
+                    }
                     Ok(())
                 }
                 Then::Open => ops::open(path),
             }
         };
-        crate::downloads::run(d, &batch, &files, &dst, at_once, segmented, &slots, &finish)
+        crate::downloads::run(d, &batch, &files, &dst, &src_root, at_once, segmented, &slots, resolver.as_ref(), &finish)
     });
 }
 
@@ -1225,10 +1341,18 @@ pub fn cancel_transfer(row: &ops::Progress) {
     row.cancel();
 }
 
-/// Cancelar todas: every row not over yet.
+/// Cancelar todas: every row not over yet, plus any open/queued conflict prompts.
 pub fn cancel_all_transfers(s: &mut State) {
     for t in &s.transfers {
         t.progress.cancel();
+    }
+    if matches!(&s.dialog, Some(Dialog::Conflict(_)))
+        && let Some(Dialog::Conflict(p)) = s.dialog.take()
+    {
+        p.send_cancel();
+    }
+    while let Some(p) = s.conflict_waiting.pop_front() {
+        p.send_cancel();
     }
 }
 
