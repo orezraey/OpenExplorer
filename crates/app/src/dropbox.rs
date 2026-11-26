@@ -1029,6 +1029,19 @@ mod batches {
         open(&mut s, 0, Location::Local(local.clone()));
         open(&mut s, 1, folder(&sv, vec!["U".into()]));
         paste_now(&mut s, &[], ClipMode::Copy);
+        let wait_start = Instant::now();
+        loop {
+            crate::poll(&mut s, 0.0, &mut rune::Tx::default());
+            if matches!(&s.dialog, Some(crate::actions::Dialog::Conflict(_))) {
+                crate::actions::answer_conflict(&mut s, Some(crate::conflict::Choice::KeepBoth));
+                break;
+            }
+            if !s.status.is_empty() && !s.status.ends_with('…') {
+                break;
+            }
+            assert!(wait_start.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(10));
+        }
         settle(&mut s);
         let st = stages(&s, 302);
         assert_eq!(count(&st, Stage::Done), 302, "{}", s.status);

@@ -5,7 +5,7 @@
 //!
 //! A server has no recycle bin: Excluir deletes for good, after asking.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -17,8 +17,9 @@ use rune::{Icon, TextEdit, Tx};
 
 use crate::accounts::Account;
 use crate::actions::Then;
-use crate::model::{Entry, Location};
-use crate::ops::{self, CANCELLED, Progress};
+use crate::conflict::{self, Decision, FileInfo, Resolver};
+use crate::model::{Entry, Location, shown};
+use crate::ops::{self, CANCELLED, Progress, Stage};
 use crate::transfers::{self, End, Op};
 use crate::undo;
 use crate::{Msg, Part, State, background, catch_panic};
@@ -344,7 +345,9 @@ fn transfer<P: Send + Sync + 'static>(
                                     }
                                 }
                                 for ((_, p), r) in rows.iter().zip(step(c, &shared, &rows)) {
-                                    p.end(r);
+                                    if p.stage() != Stage::Skipped {
+                                        p.end(r);
+                                    }
                                 }
                             }
                             Ok(())
@@ -365,6 +368,11 @@ fn transfer<P: Send + Sync + 'static>(
     });
 }
 
+fn child_place(place: &str, name: &str) -> String {
+    let s = shown(name);
+    if place.is_empty() { s } else { format!("{place}\\{s}") }
+}
+
 /// Downloads `items` of the server folder `from` into the folder `dst` on the computer, a row
 /// each in the queue, several at once; then `then` (Recortar: deleting them from the server).
 pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf, then: Then, reload: Vec<Location>) {
@@ -375,6 +383,9 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
     let at_once = usize::from(s.settings.downloads);
     s.download_slots.set_limit(at_once);
     let slots = s.download_slots.clone();
+    let may_have_more = items.len() > 1 || items.iter().any(|e| e.is_dir);
+    let resolver = (then != Then::Open).then(|| crate::actions::make_resolver(s, Op::Download, may_have_more, &batch));
+    let src_root = end(from, None).text;
     let sizes: Vec<(bool, Option<u64>, String)> = items.iter().zip(&paths).map(|(e, p)| (e.is_dir, e.size, p.clone())).collect();
     let prepare = move |c: &mut dyn Conn, batch: &transfers::Batch| {
         for (p, (is_dir, size, path)) in batch.rows().iter().zip(&sizes) {
@@ -387,22 +398,123 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
     };
     let one = move |c: &mut dyn Conn, (claimed, paths): &(std::sync::Mutex<HashSet<PathBuf>>, Vec<String>), i: usize, p: &Progress| {
         let e = &items[i];
-        let local = {
-            let mut claimed = claimed.lock().unwrap_or_else(|e| e.into_inner());
-            let local = ops::unique_where(&dst, &ops::windows_name(&e.name), &|p| claimed.contains(p));
-            claimed.insert(local.clone());
-            local
+        let raw_name = ops::windows_name(&e.name);
+        let desired = dst.join(&raw_name);
+        let (local, created) = match &resolver {
+            None => {
+                let mut claimed = claimed.lock().unwrap_or_else(|e| e.into_inner());
+                let local = ops::unique_where(&dst, &raw_name, &|p| claimed.contains(p));
+                claimed.insert(local.clone());
+                (local, true)
+            }
+            Some(res) => {
+                if e.is_dir {
+                    if desired.is_dir() {
+                        claimed.lock().unwrap_or_else(|e| e.into_inner()).insert(desired.clone());
+                        (desired, false)
+                    } else if desired.exists() {
+                        let free = conflict::numbered_local(&dst, &raw_name, true, &|p| claimed.lock().unwrap_or_else(|e| e.into_inner()).contains(p));
+                        let renamed = free.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| raw_name.clone());
+                        let dst_info = FileInfo::local(&desired).unwrap_or_else(|| FileInfo {
+                            name: raw_name.clone(),
+                            place: dst.display().to_string(),
+                            is_dir: false,
+                            size: None,
+                            modified: None,
+                            kind: conflict::kind_of(&raw_name, false, None),
+                        });
+                        match res.resolve(FileInfo::entry(e, src_root.clone()), dst_info, renamed, || p.cancelled()) {
+                            Decision::Cancel => return Err(CANCELLED.into()),
+                            Decision::Skip => {
+                                p.skip();
+                                return Ok(());
+                            }
+                            Decision::KeepBoth | Decision::Replace => {
+                                let mut g = claimed.lock().unwrap_or_else(|e| e.into_inner());
+                                let free = conflict::numbered_local(&dst, &raw_name, true, &|p| g.contains(p));
+                                g.insert(free.clone());
+                                (free, true)
+                            }
+                        }
+                    } else {
+                        let mut g = claimed.lock().unwrap_or_else(|e| e.into_inner());
+                        if !g.contains(&desired) {
+                            g.insert(desired.clone());
+                            (desired, true)
+                        } else {
+                            let free = conflict::numbered_local(&dst, &raw_name, true, &|p| g.contains(p));
+                            g.insert(free.clone());
+                            (free, true)
+                        }
+                    }
+                } else {
+                    let (exists_on_disk, renamed_name) = {
+                        let mut g = claimed.lock().unwrap_or_else(|e| e.into_inner());
+                        if !desired.exists() && !g.contains(&desired) {
+                            g.insert(desired.clone());
+                            (false, String::new())
+                        } else {
+                            let free = conflict::numbered_local(&dst, &raw_name, false, &|p| g.contains(p));
+                            let rn = free.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| raw_name.clone());
+                            (desired.exists(), rn)
+                        }
+                    };
+                    if !exists_on_disk && renamed_name.is_empty() {
+                        (desired, true)
+                    } else if !exists_on_disk {
+                        let mut g = claimed.lock().unwrap_or_else(|e| e.into_inner());
+                        let free = conflict::numbered_local(&dst, &raw_name, false, &|p| g.contains(p));
+                        g.insert(free.clone());
+                        (free, true)
+                    } else {
+                        let dst_info = FileInfo::local(&desired).unwrap_or_else(|| FileInfo {
+                            name: raw_name.clone(),
+                            place: dst.display().to_string(),
+                            is_dir: false,
+                            size: None,
+                            modified: None,
+                            kind: conflict::kind_of(&raw_name, false, None),
+                        });
+                        match res.resolve(FileInfo::entry(e, src_root.clone()), dst_info, renamed_name, || p.cancelled()) {
+                            Decision::Cancel => return Err(CANCELLED.into()),
+                            Decision::Skip => {
+                                p.skip();
+                                return Ok(());
+                            }
+                            Decision::Replace if !desired.is_dir() => {
+                                let mut g = claimed.lock().unwrap_or_else(|e| e.into_inner());
+                                if g.contains(&desired) {
+                                    let free = conflict::numbered_local(&dst, &raw_name, false, &|p| g.contains(p));
+                                    g.insert(free.clone());
+                                    (free, true)
+                                } else {
+                                    g.insert(desired.clone());
+                                    (desired, false)
+                                }
+                            }
+                            Decision::KeepBoth | Decision::Replace => {
+                                let mut g = claimed.lock().unwrap_or_else(|e| e.into_inner());
+                                let free = conflict::numbered_local(&dst, &raw_name, false, &|p| g.contains(p));
+                                g.insert(free.clone());
+                                (free, true)
+                            }
+                        }
+                    }
+                }
+            }
         };
-        if let Err(err) = fetch(c, &paths[i], e.is_dir, e.modified, &local, p, 0) {
-            // What arrived of an item cancelled midway is no use.
-            if err == CANCELLED {
+        let mut kept = false;
+        let place = if e.is_dir { child_place(&src_root, &e.name) } else { src_root.clone() };
+        if let Err(err) = fetch(c, &paths[i], e.is_dir, e.modified, &local, created, &place, resolver.as_ref(), &mut kept, p, 0) {
+            // What arrived of an item cancelled midway is no use (never remove pre-existing files/folders).
+            if err == CANCELLED && created {
                 let _ = if e.is_dir { std::fs::remove_dir_all(&local) } else { std::fs::remove_file(&local) };
             }
             return Err(err);
         }
         match then {
             Then::Nothing => Ok(()),
-            Then::Trash => c.remove(&paths[i], e.is_dir),
+            Then::Trash => if !kept { c.remove(&paths[i], e.is_dir) } else { Ok(()) },
             Then::Open => ops::open(&local),
         }
     };
@@ -411,9 +523,22 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
 }
 
 /// A file or a folder and all it holds, from `path` on the server to `local`, `depth` folders
-/// down from where the download started. Two names the server tells apart but Windows doesn't
-/// ("Nota" and "nota", "a:b" and "a_b") each get their own file.
-fn fetch(c: &mut dyn Conn, path: &str, is_dir: bool, modified: Option<SystemTime>, local: &Path, p: &Progress, depth: usize) -> Result<(), String> {
+/// down from where the download started. Writes files via a `.openexplorer-part` temp file so
+/// overwriting an existing file is atomic and cancellation never destroys the previous file.
+#[allow(clippy::too_many_arguments)]
+fn fetch(
+    c: &mut dyn Conn,
+    path: &str,
+    is_dir: bool,
+    modified: Option<SystemTime>,
+    local: &Path,
+    created: bool,
+    src_place: &str,
+    resolver: Option<&Resolver>,
+    kept: &mut bool,
+    p: &Progress,
+    depth: usize,
+) -> Result<(), String> {
     if p.cancelled() {
         return Err(CANCELLED.into());
     }
@@ -421,17 +546,71 @@ fn fetch(c: &mut dyn Conn, path: &str, is_dir: bool, modified: Option<SystemTime
         if depth > DEEPEST {
             return Err(tr!("{path}: pastas demais umas dentro das outras (um link que volta para cima?).", "{path}: too many folders inside one another (a link that loops back up?)."));
         }
-        std::fs::create_dir(local).map_err(|e| tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", local.display()))?;
+        if created || !local.exists() {
+            std::fs::create_dir_all(local).map_err(|e| tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", local.display()))?;
+        }
+        let mut child_taken = HashSet::<PathBuf>::new();
         for it in c.list(path)? {
             if it.is_dir && c.passed_over(&child(path, &it.name)) {
                 continue;
             }
-            let to = ops::unique_in(local, &ops::windows_name(&it.name));
-            fetch(c, &child(path, &it.name), it.is_dir, it.modified, &to, p, depth + 1)?;
+            let raw_name = ops::windows_name(&it.name);
+            let desired = local.join(&raw_name);
+            let (to, child_created) = match resolver {
+                None => {
+                    let to = ops::unique_where(local, &raw_name, &|x| child_taken.contains(x));
+                    child_taken.insert(to.clone());
+                    (to, true)
+                }
+                Some(res) => {
+                    if it.is_dir && desired.is_dir() {
+                        child_taken.insert(desired.clone());
+                        (desired, false)
+                    } else if desired.exists() {
+                        let free = conflict::numbered_local(local, &raw_name, it.is_dir, &|x| child_taken.contains(x));
+                        let renamed = free.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| raw_name.clone());
+                        let dst_info = FileInfo::local(&desired).unwrap_or_else(|| FileInfo {
+                            name: raw_name.clone(),
+                            place: local.display().to_string(),
+                            is_dir: desired.is_dir(),
+                            size: None,
+                            modified: None,
+                            kind: conflict::kind_of(&raw_name, desired.is_dir(), None),
+                        });
+                        match res.resolve(FileInfo::remote(&it, src_place.to_string()), dst_info, renamed, || p.cancelled()) {
+                            Decision::Cancel => return Err(CANCELLED.into()),
+                            Decision::Skip => {
+                                *kept = true;
+                                p.unsize(it.size.unwrap_or(0));
+                                continue;
+                            }
+                            Decision::Replace if !it.is_dir && !desired.is_dir() && !child_taken.contains(&desired) => {
+                                child_taken.insert(desired.clone());
+                                (desired, false)
+                            }
+                            Decision::KeepBoth | Decision::Replace => {
+                                let free = conflict::numbered_local(local, &raw_name, it.is_dir, &|x| child_taken.contains(x));
+                                child_taken.insert(free.clone());
+                                (free, true)
+                            }
+                        }
+                    } else if !child_taken.contains(&desired) {
+                        child_taken.insert(desired.clone());
+                        (desired, true)
+                    } else {
+                        let free = conflict::numbered_local(local, &raw_name, it.is_dir, &|x| child_taken.contains(x));
+                        child_taken.insert(free.clone());
+                        (free, true)
+                    }
+                }
+            };
+            let next_place = if it.is_dir { child_place(src_place, &it.name) } else { src_place.to_string() };
+            fetch(c, &child(path, &it.name), it.is_dir, it.modified, &to, child_created, &next_place, resolver, kept, p, depth + 1)?;
         }
         return Ok(());
     }
-    let mut file = std::fs::File::create_new(local).map_err(|e| tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", local.display()))?;
+    let part = ops::part_path(local);
+    let mut file = std::fs::File::create_new(&part).map_err(|e| tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", local.display()))?;
     let mut last = 0;
     let got = c.download(path, &mut file, &mut |n| {
         p.reached(&mut last, n);
@@ -439,19 +618,25 @@ fn fetch(c: &mut dyn Conn, path: &str, is_dir: bool, modified: Option<SystemTime
     });
     if let Err(e) = got {
         drop(file);
-        let _ = std::fs::remove_file(local);
+        let _ = std::fs::remove_file(&part);
         return Err(cancelled(e));
     }
     // Dated as on the server, as a copy on the disk is.
     if let Some(m) = modified {
         let _ = file.set_modified(m);
     }
+    drop(file);
+    if let Err(e) = std::fs::rename(&part, local) {
+        let _ = std::fs::remove_file(&part);
+        return Err(tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", local.display()));
+    }
     Ok(())
 }
 
 /// Uploads `sources` (files and folders on the computer) into the server folder `to` shows, a
-/// row each in the queue, several at once, a taken name getting a free one ("nome (2).ext").
-/// With `remove` (Recortar), each original goes to the Recycle Bin once all of it arrived.
+/// row each in the queue, several at once, prompting on destination collisions (or merging
+/// existing folders). With `remove` (Recortar), each original goes to the Recycle Bin once all
+/// of it arrived without skipped items.
 pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool, reload: Vec<Location>) {
     let Some((server, dir)) = target(to) else {
         s.status = t("Abra uma pasta do servidor para enviar para ela.", "Open a folder on the server to upload to it.").into();
@@ -459,10 +644,14 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
     };
     let server = server.clone();
     let dest = end(to, None);
-    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Upload, sources.iter().map(|p| (End::local(p), dest.clone())));
+    let op = if remove { Op::Move } else { Op::Upload };
+    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, sources.iter().map(|p| (End::local(p), dest.clone())));
     let at_once = usize::from(s.settings.uploads);
     s.upload_slots.set_limit(at_once);
     let slots = s.upload_slots.clone();
+    let may_have_more = sources.len() > 1 || sources.iter().any(|p| p.is_dir());
+    let resolver = crate::actions::make_resolver(s, op, may_have_more, &batch);
+    let dst_place = dest.text;
     let measured = sources.clone();
     let listed = dir.clone();
     let prepare = move |c: &mut dyn Conn, batch: &transfers::Batch| {
@@ -476,53 +665,123 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
         }
         // Lowercased: a server on Windows (or many NAS) takes "Nota.txt" and "nota.txt" for one
         // file, and an upload under the other spelling would replace it.
-        let taken: HashSet<String> = c.list(&listed)?.into_iter().map(|i| i.name.to_lowercase()).collect();
-        Ok((std::sync::Mutex::new(taken), small))
+        let existing: HashMap<String, Item> = c.list(&listed)?.into_iter().map(|i| (i.name.to_lowercase(), i)).collect();
+        let taken: HashSet<String> = existing.keys().cloned().collect();
+        Ok((std::sync::Mutex::new((existing, taken)), small))
     };
-    let step = move |c: &mut dyn Conn, (taken, _): &(std::sync::Mutex<HashSet<String>>, Vec<bool>), rows: &[(usize, &Progress)]| {
-        // Each row's name, taken before any is sent.
-        let targets: Vec<(String, bool)> = rows
-            .iter()
-            .map(|(i, _)| {
-                let src = &sources[*i];
-                let is_dir = src.is_dir();
-                let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let mut taken = taken.lock().unwrap_or_else(|e| e.into_inner());
-                let name = free_name(&name, is_dir, &taken);
-                taken.insert(name.to_lowercase());
-                (child(&dir, &name), is_dir)
-            })
-            .collect();
-        let sent: Vec<Result<(), String>> = match rows {
-            [(i, p)] => vec![send(c, &sources[*i], &targets[0].0, p)],
-            // Small files, together.
-            _ => {
-                let files: Vec<(String, PathBuf)> = rows.iter().zip(&targets).map(|((i, _), (to, _))| (to.clone(), sources[*i].clone())).collect();
-                let mut last = vec![0u64; rows.len()];
-                c.upload_files(&files, &mut |k, n| {
-                    let p = rows[k].1;
-                    p.reached(&mut last[k], n);
-                    !p.cancelled()
-                })
-                .into_iter()
-                .map(|r| r.map_err(cancelled))
-                .collect()
-            }
-        };
-        rows.iter()
-            .zip(&targets)
-            .zip(sent)
-            .map(|(((i, _), (target, is_dir)), r)| {
-                if let Err(e) = r {
-                    if e == CANCELLED {
-                        let _ = c.remove(target, *is_dir);
+    let step = move |c: &mut dyn Conn, (state, _): &(std::sync::Mutex<(HashMap<String, Item>, HashSet<String>)>, Vec<bool>), rows: &[(usize, &Progress)]| {
+        enum Action {
+            Send { idx: usize, target: String, is_dir: bool, merge: bool },
+            Skip,
+            Cancel,
+        }
+        let mut actions = Vec::with_capacity(rows.len());
+        let mut to_batch: Vec<(usize, String, PathBuf)> = Vec::new();
+        for (i, p) in rows {
+            let src = &sources[*i];
+            let is_dir = src.is_dir();
+            let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let key = name.to_lowercase();
+            let ex = {
+                let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+                let ex = g.0.get(&key).cloned();
+                if ex.is_none() && !g.1.contains(&key) {
+                    g.1.insert(key.clone());
+                }
+                ex
+            };
+            let act = match ex {
+                None => Action::Send { idx: *i, target: child(&dir, &name), is_dir, merge: false },
+                Some(ex) if is_dir && ex.is_dir => {
+                    Action::Send { idx: *i, target: child(&dir, &ex.name), is_dir: true, merge: true }
+                }
+                Some(ex) => {
+                    let renamed = {
+                        let g = state.lock().unwrap_or_else(|e| e.into_inner());
+                        free_name(&name, is_dir, &g.1)
+                    };
+                    let src_info = FileInfo::local(src).unwrap_or_else(|| FileInfo {
+                        name: name.clone(),
+                        place: src.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+                        is_dir,
+                        size: None,
+                        modified: None,
+                        kind: conflict::kind_of(&name, is_dir, None),
+                    });
+                    match resolver.resolve(src_info, FileInfo::remote(&ex, dst_place.clone()), renamed, || p.cancelled()) {
+                        Decision::Cancel => Action::Cancel,
+                        Decision::Skip => Action::Skip,
+                        Decision::Replace if !is_dir && !ex.is_dir => {
+                            Action::Send { idx: *i, target: child(&dir, &ex.name), is_dir: false, merge: false }
+                        }
+                        Decision::KeepBoth | Decision::Replace => {
+                            let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+                            let free = free_name(&name, is_dir, &g.1);
+                            g.1.insert(free.to_lowercase());
+                            Action::Send { idx: *i, target: child(&dir, &free), is_dir, merge: false }
+                        }
                     }
-                    return Err(e);
                 }
-                if remove {
-                    trash::delete(&sources[*i]).map_err(|e| tr!("Enviado, mas não consegui mover o original para a Lixeira: {e}", "Uploaded, but couldn't move the original to the Recycle Bin: {e}"))?;
+            };
+            if let Action::Send { idx, target, is_dir: false, .. } = &act
+                && rows.len() > 1
+            {
+                to_batch.push((idx.to_owned(), target.clone(), sources[*idx].clone()));
+            }
+            actions.push(act);
+        }
+
+        // Fast batch path when all rows in this group are small files to upload.
+        if to_batch.len() == rows.len() && rows.len() > 1 {
+            let files: Vec<(String, PathBuf)> = to_batch.iter().map(|(_, t, p)| (t.clone(), p.clone())).collect();
+            let mut last = vec![0u64; rows.len()];
+            let sent = c.upload_files(&files, &mut |k, n| {
+                let p = rows[k].1;
+                p.reached(&mut last[k], n);
+                !p.cancelled()
+            });
+            return rows
+                .iter()
+                .zip(to_batch)
+                .zip(sent)
+                .map(|(((i, _), (_, target, _)), r)| {
+                    if let Err(e) = r.map_err(cancelled) {
+                        if e == CANCELLED {
+                            let _ = c.remove(&target, false);
+                        }
+                        return Err(e);
+                    }
+                    if remove {
+                        trash::delete(&sources[*i]).map_err(|e| tr!("Enviado, mas não consegui mover o original para a Lixeira: {e}", "Uploaded, but couldn't move the original to the Recycle Bin: {e}"))?;
+                    }
+                    Ok(())
+                })
+                .collect();
+        }
+
+        rows.iter()
+            .zip(actions)
+            .map(|((i, p), act)| match act {
+                Action::Cancel => Err(CANCELLED.into()),
+                Action::Skip => {
+                    p.skip();
+                    Ok(())
                 }
-                Ok(())
+                Action::Send { target, is_dir, merge, .. } => {
+                    let mut kept = false;
+                    let place = if is_dir { child_place(&dst_place, &sources[*i].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()) } else { dst_place.clone() };
+                    let r = send(c, &sources[*i], &target, merge, &place, &resolver, &mut kept, p);
+                    if let Err(e) = r {
+                        if e == CANCELLED && !merge {
+                            let _ = c.remove(&target, is_dir);
+                        }
+                        return Err(e);
+                    }
+                    if remove && !kept {
+                        trash::delete(&sources[*i]).map_err(|e| tr!("Enviado, mas não consegui mover o original para a Lixeira: {e}", "Uploaded, but couldn't move the original to the Recycle Bin: {e}"))?;
+                    }
+                    Ok(())
+                }
             })
             .collect()
     };
@@ -542,22 +801,69 @@ pub(crate) fn free_name(name: &str, is_dir: bool, taken: &HashSet<String>) -> St
 }
 
 /// A file or a folder and all it holds, from the computer to `target` on the server.
-fn send(c: &mut dyn Conn, src: &Path, target: &str, p: &Progress) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+fn send(c: &mut dyn Conn, src: &Path, target: &str, merge: bool, dst_place: &str, resolver: &Resolver, kept: &mut bool, p: &Progress) -> Result<(), String> {
     if p.cancelled() {
         return Err(CANCELLED.into());
     }
     if src.is_dir() {
-        c.mkdir(target)?;
+        let existing: HashMap<String, Item> = if merge {
+            c.list(target)?.into_iter().map(|i| (i.name.to_lowercase(), i)).collect()
+        } else {
+            c.mkdir(target)?;
+            HashMap::new()
+        };
+        let mut taken: HashSet<String> = existing.keys().cloned().collect();
         let items = std::fs::read_dir(src).map_err(|e| tr!("Não consegui ler {}: {e}", "Couldn't read {}: {e}", src.display()))?;
         // Where the server takes files in batches, the folder's small files go together.
         let (most, largest) = c.batches();
         let mut small = Vec::new();
         for item in items {
             let item = item.map_err(|e| tr!("Não consegui ler {}: {e}", "Couldn't read {}: {e}", src.display()))?;
-            let (from, to) = (item.path(), child(target, &item.file_name().to_string_lossy()));
+            let from = item.path();
+            let raw_name = item.file_name().to_string_lossy().into_owned();
+            let is_dir = from.is_dir();
+            let key = raw_name.to_lowercase();
+            let (child_name, child_merge) = match existing.get(&key) {
+                None => {
+                    let chosen = if taken.contains(&key) { free_name(&raw_name, is_dir, &taken) } else { raw_name.clone() };
+                    taken.insert(chosen.to_lowercase());
+                    (chosen, false)
+                }
+                Some(ex) if is_dir && ex.is_dir => (ex.name.clone(), true),
+                Some(ex) => {
+                    let renamed = free_name(&raw_name, is_dir, &taken);
+                    let src_info = FileInfo::local(&from).unwrap_or_else(|| FileInfo {
+                        name: raw_name.clone(),
+                        place: src.display().to_string(),
+                        is_dir,
+                        size: None,
+                        modified: None,
+                        kind: conflict::kind_of(&raw_name, is_dir, None),
+                    });
+                    match resolver.resolve(src_info, FileInfo::remote(ex, dst_place.to_string()), renamed, || p.cancelled()) {
+                        Decision::Cancel => return Err(CANCELLED.into()),
+                        Decision::Skip => {
+                            *kept = true;
+                            p.unsize(ops::measure(&from, &|| p.cancelled()));
+                            continue;
+                        }
+                        Decision::Replace if !is_dir && !ex.is_dir => (ex.name.clone(), false),
+                        Decision::KeepBoth | Decision::Replace => {
+                            let free = free_name(&raw_name, is_dir, &taken);
+                            taken.insert(free.to_lowercase());
+                            (free, false)
+                        }
+                    }
+                }
+            };
+            let to = child(target, &child_name);
             match item.metadata() {
-                Ok(m) if most > 1 && m.is_file() && m.len() <= largest => small.push((to, from)),
-                _ => send(c, &from, &to, p)?,
+                Ok(m) if !is_dir && most > 1 && m.is_file() && m.len() <= largest => small.push((to, from)),
+                _ => {
+                    let next_place = if is_dir { child_place(dst_place, &child_name) } else { dst_place.to_string() };
+                    send(c, &from, &to, child_merge, &next_place, resolver, kept, p)?;
+                }
             }
         }
         for files in small.chunks(most.max(1)) {
@@ -2256,10 +2562,10 @@ pub(crate) mod tests {
         let local = dir.join("x.bin");
         std::fs::write(&local, [0u8; 30]).unwrap();
         let p = Progress::new(None);
-        send(&mut Resends(vec![10, 20, 5, 30]), &local, "/x.bin", &p).unwrap();
+        send(&mut Resends(vec![10, 20, 5, 30]), &local, "/x.bin", false, "", &Resolver::fixed(conflict::Choice::Replace), &mut false, &p).unwrap();
         assert_eq!(p.bytes.load(Ordering::Relaxed), 30);
         let p = Progress::new(None);
-        fetch(&mut Resends(vec![10, 20, 5, 30]), "/x.bin", false, None, &dir.join("y.bin"), &p, 0).unwrap();
+        fetch(&mut Resends(vec![10, 20, 5, 30]), "/x.bin", false, None, &dir.join("y.bin"), true, "", None, &mut false, &p, 0).unwrap();
         assert_eq!(p.bytes.load(Ordering::Relaxed), 30);
         let _ = std::fs::remove_dir_all(dir);
     }
