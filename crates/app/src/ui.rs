@@ -536,15 +536,6 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 ))
                 .child(divider())
                 .child(switch_row(
-                    "opt-clear-done",
-                    t("Limpar concluídos automaticamente", "Clear finished automatically"),
-                    t("Remove da fila inferior os envios e downloads assim que terminam sem erro.", "Removes uploads and downloads from the queue below as soon as they finish without errors."),
-                    None,
-                    st.clear_completed,
-                    toggle_clear_completed,
-                ))
-                .child(divider())
-                .child(switch_row(
                     "opt-skip-trash",
                     t("Não mover arquivos locais para a Lixeira", "Don't move local files to the Recycle Bin"),
                     t("Exclui itens do computador permanentemente após confirmação, sem passar pela Lixeira.", "Deletes items on this PC permanently after confirmation, skipping the Recycle Bin."),
@@ -612,7 +603,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .key("page-general")
                 .w_full()
                 .gap(12.0)
-                .child(section_head(t("Geral", "General"), t("Aparência, fonte da interface e comportamento de arquivos e transferências.", "Appearance, interface font, and how files and transfers behave.")))
+                .child(section_head(t("Geral", "General"), t("Aparência, fonte da interface e comportamento de arquivos.", "Appearance, interface font, and how files behave.")))
                 .child(appearance)
                 .child(files_card)
                 .child(updates_card)
@@ -897,6 +888,18 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 |s| change_settings(s, |c| c.segmented_downloads = !c.segmented_downloads),
             ));
 
+            let queue_card = card_box("card-queue").child(switch_row(
+                "opt-clear-done",
+                t("Limpar concluídos automaticamente", "Clear finished automatically"),
+                t(
+                    "Remove da fila inferior as transferências assim que terminam sem erro. Quando desativado, elas permanecem visíveis até você limpá-las manualmente.",
+                    "Removes transfers from the queue below as soon as they finish without errors. When off, they stay visible until you clear them manually.",
+                ),
+                None,
+                st.clear_completed,
+                toggle_clear_completed,
+            ));
+
             let info_box = row()
                 .key("transfer-note")
                 .w_full()
@@ -921,9 +924,16 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .key("page-transfers")
                 .w_full()
                 .gap(12.0)
-                .child(section_head(t("Transferências", "Transfers"), t("Ajuste quantas transferências rodam em paralelo e a aceleração de downloads grandes.", "Set how many transfers run in parallel and how large downloads are sped up.")))
+                .child(section_head(
+                    t("Transferências", "Transfers"),
+                    t(
+                        "Ajuste quantas transferências rodam em paralelo, a aceleração de downloads grandes e a limpeza da fila.",
+                        "Set how many transfers run in parallel, how large downloads are sped up, and how the queue is cleared.",
+                    ),
+                ))
                 .child(concurrency)
                 .child(speed_card)
+                .child(queue_card)
                 .child(info_box)
         }
         OptionsTab::Cache => cache_page(
@@ -1403,6 +1413,28 @@ fn transfers(s: &State, k: &Kit) -> El {
     // One viewport scrolls both ways, as the file list's: sideways when the columns are wider
     // than the window, with the header stuck to the top.
     let table = col().key("queue-table").w_full().min_w(total + bar.strip()).child(header).child(rows);
+    let any_over = s.transfers.iter().any(|t| t.progress.over());
+    let clear_btn = if any_over {
+        k.interactive(
+            row()
+                .key("queue-clear")
+                .role("button")
+                .label(t("Limpar finalizadas", "Clear finished"))
+                .focusable(true)
+                .focus_ring(2.0, 1.0, k.c.border_focus)
+                .h(18.0)
+                .px(6.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .hover(k.c.hover)
+                .press(k.c.pressed)
+                .cursor(Cursor::Pointer),
+        )
+        .on_press(actions::clear_transfers)
+        .child(text(t("Limpar finalizadas", "Clear finished")).font(k.ty.text_xsmall).color(k.c.text_muted))
+    } else {
+        el().key("queue-clear")
+    };
     let queue = col()
         .key("queue")
         .w_full()
@@ -1413,7 +1445,18 @@ fn transfers(s: &State, k: &Kit) -> El {
         .clip_soft(0.0)
         .on_secondary_press(|s: &mut State, at: rune::PointerPress, _: &mut Tx| s.transfer_menu = Some((None, at)))
         .child(col().key("queue-viewport").w_full().grow(1.0).min_h(0.0).scroll_xy().child(table).scroll_bar_styled(bar))
-        .child(row().key("queue-foot").w_full().h(22.0).px(8.0).justify_end().center_y().border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_weak).child(queue_totals(s, k)));
+        .child(
+            row()
+                .key("queue-foot")
+                .w_full()
+                .h(22.0)
+                .px(6.0)
+                .center_y()
+                .border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_weak)
+                .child(clear_btn)
+                .child(el().grow(1.0))
+                .child(queue_totals(s, k)),
+        );
     // The strip above the queue drags up and down to change its height. On a window too
     // short for it, the queue gives way rather than the panes.
     let edge = splitter(k, "queue-edge", 6.0, Split::Up, |s: &mut State| &mut s.layout.queue_h, layout::QUEUE_H, layout::clamp_queue_h);
