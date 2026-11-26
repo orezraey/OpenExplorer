@@ -833,6 +833,20 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
         }
     }
+    // Clipboard Copy/Cut icon wiggle: only wake while copied/cut items are visible in an open pane.
+    if s.main_tab == MainTab::Explore
+        && s.settings.clipboard_animated()
+        && let Some(clip) = &s.clip
+        && !clip.items.is_empty()
+        && (0..2).any(|p| {
+            !s.tabs[p].is_picker()
+                && s.panes[p].loc == clip.from
+                && s.panes[p].entries.iter().any(|e| clip.items.iter().any(|c| c.id == e.id))
+        })
+    {
+        changed = true;
+        anim_wake = true;
+    }
     if anim_wake {
         tx.wake_at(now + 1.0 / 60.0);
     }
@@ -1872,9 +1886,13 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             }
             return true;
         }
-        // Esc lets go of the selection; the cursor stays.
+        // Esc lets go of the selection (the cursor stays), or clears a pending copy/cut.
         Key::Escape if owns && !s.panes[p].selected.is_empty() => {
             s.panes[p].selected.clear();
+            return true;
+        }
+        Key::Escape if owns && s.clip.is_some() => {
+            s.clip = None;
             return true;
         }
         Key::Enter if ev.mods.alt => {

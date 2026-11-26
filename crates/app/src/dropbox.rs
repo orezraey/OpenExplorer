@@ -883,7 +883,7 @@ mod batches {
     fn paste_now(s: &mut State, names: &[&str], mode: ClipMode) {
         let items: Vec<Entry> = s.panes[0].entries.iter().filter(|e| names.is_empty() || names.contains(&e.name.as_str())).cloned().collect();
         s.status.clear();
-        s.clip = Some(Clip { mode, from: s.panes[0].loc.clone(), items });
+        s.clip = Some(Clip { mode, from: s.panes[0].loc.clone(), items, picked_at: 0.0 });
         actions::paste(s, 1);
     }
 

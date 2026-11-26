@@ -5741,6 +5741,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let row_h = s.zoom[p].row_height();
     let icon_sz = s.zoom[p].icon_size();
     let hover_glides = s.settings.hover_animated();
+    let clip_anim = s.settings.clipboard_animated();
 
     let selected = k.alpha(k.c.text_accent, if k.dark { 0.26 } else { 0.18 });
     let hover = k.alpha(k.c.text_base, if k.dark { 0.065 } else { 0.05 });
@@ -5760,8 +5761,13 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         let e = &pane.entries[i];
         let is_sel = pane.selected.contains(&e.id);
         let found = pane.loc.finds();
+        let clip_match = s.clip.as_ref().filter(|c| c.from == pane.loc && c.items.iter().any(|it| it.id == e.id));
+        let is_cut = clip_match.is_some_and(|c| c.mode == ClipMode::Cut);
         // As wide as the columns: past them is empty space, where a drag draws a rectangle.
         let mut r = row().key(row_key(&e.id)).role("row").label(shown(&e.name)).focus_selected(is_sel).w(total).h(row_h).center_y();
+        if clip_anim {
+            r = r.animated_changes();
+        }
         r = if is_sel {
             r.fill(selected)
         } else if hover_glides {
@@ -5769,6 +5775,11 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         } else {
             r.hover(hover)
         };
+        if clip_anim {
+            r = r.opacity(if is_cut { 0.55 } else { 1.0 }).opacity_motion(crate::anim::hover_curve());
+        } else if is_cut {
+            r = r.opacity(0.55);
+        }
         // The keyboard's row is outlined only when it isn't selected (Ctrl+arrows moved it
         // alone): a selected row already shows, and an outline on the end of a Shift range
         // reads as a second kind of selection.
@@ -5778,11 +5789,19 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         let (id_press, id_open, id_drag, id_start) = (e.id.clone(), e.id.clone(), e.id.clone(), e.id.clone());
         let cell = |i: usize| row().w(w[i]).h_full().px(8.0).center_y().clip_soft(0.0);
         let muted = |t: String| text(t).font(font).color(muted_c).truncate().shrink().min_w(0.0);
+        let mut ico = entry_icon(s, &pane.loc, e, icon_sz);
+        if clip_anim
+            && let Some(clip) = clip_match
+        {
+            let elapsed = (s.now - clip.picked_at).max(0.0);
+            let angle = crate::anim::wiggle_radians(icon_sz, elapsed, &e.id);
+            ico = ico.origin(0.5, 0.5).rotate(angle).rotate_motion(Anim::INSTANT);
+        }
         r.child(
             cell(0)
                 .px(6.0)
                 .gap(6.0)
-                .child(entry_icon(s, &pane.loc, e, icon_sz))
+                .child(ico)
                 .child(match &s.renaming {
                     Some((rp, item)) if *rp == p && item.id == e.id => rename_field(s, rename_look),
                     _ => {
