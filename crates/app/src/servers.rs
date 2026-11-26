@@ -979,6 +979,11 @@ impl Provider {
             Provider::OwnCloud => &crate::icons::PROVIDER_OWNCLOUD,
             Provider::Sftp => &crate::icons::PROVIDER_SFTP,
             Provider::Ftp => &crate::icons::PROVIDER_FTP,
+            Provider::Service(Brand::Koofr) => &crate::icons::PROVIDER_KOOFR,
+            Provider::Service(Brand::MailRu) => &crate::icons::PROVIDER_MAILRU,
+            Provider::Service(Brand::Yandex) => &crate::icons::PROVIDER_YANDEX,
+            Provider::Service(Brand::Onlime) => &crate::icons::PROVIDER_ONLIME,
+            // The others' brand files don't allow it without asking (see `icons.rs`).
             Provider::WebDav | Provider::Service(_) => &crate::icons::PROVIDER_WEBDAV,
         }
     }

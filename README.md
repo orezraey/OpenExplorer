@@ -74,7 +74,7 @@ Every measurement, with how it was taken, is in
 * Backblaze B2: buckets and folders, large uploads in parallel parts (and resumed), hidden
   versions with undo.
 * SFTP, FTP/FTPS, WebDAV, Nextcloud and ownCloud.
-* Ready to add through WebDAV: Koofr, pCloud, Yandex Disk, Mail.ru Cloud, MagentaCLOUD,
+* Ready to add through WebDAV: [Koofr](https://koofr.eu), pCloud, Yandex Disk, Mail.ru Cloud, MagentaCLOUD,
   HiDrive (STRATO and IONOS), kDrive, Stack, InfiniCLOUD, Mail.com Cloud and Onlime limeDRIVE.
   Pick the service, then type your login: the server and folder are filled in, and the form
   says which password to use (several ask for an app password made on their website).
