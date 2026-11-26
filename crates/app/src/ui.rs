@@ -5738,11 +5738,16 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .child(head(3, "h-kind", if let Some(c) = crate::onedrive::bin_columns(&pane.loc) { c.1 } else if pane.loc.finds() { t("Pasta", "Folder") } else { t("Tipo", "Type") }, SortCol::Kind, false))
         .children(grips);
 
+    let row_h = s.zoom[p].row_height();
+    let icon_sz = s.zoom[p].icon_size();
+    let hover_glides = s.settings.hover_animated();
+
     let selected = k.alpha(k.c.text_accent, if k.dark { 0.26 } else { 0.18 });
-    let hover = k.alpha(k.c.text_base, 0.045);
+    let hover = k.alpha(k.c.text_base, if k.dark { 0.065 } else { 0.05 });
     let ring = k.c.border_focus;
     let (text_c, muted_c) = (k.c.text_base, k.c.text_muted);
-    let font = k.ty.text_small;
+    let mut font = k.ty.text_small;
+    font.size = s.zoom[p].font_size(font.size);
     let rename_look = RenameLook { font, ink: text_c, fill: k.c.bg_base, edge: k.c.border_focus, selection: k.selection() };
     // A search's results show what matched each name in the accent colour: a colour-only span,
     // so the name keeps its shape and width. The words are folded once here; each row finds
@@ -5756,8 +5761,14 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         let is_sel = pane.selected.contains(&e.id);
         let found = pane.loc.finds();
         // As wide as the columns: past them is empty space, where a drag draws a rectangle.
-        let mut r = row().key(row_key(&e.id)).role("row").label(shown(&e.name)).focus_selected(is_sel).w(total).h(ROW_H).center_y();
-        r = if is_sel { r.fill(selected) } else { r.hover(hover) };
+        let mut r = row().key(row_key(&e.id)).role("row").label(shown(&e.name)).focus_selected(is_sel).w(total).h(row_h).center_y();
+        r = if is_sel {
+            r.fill(selected)
+        } else if hover_glides {
+            r.fill(Color::TRANSPARENT)
+        } else {
+            r.hover(hover)
+        };
         // The keyboard's row is outlined only when it isn't selected (Ctrl+arrows moved it
         // alone): a selected row already shows, and an outline on the end of a Shift range
         // reads as a second kind of selection.
@@ -5771,7 +5782,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
             cell(0)
                 .px(6.0)
                 .gap(6.0)
-                .child(entry_icon(s, &pane.loc, e, 16.0))
+                .child(entry_icon(s, &pane.loc, e, icon_sz))
                 .child(match &s.renaming {
                     Some((rp, item)) if *rp == p && item.id == e.id => rename_field(s, rename_look),
                     _ => {
@@ -5843,10 +5854,10 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .key("rows")
         .w_full()
         .pr(bar.strip())
-        .pb(2.0 * ROW_H)
+        .pb(2.0 * row_h)
         .growth(GrowthSpec::default())
-        .virtual_rows(n, ROW_H, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
-        .virtual_rows_version((pane.version, w.map(f32::to_bits), s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))));
+        .virtual_rows(n, row_h, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
+        .virtual_rows_version((pane.version, w.map(f32::to_bits), row_h.to_bits(), s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))));
     let notice = |msg: String, color| col().key("notice").w_full().grow(1.0).padding(16.0).child(text(msg).font(k.ty.text_small).color(color).wrap());
     let body = if let Some(consent) = crate::onedrive::bin_notice(s, k, p) {
         consent
@@ -5888,10 +5899,28 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     } else {
         rows
     };
+    // Gliding hover highlight pill (80 ms ease-out cubic, matching Explorer GPU mod):
+    // sits behind the rows and slides smoothly from row to row without leaving a trail.
+    let hover_pill = (hover_glides && n > 0 && pane.error.is_none()).then(|| {
+        let active = s.hovered_row[p].filter(|&idx| idx < n && s.lasso.is_none());
+        let row_idx = active.unwrap_or_else(|| s.hover_last_row[p].min(n.saturating_sub(1)));
+        let y = row_idx as f32 * row_h;
+        let curve = crate::anim::hover_curve();
+        el().key("hover-pill")
+            .animated_changes()
+            .absolute(2.0, HEADER_H)
+            .size((total - 4.0).max(0.0), row_h)
+            .radius(5.0)
+            .fill(hover)
+            .offset(0.0, y)
+            .offset_motion(curve)
+            .opacity(if active.is_some() { 1.0 } else { 0.0 })
+            .opacity_motion(curve)
+    });
     // One viewport scrolls both ways: sideways when the columns are wider than the pane,
     // header and rows together, and up and down with the header stuck to the top. Its
     // vertical bar sits on the pane's right edge, wherever the columns end.
-    let table = col().key("table").w_full().min_w(total + bar.strip()).child(header).child(body).children(lasso_rect(s, k, p));
+    let table = col().key("table").w_full().min_w(total + bar.strip()).children(hover_pill).child(header).child(body).children(lasso_rect(s, k, p));
     // A right click on empty space opens the folder's menu (Colar, Nova pasta); a drag there
     // selects with a rectangle (see `crate::lasso`), which needs where the viewport is.
     // Its key is the pane's own: the scroll bar keeps its state, and finds the viewport it
@@ -5904,11 +5933,64 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .h_full()
         .scroll_xy()
         .on_scroll_offset(move |at| scrolled.set(at.into()))
+        // Track hovered row for the gliding hover highlight; returns live_only when the row
+        // doesn't change so pointer motion inside a row triggers zero view rebuilds.
+        .on_pointer_move_local(move |s: &mut State, ev: rune::PointerEvent, tx: &mut Tx| {
+            if !s.settings.hover_animated() {
+                tx.live_only();
+                return;
+            }
+            let scroll = s.views[p].scroll.get();
+            let content_x = ev.x + scroll.x;
+            let content_y = ev.y + scroll.y - HEADER_H;
+            let total_w: f32 = s.layout.columns[p].iter().sum();
+            let rh = s.zoom[p].row_height().max(1.0);
+            let next = if ev.y >= HEADER_H && content_y >= 0.0 && content_x >= 0.0 && content_x < total_w && s.lasso.is_none() {
+                let idx = (content_y / rh).floor() as usize;
+                (idx < s.panes[p].entries.len()).then_some(idx)
+            } else {
+                None
+            };
+            if next != s.hovered_row[p] {
+                s.hovered_row[p] = next;
+                if let Some(idx) = next {
+                    s.hover_last_row[p] = idx;
+                }
+            } else {
+                tx.live_only();
+            }
+        })
+        .on_hover_change(move |s: &mut State, inside: bool, tx: &mut Tx| {
+            if !inside && s.hovered_row[p].is_some() {
+                s.hovered_row[p] = None;
+            } else {
+                tx.live_only();
+            }
+        })
+        // Ctrl + mouse wheel smoothly zooms row height, icons, and text.
+        .on_wheel(move |s: &mut State, e: rune::WheelEvent, tx: &mut Tx| {
+            if !(e.mods.ctrl || e.mods.cmd) {
+                return false;
+            }
+            let delta = if e.dy > 0.0 { 1.0 } else if e.dy < 0.0 { -1.0 } else { 0.0 };
+            if delta != 0.0 && s.zoom[p].step_by(delta, s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+            true
+        })
+        // Trackpad pinch-to-zoom.
+        .on_magnify(move |s: &mut State, e: rune::MagnifyEvent, tx: &mut Tx| {
+            if s.zoom[p].scale_by(1.0 + e.delta, s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+            true
+        })
         // Where the viewport is, for the lasso, and the rows in view below the header, which
         // Page Up and Page Down move by. Only handlers read them, so the view needn't run again.
         .on_layout_tx(move |s: &mut State, r: [f32; 4], tx: &mut Tx| {
             s.views[p].rect = r;
-            s.page_rows[p] = ((r[3] - HEADER_H) / ROW_H).floor().max(1.0) as usize;
+            let rh = s.zoom[p].row_height().max(1.0);
+            s.page_rows[p] = ((r[3] - HEADER_H) / rh).floor().max(1.0) as usize;
             tx.live_only();
         })
         .on_drag(move |s: &mut State, d: &mut Drag, tx: &mut Tx| crate::lasso::drag(s, p, d, tx))
@@ -5976,6 +6058,30 @@ fn statusbar(s: &State, k: &Kit, p: usize) -> El {
         .center_y()
         .border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_weak)
         .child(text(left).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0).grow(1.0));
+    let zoom_pct = s.zoom[p].percent();
+    if zoom_pct != 100 {
+        bar = bar.child(
+            row()
+                .key("zoom-reset")
+                .role("button")
+                .label(t("Redefinir zoom (Ctrl+0)", "Reset zoom (Ctrl+0)"))
+                .help(t("Clique ou pressione Ctrl+0 para voltar a 100%", "Click or press Ctrl+0 to reset to 100%"))
+                .h(16.0)
+                .px(5.0)
+                .mr(8.0)
+                .center()
+                .radius(4.0)
+                .fill(k.alpha(k.c.text_accent, if k.dark { 0.16 } else { 0.10 }))
+                .hover(k.alpha(k.c.text_accent, if k.dark { 0.24 } else { 0.16 }))
+                .cursor(Cursor::Pointer)
+                .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                    if s.zoom[p].reset(s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                        tx.wake_at(s.now + 1.0 / 60.0);
+                    }
+                })
+                .child(text(format!("{zoom_pct}%")).font(k.ty.caption()).color(k.c.text_accent)),
+        );
+    }
     if let Some(m) = meter {
         bar = bar.child(m);
     }

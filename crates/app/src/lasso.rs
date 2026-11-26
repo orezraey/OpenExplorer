@@ -79,16 +79,21 @@ pub fn content(at: [f32; 2], scroll: Scroll) -> [f32; 2] {
 }
 
 /// The rows of `n` that rectangle `rect` (content points, ordered) touches: a row spans the
-/// columns' `width` and [`ROW_H`] from `i * ROW_H`. A rectangle with no height still touches
+/// columns' `width` and `row_h` from `i * row_h`. A rectangle with no height still touches
 /// the row it lies in, as a click on it would; one wholly beside the columns touches none.
-pub fn hits(rect: [f32; 4], n: usize, width: f32) -> Range<usize> {
+pub fn hits_with_row_h(rect: [f32; 4], n: usize, width: f32, row_h: f32) -> Range<usize> {
     let [x0, y0, x1, y1] = rect;
-    if n == 0 || x0 >= width || x1 < 0.0 || y1 < 0.0 || y0 >= n as f32 * ROW_H {
+    let row_h = row_h.max(1.0);
+    if n == 0 || x0 >= width || x1 < 0.0 || y1 < 0.0 || y0 >= n as f32 * row_h {
         return 0..0;
     }
-    let first = (y0.max(0.0) / ROW_H).floor() as usize;
-    let last = (y1 / ROW_H).floor() as usize;
+    let first = (y0.max(0.0) / row_h).floor() as usize;
+    let last = (y1 / row_h).floor() as usize;
     first.min(n)..(last + 1).min(n)
+}
+
+pub fn hits(rect: [f32; 4], n: usize, width: f32) -> Range<usize> {
+    hits_with_row_h(rect, n, width, ROW_H)
 }
 
 /// The selection a lasso makes: the rows it touches, or with `toggle` the old selection with
@@ -123,7 +128,7 @@ fn apply(s: &mut State) {
     let scroll = s.views[p].scroll.get();
     let width: f32 = s.layout.columns[p].iter().sum();
     let pane = &s.panes[p];
-    let rows = hits(l.rect(scroll), pane.entries.len(), width);
+    let rows = hits_with_row_h(l.rect(scroll), pane.entries.len(), width, s.zoom[p].row_height());
     let selected = picked(&l.before, pane.entries[rows].iter().map(|e| e.id.clone()), l.toggle);
     s.panes[p].selected = selected;
 }
@@ -188,6 +193,7 @@ pub fn moved(s: &mut State, p: usize, at: [f32; 2]) -> bool {
 pub fn released(s: &mut State, p: usize, cancelled: bool) {
     let Some(l) = s.lasso.take_if(|l| l.pane == p) else { return };
     let scroll = s.views[p].scroll.get();
+    let row_h = s.zoom[p].row_height();
     let pane = &mut s.panes[p];
     if cancelled {
         pane.selected = l.before;
@@ -195,7 +201,7 @@ pub fn released(s: &mut State, p: usize, cancelled: bool) {
         pane.cursor = l.cursor;
         return;
     }
-    let rows = hits(l.rect(scroll), pane.entries.len(), f32::MAX);
+    let rows = hits_with_row_h(l.rect(scroll), pane.entries.len(), f32::MAX, row_h);
     if !l.moved || rows.is_empty() {
         return;
     }

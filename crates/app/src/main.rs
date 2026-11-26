@@ -166,6 +166,12 @@ struct State {
     /// Where each pane's file list viewport is and how far it's scrolled, for the rectangle
     /// selection and the menu the keyboard opens.
     views: [lasso::Viewport; 2],
+    /// Smooth Ctrl+wheel / pinch zoom state for each pane's file list.
+    zoom: [anim::ZoomState; 2],
+    /// Row index currently under the pointer in each pane's file list (for the gliding hover pill).
+    hovered_row: [Option<usize>; 2],
+    /// Last hovered row index in each pane so the hover pill fades out in place when leaving.
+    hover_last_row: [usize; 2],
     dialog: Option<actions::Dialog>,
     /// The window was asked to close while transfers ran: Fechar o Open Explorer? shows over
     /// everything, the dialog under it untouched (see [`actions::close_requested`]).
@@ -343,6 +349,9 @@ impl State {
             renamed: Vec::new(),
             lasso: None,
             views: Default::default(),
+            zoom: Default::default(),
+            hovered_row: [None; 2],
+            hover_last_row: [0; 2],
             dialog: None,
             quit_asked: false,
             clash_waiting: Default::default(),
@@ -550,6 +559,9 @@ fn init() -> State {
         renamed: Vec::new(),
         lasso: None,
         views: Default::default(),
+        zoom: Default::default(),
+        hovered_row: [None; 2],
+        hover_last_row: [0; 2],
         dialog: None,
         quit_asked: false,
         clash_waiting: Default::default(),
@@ -811,6 +823,19 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     let mut changed = std::mem::take(&mut s.main_dirty) | s.icons.settle();
     changed |= notice(s, now, &mut |text, how| tx.announce(text, how));
+    // Smooth Ctrl+wheel / pinch zoom animation for each pane.
+    let mut anim_wake = false;
+    for p in 0..2 {
+        if s.zoom[p].tick(now) {
+            changed = true;
+            if s.zoom[p].is_animating() {
+                anim_wake = true;
+            }
+        }
+    }
+    if anim_wake {
+        tx.wake_at(now + 1.0 / 60.0);
+    }
     // A rectangle selection held past the list's edge scrolls it.
     changed |= lasso::step(s, now, tx);
     // A local pane searches the computer as its field is typed in, once the keys pause.
@@ -1825,6 +1850,25 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
                 let id = s.panes[p].entries[i].id.clone();
                 click(s, p, &id, Mods::default());
                 tx.scroll_into_view_in(pane_key(p), row_key(&id));
+            }
+            return true;
+        }
+        // Ctrl+0 resets list zoom; Ctrl+= / Ctrl++ zooms in; Ctrl+- zooms out.
+        _ if ev.is_command('0') => {
+            if s.zoom[p].reset(s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+            return true;
+        }
+        _ if ev.is_command('=') || ev.is_command('+') => {
+            if s.zoom[p].step_by(1.0, s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+            return true;
+        }
+        _ if ev.is_command('-') => {
+            if s.zoom[p].step_by(-1.0, s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
             }
             return true;
         }
