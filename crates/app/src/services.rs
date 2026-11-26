@@ -160,14 +160,15 @@ const SERVICES: &[Service] = &[
         keywords: "stack transip stackstorage webdav nuvem cloud holanda netherlands",
         host: Host::Part { pattern: "{}.stack.storage", label: ("Conta TransIP", "TransIP account"), hint: ("nome da conta (o início do endereço do Stack)", "account name (the start of your Stack address)") },
         root: "/remote.php/webdav",
-        user: ("Usuário do Stack", "Stack user name"),
+        user: ("Usuário do Stack (em minúsculas)", "Stack user name (in lowercase)"),
         password: ("Senha (ou token de acesso, com 2FA)", "Password (or access token, with 2FA)"),
         note: (
             "O endereço completo aparece no Stack › nome da conta › configurações › WebDav. Com verificação em duas etapas, use um token de acesso.",
             "The full address is shown in Stack › account name › settings › WebDav. With two-step verification, use an access token.",
         ),
         business: true,
-        lowercase_user: false,
+        // TransIP: the user name only works in lowercase.
+        lowercase_user: true,
     },
     Service {
         brand: Brand::Onlime,

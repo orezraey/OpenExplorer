@@ -2359,6 +2359,10 @@ pub(crate) mod tests {
         let mut hidrive = Form::for_provider(Provider::Service(Brand::HiDrive));
         hidrive.user = TextEdit::new("Ana");
         assert_eq!(hidrive.server(&s).unwrap().0.user, "ana", "HiDrive takes user names in lower case");
+        let mut stack = Form::for_provider(Provider::Service(Brand::Stack));
+        stack.host = TextEdit::new("minhaconta");
+        stack.user = TextEdit::new("Ana");
+        assert_eq!(stack.server(&s).unwrap().0.user, "ana", "Stack takes user names in lower case");
 
         // InfiniCLOUD's address is copied whole, path included, and stays InfiniCLOUD.
         let mut infini = Form::for_provider(Provider::Service(Brand::InfiniCloud));
