@@ -5821,48 +5821,71 @@ fn lasso_rect(s: &State, k: &Kit, p: usize) -> Option<El> {
     Some(el().key("lasso").absolute(x0, HEADER_H + y0).size(x1 - x0, y1 - y0).fill(k.alpha(k.c.text_accent, 0.14)).border(1.0, k.alpha(k.c.text_accent, 0.7)))
 }
 
+const GRID_GAP: f32 = 8.0;
+const GRID_PAD: f32 = 8.0;
+const LIST_COL_W: f32 = 230.0;
+const LIST_COL_GAP: f32 = 8.0;
+const LIST_HORIZ_MAX: usize = 2000;
+
+fn grid_columns_for(viewport_w: f32, tile_w: f32, bar_w: f32) -> usize {
+    let avail = (viewport_w - bar_w - 2.0 * GRID_PAD + GRID_GAP).max(tile_w + GRID_GAP);
+    (avail / (tile_w + GRID_GAP)).floor().max(1.0) as usize
+}
+
+fn list_rows_for(viewport_h: f32, bar_w: f32) -> usize {
+    ((viewport_h - bar_w - 8.0) / ROW_H).floor().max(1.0) as usize
+}
+
+fn wire_entry_interactions(el: El, p: usize, id: &str) -> El {
+    let (id_press, id_open, id_drag, id_start, id_menu) = (id.to_string(), id.to_string(), id.to_string(), id.to_string(), id.to_string());
+    el.on_press_tx(move |s: &mut State, tx: &mut Tx| {
+        click(s, p, &id_press, tx.mods());
+        tx.focus(pane_key(p), false);
+    })
+    .on_secondary_press(move |s: &mut State, at: rune::PointerPress, tx: &mut Tx| {
+        s.active = p;
+        let pane = &mut s.panes[p];
+        if !pane.selected.contains(&id_menu) {
+            pane.selected = [id_menu.clone()].into();
+            pane.anchor = Some(id_menu.clone());
+        }
+        pane.cursor = Some(id_menu.clone());
+        tx.focus(pane_key(p), false);
+        s.menu = Some((p, at));
+    })
+    .on_double_press(move |s: &mut State| open(s, p, &id_open))
+    .drag_out(move |s: &State| drag_item(s, p, &id_drag))
+    .on_drag_start(move |s: &mut State, _| {
+        s.active = p;
+        let pane = &mut s.panes[p];
+        if !pane.selected.contains(&id_start) {
+            pane.selected = [id_start.clone()].into();
+            pane.anchor = Some(id_start.clone());
+            pane.cursor = Some(id_start.clone());
+        }
+        let paths = paths_for(s, p, &dragged_ids(&s.panes[p], &id_start), false);
+        s.last_drag = Some((p, paths));
+    })
+    .on_drag_end(move |s: &mut State, outcome: DragOutcome, _| {
+        s.status = match outcome {
+            DragOutcome::Cancelled => t("Arrastar cancelado.", "Drag canceled.").into(),
+            o => tr!("Arrastar terminou: {o:?}", "Drag ended: {o:?}"),
+        };
+    })
+}
+
 fn list(s: &State, k: &Kit, p: usize) -> El {
     let pane = &s.panes[p];
+    let mode = pane.view_mode;
     let w = s.layout.columns[p];
     let total: f32 = w.iter().sum();
-    let arrow = |c: SortCol| if pane.sort.0 == c { if pane.sort.1 { "  ▲" } else { "  ▼" } } else { "" };
-    let head = |i: usize, key: &str, label: &str, c: SortCol, end: bool| {
-        let mut h = row()
-            .key(key.to_string())
-            .w(w[i])
-            .h_full()
-            .px(8.0)
-            .center_y()
-            .hover(k.c.hover)
-            .cursor(Cursor::Pointer)
-            .on_press(move |s: &mut State| set_sort(s, p, c))
-            .child(text(format!("{label}{}", arrow(c))).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0))
-            .border_sides([0.0, 1.0, 0.0, 0.0], k.c.border_weak);
-        if end {
-            h = h.justify_end();
-        }
-        h
-    };
-    // The grips sit over the header, one at each column's right edge.
-    let grips = (0..4).map(|i| col_grip(k, p, i, w[..=i].iter().sum()));
-    let header = row()
-        .key("header")
-        .w_full()
-        .h(HEADER_H)
-        .fill(k.c.bg_base)
-        .sticky_top(0.0)
-        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
-        .child(head(0, "h-name", t("Nome", "Name"), SortCol::Name, false))
-        .child(head(1, "h-size", t("Tamanho", "Size"), SortCol::Size, true))
-        .child(head(2, "h-mod", crate::onedrive::bin_columns(&pane.loc).map_or(t("Data", "Date modified"), |c| c.0), SortCol::Modified, false))
-        .child(head(3, "h-kind", if let Some(c) = crate::onedrive::bin_columns(&pane.loc) { c.1 } else if pane.loc.finds() { t("Pasta", "Folder") } else { t("Tipo", "Type") }, SortCol::Kind, false))
-        .children(grips);
 
     let selected = k.alpha(k.c.text_accent, if k.dark { 0.26 } else { 0.18 });
     let hover = k.alpha(k.c.text_base, 0.045);
     let ring = k.c.border_focus;
     let (text_c, muted_c) = (k.c.text_base, k.c.text_muted);
     let font = k.ty.text_small;
+    let tile_font = k.ty.text_xsmall;
     let rename_look = RenameLook { font, ink: text_c, fill: k.c.bg_base, edge: k.c.border_focus, selection: k.selection() };
     // A search's results show what matched each name in the accent colour: a colour-only span,
     // so the name keeps its shape and width. The words are folded once here; each row finds
@@ -5870,36 +5893,90 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let words = std::rc::Rc::new(searched_words(&pane.loc));
     let accent = k.c.text_accent;
     let marker = k.alpha(k.c.text_accent, 0.28);
-    let build = move |s: &State, i: usize| -> El {
-        let pane = &s.panes[p];
-        let e = &pane.entries[i];
-        let is_sel = pane.selected.contains(&e.id);
-        let found = pane.loc.finds();
-        // As wide as the columns: past them is empty space, where a drag draws a rectangle.
-        let mut r = row().key(row_key(&e.id)).role("row").label(shown(&e.name)).focus_selected(is_sel).w(total).h(ROW_H).center_y();
-        r = if is_sel { r.fill(selected) } else { r.hover(hover) };
-        // The keyboard's row is outlined only when it isn't selected (Ctrl+arrows moved it
-        // alone): a selected row already shows, and an outline on the end of a Shift range
-        // reads as a second kind of selection.
-        if s.active == p && !is_sel && pane.cursor.as_deref() == Some(e.id.as_str()) {
-            r = r.outline(1.0, -1.0, ring);
+
+    let n = pane.entries.len();
+    let show_header = mode == ViewMode::Details;
+    let header_h = if show_header { HEADER_H } else { 0.0 };
+    let bar = bar_style(k).track_offset(header_h, 0.0);
+    let bar_strip = bar.strip();
+
+    let rows = match mode {
+        ViewMode::Details => {
+            let build = move |s: &State, i: usize| -> El {
+                let pane = &s.panes[p];
+                let e = &pane.entries[i];
+                let is_sel = pane.selected.contains(&e.id);
+                let found = pane.loc.finds();
+                let mut r = row().key(row_key(&e.id)).role("row").label(shown(&e.name)).focus_selected(is_sel).w(total).h(ROW_H).center_y();
+                r = if is_sel { r.fill(selected) } else { r.hover(hover) };
+                if s.active == p && !is_sel && pane.cursor.as_deref() == Some(e.id.as_str()) {
+                    r = r.outline(1.0, -1.0, ring);
+                }
+                let cell = |i: usize| row().w(w[i]).h_full().px(8.0).center_y().clip_soft(0.0);
+                let muted = |t: String| text(t).font(font).color(muted_c).truncate().shrink().min_w(0.0);
+                let r = r
+                    .child(
+                        cell(0)
+                            .px(6.0)
+                            .gap(6.0)
+                            .child(entry_icon(s, &pane.loc, e, 16.0))
+                            .child(match &s.renaming {
+                                Some((rp, item)) if *rp == p && item.id == e.id => rename_field(s, rename_look),
+                                _ => {
+                                    let name = shown(&e.name);
+                                    let ranges = crate::finder::match_ranges(&words, &name);
+                                    if s.settings.search_marker {
+                                        let marks = ranges.into_iter().map(|r| rune::TextHighlight::new(r, marker));
+                                        text(name).font(font).color(text_c).text_highlights(marks).truncate().shrink().min_w(0.0)
+                                    } else {
+                                        let spans: Vec<Span> = ranges.into_iter().map(|r| Span::new(r.start, r.end).color(accent)).collect();
+                                        text(name).font(font).color(text_c).spans(spans).truncate().shrink().min_w(0.0)
+                                    }
+                                }
+                            }),
+                    )
+                    .child(cell(1).justify_end().child(muted(e.size.map(format_size).unwrap_or_default()).align(Align::End)))
+                    .child(cell(2).child(muted(e.modified.map(format_time).unwrap_or_default())))
+                    .child(cell(3).child(muted(if found { crate::finder::folder_of(e) } else { crate::onedrive::origin_of(&pane.loc, e).unwrap_or_else(|| e.kind_label()) })));
+                wire_entry_interactions(r, p, &e.id)
+            };
+            col()
+                .key("rows")
+                .w_full()
+                .pr(bar_strip)
+                .pb(2.0 * ROW_H)
+                .growth(GrowthSpec::default())
+                .virtual_rows(n, ROW_H, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
+                .virtual_rows_version((pane.version, mode, w.map(f32::to_bits), s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))))
         }
-        let (id_press, id_open, id_drag, id_start) = (e.id.clone(), e.id.clone(), e.id.clone(), e.id.clone());
-        let cell = |i: usize| row().w(w[i]).h_full().px(8.0).center_y().clip_soft(0.0);
-        let muted = |t: String| text(t).font(font).color(muted_c).truncate().shrink().min_w(0.0);
-        r.child(
-            cell(0)
-                .px(6.0)
-                .gap(6.0)
-                .child(entry_icon(s, &pane.loc, e, 16.0))
-                .child(match &s.renaming {
+        ViewMode::List => {
+            let radius = k.radius.sm;
+            let make_item = move |s: &State, i: usize| -> El {
+                let pane = &s.panes[p];
+                let e = &pane.entries[i];
+                let is_sel = pane.selected.contains(&e.id);
+                let mut r = row()
+                    .key(row_key(&e.id))
+                    .role("row")
+                    .label(shown(&e.name))
+                    .focus_selected(is_sel)
+                    .w(LIST_COL_W)
+                    .h(ROW_H)
+                    .px(6.0)
+                    .gap(6.0)
+                    .center_y()
+                    .radius(radius)
+                    .clip_soft(radius);
+                r = if is_sel { r.fill(selected) } else { r.hover(hover) };
+                if s.active == p && !is_sel && pane.cursor.as_deref() == Some(e.id.as_str()) {
+                    r = r.outline(1.0, -1.0, ring);
+                }
+                let r = r.child(entry_icon(s, &pane.loc, e, 16.0)).child(match &s.renaming {
                     Some((rp, item)) if *rp == p && item.id == e.id => rename_field(s, rename_look),
                     _ => {
                         let name = shown(&e.name);
                         let ranges = crate::finder::match_ranges(&words, &name);
                         if s.settings.search_marker {
-                            // Experimental: as a highlighter marks them, painted under the
-                            // glyphs without reshaping the name.
                             let marks = ranges.into_iter().map(|r| rune::TextHighlight::new(r, marker));
                             text(name).font(font).color(text_c).text_highlights(marks).truncate().shrink().min_w(0.0)
                         } else {
@@ -5907,66 +5984,116 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                             text(name).font(font).color(text_c).spans(spans).truncate().shrink().min_w(0.0)
                         }
                     }
-                }),
-        )
-        .child(cell(1).justify_end().child(muted(e.size.map(format_size).unwrap_or_default()).align(Align::End)))
-        .child(cell(2).child(muted(e.modified.map(format_time).unwrap_or_default())))
-        // A search's results show the folder each is in where the type goes.
-        .child(cell(3).child(muted(if found { crate::finder::folder_of(e) } else { crate::onedrive::origin_of(&pane.loc, e).unwrap_or_else(|| e.kind_label()) })))
-        .on_press_tx(move |s: &mut State, tx: &mut Tx| {
-            click(s, p, &id_press, tx.mods());
-            tx.focus(pane_key(p), false);
-        })
-        .on_secondary_press({
-            let id = e.id.clone();
-            // As in Explorer: a right click on an unselected row selects just that row first.
-            move |s: &mut State, at: rune::PointerPress, tx: &mut Tx| {
-                s.active = p;
-                let pane = &mut s.panes[p];
-                if !pane.selected.contains(&id) {
-                    pane.selected = [id.clone()].into();
-                    pane.anchor = Some(id.clone());
-                }
-                pane.cursor = Some(id.clone());
-                tx.focus(pane_key(p), false);
-                s.menu = Some((p, at));
-            }
-        })
-        .on_double_press(move |s: &mut State| open(s, p, &id_open))
-        .drag_out(move |s: &State| drag_item(s, p, &id_drag))
-        .on_drag_start(move |s: &mut State, _| {
-            s.active = p;
-            let pane = &mut s.panes[p];
-            if !pane.selected.contains(&id_start) {
-                pane.selected = [id_start.clone()].into();
-                pane.anchor = Some(id_start.clone());
-                pane.cursor = Some(id_start.clone());
-            }
-            // `drag_out` already wrote the files; this only names them.
-            let paths = paths_for(s, p, &dragged_ids(&s.panes[p], &id_start), false);
-            s.last_drag = Some((p, paths));
-        })
-        .on_drag_end(move |s: &mut State, outcome: DragOutcome, _| {
-            s.status = match outcome {
-                DragOutcome::Cancelled => t("Arrastar cancelado.", "Drag canceled.").into(),
-                o => tr!("Arrastar terminou: {o:?}", "Drag ended: {o:?}"),
+                });
+                wire_entry_interactions(r, p, &e.id)
             };
-        })
+            if n <= LIST_HORIZ_MAX {
+                // Windows Explorer List view: flows top-to-bottom per column and left-to-right
+                // across columns, scrolling horizontally when there are more columns than fit.
+                let vp_h = s.views[p].rect[3];
+                let rows_per_col = if vp_h > 0.0 { list_rows_for(vp_h, bar_strip) } else { s.list_rows[p].max(1) };
+                let num_cols = n.div_ceil(rows_per_col);
+                let mut cols_row = row().key("rows-list").padding(4.0).pb(bar_strip + 4.0).gap(LIST_COL_GAP).items_start();
+                for c in 0..num_cols {
+                    let start = c * rows_per_col;
+                    let end = (start + rows_per_col).min(n);
+                    let mut column = col().key(format!("lcol-{c}")).w(LIST_COL_W);
+                    for i in start..end {
+                        column = column.child(make_item(s, i));
+                    }
+                    cols_row = cols_row.child(column);
+                }
+                cols_row
+            } else {
+                // Very large folders stay virtualized in multi-column rows.
+                let vp_w = s.views[p].rect[2];
+                let cols = if vp_w > 0.0 { grid_columns_for(vp_w, LIST_COL_W, bar_strip) } else { s.grid_cols[p].max(1) };
+                let vrows = n.div_ceil(cols);
+                let build = move |s: &State, row_idx: usize| -> El {
+                    let start = row_idx * cols;
+                    let end = (start + cols).min(s.panes[p].entries.len());
+                    let mut line = row().key(format!("lrow-{row_idx}")).w_full().h(ROW_H).px(4.0).gap(LIST_COL_GAP).center_y();
+                    for i in start..end {
+                        line = line.child(make_item(s, i));
+                    }
+                    line
+                };
+                col()
+                    .key("rows-list-virt")
+                    .w_full()
+                    .pt(4.0)
+                    .pr(bar_strip)
+                    .pb(2.0 * ROW_H)
+                    .growth(GrowthSpec::default())
+                    .virtual_rows(vrows, ROW_H, move |_, row_idx| Cow::Owned(format!("lr-{row_idx}")), build)
+                    .virtual_rows_version((pane.version, mode, cols, s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))))
+            }
+        }
+        ViewMode::ExtraLargeIcons | ViewMode::LargeIcons | ViewMode::MediumIcons => {
+            let (tile_w, tile_h, icon_size) = mode.tile_metrics();
+            let vp_w = s.views[p].rect[2];
+            let cols = if vp_w > 0.0 { grid_columns_for(vp_w, tile_w, bar_strip) } else { s.grid_cols[p].max(1) };
+            let grid_rows = n.div_ceil(cols);
+            let row_h = tile_h + GRID_GAP;
+            let radius = k.radius.sm;
+            let build = move |s: &State, row_idx: usize| -> El {
+                let pane = &s.panes[p];
+                let start = row_idx * cols;
+                let end = (start + cols).min(pane.entries.len());
+                let mut line = row().key(format!("grow-{row_idx}")).w_full().h(row_h).px(GRID_PAD).gap(GRID_GAP).items_start();
+                for i in start..end {
+                    let e = &pane.entries[i];
+                    let is_sel = pane.selected.contains(&e.id);
+                    let mut tile = col()
+                        .key(row_key(&e.id))
+                        .role("row")
+                        .label(shown(&e.name))
+                        .focus_selected(is_sel)
+                        .w(tile_w)
+                        .h(tile_h)
+                        .padding(6.0)
+                        .gap(5.0)
+                        .items_center()
+                        .radius(radius)
+                        .clip_soft(radius);
+                    tile = if is_sel { tile.fill(selected) } else { tile.hover(hover) };
+                    if s.active == p && !is_sel && pane.cursor.as_deref() == Some(e.id.as_str()) {
+                        tile = tile.outline(1.0, -1.0, ring);
+                    }
+                    let label_el = match &s.renaming {
+                        Some((rp, item)) if *rp == p && item.id == e.id => rename_field(s, rename_look),
+                        _ => {
+                            let name = shown(&e.name);
+                            let ranges = crate::finder::match_ranges(&words, &name);
+                            let t_el = if s.settings.search_marker {
+                                let marks = ranges.into_iter().map(|r| rune::TextHighlight::new(r, marker));
+                                text(name).font(tile_font).color(text_c).text_highlights(marks)
+                            } else {
+                                let spans: Vec<Span> = ranges.into_iter().map(|r| Span::new(r.start, r.end).color(accent)).collect();
+                                text(name).font(tile_font).color(text_c).spans(spans)
+                            };
+                            t_el.wrap().align(Align::Center).w_full().min_w(0.0)
+                        }
+                    };
+                    let tile = tile
+                        .child(entry_icon(s, &pane.loc, e, icon_size))
+                        .child(col().w_full().grow(1.0).min_h(0.0).clip_soft(0.0).child(label_el));
+                    line = line.child(wire_entry_interactions(tile, p, &e.id));
+                }
+                line
+            };
+            col()
+                .key("rows-grid")
+                .w_full()
+                .pt(GRID_PAD)
+                .pr(bar_strip)
+                .pb(2.0 * GRID_PAD)
+                .growth(GrowthSpec::default())
+                .virtual_rows(grid_rows, row_h, move |_, row_idx| Cow::Owned(format!("gr-{row_idx}")), build)
+                .virtual_rows_version((pane.version, mode, cols, s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))))
+        }
     };
 
-    let n = pane.entries.len();
-    // The rows end where the scroll bar starts; the header runs on above it.
-    let bar = bar_style(k).track_offset(HEADER_H, 0.0);
-    // Room under the last row, so a list that scrolls still has empty space to start a
-    // rectangle selection from.
-    let rows = col()
-        .key("rows")
-        .w_full()
-        .pr(bar.strip())
-        .pb(2.0 * ROW_H)
-        .growth(GrowthSpec::default())
-        .virtual_rows(n, ROW_H, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
-        .virtual_rows_version((pane.version, w.map(f32::to_bits), s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))));
     let notice = |msg: String, color| col().key("notice").w_full().grow(1.0).padding(16.0).child(text(msg).font(k.ty.text_small).color(color).wrap());
     let body = if let Some(consent) = crate::onedrive::bin_notice(s, k, p) {
         consent
@@ -6008,14 +6135,44 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     } else {
         rows
     };
-    // One viewport scrolls both ways: sideways when the columns are wider than the pane,
-    // header and rows together, and up and down with the header stuck to the top. Its
-    // vertical bar sits on the pane's right edge, wherever the columns end.
-    let table = col().key("table").w_full().min_w(total + bar.strip()).child(header).child(body).children(lasso_rect(s, k, p));
-    // A right click on empty space opens the folder's menu (Colar, Nova pasta); a drag there
-    // selects with a rectangle (see `crate::lasso`), which needs where the viewport is.
-    // Its key is the pane's own: the scroll bar keeps its state, and finds the viewport it
-    // scrolls, by this key, so with one key for both panes each bar moved the left pane.
+
+    let table = if show_header {
+        let arrow = |c: SortCol| if pane.sort.0 == c { if pane.sort.1 { "  ▲" } else { "  ▼" } } else { "" };
+        let head = |i: usize, key: &str, label: &str, c: SortCol, end: bool| {
+            let mut h = row()
+                .key(key.to_string())
+                .w(w[i])
+                .h_full()
+                .px(8.0)
+                .center_y()
+                .hover(k.c.hover)
+                .cursor(Cursor::Pointer)
+                .on_press(move |s: &mut State| set_sort(s, p, c))
+                .child(text(format!("{label}{}", arrow(c))).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0))
+                .border_sides([0.0, 1.0, 0.0, 0.0], k.c.border_weak);
+            if end {
+                h = h.justify_end();
+            }
+            h
+        };
+        let grips = (0..4).map(|i| col_grip(k, p, i, w[..=i].iter().sum()));
+        let header = row()
+            .key("header")
+            .w_full()
+            .h(HEADER_H)
+            .fill(k.c.bg_base)
+            .sticky_top(0.0)
+            .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+            .child(head(0, "h-name", t("Nome", "Name"), SortCol::Name, false))
+            .child(head(1, "h-size", t("Tamanho", "Size"), SortCol::Size, true))
+            .child(head(2, "h-mod", crate::onedrive::bin_columns(&pane.loc).map_or(t("Data", "Date modified"), |c| c.0), SortCol::Modified, false))
+            .child(head(3, "h-kind", if let Some(c) = crate::onedrive::bin_columns(&pane.loc) { c.1 } else if pane.loc.finds() { t("Pasta", "Folder") } else { t("Tipo", "Type") }, SortCol::Kind, false))
+            .children(grips);
+        col().key("table").w_full().min_w(total + bar_strip).child(header).child(body).children(lasso_rect(s, k, p))
+    } else {
+        col().key("table").w_full().child(body).children(lasso_rect(s, k, p))
+    };
+
     let scrolled = s.views[p].scroll.clone();
     let viewport = col()
         .key(list_key(p))
@@ -6024,12 +6181,35 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .h_full()
         .scroll_xy()
         .on_scroll_offset(move |at| scrolled.set(at.into()))
-        // Where the viewport is, for the lasso, and the rows in view below the header, which
-        // Page Up and Page Down move by. Only handlers read them, so the view needn't run again.
         .on_layout_tx(move |s: &mut State, r: [f32; 4], tx: &mut Tx| {
             s.views[p].rect = r;
-            s.page_rows[p] = ((r[3] - HEADER_H) / ROW_H).floor().max(1.0) as usize;
-            tx.live_only();
+            let mode = s.panes[p].view_mode;
+            if mode.is_grid() {
+                let (tile_w, tile_h, _) = mode.tile_metrics();
+                let new_cols = grid_columns_for(r[2], tile_w, bar_strip);
+                let visible_rows = (r[3] / (tile_h + GRID_GAP)).floor().max(1.0) as usize;
+                s.page_rows[p] = (visible_rows * new_cols).max(1);
+                if s.grid_cols[p] != new_cols {
+                    s.grid_cols[p] = new_cols;
+                } else {
+                    tx.live_only();
+                }
+            } else if mode == ViewMode::List {
+                let new_rows = list_rows_for(r[3], bar_strip);
+                let new_cols = grid_columns_for(r[2], LIST_COL_W, bar_strip);
+                s.page_rows[p] = new_rows;
+                let needs_relayout = s.list_rows[p] != new_rows || (s.panes[p].entries.len() > LIST_HORIZ_MAX && s.grid_cols[p] != new_cols);
+                s.list_rows[p] = new_rows;
+                if s.panes[p].entries.len() > LIST_HORIZ_MAX {
+                    s.grid_cols[p] = new_cols;
+                }
+                if !needs_relayout {
+                    tx.live_only();
+                }
+            } else {
+                s.page_rows[p] = ((r[3] - HEADER_H) / ROW_H).floor().max(1.0) as usize;
+                tx.live_only();
+            }
         })
         .on_drag(move |s: &mut State, d: &mut Drag, tx: &mut Tx| crate::lasso::drag(s, p, d, tx))
         .on_secondary_press(move |s: &mut State, at: rune::PointerPress, tx: &mut Tx| {
@@ -6039,7 +6219,6 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
             s.menu = Some((p, at));
         })
         .child(table);
-    // The bar runs below the header, which stays put, as Explorer's does.
     let key = list_key(p);
     let viewport = s.edges[p].list.on(viewport);
     col().key("list").w(0.0).grow(1.0).h_full().min_w(0.0).child(with_scroll_bars(k, &key, viewport, bar, true))
