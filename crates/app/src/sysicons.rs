@@ -51,17 +51,20 @@ pub fn key_for(e: &Entry, loc: &Location) -> Option<IconKey> {
 /// Straight-alpha RGBA pixels of an icon.
 pub type Rgba = (u32, u32, Vec<u8>);
 
-/// Both sizes Windows Explorer uses for an icon: `small` from `SHIL_SMALL` (the exact
-/// 16 px / DPI-scaled artwork shown in Explorer's Details list and Navigation Tree) and
-/// `large` from `SHIL_EXTRALARGE` (48 px, used in Propriedades).
+/// Windows Explorer icon sizes: `small` from `SHIL_SMALL` (16 px / DPI-scaled, Details & tree),
+/// `large` from `SHIL_EXTRALARGE` (48 px, Medium icons & Propriedades), and `jumbo` from
+/// `SHIL_JUMBO` (256 px, Large & Extra large icons) when the icon actually has artwork larger
+/// than 48 px.
 pub struct IconBitmaps {
     pub small: Rgba,
     pub large: Option<Rgba>,
+    pub jumbo: Option<Rgba>,
 }
 
 struct StoredIcon {
     small: Image,
     large: Option<Image>,
+    jumbo: Option<Image>,
 }
 
 #[derive(Default)]
@@ -139,6 +142,7 @@ impl SysIcons {
         *slot = rgba.map(|b| StoredIcon {
             small: images.rgba(b.small.0, b.small.1, b.small.2),
             large: b.large.map(|(w, h, px)| images.rgba(w, h, px)),
+            jumbo: b.jumbo.map(|(w, h, px)| images.rgba(w, h, px)),
         });
         if slot.is_some() {
             self.decoding.push(key);
@@ -153,18 +157,22 @@ impl SysIcons {
         self.decoding.retain(|k| {
             matches!(
                 known.get(k),
-                Some(Some(pair)) if !pair.small.is_ready() || pair.large.as_ref().is_some_and(|l| !l.is_ready())
+                Some(Some(pair))
+                    if !pair.small.is_ready()
+                        || pair.large.as_ref().is_some_and(|l| !l.is_ready())
+                        || pair.jumbo.as_ref().is_some_and(|j| !j.is_ready())
             )
         });
         self.decoding.len() != before
     }
 
-    /// The icon for `key`, once Windows gave one: `large = false` returns Windows Explorer's
-    /// `SHIL_SMALL` (16 px / DPI-scaled) artwork; `large = true` returns the 48 px icon for
-    /// large displays like Propriedades.
-    pub fn get(&self, key: &IconKey, large: bool) -> Option<&Image> {
+    /// The best-resolution Windows shell icon for a display `size` in points: `SHIL_JUMBO`
+    /// (256 px) above 64 pt, `SHIL_EXTRALARGE` (48 px) above 24 pt, and `SHIL_SMALL` otherwise.
+    pub fn get_sized(&self, key: &IconKey, size: f32) -> Option<&Image> {
         let pair = self.known.get(key)?.as_ref()?;
-        if large {
+        if size > 64.0 {
+            pair.jumbo.as_ref().or(pair.large.as_ref()).or(Some(&pair.small))
+        } else if size > 24.0 {
             pair.large.as_ref().or(Some(&pair.small))
         } else {
             Some(&pair.small)
@@ -181,13 +189,13 @@ fn lookup(key: &IconKey) -> Option<IconBitmaps> {
     use windows_sys::Win32::UI::Controls::{HIMAGELIST, ImageList_GetIcon};
     use windows_sys::Win32::UI::Shell::{
         SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGSI_SYSICONINDEX,
-        SHGetFileInfoW, SHGetImageList, SHGetStockIconInfo, SHIL_EXTRALARGE, SHIL_SMALL, SHSTOCKICONINFO, SIID_DESKTOPPC,
+        SHGetFileInfoW, SHGetImageList, SHGetStockIconInfo, SHIL_EXTRALARGE, SHIL_JUMBO, SHIL_SMALL, SHSTOCKICONINFO, SIID_DESKTOPPC,
     };
     const NORMAL: u32 = 0x80;
     const DIRECTORY: u32 = 0x10;
 
     // System image lists, kept for the thread's life (they are the shell's own, shared).
-    thread_local!(static LISTS: (HIMAGELIST, HIMAGELIST) = {
+    thread_local!(static LISTS: (HIMAGELIST, HIMAGELIST, HIMAGELIST) = {
         // IID_IImageList; the interface pointer works as an HIMAGELIST.
         let iid = windows_sys::core::GUID::from_u128(0x46eb5926_582e_4017_9fdf_e8998daa0950);
         let get = |shil: u32| -> HIMAGELIST {
@@ -196,10 +204,10 @@ fn lookup(key: &IconKey) -> Option<IconBitmaps> {
             let hr = unsafe { SHGetImageList(shil as i32, &iid, &mut list) };
             if hr < 0 { 0 } else { list as HIMAGELIST }
         };
-        (get(SHIL_SMALL), get(SHIL_EXTRALARGE))
+        (get(SHIL_SMALL), get(SHIL_EXTRALARGE), get(SHIL_JUMBO))
     });
     let from_index = |index: i32| -> Option<IconBitmaps> {
-        let (small_list, large_list) = LISTS.with(|l| *l);
+        let (small_list, large_list, jumbo_list) = LISTS.with(|l| *l);
         let from_list = |list: HIMAGELIST, trim: bool| -> Option<Rgba> {
             if list == 0 {
                 return None;
@@ -214,10 +222,11 @@ fn lookup(key: &IconKey) -> Option<IconBitmaps> {
         };
         let small = from_list(small_list, false);
         let large = from_list(large_list, true);
+        let jumbo = from_list(jumbo_list, false).filter(has_jumbo_artwork);
         if let Some(small) = small {
-            return Some(IconBitmaps { small, large });
+            return Some(IconBitmaps { small, large, jumbo });
         }
-        large.map(|large| IconBitmaps { small: large, large: None })
+        large.map(|large| IconBitmaps { small: large, large: None, jumbo })
     };
 
     if matches!(key, IconKey::Computer) {
@@ -254,7 +263,27 @@ fn lookup(key: &IconKey) -> Option<IconBitmaps> {
     if ok == 0 || info.hIcon.is_null() {
         return None;
     }
-    Some(IconBitmaps { small: hicon_rgba(info.hIcon)?, large: None })
+    Some(IconBitmaps { small: hicon_rgba(info.hIcon)?, large: None, jumbo: None })
+}
+
+/// True when a `SHIL_JUMBO` (256 px) bitmap actually contains pixels beyond its top-left 48×48
+/// corner; older icons without jumbo artwork are placed in that corner and should fall back to
+/// `SHIL_EXTRALARGE` instead of drawing tiny and off-centre.
+#[cfg(windows)]
+fn has_jumbo_artwork((w, h, px): &Rgba) -> bool {
+    let (w, h) = (*w as usize, *h as usize);
+    if w <= 48 || h <= 48 {
+        return true;
+    }
+    for y in 0..h {
+        let start_x = if y < 48 { 48 } else { 0 };
+        for x in start_x..w {
+            if px[(y * w + x) * 4 + 3] != 0 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// An icon that only has a 32 px image comes out of the 48 px list drawn in its top-left

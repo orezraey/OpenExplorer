@@ -3241,8 +3241,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
 
 /// Windows' icon for `key` once it has loaded, else the app's own `fallback`.
 fn shell_icon(s: &State, key: Option<&IconKey>, fallback: &'static Icon, size: f32) -> El {
-    let large = size > 24.0;
-    match key.and_then(|k| s.icons.get(k, large)).filter(|i| i.is_ready() && i.error().is_none()) {
+    match key.and_then(|k| s.icons.get_sized(k, size)).filter(|i| i.is_ready() && i.error().is_none()) {
         Some(image) => el().size(size, size).pixels(image.pixels()),
         None => icon(fallback, size),
     }
@@ -3262,8 +3261,7 @@ fn entry_icon(s: &State, loc: &Location, e: &crate::model::Entry, size: f32) -> 
         && let Some(path) = loc.local_path(e)
     {
         let key = IconKey::Dir(path);
-        let large = size > 24.0;
-        if let Some(image) = s.icons.get(&key, large).filter(|i| i.is_ready() && i.error().is_none()) {
+        if let Some(image) = s.icons.get_sized(&key, size).filter(|i| i.is_ready() && i.error().is_none()) {
             return el().size(size, size).pixels(image.pixels());
         }
     }
