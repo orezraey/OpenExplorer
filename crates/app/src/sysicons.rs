@@ -475,7 +475,7 @@ mod tests {
     use super::*;
 
     fn file(name: &str) -> Entry {
-        Entry { id: name.into(), name: name.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false }
+        Entry { id: name.into(), name: name.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }
     }
 
     #[test]

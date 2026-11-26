@@ -632,12 +632,18 @@ fn up(
 /// shows, each file through a temporary one. Google's own formats (Docs, Sheets...) go as the
 /// files they export to, as a download does.
 pub fn drive_to_server(s: &mut State, from: &Location, items: Vec<Entry>, to: &Location, cut: bool, reload: Vec<Location>) {
-    let (Location::Drive { email, .. }, Some((server, dir))) = (from, target(to)) else { return };
-    let (email, server) = (email.clone(), server.clone());
+    for (email, group) in crate::actions::group_by_account(from, items) {
+        drive_to_server_account(s, &email, from, group, to, cut, reload.clone());
+    }
+}
+
+fn drive_to_server_account(s: &mut State, email: &str, from: &Location, items: Vec<Entry>, to: &Location, cut: bool, reload: Vec<Location>) {
+    let Some((server, dir)) = target(to) else { return };
+    let (email, server) = (email.to_string(), server.clone());
     let shared = shared_drive(from);
     let files: Vec<DriveFile> = items.iter().map(crate::actions::drive_file).collect();
     let op = if cut { Op::Move } else { Op::Copy };
-    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, items.iter().map(|e| (End::drive(from, Some(&e.name)), end(to, None))));
+    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, items.iter().map(|e| (End::drive_item(from, e), end(to, None))));
     let may_have_more = items.len() > 1 || items.iter().any(|e| e.is_dir);
     let resolver = crate::actions::make_resolver(s, op, may_have_more, &batch);
     let src_place = End::drive(from, None).text;
@@ -687,7 +693,9 @@ pub fn drive_to_server(s: &mut State, from: &Location, items: Vec<Entry>, to: &L
                 let target = child(&dir, &name);
                 let next_src = if is_dir { child_place(&src_place, &f.name) } else { src_place.clone() };
                 let next_dst = if is_dir { child_place(&dst_place, &name) } else { dst_place.clone() };
-                let left_out = match down(c, d, f, &target, merge, shared.as_deref(), &next_src, &next_dst, &resolver, p, 0) {
+                // A shortcut's target, or an item found in a search, may sit in another shared drive.
+                let item_shared = f.drive_id.as_deref().or(shared.as_deref());
+                let left_out = match down(c, d, f, &target, merge, item_shared, &next_src, &next_dst, &resolver, p, 0) {
                     Ok(n) => n,
                     Err(e) => {
                         if !merge && !replace {

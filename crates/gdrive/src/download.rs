@@ -700,6 +700,8 @@ mod tests {
             target: None,
             md5: None,
             starred: false,
+            drive_id: None,
+            owned_by_me: None,
         }
     }
 

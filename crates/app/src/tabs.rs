@@ -30,6 +30,8 @@ pub struct TabSlot {
     /// What that text last searched (see `State::searched`), so coming back doesn't search
     /// again, and leaving doesn't search the next tab with this text.
     pub searched: String,
+    /// Selected Google Drive search scope for this tab.
+    pub search_scope: crate::model::DriveSearchScope,
 }
 
 /// State of the "+" new-tab picker inside a pane.
@@ -68,7 +70,7 @@ impl PaneTabs {
     /// Starts with a single active tab whose `Pane` lives in `s.panes[p]`.
     pub fn initial() -> Self {
         Self {
-            items: vec![TabSlot { id: 1, pane: None, search: String::new(), searched: String::new() }],
+            items: vec![TabSlot { id: 1, pane: None, search: String::new(), searched: String::new(), search_scope: crate::model::DriveSearchScope::Here }],
             active: Some(0),
             last_active: Some(0),
             picker: PickerState::default(),
@@ -117,6 +119,7 @@ pub fn tab_header(s: &State, loc: &Location) -> (Option<IconKey>, &'static Icon,
                 .to_string();
             (None, &icons::PROVIDER_GDRIVE, label)
         }
+        Location::DriveSearch(_) => (None, &icons::PROVIDER_GDRIVE, t("Todas as contas", "All accounts").into()),
         Location::Server { server, .. } => {
             let provider = Provider::of_server(server);
             let label = match provider {
@@ -169,6 +172,7 @@ fn reset_transient(s: &mut State, p: usize) {
         s.renaming = None;
     }
     s.address[p] = None;
+    s.search_scope_menu = None;
     s.tabs[p].picker.filter_open = false;
     s.live[p].fetch_add(1, Ordering::Relaxed);
 }
@@ -180,11 +184,13 @@ fn stash_active(s: &mut State, p: usize) {
         let live = std::mem::replace(&mut s.panes[p], placeholder);
         let search = std::mem::take(&mut s.search[p].text);
         let searched = std::mem::take(&mut s.searched[p]);
+        let search_scope = std::mem::take(&mut s.search_scope[p]);
         set_search(s, p, String::new(), String::new());
         if let Some(slot) = s.tabs[p].items.get_mut(cur) {
             slot.pane = Some(live);
             slot.search = search;
             slot.searched = searched;
+            slot.search_scope = search_scope;
         }
         s.tabs[p].last_active = Some(cur);
         s.tabs[p].active = None;
@@ -204,13 +210,14 @@ fn set_search(s: &mut State, p: usize, text: String, searched: String) {
 
 /// Takes tab `idx`'s pane and search state into `s.panes[p]` and makes it the active tab.
 fn bring_in(s: &mut State, p: usize, idx: usize) {
-    let (pane, search, searched) = {
+    let (pane, search, searched, search_scope) = {
         let slot = &mut s.tabs[p].items[idx];
-        (slot.pane.take(), std::mem::take(&mut slot.search), std::mem::take(&mut slot.searched))
+        (slot.pane.take(), std::mem::take(&mut slot.search), std::mem::take(&mut slot.searched), slot.search_scope)
     };
     if let Some(pane) = pane {
         s.panes[p] = pane;
     }
+    s.search_scope[p] = search_scope;
     set_search(s, p, search, searched);
     s.tabs[p].active = Some(idx);
     s.tabs[p].last_active = Some(idx);
@@ -268,12 +275,24 @@ pub fn open_new_tab(s: &mut State, p: usize, loc: Location) {
     stash_active(s, p);
     let id = s.tabs[p].alloc_id();
     let idx = s.tabs[p].items.len();
-    s.tabs[p].items.push(TabSlot { id, pane: None, search: String::new(), searched: String::new() });
+    let scope = match &loc {
+        Location::DriveSearch(_) => crate::model::DriveSearchScope::AllAccounts,
+        Location::Drive { space: crate::model::Space::Search(q), path, .. } if path.is_empty() => {
+            if q.within == openexplorer_gdrive::search::Within::Everything {
+                crate::model::DriveSearchScope::Account
+            } else {
+                crate::model::DriveSearchScope::Here
+            }
+        }
+        _ => crate::model::DriveSearchScope::Here,
+    };
+    s.tabs[p].items.push(TabSlot { id, pane: None, search: String::new(), searched: String::new(), search_scope: scope });
     s.tabs[p].active = Some(idx);
     s.tabs[p].last_active = Some(idx);
     s.tabs[p].picker.filter_open = false;
     s.tabs[p].picker.search = rune::TextEdit::new("");
     s.panes[p] = Pane::new(loc);
+    s.search_scope[p] = scope;
     set_search(s, p, String::new(), String::new());
     s.icons_for[p] = u64::MAX;
     crate::list(s, p, false);
@@ -295,6 +314,7 @@ pub fn close_tab(s: &mut State, p: usize, idx: usize) {
         if s.tabs[p].items.is_empty() {
             s.tabs[p].last_active = None;
             s.panes[p] = Pane::new(Location::Mock(Vec::new()));
+            s.search_scope[p] = crate::model::DriveSearchScope::Here;
             set_search(s, p, String::new(), String::new());
             return;
         }

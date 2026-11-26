@@ -30,6 +30,22 @@ pub struct Entry {
     /// Starred in Google Drive, for the menu to offer Adicionar or Remover estrela.
     #[serde(default)]
     pub starred: bool,
+    /// Where a Google Drive search result came from (not persisted in disk folder caches).
+    #[serde(skip)]
+    pub drive_origin: Option<Box<DriveOrigin>>,
+}
+
+/// Where a Google Drive search result comes from: its account, shared drive (if any),
+/// ownership flag, and formatted label for the 4th column ("Local").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriveOrigin {
+    pub email: String,
+    /// `(drive_id, drive_name)` when the item is in a shared drive.
+    pub shared_drive: Option<(String, String)>,
+    pub owned_by_me: bool,
+    /// Column text: e.g. "Séries HD", "Meu Drive", "Compartilhados comigo",
+    /// or in multi-account search: "conta@gmail.com · Séries HD".
+    pub label: String,
 }
 
 /// What a file is, for its icon and the Tipo column.
@@ -125,10 +141,30 @@ pub enum Location {
     /// A folder in a connected account: the (id, name) of each folder from the top of `space`
     /// down.
     Drive { email: String, space: Space, path: Vec<(String, String)> },
+    /// A search across all connected Google Drive accounts.
+    DriveSearch(Box<DriveSearch>),
     /// A folder on an FTP, SFTP or WebDAV server the user added: the server, and the folders
     /// from its root down. With `find`, the search for those words in that folder and below,
     /// each result's id its path from the folder searched (see [`crate::servers`]).
     Server { server: Box<openexplorer_remote::Server>, path: Vec<String>, find: Option<String> },
+}
+
+/// A search across all connected Google Drive accounts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DriveSearch {
+    pub text: String,
+}
+
+/// Explicit Google Drive search scope chosen in a pane's search bar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DriveSearchScope {
+    /// Scope to the pane's current Drive location (folder, shared drive, My Drive, or whole account for views).
+    #[default]
+    Here,
+    /// Whole current Google Drive account (`Within::Everything`: My Drive + Shared with me + all Shared Drives).
+    Account,
+    /// All connected Google Drive accounts (`Location::DriveSearch`).
+    AllAccounts,
 }
 
 /// A search of the computer: its words, the folder it looks under (everywhere when `None`), and
@@ -220,6 +256,13 @@ impl Location {
     /// each entry's id is its path, and the Tipo column shows the folder it's in.
     pub fn finds(&self) -> bool {
         matches!(self, Location::Found(_) | Location::Server { find: Some(_), .. })
+    }
+
+    /// Whether this lists Google Drive search results (one account or all accounts),
+    /// where the 4th column shows the item's Drive/account location.
+    pub fn is_drive_search(&self) -> bool {
+        matches!(self, Location::DriveSearch(_))
+            || matches!(self, Location::Drive { space: Space::Search(_), path, .. } if path.is_empty())
     }
 
     pub fn home() -> Location {
@@ -345,10 +388,16 @@ fn order(asc: bool, a: &Entry, b: &Entry, by: Ordering) -> Ordering {
     })
 }
 
-/// What the fourth column sorts by: the type, or for a search's results the folder (the column
-/// shows Pasta there, as Everything's does).
+/// What the fourth column sorts by: the type, the folder (for computer/server searches),
+/// or the Drive origin label (for Google Drive search results).
 fn kind_key(found: bool, e: &Entry) -> String {
-    if found { crate::finder::folder_of(e) } else { e.kind_label() }
+    if found {
+        crate::finder::folder_of(e)
+    } else if let Some(origin) = &e.drive_origin {
+        origin.label.clone()
+    } else {
+        e.kind_label()
+    }
 }
 
 fn by_column(col: SortCol, a: &Entry, b: &Entry) -> Ordering {
@@ -414,7 +463,7 @@ impl Pane {
         let entries = match &self.loc {
             Location::Local(dir) => read_local(dir, show_hidden).map_err(|e| format!("{}: {e}", dir.display())),
             Location::Mock(segs) => Ok(mock.list(segs)),
-            Location::Drive { .. } | Location::Found(_) | Location::Server { .. } => return,
+            Location::Drive { .. } | Location::DriveSearch(_) | Location::Found(_) | Location::Server { .. } => return,
         };
         self.set_entries(entries);
     }
@@ -536,6 +585,7 @@ impl Pane {
                 parts.extend(path.iter().map(|(_, n)| n.as_str()));
                 parts.join("/")
             }
+            Location::DriveSearch(q) => tr!("“{}” em todas as contas", "“{}” in all accounts", q.text),
             Location::Server { server, path, find } => {
                 let place = std::iter::once(server.name.as_str()).chain(path.iter().map(String::as_str)).collect::<Vec<_>>().join("/");
                 match find {
@@ -569,7 +619,7 @@ pub fn is_hidden(name: &str, meta: Option<&std::fs::Metadata>) -> bool {
 /// shared folders.
 pub fn read_local(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>> {
     if let Some((server, _)) = crate::network::unc(dir).filter(|(_, share)| share.is_empty()) {
-        let folder = |name: String| Entry { id: name.clone(), name, is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let folder = |name: String| Entry { id: name.clone(), name, is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         return Ok(crate::network::shares(&server)?.into_iter().map(folder).collect());
     }
     let mut out = Vec::new();
@@ -591,6 +641,7 @@ pub fn read_local(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>> 
             mime: None,
             md5: None,
             starred: false,
+            drive_origin: None,
         });
     }
     Ok(out)
@@ -610,8 +661,8 @@ impl MockDrive {
     pub fn new() -> MockDrive {
         let now = SystemTime::now();
         let ago = |days: u64| now - Duration::from_secs(days * 86_400);
-        let dir = |name: &str, days| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: Some(ago(days)), target: None, mime: None, md5: None, starred: false };
-        let file = |name: String, size: u64, days| Entry { id: name.clone(), name, is_dir: false, size: Some(size), modified: Some(ago(days)), target: None, mime: None, md5: None, starred: false };
+        let dir = |name: &str, days| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: Some(ago(days)), target: None, mime: None, md5: None, starred: false, drive_origin: None };
+        let file = |name: String, size: u64, days| Entry { id: name.clone(), name, is_dir: false, size: Some(size), modified: Some(ago(days)), target: None, mime: None, md5: None, starred: false, drive_origin: None };
 
         let mut folders = HashMap::new();
         folders.insert(
@@ -853,6 +904,10 @@ pub fn crumbs(loc: &Location) -> Vec<Crumb> {
             }
             out
         }
+        Location::DriveSearch(q) => vec![Crumb {
+            label: tr!("“{}” em todas as contas", "“{}” in all accounts", q.text),
+            to: loc.clone(),
+        }],
         Location::Server { server, path, find } => {
             let at = |path: &[String]| Location::Server { server: server.clone(), path: path.to_vec(), find: None };
             let mut out = vec![Crumb { label: server.name.clone(), to: at(&[]) }];
@@ -966,7 +1021,7 @@ mod tests {
     use super::*;
 
     fn file(name: &str) -> Entry {
-        Entry { id: name.into(), name: name.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false }
+        Entry { id: name.into(), name: name.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }
     }
 
     /// Pages merged in one by one end in the order a full sort gives, for every column and
@@ -1123,5 +1178,54 @@ mod tests {
         assert!(ViewMode::MediumIcons.is_grid());
         assert!(!ViewMode::List.is_grid());
         assert!(!ViewMode::Details.is_grid());
+    }
+
+    #[test]
+    fn drive_search_results_sort_by_location_and_show_title_and_crumbs() {
+        let loc = Location::DriveSearch(Box::new(DriveSearch { text: "batman".into() }));
+        assert!(loc.is_drive_search());
+        assert!(!Location::drive("a@b", Space::MyDrive).is_drive_search());
+        let search_one = Location::drive("a@b", Space::Search(Box::new(Search {
+            text: "batman".into(),
+            within: openexplorer_gdrive::search::Within::Everything,
+            place: "todo o Drive".into(),
+        })));
+        assert!(search_one.is_drive_search());
+
+        let with_origin = |id: &str, label: &str, is_dir: bool| Entry {
+            id: id.into(),
+            name: id.into(),
+            is_dir,
+            size: None,
+            modified: None,
+            target: None,
+            mime: None,
+            md5: None,
+            starred: false,
+            drive_origin: Some(Box::new(DriveOrigin {
+                email: "a@b".into(),
+                shared_drive: None,
+                owned_by_me: true,
+                label: label.into(),
+            })),
+        };
+
+        let mut p = Pane::new(loc.clone());
+        assert_eq!(p.title(), "“batman” em todas as contas");
+        assert_eq!(crumbs(&loc).len(), 1);
+        assert_eq!(crumbs(&loc)[0].label, "“batman” em todas as contas");
+
+        p.sort = (SortCol::Kind, true);
+        p.set_entries(Ok(vec![
+            with_origin("f1", "Zebra", false),
+            with_origin("f2", "Alfa", false),
+            with_origin("d1", "Zebra", true),
+        ]));
+        let ids: Vec<&str> = p.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["d1", "f2", "f1"]);
+
+        p.append_entries(vec![with_origin("f3", "Meio", false)]);
+        let ids: Vec<&str> = p.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["d1", "f2", "f3", "f1"]);
     }
 }

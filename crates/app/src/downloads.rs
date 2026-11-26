@@ -584,7 +584,7 @@ mod tests {
     use super::*;
 
     fn item(name: &str, mime: &str, is_dir: bool) -> DriveFile {
-        DriveFile { id: "x".into(), name: name.into(), is_dir, size: Some(1024), modified: None, mime: mime.into(), target: None, md5: None, starred: false }
+        DriveFile { id: "x".into(), name: name.into(), is_dir, size: Some(1024), modified: None, mime: mime.into(), target: None, md5: None, starred: false, drive_id: None, owned_by_me: None }
     }
 
     #[test]

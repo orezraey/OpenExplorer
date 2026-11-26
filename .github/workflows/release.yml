@@ -149,7 +149,18 @@ jobs:
         if: runner.os == 'macOS' && env.CACHE_ONLY != 'true'
         run: |
           app="dist/Open Explorer.app"
-          mkdir -p "$app/Contents/MacOS"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          iconset="$RUNNER_TEMP/AppIcon.iconset"
+          mkdir -p "$iconset"
+          # icon.png is 512 px: no size is made bigger than that (512@2x would be blown up).
+          for sz in 16 32 128 256 512; do
+            sips -z $sz $sz crates/app/assets/icon.png --out "$iconset/icon_${sz}x${sz}.png" >/dev/null
+            sz2=$((sz * 2))
+            if [ "$sz2" -le 512 ]; then
+              sips -z $sz2 $sz2 crates/app/assets/icon.png --out "$iconset/icon_${sz}x${sz}@2x.png" >/dev/null
+            fi
+          done
+          iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
           lipo -create -output "$app/Contents/MacOS/openexplorer" \
             target/aarch64-apple-darwin/release/openexplorer target/x86_64-apple-darwin/release/openexplorer
           chmod +x "$app/Contents/MacOS/openexplorer"
@@ -162,6 +173,7 @@ jobs:
             <key>CFBundleDisplayName</key><string>Open Explorer</string>
             <key>CFBundleIdentifier</key><string>io.github.openexplorer</string>
             <key>CFBundleExecutable</key><string>openexplorer</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>$VERSION</string>
             <key>CFBundleVersion</key><string>$VERSION</string>
@@ -200,20 +212,24 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      # SHA-256 checksums for the built-in updater, plus an optional Ed25519 signature when
-      # UPDATE_SIGNING_KEY (PEM-encoded Ed25519 private key) is set in repository secrets.
+      # SHA-256 checksums for the built-in updater and their Ed25519 signature, made with
+      # UPDATE_SIGNING_KEY (a PEM-encoded Ed25519 private key in the repository's secrets).
       - name: Checksums and signature
         env:
           UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        # The app refuses a release without checksums.txt.sig, so none is published unsigned:
+        # every copy would refuse it. (Only tags reach this job; a manual build only builds.)
         run: |
-          (cd dist && sha256sum * > checksums.txt)
-          if [ -n "$UPDATE_SIGNING_KEY" ]; then
-            printf '%s\n' "$UPDATE_SIGNING_KEY" > "$RUNNER_TEMP/update-key.pem"
-            chmod 600 "$RUNNER_TEMP/update-key.pem"
-            openssl pkeyutl -sign -inkey "$RUNNER_TEMP/update-key.pem" -rawin \
-              -in dist/checksums.txt -out dist/checksums.txt.sig
-            rm -f "$RUNNER_TEMP/update-key.pem"
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            echo "::error::UPDATE_SIGNING_KEY is not set: the release would be unsigned, and the app refuses unsigned updates."
+            exit 1
           fi
+          (cd dist && sha256sum * > checksums.txt)
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$RUNNER_TEMP/update-key.pem"
+          chmod 600 "$RUNNER_TEMP/update-key.pem"
+          openssl pkeyutl -sign -inkey "$RUNNER_TEMP/update-key.pem" -rawin \
+            -in dist/checksums.txt -out dist/checksums.txt.sig
+          rm -f "$RUNNER_TEMP/update-key.pem"
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*

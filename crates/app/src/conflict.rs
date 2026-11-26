@@ -87,6 +87,7 @@ pub fn kind_of(name: &str, is_dir: bool, mime: Option<&str>) -> Kind {
         mime: mime.map(str::to_string),
         md5: None,
         starred: false,
+        drive_origin: None,
     }
     .kind()
 }

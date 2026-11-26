@@ -257,7 +257,10 @@ pub struct Settings {
     pub segmented_downloads: bool,
     /// Show hidden files and `.` dotfiles in local folders, servers and the navigation tree.
     pub show_hidden: bool,
-    /// Remove finished transfers from the queue automatically once done.
+    /// Remove finished transfers from the queue automatically once done. Off by default; kept
+    /// under `auto_clear_completed` in JSON so older settings files with `clear_completed: true`
+    /// adopt the new default instead of keeping finished rows hidden.
+    #[serde(rename = "auto_clear_completed")]
     pub clear_completed: bool,
     /// Delete local files permanently (with confirmation) instead of sending them to Recycle Bin.
     pub skip_recycle_bin: bool,
@@ -323,7 +326,7 @@ impl Default for Settings {
             downloads: 4,
             segmented_downloads: true,
             show_hidden: false,
-            clear_completed: true,
+            clear_completed: false,
             skip_recycle_bin: false,
             window: None,
             mica: false,
@@ -499,9 +502,16 @@ mod tests {
 
     #[test]
     fn settings_read_back_and_stay_in_bounds() {
+        assert!(!Settings::default().clear_completed);
         assert_eq!(serde_json::from_str::<Settings>("{}").unwrap(), Settings::default());
-        let s: Settings = serde_json::from_str(r#"{"theme":"Dark","uploads":7,"show_hidden":true,"clear_completed":false}"#).unwrap();
-        assert_eq!((s.theme, s.uploads, s.downloads, s.show_hidden, s.clear_completed, s.skip_recycle_bin), (Theme::Dark, 7, 4, true, false, false));
+        // An older settings file with `clear_completed: true` adopts the new `false` default.
+        let legacy: Settings = serde_json::from_str(r#"{"theme":"Dark","uploads":7,"show_hidden":true,"clear_completed":true}"#).unwrap();
+        assert_eq!((legacy.theme, legacy.uploads, legacy.downloads, legacy.show_hidden, legacy.clear_completed, legacy.skip_recycle_bin), (Theme::Dark, 7, 4, true, false, false));
+        // Enabling auto-clear under the current key persists across save/load round-trips.
+        let auto_clear: Settings = serde_json::from_str(r#"{"auto_clear_completed":true}"#).unwrap();
+        assert!(auto_clear.clear_completed);
+        let round_trip: Settings = serde_json::from_str(&serde_json::to_string(&auto_clear).unwrap()).unwrap();
+        assert!(round_trip.clear_completed);
         let s: Settings = serde_json::from_str(r#"{"theme":"HighContrast","uploads":7}"#).unwrap();
         assert_eq!((s.theme, s.uploads), (Theme::Auto, 7));
         assert_eq!((at_once(0), at_once(50), at_once(3)), (1, MAX_AT_ONCE, 3));

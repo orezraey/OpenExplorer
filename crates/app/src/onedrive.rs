@@ -850,6 +850,7 @@ pub fn scene_bin(s: &mut State, granted: bool) {
             mime: None,
             md5: None,
             starred: false,
+            drive_origin: None,
         })
         .collect();
     od::bin::show(drive, items, od::BinAccess::Ready);
