@@ -113,6 +113,7 @@ pub fn text(loc: &Location) -> String {
             parts.extend(path.iter().map(|(_, name)| shown(name)));
             parts.join("/")
         }
+        Location::DriveSearch(_) => String::new(),
         Location::Server { .. } => crate::servers::address_text(loc),
     }
 }

@@ -117,6 +117,7 @@ pub fn tab_header(s: &State, loc: &Location) -> (Option<IconKey>, &'static Icon,
                 .to_string();
             (None, &icons::PROVIDER_GDRIVE, label)
         }
+        Location::DriveSearch(_) => (None, &icons::PROVIDER_GDRIVE, t("Todas as contas", "All accounts").into()),
         Location::Server { server, .. } => {
             let provider = Provider::of_server(server);
             let label = match provider {

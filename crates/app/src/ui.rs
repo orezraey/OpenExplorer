@@ -1651,7 +1651,7 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             .separator()
             .item(item(t("Excluir", "Delete"), &icons::M_DELETE, "Del", changeable, |s, p, _| actions::ask_delete(s, p)).danger(true))
             .item(item(t("Renomear", "Rename"), &icons::M_RENAME, "F2", changeable && n == 1, actions::ask_rename));
-        if changeable && matches!(s.panes[p].loc, Location::Drive { .. }) {
+        if changeable && matches!(s.panes[p].loc, Location::Drive { .. } | Location::DriveSearch(_)) {
             let label = if actions::stars_to_add(s, p) { t("Adicionar estrela", "Add star") } else { t("Remover estrela", "Remove star") };
             menu = menu.item(item(label, &icons::M_STAR, "", true, |s, p, _| actions::star(s, p)));
         }
@@ -3412,6 +3412,11 @@ fn place_of(p: &actions::Props) -> String {
             Some(e) => format!("{}{}", server.address(), crate::servers::path_of(loc, e).unwrap_or_default()),
             None => format!("{}{}", server.address(), server.path(path)),
         },
+        (Location::DriveSearch(_), Some(e)) => match &e.drive_origin {
+            Some(o) => format!("{}/{}/{}", o.email, o.label, shown(&e.name)),
+            None => shown(&e.name),
+        },
+        (Location::DriveSearch(q), None) => tr!("Resultados de “{}” em todas as contas", "Results for “{}” in all accounts", q.text),
         (loc, single) => {
             let mut parts: Vec<String> = crumbs(loc).into_iter().skip(1).map(|c| c.label).collect();
             if let Some(e) = single {
@@ -3427,6 +3432,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
     let loc = &p.loc;
     let drive = match loc {
         Location::Drive { email, .. } => Some(email.clone()),
+        Location::DriveSearch(_) => p.single().and_then(|e| e.drive_origin.as_deref().map(|o| o.email.clone())),
         _ => None,
     };
     let details = match &p.details {
@@ -5708,6 +5714,7 @@ fn search_box(s: &State, k: &Kit, p: usize) -> El {
         Location::Local(dir) => crate::finder::place_of(dir),
         Location::Found(f) => f.place.clone(),
         Location::Server { server, path, .. } => path.last().unwrap_or(&server.name).clone(),
+        Location::DriveSearch(_) => t("todas as contas", "all accounts").to_string(),
         _ => match actions::search_scope(loc) {
             Some((_, place)) => place,
             None => return el().key("search"),
@@ -5826,12 +5833,45 @@ fn search_bar(s: &State, k: &Kit, p: usize) -> El {
             .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
             .child(text(said).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0));
     }
+    if let Location::DriveSearch(q) = &s.panes[p].loc {
+        let pane = &s.panes[p];
+        let n = pane.entries.len();
+        let found = match (pane.loading, n) {
+            (true, 0) => t("Pesquisando…", "Searching…").to_string(),
+            (true, _) => tr!("Pesquisando… {} até agora", "Searching… {} so far", results(n)),
+            _ => results(n),
+        };
+        let mut said = tr!("“{}” em todas as contas ({}) · {found}", "“{}” in all accounts ({}) · {found}", q.text, s.accounts.len());
+        let mut bar = row()
+            .key("search-bar")
+            .w_full()
+            .h(28.0)
+            .px(10.0)
+            .gap(10.0)
+            .center_y()
+            .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+            .child(text(said.clone()).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0));
+        if !s.drive_search_warnings[p].is_empty() {
+            let failed_emails = s.drive_search_warnings[p].iter().map(|(e, _)| e.as_str()).collect::<Vec<_>>().join(", ");
+            let details = s.drive_search_warnings[p].iter().map(|(e, err)| format!("{e}: {err}")).collect::<Vec<_>>().join("\n");
+            said = tr!("falha em {failed_emails}", "failed on {failed_emails}");
+            bar = bar
+                .child(el().grow(1.0))
+                .child(text(said).font(k.ty.text_xsmall).color(k.c.danger.fg).help(details).truncate().shrink().min_w(0.0));
+        }
+        return bar;
+    }
     let Location::Drive { space: Space::Search(q), path, .. } = &s.panes[p].loc else { return el().key("search-bar") };
     if !path.is_empty() {
         return el().key("search-bar");
     }
     let pane = &s.panes[p];
-    let found = if pane.loading { t("Pesquisando…", "Searching…").to_string() } else { results(pane.entries.len()) };
+    let n = pane.entries.len();
+    let found = match (pane.loading, n) {
+        (true, 0) => t("Pesquisando…", "Searching…").to_string(),
+        (true, _) => tr!("Pesquisando… {} até agora", "Searching… {} so far", results(n)),
+        _ => results(n),
+    };
     let mut bar = row()
         .key("search-bar")
         .w_full()
@@ -5843,7 +5883,7 @@ fn search_bar(s: &State, k: &Kit, p: usize) -> El {
         .child(text(tr!("“{}” em {} · {found}", "“{}” in {} · {found}", q.text, q.place)).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0));
     if q.within != openexplorer_gdrive::search::Within::Everything {
         bar = bar.child(el().grow(1.0)).child(
-            text(t("Pesquisar em todo o Drive", "Search all of Drive"))
+            text(t("Pesquisar em toda a conta", "Search all of this account"))
                 .key("search-everywhere")
                 .role("link")
                 .font(k.ty.text_xsmall)
@@ -5858,7 +5898,7 @@ fn search_bar(s: &State, k: &Kit, p: usize) -> El {
 fn can_go_up(loc: &Location) -> bool {
     match loc {
         Location::Local(dir) => crate::network::parent(dir).is_some(),
-        Location::Found(_) => false,
+        Location::Found(_) | Location::DriveSearch(_) => false,
         Location::Mock(segs) => !segs.is_empty(),
         Location::Drive { space, path, .. } => !path.is_empty() || matches!(space, Space::Shared { .. }),
         Location::Server { path, find, .. } => !path.is_empty() || find.is_some(),
@@ -6259,6 +6299,7 @@ fn searched_words(loc: &Location) -> Vec<Vec<u8>> {
         Location::Found(f) => &f.text,
         Location::Server { find: Some(text), .. } => text,
         Location::Drive { space: Space::Search(q), path, .. } if path.is_empty() => &q.text,
+        Location::DriveSearch(q) => &q.text,
         _ => return Vec::new(),
     };
     crate::finder::words(text)
@@ -6695,6 +6736,8 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         && path.is_empty()
     {
         notice(tr!("Nada com “{}” no nome em {}.", "Nothing with “{}” in its name in {}.", q.text, q.place), k.c.text_faint)
+    } else if let (0, Location::DriveSearch(q)) = (n, &pane.loc) {
+        notice(tr!("Nada com “{}” no nome em nenhuma conta.", "Nothing with “{}” in its name in any account.", q.text), k.c.text_faint)
     } else if let (0, Location::Found(f)) = (n, &pane.loc) {
         notice(tr!("Nada com “{}” no nome em {}.", "Nothing with “{}” in its name in {}.", f.text, f.place), k.c.text_faint)
     } else if let (0, Location::Server { server, path, find: Some(text) }) = (n, &pane.loc) {

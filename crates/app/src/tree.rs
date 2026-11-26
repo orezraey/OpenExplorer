@@ -699,6 +699,7 @@ fn chain(s: &State, loc: &Location) -> Vec<Node> {
         Location::Local(path) => local_chain(s, path),
         Location::Found(f) => f.within.as_ref().map(|w| local_chain(s, w)).unwrap_or_default(),
         Location::Mock(segs) => (0..=segs.len()).map(|i| mock_node(segs[..i].to_vec())).collect(),
+        Location::DriveSearch(_) => Vec::new(),
         Location::Server { server, path, .. } => (0..=path.len()).map(|i| remote_node(server, path[..i].to_vec())).collect(),
         Location::Drive { email, space, path } => {
             let mut out = vec![account_node(email)];
