@@ -651,6 +651,22 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                     st.search_marker,
                     |s| change_settings(s, |c| c.search_marker = !c.search_marker),
                 ));
+            // Rune does it only on Windows.
+            let exp_card = if cfg!(windows) {
+                exp_card.child(divider()).child(switch_row(
+                    "opt-resize-sync",
+                    t("Redimensionar sem atraso", "Resize without lag"),
+                    t(
+                        "Ao arrastar a borda esquerda ou de cima da janela, o conteúdo acompanha a borda em vez de tremer. Não vale com o fundo Mica ligado. Vale ao abrir o Open Explorer de novo.",
+                        "Dragging the window's left or top edge, the content keeps up with the edge instead of shaking. Not with the Mica background on. Takes effect the next time Open Explorer opens.",
+                    ),
+                    None,
+                    st.resize_sync,
+                    |s| change_settings(s, |c| c.resize_sync = !c.resize_sync),
+                ))
+            } else {
+                exp_card
+            };
 
             col()
                 .key("page-experimental")

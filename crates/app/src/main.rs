@@ -2749,6 +2749,11 @@ fn main() {
     if mica {
         main_app = main_app.window_backdrop(initial.material.backdrop()).color_scheme(initial.theme.color_scheme());
     }
+    // Experimental: content that keeps up with a drag of the left or top edge. Rune ignores it
+    // in a transparent window, so not with Mica.
+    if initial.resize_sync && cfg!(windows) {
+        main_app = main_app.resize_sync(rune::ResizeSync::On);
+    }
 
     let (account_handle, _) = main_app.window(rune::windows::WindowSpec::from_app("add-account", account_app));
     let main_handle = main_app.handle();

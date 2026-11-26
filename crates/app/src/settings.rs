@@ -229,6 +229,9 @@ pub struct Settings {
     /// Experimental: a search's matches in names marked as with a highlighter, rather than
     /// only coloured.
     pub search_marker: bool,
+    /// Experimental (Windows): the window's content keeps up with a drag of its left or top
+    /// edge (Rune's `ResizeSync::On`), from the next start.
+    pub resize_sync: bool,
 }
 
 impl Default for Settings {
@@ -250,6 +253,7 @@ impl Default for Settings {
             mica: false,
             material: Material::Mica,
             search_marker: false,
+            resize_sync: false,
         }
     }
 }
