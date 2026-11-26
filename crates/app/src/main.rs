@@ -148,6 +148,12 @@ pub enum MainTab {
 struct State {
     main_tab: MainTab,
     view_menu_open: bool,
+    /// Which pane's view-mode dropdown menu is currently open, if any.
+    view_mode_menu: Option<usize>,
+    /// Number of columns per pane in icon-grid view modes (updated from viewport width).
+    grid_cols: [usize; MAX_PANES],
+    /// Number of rows per column in multi-column List view mode (updated from viewport height).
+    list_rows: [usize; MAX_PANES],
     accounts_filter: Option<servers::Provider>,
     accounts_search: rune::TextEdit,
     panes: [Pane; MAX_PANES],
@@ -335,6 +341,9 @@ impl State {
         State {
             main_tab: MainTab::Explore,
             view_menu_open: false,
+            view_mode_menu: None,
+            grid_cols: [1; MAX_PANES],
+            list_rows: [1; MAX_PANES],
             accounts_filter: None,
             accounts_search: rune::TextEdit::new(""),
             panes: std::array::from_fn(|_| Pane::new(loc.clone())),
@@ -543,6 +552,9 @@ fn init() -> State {
     State {
         main_tab: MainTab::Explore,
         view_menu_open: false,
+        view_mode_menu: None,
+        grid_cols: [1; MAX_PANES],
+        list_rows: [1; MAX_PANES],
         accounts_filter: None,
         accounts_search: rune::TextEdit::new(""),
         panes,
@@ -1289,6 +1301,7 @@ pub(crate) fn refresh_all_quotas(s: &mut State) {
 pub(crate) fn set_main_tab(s: &mut State, tab: MainTab) {
     s.main_tab = tab;
     s.view_menu_open = false;
+    s.view_mode_menu = None;
     if tab == MainTab::Accounts {
         ensure_all_quotas(s);
     }
@@ -1299,6 +1312,7 @@ pub(crate) fn set_pane_layout(s: &mut State, layout: settings::PaneLayout) {
     s.settings.pane_layout = layout;
     s.settings.save();
     s.view_menu_open = false;
+    s.view_mode_menu = None;
     s.menu = None;
     s.tree_menu = None;
     s.address_menu = None;
@@ -1313,6 +1327,22 @@ pub(crate) fn set_pane_layout(s: &mut State, layout: settings::PaneLayout) {
         s.lasso = None;
     }
     s.main_tab = MainTab::Explore;
+}
+
+/// Sets the file display mode (Extra large / Large / Medium icons, List, Details) for pane `p`.
+pub(crate) fn set_view_mode(s: &mut State, p: usize, mode: model::ViewMode) {
+    s.active = p;
+    s.panes[p].view_mode = mode;
+    s.view_mode_menu = None;
+    if s.lasso.as_ref().is_some_and(|l| l.pane == p) {
+        s.lasso = None;
+    }
+}
+
+/// Cycles pane `p` directly to the next file display mode.
+pub(crate) fn cycle_view_mode(s: &mut State, p: usize) {
+    let next = s.panes[p].view_mode.next();
+    set_view_mode(s, p, next);
 }
 
 /// Opens `loc` in pane `p` (0 = left, 1 = right) and switches to `Explorar`.
@@ -1870,8 +1900,12 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             go_forward(s, p);
             return true;
         }
-        Key::Up => step(-1),
-        Key::Down => step(1),
+        Key::Left if s.panes[p].view_mode.is_grid() => step(-1),
+        Key::Right if s.panes[p].view_mode.is_grid() => step(1),
+        Key::Left if s.panes[p].view_mode == model::ViewMode::List => step(-(s.list_rows[p].max(1) as isize)),
+        Key::Right if s.panes[p].view_mode == model::ViewMode::List => step(s.list_rows[p].max(1) as isize),
+        Key::Up => step(-(if s.panes[p].view_mode.is_grid() { s.grid_cols[p].max(1) as isize } else { 1 })),
+        Key::Down => step(if s.panes[p].view_mode.is_grid() { s.grid_cols[p].max(1) as isize } else { 1 }),
         Key::PageUp => step(-page),
         Key::PageDown => step(page),
         Key::Home => step(-(n as isize)),

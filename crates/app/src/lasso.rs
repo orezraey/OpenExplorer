@@ -152,6 +152,13 @@ pub fn drag(s: &mut State, p: usize, d: &mut Drag, tx: &mut Tx) {
 /// (which doesn't run under this one) would make it. True when it started a lasso.
 pub fn press(s: &mut State, p: usize, at: [f32; 2], ctrl: bool) -> bool {
     s.active = p;
+    let mode = s.panes[p].view_mode;
+    if mode != crate::model::ViewMode::Details {
+        if !ctrl {
+            s.panes[p].selected.clear();
+        }
+        return true;
+    }
     if at[1] < HEADER_H {
         return false;
     }
