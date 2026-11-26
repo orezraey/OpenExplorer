@@ -34,7 +34,7 @@ pub const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 
 /// Ed25519 public key (64 hex characters) used to require a signed `checksums.txt.sig`
 /// on every release. Matches the private key in GitHub Secret `UPDATE_SIGNING_KEY`.
-pub const PUBLISHER_KEY: Option<&str> = Some("ce55eeb92f07d3fe024e27f7a2b59a1de0d6101e0eea83d74da6e48ce4f4cdbe");
+pub const PUBLISHER_KEY: Option<&str> = Some("f03cdd4d372b791c4b7f47a2ad320b813f9ca391a5fce04c19254ef4ee165e74");
 
 /// Pending update to hand off right after `on_quit` saves caches.
 static PENDING_HANDOFF: Mutex<Option<Staged>> = Mutex::new(None);
@@ -1201,6 +1201,20 @@ mod tests {
         assert!(verify_signature(&pub_hex, msg, sig.as_ref()).is_ok());
         assert!(verify_signature(&pub_hex, msg, sig_hex.as_bytes()).is_ok());
         assert!(verify_signature(&pub_hex, b"tampered", sig.as_ref()).is_err());
+    }
+
+    /// The release workflow signs with `openssl pkeyutl -sign -rawin` and the Ed25519 key in
+    /// UPDATE_SIGNING_KEY: a signature made that way with that key, over a sample checksums.txt,
+    /// verifies against the key the app carries.
+    #[test]
+    fn the_release_workflows_signature_verifies() {
+        let sums = b"deadbeef  OpenExplorer-test.exe
+";
+        let sig = hex::decode("079916e5b2df0309e44bd6eb92a7107b9aae3d3fb88f1d6bbd365bb9210f25567d48f49dadc6cb0dfcf2e9a875a8045ee4633b872f3f913bb8fe6ea29bf60009").unwrap();
+        let key = PUBLISHER_KEY.unwrap();
+        assert!(verify_signature(key, sums, &sig).is_ok());
+        assert!(verify_signature(key, b"deadbeef  OpenExplorer-other.exe
+", &sig).is_err());
     }
 
     #[test]
