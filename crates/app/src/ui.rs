@@ -2242,6 +2242,7 @@ fn account_configure_body(
         (Provider::Ftp, _) => (t("FTP padrão · ative SSL/TLS abaixo se o servidor aceitar", "Standard FTP · turn on SSL/TLS below if the server supports it"), "FTP"),
         (Provider::WebDav, Protocol::Davs) => (t("Servidor WebDAV seguro · porta padrão 443", "Secure WebDAV server · default port 443"), "HTTPS"),
         (Provider::WebDav, _) => (t("Servidor WebDAV sem criptografia · porta padrão 80", "Unencrypted WebDAV server · default port 80"), "HTTP"),
+        (Provider::Service(b), _) => (crate::services::of(b).map_or("WebDAV", |svc| svc.about()), "HTTPS"),
     };
 
     let badge_variant = if f.provider != Provider::GoogleDrive && proto.plain() {
@@ -2519,7 +2520,11 @@ fn account_configure_body(
                 .child(connect);
             (inner, actions)
         }
-        Provider::Sftp | Provider::Ftp | Provider::WebDav | Provider::Nextcloud | Provider::OwnCloud => {
+        Provider::Sftp | Provider::Ftp | Provider::WebDav | Provider::Nextcloud | Provider::OwnCloud | Provider::Service(_) => {
+            let service = match f.provider {
+                Provider::Service(b) => crate::services::of(b),
+                _ => None,
+            };
             let field = |key: &'static str, label: &str, edit: &rune::TextEdit, placeholder: &str, pick: fn(&mut Form) -> &mut rune::TextEdit| {
                 let input = rune_kit::TextInput::new(edit).width(None).label(label).placeholder(placeholder).on_edit(move |s: &mut State| account_part(s, pick)).on_submit(|s: &mut State, _: &mut Tx| crate::servers::submit(s));
                 col().key(key).w_full().gap(4.0).child(text(label.to_string()).font(k.ty.text_small_medium).color(k.c.text_base)).child(input.build(k))
@@ -2532,6 +2537,7 @@ fn account_configure_body(
             });
             let password_label = match (f.editing.is_some(), f.provider) {
                 (true, _) => t("Senha (vazio: manter a salva)", "Password (empty: keep the saved one)"),
+                (false, Provider::Service(_)) => service.map_or(t("Senha", "Password"), |svc| svc.password_label()),
                 (false, Provider::Nextcloud | Provider::OwnCloud) => t("Senha ou senha de app", "Password or app password"),
                 (false, _) => t("Senha", "Password"),
             };
@@ -2560,32 +2566,47 @@ fn account_configure_body(
                 Provider::Sftp => t("nas.local, 192.168.0.10 ou sftp://usuario@host", "nas.local, 192.168.0.10 or sftp://user@host"),
                 Provider::Ftp => t("ftp.exemplo.com, 192.168.0.10 ou ftp://usuario@host", "ftp.example.com, 192.168.0.10 or ftp://user@host"),
                 Provider::WebDav | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive | Provider::Telegram => t("dav.exemplo.com, 192.168.0.10 ou https://host/dav", "dav.example.com, 192.168.0.10 or https://host/dav"),
+                Provider::Service(_) => match service.map(|svc| svc.host) {
+                    Some(crate::services::Host::Part { hint, .. }) => t(hint.0, hint.1),
+                    Some(crate::services::Host::Pasted { hint }) => hint,
+                    _ => "",
+                },
             };
             let folder_hint = match f.provider {
                 Provider::Nextcloud | Provider::OwnCloud => t("/remote.php/webdav (automático, se vazio)", "/remote.php/webdav (automatic if empty)"),
                 Provider::WebDav => t("/dav ou /remote.php/dav/files/usuario (raiz /, se vazio)", "/dav or /remote.php/dav/files/user (root / if empty)"),
+                Provider::Service(_) => match service.map(|svc| svc.root) {
+                    Some(root) if !root.is_empty() => root,
+                    _ => t("a pasta de cima, se vazio", "the top folder if empty"),
+                },
                 Provider::Sftp => t("a pasta pessoal, se vazio", "the home folder if empty"),
                 Provider::Ftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive | Provider::Telegram => t("a pasta do login, se vazio", "the login folder if empty"),
             };
             let name_hint = match f.provider {
                 Provider::Nextcloud => t("Nextcloud (servidor), se vazio", "Nextcloud (server) if empty"),
                 Provider::OwnCloud => t("ownCloud (servidor), se vazio", "ownCloud (server) if empty"),
+                Provider::Service(_) => service.map_or("", |svc| svc.name),
                 _ => t("o endereço do servidor, se vazio", "the server's address if empty"),
             };
             let user_hint = if matches!(proto, Protocol::Ftp | Protocol::Ftps) { t("anonymous, se vazio", "anonymous if empty") } else { "" };
 
-            let mut inner = col()
-                .w_full()
-                .gap(10.0)
-                .child(banner)
-                .child(
+            let mut inner = col().w_full().gap(10.0).child(banner);
+            // A ready-made service needs no port, and its server only when it's the account's own:
+            // the part of it to type, under the name the provider gives it.
+            inner = match service.map(|svc| svc.host) {
+                None => inner.child(
                     row()
                         .w_full()
                         .gap(10.0)
                         .child(field("host", t("Servidor", "Server"), &f.host, host_hint, |f| &mut f.host).grow(3.0).w(0.0))
                         .child(field("port", t("Porta", "Port"), &f.port, &port_hint, |f| &mut f.port).grow(1.0).w(0.0)),
-                )
-                .child(half(field("user", t("Usuário", "User name"), &f.user, user_hint, |f| &mut f.user), password_field));
+                ),
+                Some(crate::services::Host::Part { label, .. }) => inner.child(field("host", t(label.0, label.1), &f.host, host_hint, |f| &mut f.host)),
+                Some(crate::services::Host::Pasted { .. }) => inner.child(field("host", t("Endereço WebDAV", "WebDAV address"), &f.host, host_hint, |f| &mut f.host)),
+                Some(crate::services::Host::Fixed(_) | crate::services::Host::FromUser(_)) => inner,
+            };
+            let user_label = service.map_or(t("Usuário", "User name"), |svc| svc.user_label());
+            inner = inner.child(half(field("user", user_label, &f.user, user_hint, |f| &mut f.user), password_field));
 
             match f.provider {
                 Provider::Ftp => {
@@ -2608,7 +2629,7 @@ fn account_configure_body(
                             .key("tls-toggle"),
                     );
                 }
-                Provider::Sftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive | Provider::Telegram => {}
+                Provider::Sftp | Provider::GoogleDrive | Provider::Mega | Provider::Dropbox | Provider::B2 | Provider::OneDrive | Provider::Telegram | Provider::Service(_) => {}
             }
 
             inner = inner.child(field("folder", t("Pasta inicial", "Start folder"), &f.folder, folder_hint, |f| &mut f.folder));
@@ -2628,6 +2649,8 @@ fn account_configure_body(
                     )
                     .into(),
                 ));
+            } else if let Some(svc) = service {
+                inner = inner.child(muted(svc.note().into()));
             } else if matches!(f.provider, Provider::Nextcloud | Provider::OwnCloud) {
                 inner = inner.child(muted(
                     t(
@@ -3601,7 +3624,7 @@ pub(crate) fn hub_cards(s: &State) -> Vec<HubCard> {
                     remove_target: actions::AccountTarget::Server(sv.id.clone()),
                 });
             }
-            Provider::Nextcloud | Provider::OwnCloud | Provider::Sftp | Provider::Ftp | Provider::WebDav | Provider::GoogleDrive => {
+            Provider::Nextcloud | Provider::OwnCloud | Provider::Sftp | Provider::Ftp | Provider::WebDav | Provider::GoogleDrive | Provider::Service(_) => {
                 let drive_name = match (provider, sv.protocol) {
                     (Provider::Ftp, Protocol::Ftps) => "FTPS",
                     (Provider::WebDav, Protocol::Dav) => "WebDAV (HTTP)",
@@ -3706,7 +3729,7 @@ fn accounts_hub(s: &State, k: &Kit) -> El {
     let globe_icon = icon(&icons::GLOBE, 16.0).color(if all_on { k.c.text_accent } else { k.c.icon_muted });
     sidebar = sidebar.child(sidebar_row("hub-filter-all".into(), t("Todos", "All"), globe_icon, all_cards.len(), all_on, None));
 
-    for provider in Provider::ALL {
+    for provider in Provider::all() {
         let count = all_cards.iter().filter(|c| c.provider == provider).count();
         if count == 0 {
             continue;
@@ -4434,7 +4457,7 @@ fn new_tab_picker(s: &State, k: &Kit, p: usize, layer: &mut Vec<El>) -> El {
             None,
         ));
 
-        for prov in Provider::ALL {
+        for prov in Provider::all() {
             let count = all_cards.iter().filter(|c| c.provider == prov).count();
             if count == 0 {
                 continue;

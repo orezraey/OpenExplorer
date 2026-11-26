@@ -706,6 +706,8 @@ pub enum Provider {
     Sftp,
     Ftp,
     WebDav,
+    /// A cloud reached through WebDAV, ready-made (see `services.rs`).
+    Service(Brand),
 }
 
 /// A selectable account or protocol entry (including multi-version variants like Custom Client ID
@@ -729,11 +731,13 @@ pub enum ProviderVariant {
     Telegram,
     WebDav,
     WebDavHttp,
+    Service(Brand),
 }
 
 impl ProviderVariant {
-    /// All supported variants sorted alphabetically (A–Z) for "Todas as nuvens".
-    pub const ALL_AZ: [ProviderVariant; 17] = [
+    /// All supported variants sorted alphabetically (A–Z) for "Todas as nuvens": these and
+    /// the services.
+    const BUILT_IN: [ProviderVariant; 17] = [
         ProviderVariant::B2,
         ProviderVariant::Dropbox,
         ProviderVariant::DropboxCustom,
@@ -753,8 +757,16 @@ impl ProviderVariant {
         ProviderVariant::WebDavHttp,
     ];
 
+    /// Every variant, A–Z by label.
+    pub fn all_az() -> Vec<ProviderVariant> {
+        let mut all: Vec<ProviderVariant> = ProviderVariant::BUILT_IN.into_iter().chain(crate::services::all().iter().map(|s| ProviderVariant::Service(s.brand))).collect();
+        all.sort_by_key(|v| v.label().to_lowercase());
+        all
+    }
+
     pub fn provider(self) -> Provider {
         match self {
+            ProviderVariant::Service(b) => Provider::Service(b),
             ProviderVariant::B2 => Provider::B2,
             ProviderVariant::Dropbox | ProviderVariant::DropboxCustom => Provider::Dropbox,
             ProviderVariant::Ftp | ProviderVariant::Ftps => Provider::Ftp,
@@ -788,6 +800,7 @@ impl ProviderVariant {
             ProviderVariant::Telegram => "Telegram",
             ProviderVariant::WebDav => "WebDav",
             ProviderVariant::WebDavHttp => "WebDav (HTTP)",
+            ProviderVariant::Service(b) => Provider::Service(b).label(),
         }
     }
 
@@ -810,6 +823,7 @@ impl ProviderVariant {
             ProviderVariant::Telegram => t("Canal privado de armazenamento na sua conta", "Private storage channel in your account"),
             ProviderVariant::WebDav => t("Servidor WebDAV seguro via HTTPS", "Secure WebDAV server over HTTPS"),
             ProviderVariant::WebDavHttp => t("Servidor WebDAV sem criptografia (porta 80)", "Unencrypted WebDAV server (port 80)"),
+            ProviderVariant::Service(b) => Provider::Service(b).subtitle(),
         }
     }
 
@@ -818,6 +832,15 @@ impl ProviderVariant {
     }
 
     pub fn in_category(self, category: Category) -> bool {
+        if let ProviderVariant::Service(b) = self {
+            let business = crate::services::of(b).is_some_and(|s| s.business);
+            return match category {
+                Category::All => true,
+                Category::Personal => !business,
+                Category::Business => business,
+                Category::Nas => false,
+            };
+        }
         match category {
             Category::All => true,
             Category::Personal => matches!(
@@ -918,7 +941,13 @@ impl Provider {
             Provider::Sftp => "SFTP",
             Provider::Ftp => "FTP",
             Provider::WebDav => "WebDAV",
+            Provider::Service(b) => crate::services::of(b).map_or("WebDAV", |s| s.name),
         }
+    }
+
+    /// Every provider: these and the WebDAV services.
+    pub fn all() -> Vec<Provider> {
+        Provider::ALL.into_iter().chain(crate::services::all().iter().map(|s| Provider::Service(s.brand))).collect()
     }
 
     pub fn subtitle(self) -> &'static str {
@@ -934,6 +963,7 @@ impl Provider {
             Provider::Sftp => t("SSH seguro · porta 22", "Secure SSH · port 22"),
             Provider::Ftp => t("FTP / FTPS · porta 21", "FTP / FTPS · port 21"),
             Provider::WebDav => "HTTPS / HTTP",
+            Provider::Service(b) => crate::services::of(b).map_or("WebDAV", |s| s.about()),
         }
     }
 
@@ -949,7 +979,12 @@ impl Provider {
             Provider::OwnCloud => &crate::icons::PROVIDER_OWNCLOUD,
             Provider::Sftp => &crate::icons::PROVIDER_SFTP,
             Provider::Ftp => &crate::icons::PROVIDER_FTP,
-            Provider::WebDav => &crate::icons::PROVIDER_WEBDAV,
+            Provider::Service(Brand::Koofr) => &crate::icons::PROVIDER_KOOFR,
+            Provider::Service(Brand::MailRu) => &crate::icons::PROVIDER_MAILRU,
+            Provider::Service(Brand::Yandex) => &crate::icons::PROVIDER_YANDEX,
+            Provider::Service(Brand::Onlime) => &crate::icons::PROVIDER_ONLIME,
+            // The others' brand files don't allow it without asking (see `icons.rs`).
+            Provider::WebDav | Provider::Service(_) => &crate::icons::PROVIDER_WEBDAV,
         }
     }
 
@@ -966,10 +1001,16 @@ impl Provider {
             Provider::Sftp => &[ProviderVariant::Sftp],
             Provider::Ftp => &[ProviderVariant::Ftps, ProviderVariant::Ftp],
             Provider::WebDav => &[ProviderVariant::WebDav, ProviderVariant::WebDavHttp],
+            // Each service is its own single version: the variants are made, not listed.
+            Provider::Service(_) => &[],
         }
     }
 
     pub fn versions_in(self, category: Category, query: &str) -> Vec<ProviderVariant> {
+        if let Provider::Service(b) = self {
+            let v = ProviderVariant::Service(b);
+            return if v.in_category(category) && v.matches_query(query) { vec![v] } else { Vec::new() };
+        }
         self.versions().iter().copied().filter(|v| v.in_category(category) && v.matches_query(query)).collect()
     }
 
@@ -986,6 +1027,7 @@ impl Provider {
             Provider::Sftp => "sftp ssh servidor linux nas chave 22 server key secure",
             Provider::Ftp => "ftp ftps tls ssl servidor nas 21 990 server",
             Provider::WebDav => "webdav dav davs http https servidor nas server",
+            Provider::Service(b) => crate::services::of(b).map_or("webdav", |s| s.keywords),
         };
         self.label().to_lowercase().contains(w) || self.subtitle().to_lowercase().contains(w) || keywords.contains(w)
     }
@@ -999,7 +1041,7 @@ impl Provider {
             Provider::OneDrive => Protocol::OneDrive,
             Provider::Telegram => Protocol::Telegram,
             Provider::Ftp => Protocol::Ftp,
-            Provider::Nextcloud | Provider::OwnCloud | Provider::WebDav => Protocol::Davs,
+            Provider::Nextcloud | Provider::OwnCloud | Provider::WebDav | Provider::Service(_) => Protocol::Davs,
         }
     }
 
@@ -1007,6 +1049,7 @@ impl Provider {
         match self {
             Provider::Nextcloud => Some(Brand::Nextcloud),
             Provider::OwnCloud => Some(Brand::OwnCloud),
+            Provider::Service(b) => Some(b),
             _ => None,
         }
     }
@@ -1015,6 +1058,7 @@ impl Provider {
         match (server.brand, server.protocol) {
             (Some(Brand::Nextcloud), _) => Provider::Nextcloud,
             (Some(Brand::OwnCloud), _) => Provider::OwnCloud,
+            (Some(b), Protocol::Dav | Protocol::Davs) => Provider::Service(b),
             (_, Protocol::Sftp) => Provider::Sftp,
             (_, Protocol::Ftp | Protocol::Ftps) => Provider::Ftp,
             (_, Protocol::Dav | Protocol::Davs) => Provider::WebDav,
@@ -1200,7 +1244,7 @@ impl Form {
             ProviderVariant::WebDavHttp => {
                 self.protocol = Protocol::Dav;
             }
-            ProviderVariant::B2 | ProviderVariant::Mega | ProviderVariant::Telegram | ProviderVariant::Nextcloud | ProviderVariant::OwnCloud | ProviderVariant::Sftp => {}
+            ProviderVariant::B2 | ProviderVariant::Mega | ProviderVariant::Telegram | ProviderVariant::Nextcloud | ProviderVariant::OwnCloud | ProviderVariant::Sftp | ProviderVariant::Service(_) => {}
         }
     }
 
@@ -1246,6 +1290,22 @@ impl Form {
         if provider == Provider::Telegram {
             return crate::telegram::prepare(self);
         }
+        if let Provider::Service(b) = provider
+            && let Some(svc) = crate::services::of(b)
+        {
+            use crate::services::Host;
+            if self.editing.is_none() {
+                self.host = TextEdit::new(match svc.host {
+                    Host::Fixed(h) => h,
+                    Host::Part { .. } | Host::FromUser(_) | Host::Pasted { .. } => "",
+                });
+            }
+            match svc.host {
+                Host::Part { .. } | Host::Pasted { .. } => self.host.focused = true,
+                Host::Fixed(_) | Host::FromUser(_) => self.user.focused = true,
+            }
+            return;
+        }
         if provider == Provider::GoogleDrive {
             let missing = openexplorer_gdrive::ClientConfig::load().is_err();
             self.custom_oauth = missing;
@@ -1265,7 +1325,7 @@ impl Form {
             && let Some(a) = parse_address(h)
         {
             self.protocol = a.protocol;
-            if self.editing.is_none() && !matches!(self.provider, Provider::Nextcloud | Provider::OwnCloud) {
+            if self.editing.is_none() && !matches!(self.provider, Provider::Nextcloud | Provider::OwnCloud | Provider::Service(_)) {
                 self.provider = detect_provider(&a);
             }
         }
@@ -1286,12 +1346,12 @@ impl Form {
     /// picker shows `visible_variants`).
     #[cfg(test)]
     pub fn visible_providers(&self) -> Vec<Provider> {
-        Provider::ALL.into_iter().filter(|p| !p.versions_in(self.category, &self.filter.text).is_empty()).collect()
+        Provider::all().into_iter().filter(|p| !p.versions_in(self.category, &self.filter.text).is_empty()).collect()
     }
 
     /// Individual variants matching both the selected category tab and search text, sorted A–Z.
     pub fn visible_variants(&self) -> Vec<ProviderVariant> {
-        ProviderVariant::ALL_AZ.into_iter().filter(|v| v.in_category(self.category) && v.matches_query(&self.filter.text)).collect()
+        ProviderVariant::all_az().into_iter().filter(|v| v.in_category(self.category) && v.matches_query(&self.filter.text)).collect()
     }
 
     /// The form filled with `server`, to change it; the password stays as stored unless typed.
@@ -1302,11 +1362,15 @@ impl Form {
         f.protocol = server.protocol;
         f.name = TextEdit::new(server.name.clone());
         f.host = TextEdit::new(server.host.clone());
-        f.host.focused = true;
+        // A service whose server isn't shown takes the focus on the user name instead.
+        let host_shown = !matches!(provider, Provider::Service(b)
+            if crate::services::of(b).is_some_and(|s| matches!(s.host, crate::services::Host::Fixed(_) | crate::services::Host::FromUser(_))));
+        f.host.focused = host_shown;
         if server.port != server.protocol.default_port() {
             f.port = TextEdit::new(server.port.to_string());
         }
         f.user = TextEdit::new(server.user.clone());
+        f.user.focused = !host_shown;
         f.folder = TextEdit::new(server.root.clone());
         f.key = TextEdit::new(server.key.clone().unwrap_or_default());
         if server.connections != remote::USUAL_CONNECTIONS {
@@ -1347,9 +1411,19 @@ impl Form {
         f
     }
 
+    /// What the Servidor field stands for: as typed, or, for a ready-made service, its server
+    /// made from the part typed (see [`crate::services::Service::host_for`]).
+    fn host_text(&self) -> String {
+        match self.provider {
+            Provider::Service(b) if let Some(svc) = crate::services::of(b) => svc.host_for(&self.host.text, &self.user.text),
+            _ => self.host.text.trim().to_string(),
+        }
+    }
+
     /// Effective protocol, honoring an explicit URL scheme typed in `Servidor` (`ftps://`, `http://`, etc.).
     pub fn effective_protocol(&self) -> Protocol {
-        let h = self.host.text.trim();
+        let h = self.host_text();
+        let h = h.as_str();
         if h.contains("://")
             && let Some(a) = parse_address(h)
         {
@@ -1361,7 +1435,8 @@ impl Form {
     /// Current `(host, port)` target parsed from the form, used to scope trusted TLS fingerprints.
     pub fn target_endpoint(&self) -> Option<(String, u16, Protocol)> {
         let mut protocol = self.protocol;
-        let raw_host = self.host.text.trim();
+        let raw_host = self.host_text();
+        let raw_host = raw_host.as_str();
         let (host, url_port) = if raw_host.contains("://") {
             let a = parse_address(raw_host)?;
             protocol = a.protocol;
@@ -1397,7 +1472,12 @@ impl Form {
     /// missing.
     fn server(&self, s: &State) -> Result<(Server, Option<String>), String> {
         let mut protocol = self.protocol;
-        let raw_host = self.host.text.trim();
+        let raw_host = self.host_text();
+        let raw_host = raw_host.as_str();
+        let service = match self.provider {
+            Provider::Service(b) => crate::services::of(b),
+            _ => None,
+        };
         let mut user = self.user.text.trim().to_string();
         let explicit_folder = !self.folder.text.trim().is_empty();
         let mut root = self.folder.text.trim().to_string();
@@ -1420,8 +1500,23 @@ impl Form {
         } else {
             split_host_port(raw_host)?
         };
+        // After the address, whose user name fills an empty one.
+        if service.is_some_and(|s| s.lowercase_user) {
+            user = user.to_lowercase();
+        }
         if host.is_empty() {
-            return Err(t("Escreva o endereço do servidor.", "Type the server's address.").into());
+            use crate::services::Host;
+            // A service's server comes from the field it shows, under that field's name.
+            let field = match service.map(|s| (s, s.host)) {
+                Some((s, Host::FromUser(_))) => Some(s.user_label()),
+                Some((_, Host::Part { label, .. })) => Some(t(label.0, label.1)),
+                Some((_, Host::Pasted { .. })) => Some(t("Endereço WebDAV", "WebDAV address")),
+                Some((_, Host::Fixed(_))) | None => None,
+            };
+            return Err(match field {
+                Some(field) => tr!("Preencha \"{field}\".", "Fill in \"{field}\"."),
+                None => t("Escreva o endereço do servidor.", "Type the server's address.").into(),
+            });
         }
         if host.contains('/') || host.contains(' ') {
             return Err(t("O servidor é só o nome ou o IP, sem pastas: a pasta vai em Pasta inicial.", "The server is just the name or IP, without folders: the folder goes in Start folder.").into());
@@ -1434,6 +1529,8 @@ impl Form {
                 root = branded_webdav_root(pasted_path.as_deref().unwrap_or("/"));
             } else if let Some(p) = pasted_path {
                 root = p;
+            } else if let Some(svc) = service {
+                root = svc.root.to_string();
             }
         }
         let port = match (self.port.text.trim(), parsed_port) {
@@ -1449,7 +1546,8 @@ impl Form {
             "" => match brand {
                 Some(Brand::Nextcloud) => format!("Nextcloud ({host})"),
                 Some(Brand::OwnCloud) => format!("ownCloud ({host})"),
-                None => host.clone(),
+                Some(_) if let Some(svc) = service => if user.is_empty() { svc.name.to_string() } else { format!("{} ({user})", svc.name) },
+                Some(_) | None => host.clone(),
             },
             n => n.to_string(),
         };
@@ -1775,10 +1873,15 @@ pub fn submit(s: &mut State) {
         f.untrusted = None;
     }
     background(s, move |emit| {
+        let tried = format!("{}{}", server.address(), server.root);
         let checked = catch_panic(t("conectar ao servidor", "connect to the server"), || {
             let mut server = server;
             Ok(remote::probe(&mut server, secret.as_deref()).map(|_| server))
         });
+        // Where it went, never the password: a refusal says little without it.
+        if let Ok(Err(Refusal::Failed(e))) = &checked {
+            openexplorer_gdrive::log(&format!("falha ao conectar {tried}: {e}"));
+        }
         let result = checked.unwrap_or_else(|e| Err(Refusal::Failed(e)));
         emit(Msg::ServerChecked { attempt, result, secret: keep });
     });
@@ -1814,7 +1917,6 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
             return;
         }
         Err(Refusal::Failed(e)) => {
-            openexplorer_gdrive::log(&format!("falha ao conectar servidor: {e}"));
             form.error = Some(e);
             s.notify_account();
             return;
@@ -2235,23 +2337,88 @@ pub(crate) mod tests {
         assert_eq!(target(&folder(&sv, vec![])).map(|(_, d)| d), Some("/srv".into()));
     }
 
+    /// A ready-made WebDAV service fills its server and folder: the user types only their login
+    /// (and, where the address holds the account, that part of it), and the server keeps which
+    /// service it is, so editing it opens the same form.
+    #[test]
+    fn ready_made_webdav_services_fill_the_server() {
+        let s = crate::init();
+        let mut f = Form::new();
+        f.filter = TextEdit::new("pcloud");
+        assert_eq!(f.visible_variants(), [ProviderVariant::Service(Brand::PCloudEu), ProviderVariant::Service(Brand::PCloud)]);
+        f.filter = TextEdit::new("");
+        f.category = Category::Nas;
+        assert!(f.visible_providers().iter().all(|p| !matches!(p, Provider::Service(_))));
+        f.category = Category::Business;
+        assert!(f.visible_providers().contains(&Provider::Service(Brand::KDrive)) && !f.visible_providers().contains(&Provider::Service(Brand::Koofr)));
+
+        let mut koofr = Form::for_provider(Provider::Service(Brand::Koofr));
+        assert_eq!((koofr.step, koofr.protocol, koofr.host.text.as_str()), (Step::Configure, Protocol::Davs, "app.koofr.net"));
+        koofr.user = TextEdit::new("ana@exemplo.com");
+        let (sv, _) = koofr.server(&s).unwrap();
+        assert_eq!((sv.host.as_str(), sv.port, sv.root.as_str(), sv.brand, sv.name.as_str()), ("app.koofr.net", 443, "/dav/Koofr", Some(Brand::Koofr), "Koofr (ana@exemplo.com)"));
+        // Editing it opens the service's form again, with what was saved.
+        let again = Form::of(&sv);
+        assert_eq!((again.provider, again.folder.text.as_str()), (Provider::Service(Brand::Koofr), "/dav/Koofr"));
+
+        let mut kdrive = Form::for_provider(Provider::Service(Brand::KDrive));
+        assert!(kdrive.host.text.is_empty() && kdrive.host.focused);
+        kdrive.host = TextEdit::new("123456");
+        kdrive.user = TextEdit::new("ana@exemplo.ch");
+        let (sv, _) = kdrive.server(&s).unwrap();
+        assert_eq!((sv.host.as_str(), sv.root.as_str()), ("123456.connect.kdrive.infomaniak.com", ""));
+
+        let mut onlime = Form::for_provider(Provider::Service(Brand::Onlime));
+        onlime.user = TextEdit::new("web123");
+        assert_eq!(onlime.server(&s).unwrap().0.host, "web123-dav.onlime.ch");
+
+        let mut hidrive = Form::for_provider(Provider::Service(Brand::HiDrive));
+        hidrive.user = TextEdit::new("Ana");
+        assert_eq!(hidrive.server(&s).unwrap().0.user, "ana", "HiDrive takes user names in lower case");
+        let mut stack = Form::for_provider(Provider::Service(Brand::Stack));
+        stack.host = TextEdit::new("minhaconta");
+        stack.user = TextEdit::new("Ana");
+        assert_eq!(stack.server(&s).unwrap().0.user, "ana", "Stack takes user names in lower case");
+        stack.host = TextEdit::new("https://Ana@minhaconta.stack.storage/remote.php/webdav/");
+        stack.user = TextEdit::new("");
+        assert_eq!(stack.server(&s).unwrap().0.user, "ana", "a pasted address's user name too");
+        // Onlime shows no server field: an empty one is asked for by the field it comes from.
+        let mut onlime = Form::for_provider(Provider::Service(Brand::Onlime));
+        assert_eq!(onlime.server(&s).unwrap_err(), "Preencha \"Hospedagem (webNNN)\".");
+        onlime.user = TextEdit::new("web123");
+        let (sv, _) = onlime.server(&s).unwrap();
+        let again = Form::of(&sv);
+        assert!(again.user.focused && !again.host.focused, "editing it focuses a field that is shown");
+
+        // InfiniCLOUD's address is copied whole, path included, and stays InfiniCLOUD.
+        let mut infini = Form::for_provider(Provider::Service(Brand::InfiniCloud));
+        infini.host = TextEdit::new("https://ana.teracloud.jp/dav/");
+        infini.sync_host_scheme();
+        infini.user = TextEdit::new("ana");
+        let (sv, _) = infini.server(&s).unwrap();
+        assert_eq!((infini.provider, sv.host.as_str(), sv.root.as_str(), sv.brand), (Provider::Service(Brand::InfiniCloud), "ana.teracloud.jp", "/dav/", Some(Brand::InfiniCloud)));
+    }
+
     #[test]
     fn unified_catalog_filters_and_configures_presets() {
-        // Verify ALL_AZ is strictly sorted alphabetically (case-insensitive).
-        let az_labels: Vec<String> = ProviderVariant::ALL_AZ.iter().map(|v| v.label().to_lowercase()).collect();
+        // The A–Z list is sorted alphabetically (case-insensitive).
+        let az_labels: Vec<String> = ProviderVariant::all_az().iter().map(|v| v.label().to_lowercase()).collect();
         let mut sorted = az_labels.clone();
         sorted.sort();
         assert_eq!(az_labels, sorted);
 
         let mut f = Form::new();
         assert_eq!(f.step, Step::Pick);
-        assert_eq!(f.visible_providers().len(), 11);
-        assert_eq!(f.visible_variants().len(), 17);
+        let services = crate::services::all().len();
+        assert_eq!(f.visible_providers().len(), 11 + services);
+        assert_eq!(f.visible_variants().len(), 17 + services);
         assert_eq!(f.visible_popular().len(), 8);
+        // The built-in providers per category; the WebDAV services are checked on their own.
+        let built_in = |f: &Form| f.visible_providers().into_iter().filter(|p| !matches!(p, Provider::Service(_))).collect::<Vec<_>>();
         f.category = Category::Personal;
-        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::OneDrive, Provider::Dropbox, Provider::Mega, Provider::Telegram, Provider::Nextcloud, Provider::OwnCloud]);
+        assert_eq!(built_in(&f), [Provider::GoogleDrive, Provider::OneDrive, Provider::Dropbox, Provider::Mega, Provider::Telegram, Provider::Nextcloud, Provider::OwnCloud]);
         f.category = Category::Business;
-        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::OneDrive, Provider::Dropbox, Provider::B2, Provider::Nextcloud, Provider::OwnCloud, Provider::Sftp, Provider::WebDav]);
+        assert_eq!(built_in(&f), [Provider::GoogleDrive, Provider::OneDrive, Provider::Dropbox, Provider::B2, Provider::Nextcloud, Provider::OwnCloud, Provider::Sftp, Provider::WebDav]);
         f.category = Category::Nas;
         assert_eq!(f.visible_providers(), [Provider::Nextcloud, Provider::OwnCloud, Provider::Sftp, Provider::Ftp, Provider::WebDav]);
         f.category = Category::All;
