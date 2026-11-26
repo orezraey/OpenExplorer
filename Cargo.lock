@@ -3290,6 +3290,7 @@ name = "openexplorer"
 version = "0.4.0"
 dependencies = [
  "chrono",
+ "hex",
  "md-5",
  "openexplorer-b2",
  "openexplorer-dropbox",
@@ -3300,11 +3301,15 @@ dependencies = [
  "openexplorer-onedrive",
  "openexplorer-remote",
  "openexplorer-telegram",
+ "ring",
  "rune",
  "rune-kit",
+ "semver",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "trash",
+ "ureq",
  "windows",
  "windows-core",
  "windows-sys 0.61.2",
