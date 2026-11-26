@@ -70,6 +70,9 @@ pub struct Pos {
 pub struct Listing {
     pub entries: Arc<Vec<Entry>>,
     pub pos: Option<Pos>,
+    /// When this run of the app last read it from Drive or saw the change log confirm it; `None`
+    /// for one only read from disk, or no longer known to stand (see [`crate::watch::Watch::vouches`]).
+    pub seen: Option<std::time::Instant>,
 }
 
 /// Disk work, done in order on one thread: a write never lands after the forget that should
@@ -203,9 +206,11 @@ impl Cache {
     /// Keeps a complete listing valid at `pos`, and saves it to disk: the entries unless
     /// they're what was already kept, the position whenever it moved.
     pub fn put(&mut self, k: Key, entries: Arc<Vec<Entry>>, pos: Option<Pos>) {
-        let (entries, changed) = match self.mem.get(&k) {
+        let seen = Some(std::time::Instant::now());
+        let (entries, changed) = match self.mem.get_mut(&k) {
             Some(old) if old.entries == entries => {
                 if old.pos == pos {
+                    old.seen = seen;
                     return;
                 }
                 (old.entries.clone(), false)
@@ -213,7 +218,7 @@ impl Cache {
             _ => (entries, true),
         };
         self.disk(Job::Put { file: path(&k), entries: changed.then(|| entries.clone()), count: entries.len(), pos: pos.clone() });
-        self.mem.insert(k, Listing { entries, pos });
+        self.mem.insert(k, Listing { entries, pos, seen });
     }
 
     /// Keeps `listing`, which the change log proved still stands at its new position. Read from
@@ -223,7 +228,7 @@ impl Cache {
             return self.put(k, listing.entries, listing.pos);
         }
         self.disk(Job::Put { file: path(&k), entries: None, count: listing.entries.len(), pos: listing.pos.clone() });
-        self.mem.insert(k, listing);
+        self.mem.insert(k, Listing { seen: Some(std::time::Instant::now()), ..listing });
     }
 
     /// The listing of `k` is no longer known valid at its position (the app just changed the
@@ -232,6 +237,7 @@ impl Cache {
         let count = match self.mem.get_mut(k) {
             Some(l) => {
                 l.pos = None;
+                l.seen = None;
                 l.entries.len()
             }
             None => 0,
@@ -280,7 +286,7 @@ fn read(file: &Path) -> Option<Listing> {
         .and_then(|b| serde_json::from_slice::<PosFile>(&b).ok())
         .filter(|p| p.format == FORMAT && p.count == f.entries.len())
         .map(|p| p.pos);
-    Some(Listing { entries: Arc::new(f.entries), pos })
+    Some(Listing { entries: Arc::new(f.entries), pos, seen: None })
 }
 
 #[cfg(test)]
@@ -347,7 +353,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut c = Cache::default();
         let k = key(&Location::drive("a@b", Space::MyDrive)).unwrap();
-        c.mem.insert(k.clone(), Listing { entries: entries(2), pos: None });
+        c.mem.insert(k.clone(), Listing { entries: entries(2), pos: None, seen: None });
         // A write queued before the clear lands first, so it's cleared too.
         let file = dir.join("conta").join("pasta.json");
         c.disk(Job::Put { file: file.clone(), entries: Some(entries(2)), count: 2, pos: None });

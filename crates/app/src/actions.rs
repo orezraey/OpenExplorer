@@ -505,7 +505,7 @@ pub fn go_to_address(s: &mut State, p: usize, typed: &str) -> bool {
             // Through folders this session has listed, at once; else Drive looks each step up.
             let known = s.panes.iter().flat_map(|pane| pane.back.iter().chain(&pane.forward).chain([&pane.loc]));
             let tabs = s.tabs.iter().flat_map(|t| t.items.iter().filter_map(|slot| slot.pane.as_ref())).flat_map(|pane| pane.back.iter().chain(&pane.forward).chain([&pane.loc]));
-            if let Some(to) = address::reach_cached(&s.cache, known.chain(tabs), &email, &way) {
+            if let Some(to) = address::reach_cached(&s.cache, known.chain(tabs), &email, &way, s.watch.get(&email)) {
                 s.history.reached(p, s.panes[p].moves, true);
                 arrive(s, p, to);
                 return true;

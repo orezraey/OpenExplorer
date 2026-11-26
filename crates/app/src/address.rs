@@ -348,11 +348,15 @@ pub fn reach_drive(d: &Drive, email: String, way: Way) -> Result<Reached, String
 
 /// Where a typed My Drive path leads, worked out from what this session already knows: the
 /// folders of `known` places (the panes', their history's and tabs': each names its folders by
-/// id), then the folder listings it holds. `None` when a step is in neither, and the path is
-/// then looked up in Drive ([`reach_drive`], one request a folder). A path to a folder opened
-/// before so opens at once, as Air Explorer's does from the folders it keeps.
-pub fn reach_cached<'a>(cache: &crate::cache::Cache, known: impl IntoIterator<Item = &'a Location>, email: &str, way: &Way) -> Option<Reached> {
+/// id), then the folder listings it holds. Only what the account's change log, `log`, vouches
+/// for counts (see [`crate::watch::Watch::vouches`]): a folder renamed, moved or deleted
+/// elsewhere since it was listed, or one the log doesn't account for, isn't gone through. `None`
+/// when a step is left, and the path is then looked up in Drive ([`reach_drive`], one request a
+/// folder). A path to a folder opened before so opens at once, as Air Explorer's does from the
+/// folders it keeps, and never to what's no longer there.
+pub fn reach_cached<'a>(cache: &crate::cache::Cache, known: impl IntoIterator<Item = &'a Location>, email: &str, way: &Way, log: Option<&crate::watch::Watch>) -> Option<Reached> {
     let Way::Path { root: Root::MyDrive, names } = way else { return None };
+    let log = log?;
     // The longest start of the way a known place already went down.
     let mut path: Vec<(String, String)> = Vec::new();
     for loc in known {
@@ -365,11 +369,29 @@ pub fn reach_cached<'a>(cache: &crate::cache::Cache, known: impl IntoIterator<It
             path = p[..same].to_vec();
         }
     }
+    // That start stands while the log vouches for its folders since the last of them was
+    // listed; else the way starts from the top.
+    if !path.is_empty() {
+        let here = Location::Drive { email: email.to_string(), space: Space::MyDrive, path: path.clone() };
+        let seen = crate::cache::key(&here).and_then(|k| cache.get(&k)).and_then(|l| l.seen);
+        let ids: Vec<&str> = path.iter().map(|(id, _)| id.as_str()).collect();
+        if !log.vouches(seen, &ids) {
+            path.clear();
+        }
+    }
     for (i, name) in names.iter().enumerate().skip(path.len()) {
         let here = Location::Drive { email: email.to_string(), space: Space::MyDrive, path: path.clone() };
         let listing = cache.get(&crate::cache::key(&here)?)?;
         let wanted = names_for(name);
         let found = listing.entries.iter().find(|e| wanted.contains(&e.name))?;
+        // The folder's listing, and the item found in it, as they still are.
+        let folder = match path.last() {
+            Some((id, _)) => id.as_str(),
+            None => log.root()?,
+        };
+        if !log.vouches(listing.seen, &[folder, &found.id]) {
+            return None;
+        }
         if !found.is_dir {
             // A file names the end of the way: its folder opens with it selected.
             return (i + 1 == names.len()).then(|| Reached { loc: here, reveal: Some((found.id.clone(), found.name.clone())) });
@@ -480,37 +502,56 @@ mod tests {
     use super::*;
 
     /// A My Drive path through folders whose listings the session holds opens without asking
-    /// Drive; a step it hasn't listed, or another space, is left to Drive.
+    /// Drive, while the change log vouches for them; a step it hasn't listed, one the log names
+    /// as changed or can't account for, or another space, is left to Drive.
     #[test]
     fn a_path_through_listed_folders_needs_no_request() {
         use crate::cache::{Cache, Listing, key};
         use crate::model::Entry;
+        use crate::watch::Watch;
         let entry = |id: &str, name: &str, dir: bool| Entry { id: id.into(), name: name.into(), is_dir: dir, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
         let at = |path: Vec<(String, String)>| Location::Drive { email: "ana@gmail.com".into(), space: Space::MyDrive, path };
+        // The log, read since before the listings below: nothing changed.
+        let log = Watch::reading("root-id", &[]);
+        let log = Some(&log);
         let mut cache = Cache::memory_only();
-        let listing = |entries: Vec<Entry>| Listing { entries: std::sync::Arc::new(entries), pos: None };
+        let listing = |entries: Vec<Entry>| Listing { entries: std::sync::Arc::new(entries), pos: None, seen: None };
         cache.keep(key(&at(vec![])).unwrap(), listing(vec![entry("f1", "Fotos", true), entry("n1", "notas.txt", false)]));
         cache.keep(key(&at(vec![("f1".into(), "Fotos".into())])).unwrap(), listing(vec![entry("f2", "2024", true)]));
         let path = |names: &[&str]| Way::Path { root: Root::MyDrive, names: names.iter().map(|n| n.to_string()).collect() };
 
         let none: [&Location; 0] = [];
-        let to = reach_cached(&cache, none, "ana@gmail.com", &path(&["Fotos", "2024"])).expect("both folders listed");
+        let to = reach_cached(&cache, none, "ana@gmail.com", &path(&["Fotos", "2024"]), log).expect("both folders listed");
         assert_eq!(to.loc, at(vec![("f1".into(), "Fotos".into()), ("f2".into(), "2024".into())]));
         assert!(to.reveal.is_none());
-        let to = reach_cached(&cache, none, "ana@gmail.com", &path(&["notas.txt"])).expect("a file at the top");
+        let to = reach_cached(&cache, none, "ana@gmail.com", &path(&["notas.txt"]), log).expect("a file at the top");
         assert_eq!((to.loc, to.reveal), (at(vec![]), Some(("n1".into(), "notas.txt".into()))));
         // 2024 was never listed, and a file isn't a folder to go through.
-        assert!(reach_cached(&cache, none, "ana@gmail.com", &path(&["Fotos", "2024", "Março"])).is_none());
-        assert!(reach_cached(&cache, none, "ana@gmail.com", &path(&["notas.txt", "x"])).is_none());
-        assert!(reach_cached(&cache, none, "ana@gmail.com", &Way::Path { root: Root::SharedDrives, names: vec!["Equipe".into()] }).is_none());
+        assert!(reach_cached(&cache, none, "ana@gmail.com", &path(&["Fotos", "2024", "Março"]), log).is_none());
+        assert!(reach_cached(&cache, none, "ana@gmail.com", &path(&["notas.txt", "x"]), log).is_none());
+        assert!(reach_cached(&cache, none, "ana@gmail.com", &Way::Path { root: Root::SharedDrives, names: vec!["Equipe".into()] }, log).is_none());
 
         // A place a pane shows knows its folders' ids, top unlisted or not; from there, a listing.
         let deep = at(vec![("f1".into(), "Fotos".into()), ("f2".into(), "2024".into())]);
         let mut cache = Cache::memory_only();
         cache.keep(key(&deep).unwrap(), listing(vec![entry("f3", "Março", true)]));
-        let to = reach_cached(&cache, [&deep], "ana@gmail.com", &path(&["Fotos", "2024", "Março"])).expect("from the pane's place");
+        let to = reach_cached(&cache, [&deep], "ana@gmail.com", &path(&["Fotos", "2024", "Março"]), log).expect("from the pane's place");
         assert_eq!(to.loc, at(vec![("f1".into(), "Fotos".into()), ("f2".into(), "2024".into()), ("f3".into(), "Março".into())]));
-        assert!(reach_cached(&cache, [&deep], "ana@gmail.com", &path(&["Outra", "2024"])).is_none());
+        assert!(reach_cached(&cache, [&deep], "ana@gmail.com", &path(&["Outra", "2024"]), log).is_none());
+
+        // Renamed or moved elsewhere since (the log names it), the log not read (no pane shows
+        // the account), or listings kept from before the log began: left to Drive.
+        let mut cache = Cache::memory_only();
+        cache.keep(key(&at(vec![])).unwrap(), listing(vec![entry("f1", "Fotos", true)]));
+        let fotos = path(&["Fotos"]);
+        assert!(reach_cached(&cache, none, "ana@gmail.com", &fotos, log).is_some());
+        assert!(reach_cached(&cache, none, "ana@gmail.com", &fotos, Some(&Watch::reading("root-id", &["f1"]))).is_none());
+        assert!(reach_cached(&cache, none, "ana@gmail.com", &fotos, Some(&Watch::reading("root-id", &["root-id"]))).is_none());
+        assert!(reach_cached(&cache, none, "ana@gmail.com", &fotos, None).is_none());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let later = Watch::reading("root-id", &[]);
+        assert!(reach_cached(&cache, none, "ana@gmail.com", &fotos, Some(&later)).is_none());
+        assert!(reach_cached(&cache, [&deep], "ana@gmail.com", &path(&["Fotos", "2024", "Março"]), Some(&Watch::reading("root-id", &["f2"]))).is_none());
     }
 
     fn drive(space: Space, path: &[(&str, &str)]) -> Location {
