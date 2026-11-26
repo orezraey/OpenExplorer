@@ -90,11 +90,11 @@ pub struct Tree {
     /// Folders read so far, of the nodes whose folders aren't known without asking.
     kids: HashMap<NodeId, Kids>,
     /// Each pane's open nodes.
-    open: [HashSet<NodeId>; 2],
+    open: [HashSet<NodeId>; crate::layout::MAX_PANES],
     /// Bumped on every change to what the trees show, so the view skips re-reading its rows.
     pub version: u64,
     /// Per pane: bring the node of the folder shown into view once it's in the tree.
-    follow: [bool; 2],
+    follow: [bool; crate::layout::MAX_PANES],
     /// Rede's computers, by name: those the network search found, those of the network drives,
     /// and those reached by address this session.
     servers: Vec<String>,
@@ -102,11 +102,11 @@ pub struct Tree {
     searched: bool,
     searching: bool,
     /// Per pane: the row the keyboard is on, by its line's key.
-    cursor: [Option<String>; 2],
+    cursor: [Option<String>; crate::layout::MAX_PANES],
     /// Per pane: the letters typed to jump to a row, and when the last one came (app clock).
-    typed: [(String, f64); 2],
+    typed: [(String, f64); crate::layout::MAX_PANES],
     /// Per pane: whether the tree has keyboard focus, so its row under the keyboard shows a ring.
-    pub focused: [bool; 2],
+    pub focused: [bool; crate::layout::MAX_PANES],
 }
 
 /// A row of a pane's tree.
@@ -143,7 +143,7 @@ impl Tree {
     /// independently on demand.
     pub fn new(accounts: impl IntoIterator<Item = String>) -> Tree {
         let open: HashSet<NodeId> = [NodeId::Computer].into_iter().chain(accounts.into_iter().map(NodeId::Account)).collect();
-        Tree { open: [open.clone(), open], ..Tree::default() }
+        Tree { open: std::array::from_fn(|_| open.clone()), ..Tree::default() }
     }
 
     /// A newly connected account shows open.

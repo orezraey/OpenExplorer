@@ -328,7 +328,7 @@ const RETRY: f64 = 120.0;
 pub struct Watch {
     /// The window lost the focus: nothing is read until it's back.
     away: bool,
-    panes: [Option<Turn>; 2],
+    panes: [Option<Turn>; crate::layout::MAX_PANES],
 }
 
 struct Turn {
@@ -355,7 +355,7 @@ fn every(items: usize) -> f64 {
 
 /// Reads again each pane's B2 folder whose turn came.
 pub fn tick(s: &mut State, now: f64) {
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         let shows = matches!(&s.panes[p].loc, Location::Server { server, find: None, .. } if server.is_b2());
         if !shows {
             s.servers.b2_watch.panes[p] = None;
