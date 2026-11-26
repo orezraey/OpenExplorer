@@ -3297,7 +3297,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "openexplorer"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "chrono",
  "hex",
@@ -3328,7 +3328,7 @@ dependencies = [
 
 [[package]]
 name = "openexplorer-b2"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "base64 0.22.1",
  "keyring",
@@ -3342,7 +3342,7 @@ dependencies = [
 
 [[package]]
 name = "openexplorer-cloud"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "aes-gcm",
  "getrandom 0.3.4",
@@ -3352,7 +3352,7 @@ dependencies = [
 
 [[package]]
 name = "openexplorer-dropbox"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
@@ -3368,7 +3368,7 @@ dependencies = [
 
 [[package]]
 name = "openexplorer-gdrive"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3386,14 +3386,14 @@ dependencies = [
 
 [[package]]
 name = "openexplorer-i18n"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "openexplorer-index"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "libc",
  "memchr",
@@ -3407,7 +3407,7 @@ dependencies = [
 
 [[package]]
 name = "openexplorer-mega"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3427,7 +3427,7 @@ dependencies = [
 
 [[package]]
 name = "openexplorer-onedrive"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3444,7 +3444,7 @@ dependencies = [
 
 [[package]]
 name = "openexplorer-remote"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3471,7 +3471,7 @@ dependencies = [
 
 [[package]]
 name = "openexplorer-telegram"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",

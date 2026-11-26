@@ -161,6 +161,8 @@ fn stepper(k: &Kit, key: &str, value: u8, set: fn(&mut State, i32)) -> El {
 
 fn change_settings(s: &mut State, f: impl FnOnce(&mut crate::settings::Settings)) {
     f(&mut s.settings);
+    s.upload_slots.set_limit(usize::from(s.settings.uploads));
+    s.download_slots.set_limit(usize::from(s.settings.downloads));
     s.settings.save();
 }
 

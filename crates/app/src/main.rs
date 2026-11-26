@@ -291,6 +291,9 @@ struct State {
     waker: Option<Waker>,
     /// What the user picked in Opções.
     settings: settings::Settings,
+    /// Shared concurrency caps across all upload and download batches.
+    upload_slots: Arc<work::Slots>,
+    download_slots: Arc<work::Slots>,
     /// Copies and moves under way, each with its bar.
     transfers: Vec<transfers::Transfer>,
     /// The transfer queue's right-click menu: the row it was opened on, and where.
@@ -466,6 +469,8 @@ impl State {
             outbox,
             waker: None,
             settings: Default::default(),
+            upload_slots: Arc::new(work::Slots::new(usize::from(settings::Settings::default().uploads))),
+            download_slots: Arc::new(work::Slots::new(usize::from(settings::Settings::default().downloads))),
             transfers: Vec::new(),
             transfer_menu: None,
             transfers_live: 0,
@@ -669,6 +674,8 @@ fn init() -> State {
         inbox,
         outbox,
         waker: None,
+        upload_slots: Arc::new(work::Slots::new(usize::from(settings.uploads))),
+        download_slots: Arc::new(work::Slots::new(usize::from(settings.downloads))),
         settings,
         transfers: Vec::new(),
         transfer_menu: None,
