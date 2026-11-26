@@ -24,6 +24,9 @@ pub const QUEUE_H_MAX: f32 = 700.0;
 pub const QUEUE_COLS: [f32; 8] = [92.0, 300.0, 240.0, 190.0, 128.0, 112.0, 96.0, 88.0];
 pub const QUEUE_COL_MIN: f32 = 50.0;
 
+/// Default visual order of the 4 list columns: Nome (0), Tamanho (1), Data (2), Tipo (3).
+pub const COL_ORDER: [usize; 4] = [0, 1, 2, 3];
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Layout {
@@ -31,14 +34,34 @@ pub struct Layout {
     /// Per pane, the widths of Nome, Tamanho, Data and Tipo. (`cols`, from an earlier
     /// version that had three, is ignored.)
     pub columns: [[f32; 4]; 2],
+    /// Per pane, the visual order of the four columns (a permutation of `0..4`).
+    pub col_order: [[usize; 4]; 2],
     pub queue_h: f32,
     pub queue_cols: [f32; 8],
 }
 
 impl Default for Layout {
     fn default() -> Layout {
-        Layout { tree: [TREE_W; 2], columns: [COLS; 2], queue_h: QUEUE_H, queue_cols: QUEUE_COLS }
+        Layout {
+            tree: [TREE_W; 2],
+            columns: [COLS; 2],
+            col_order: [COL_ORDER; 2],
+            queue_h: QUEUE_H,
+            queue_cols: QUEUE_COLS,
+        }
     }
+}
+
+/// Ensures `order` is a valid permutation of `0..4`, falling back to [`COL_ORDER`].
+pub fn valid_col_order(order: [usize; 4]) -> [usize; 4] {
+    let mut seen = [false; 4];
+    for i in order {
+        if i >= 4 || seen[i] {
+            return COL_ORDER;
+        }
+        seen[i] = true;
+    }
+    order
 }
 
 pub fn clamp_queue_h(h: f32) -> f32 {
@@ -69,6 +92,7 @@ impl Layout {
         Layout {
             tree: l.tree.map(clamp_tree),
             columns: l.columns.map(|c| [0, 1, 2, 3].map(|i| clamp_col(i, c[i]))),
+            col_order: l.col_order.map(valid_col_order),
             queue_h: clamp_queue_h(l.queue_h),
             queue_cols: std::array::from_fn(|i| clamp_queue_col(i, l.queue_cols[i])),
         }

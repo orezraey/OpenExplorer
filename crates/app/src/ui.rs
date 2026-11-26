@@ -5730,6 +5730,7 @@ fn lasso_rect(s: &State, k: &Kit, p: usize) -> Option<El> {
 fn list(s: &State, k: &Kit, p: usize) -> El {
     let pane = &s.panes[p];
     let w = s.layout.columns[p];
+    let order = s.layout.col_order[p];
     let total: f32 = w.iter().sum();
 
     let row_h = s.zoom[p].row_height();
@@ -5739,24 +5740,125 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let clip_anim = s.settings.clipboard_animated();
     let zebra = s.settings.zebra_stripes;
 
-    let head = |i: usize, key: &str, label: &str, c: SortCol, end: bool| {
+    let col_meta: [(&'static str, &str, SortCol, bool); 4] = [
+        ("h-name", t("Nome", "Name"), SortCol::Name, false),
+        ("h-size", t("Tamanho", "Size"), SortCol::Size, true),
+        ("h-mod", crate::onedrive::bin_columns(&pane.loc).map_or(t("Data", "Date modified"), |c| c.0), SortCol::Modified, false),
+        (
+            "h-kind",
+            if let Some(c) = crate::onedrive::bin_columns(&pane.loc) {
+                c.1
+            } else if pane.loc.finds() {
+                t("Pasta", "Folder")
+            } else {
+                t("Tipo", "Type")
+            },
+            SortCol::Kind,
+            false,
+        ),
+    ];
+
+    let active_drag = s.col_drag.filter(|d| d.pane == p);
+    let mut header_cells = Vec::with_capacity(4);
+    let mut slot_x = 0.0_f32;
+    for slot in 0..4 {
+        let col_id = order[slot];
+        let (key, label, c, end) = col_meta[col_id];
+        let is_dragged = active_drag.is_some_and(|d| d.col_id == col_id && d.moved);
+        let drag_dx = active_drag.filter(|d| d.col_id == col_id && d.moved).map_or(0.0, |d| d.visual_dx);
+        let start_x = slot_x;
+        slot_x += w[col_id];
+
         let mut h = row()
             .key(key.to_string())
-            .w(w[i])
+            .w(w[col_id])
             .h_full()
             .px(8.0)
             .gap(4.0)
             .center_y()
             .hover(k.c.hover)
-            .cursor(Cursor::Pointer)
+            .cursor(if is_dragged { Cursor::Grabbing } else { Cursor::Pointer })
             .on_press_tx(move |s: &mut State, tx: &mut Tx| {
                 set_sort(s, p, c);
                 if s.row_reorder[p].is_active() {
                     tx.wake_at(s.now + 1.0 / 60.0);
                 }
             })
+            .on_drag(move |s: &mut State, d: &mut Drag, _tx: &mut Tx| match d.phase {
+                Phase::Down => {
+                    let cur_order = s.layout.col_order[p];
+                    let cur_w = s.layout.columns[p];
+                    let mut x = 0.0;
+                    for &cid in &cur_order {
+                        if cid == col_id {
+                            break;
+                        }
+                        x += cur_w[cid];
+                    }
+                    s.col_drag = Some(crate::anim::ColDrag {
+                        pane: p,
+                        col_id,
+                        original_order: cur_order,
+                        start_x: x,
+                        visual_dx: 0.0,
+                        moved: false,
+                    });
+                }
+                Phase::Move => {
+                    let Some(drag) = s.col_drag.as_mut().filter(|cd| cd.pane == p && cd.col_id == col_id) else {
+                        return;
+                    };
+                    if !drag.moved && d.dx.abs() < 5.0 {
+                        return;
+                    }
+                    drag.moved = true;
+                    let cur_w = s.layout.columns[p];
+                    let mut ord = s.layout.col_order[p];
+                    let cur_slot = ord.iter().position(|&id| id == col_id).unwrap_or(slot);
+                    let dragged_center = drag.start_x + d.dx + cur_w[col_id] * 0.5;
+                    let mut acc = 0.0;
+                    let mut target_slot = cur_slot;
+                    for (idx, &cid) in ord.iter().enumerate() {
+                        let cw = cur_w[cid];
+                        let mid = acc + cw * 0.5;
+                        if idx < cur_slot && dragged_center < mid {
+                            target_slot = idx;
+                            break;
+                        }
+                        if idx > cur_slot && dragged_center > mid {
+                            target_slot = idx;
+                        }
+                        acc += cw;
+                    }
+                    if target_slot != cur_slot {
+                        let mut v = ord.to_vec();
+                        v.remove(cur_slot);
+                        v.insert(target_slot, col_id);
+                        ord = [v[0], v[1], v[2], v[3]];
+                        s.layout.col_order[p] = ord;
+                    }
+                    let mut new_slot_x = 0.0;
+                    for &cid in &ord {
+                        if cid == col_id {
+                            break;
+                        }
+                        new_slot_x += cur_w[cid];
+                    }
+                    drag.visual_dx = (drag.start_x + d.dx) - new_slot_x;
+                }
+                Phase::Up => {
+                    if let Some(drag) = s.col_drag.take() {
+                        if d.cancelled() {
+                            s.layout.col_order[p] = drag.original_order;
+                        } else if drag.moved {
+                            s.layout.save();
+                        }
+                    }
+                }
+            })
             .child(text(label.to_string()).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0))
             .border_sides([0.0, 1.0, 0.0, 0.0], k.c.border_weak);
+
         if pane.sort.0 == c {
             let angle = if pane.sort.1 { -std::f32::consts::FRAC_PI_2 } else { std::f32::consts::FRAC_PI_2 };
             let chev = icon(&icons::CHEVRON, 10.0)
@@ -5771,10 +5873,30 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         if end {
             h = h.justify_end();
         }
-        h
-    };
-    // The grips sit over the header, one at each column's right edge.
-    let grips = (0..4).map(|i| col_grip(k, p, i, w[..=i].iter().sum()));
+        if is_dragged {
+            h = h
+                .raise()
+                .fill(k.c.bg_base)
+                .border(1.0, k.alpha(k.c.text_accent, 0.55))
+                .radius(4.0)
+                .box_shadow(rune::Shadow { y: 2.0, blur: 6.0, color: k.dark_a(0.28), ..Default::default() })
+                .offset(drag_dx, 0.0)
+                .offset_motion(Anim::INSTANT);
+        } else if sel_anim {
+            h = h.animated_changes().motion(crate::anim::ui_spring());
+        }
+        let _ = start_x;
+        header_cells.push(h);
+    }
+
+    // The grips sit over the header, one at each column's right edge in visual order.
+    let mut grip_edge = 0.0_f32;
+    let mut grips = Vec::with_capacity(4);
+    for slot in 0..4 {
+        let col_id = order[slot];
+        grip_edge += w[col_id];
+        grips.push(col_grip(k, p, col_id, grip_edge));
+    }
     let header = row()
         .key("header")
         .w_full()
@@ -5782,10 +5904,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .fill(k.c.bg_base)
         .sticky_top(0.0)
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
-        .child(head(0, "h-name", t("Nome", "Name"), SortCol::Name, false))
-        .child(head(1, "h-size", t("Tamanho", "Size"), SortCol::Size, true))
-        .child(head(2, "h-mod", crate::onedrive::bin_columns(&pane.loc).map_or(t("Data", "Date modified"), |c| c.0), SortCol::Modified, false))
-        .child(head(3, "h-kind", if let Some(c) = crate::onedrive::bin_columns(&pane.loc) { c.1 } else if pane.loc.finds() { t("Pasta", "Folder") } else { t("Tipo", "Type") }, SortCol::Kind, false))
+        .children(header_cells)
         .children(grips);
 
     let selected = k.alpha(k.c.text_accent, if k.dark { 0.26 } else { 0.18 });
@@ -5856,32 +5975,41 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
             let angle = crate::anim::wiggle_radians(icon_sz, elapsed, &e.id);
             ico = ico.origin(0.5, 0.5).rotate(angle).rotate_motion(Anim::INSTANT);
         }
-        r.child(
-            cell(0)
-                .px(6.0)
-                .gap(6.0)
-                .child(ico)
-                .child(match &s.renaming {
-                    Some((rp, item)) if *rp == p && item.id == e.id => rename_field(s, rename_look),
-                    _ => {
-                        let name = shown(&e.name);
-                        let ranges = crate::finder::match_ranges(&words, &name);
-                        if s.settings.search_marker {
-                            // Experimental: as a highlighter marks them, painted under the
-                            // glyphs without reshaping the name.
-                            let marks = ranges.into_iter().map(|r| rune::TextHighlight::new(r, marker));
-                            text(name).font(font).color(text_c).text_highlights(marks).truncate().shrink().min_w(0.0)
-                        } else {
-                            let spans: Vec<Span> = ranges.into_iter().map(|r| Span::new(r.start, r.end).color(accent)).collect();
-                            text(name).font(font).color(text_c).spans(spans).truncate().shrink().min_w(0.0)
+        let mut cells = Vec::with_capacity(4);
+        let mut ico_opt = Some(ico);
+        for col_id in order {
+            let c = match col_id {
+                0 => cell(0)
+                    .px(6.0)
+                    .gap(6.0)
+                    .child(ico_opt.take().unwrap_or_else(|| entry_icon(s, &pane.loc, e, icon_sz)))
+                    .child(match &s.renaming {
+                        Some((rp, item)) if *rp == p && item.id == e.id => rename_field(s, rename_look),
+                        _ => {
+                            let name = shown(&e.name);
+                            let ranges = crate::finder::match_ranges(&words, &name);
+                            if s.settings.search_marker {
+                                // Experimental: as a highlighter marks them, painted under the
+                                // glyphs without reshaping the name.
+                                let marks = ranges.into_iter().map(|r| rune::TextHighlight::new(r, marker));
+                                text(name).font(font).color(text_c).text_highlights(marks).truncate().shrink().min_w(0.0)
+                            } else {
+                                let spans: Vec<Span> = ranges.into_iter().map(|r| Span::new(r.start, r.end).color(accent)).collect();
+                                text(name).font(font).color(text_c).spans(spans).truncate().shrink().min_w(0.0)
+                            }
                         }
-                    }
-                }),
-        )
-        .child(cell(1).justify_end().child(muted(e.size.map(format_size).unwrap_or_default()).align(Align::End)))
-        .child(cell(2).child(muted(e.modified.map(format_time).unwrap_or_default())))
-        // A search's results show the folder each is in where the type goes.
-        .child(cell(3).child(muted(if found { crate::finder::folder_of(e) } else { crate::onedrive::origin_of(&pane.loc, e).unwrap_or_else(|| e.kind_label()) })))
+                    }),
+                1 => cell(1).justify_end().child(muted(e.size.map(format_size).unwrap_or_default()).align(Align::End)),
+                2 => cell(2).child(muted(e.modified.map(format_time).unwrap_or_default())),
+                _ => cell(3).child(muted(if found {
+                    crate::finder::folder_of(e)
+                } else {
+                    crate::onedrive::origin_of(&pane.loc, e).unwrap_or_else(|| e.kind_label())
+                })),
+            };
+            cells.push(c);
+        }
+        r.children(cells)
         .on_press_tx(move |s: &mut State, tx: &mut Tx| {
             click(s, p, &id_press, tx.mods());
             tx.focus(pane_key(p), false);
@@ -5935,7 +6063,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .pb(2.0 * row_h)
         .growth(GrowthSpec::default())
         .virtual_rows(n, row_h, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
-        .virtual_rows_version((pane.version, w.map(f32::to_bits), row_h.to_bits(), s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))));
+        .virtual_rows_version((pane.version, w.map(f32::to_bits), order, row_h.to_bits(), s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))));
     let notice = |msg: String, color| col().key("notice").w_full().grow(1.0).padding(16.0).child(text(msg).font(k.ty.text_small).color(color).wrap());
     let body = if let Some(consent) = crate::onedrive::bin_notice(s, k, p) {
         consent

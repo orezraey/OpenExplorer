@@ -178,6 +178,8 @@ struct State {
     lasso_fade: Option<anim::LassoFade>,
     /// Smooth row reorder glide when sorting a pane's file list.
     row_reorder: [anim::RowReorder; 2],
+    /// Active header column drag-to-reorder state.
+    col_drag: Option<anim::ColDrag>,
     dialog: Option<actions::Dialog>,
     /// The window was asked to close while transfers ran: Fechar o Open Explorer? shows over
     /// everything, the dialog under it untouched (see [`actions::close_requested`]).
@@ -361,6 +363,7 @@ impl State {
             kbd_sel: Default::default(),
             lasso_fade: None,
             row_reorder: Default::default(),
+            col_drag: None,
             dialog: None,
             quit_asked: false,
             clash_waiting: Default::default(),
@@ -574,6 +577,7 @@ fn init() -> State {
         kbd_sel: Default::default(),
         lasso_fade: None,
         row_reorder: Default::default(),
+        col_drag: None,
         dialog: None,
         quit_asked: false,
         clash_waiting: Default::default(),
