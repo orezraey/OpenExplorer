@@ -92,6 +92,7 @@ pub fn hits_with_row_h(rect: [f32; 4], n: usize, width: f32, row_h: f32) -> Rang
     first.min(n)..(last + 1).min(n)
 }
 
+#[cfg(test)]
 pub fn hits(rect: [f32; 4], n: usize, width: f32) -> Range<usize> {
     hits_with_row_h(rect, n, width, ROW_H)
 }

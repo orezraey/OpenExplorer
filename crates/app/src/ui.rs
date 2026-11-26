@@ -5701,14 +5701,13 @@ fn lasso_rect(s: &State, k: &Kit, p: usize) -> Option<El> {
     let scroll = view.scroll.get();
     let (rect, alpha) = if let Some(l) = s.lasso.as_ref().filter(|l| l.pane == p && l.moved) {
         (l.rect(scroll), 1.0)
-    } else if let Some(fade) = s.lasso_fade.filter(|f| f.pane == p) {
+    } else {
+        let fade = s.lasso_fade.filter(|f| f.pane == p)?;
         let a = fade.opacity(s.now);
         if a <= 0.01 {
             return None;
         }
         (fade.rect, a)
-    } else {
-        return None;
     };
     let [x0, y0, x1, y1] = rect;
     // Before the first layout says how big the viewport is, nothing is cut.
@@ -5761,8 +5760,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let active_drag = s.col_drag.filter(|d| d.pane == p);
     let mut header_cells = Vec::with_capacity(4);
     let mut slot_x = 0.0_f32;
-    for slot in 0..4 {
-        let col_id = order[slot];
+    for (slot, &col_id) in order.iter().enumerate() {
         let (key, label, c, end) = col_meta[col_id];
         let is_dragged = active_drag.is_some_and(|d| d.col_id == col_id && d.moved);
         let drag_dx = active_drag.filter(|d| d.col_id == col_id && d.moved).map_or(0.0, |d| d.visual_dx);
@@ -5892,8 +5890,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     // The grips sit over the header, one at each column's right edge in visual order.
     let mut grip_edge = 0.0_f32;
     let mut grips = Vec::with_capacity(4);
-    for slot in 0..4 {
-        let col_id = order[slot];
+    for &col_id in &order {
         grip_edge += w[col_id];
         grips.push(col_grip(k, p, col_id, grip_edge));
     }
@@ -5925,12 +5922,17 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let words = std::rc::Rc::new(searched_words(&pane.loc));
     let accent = k.c.text_accent;
     let marker = k.alpha(k.c.text_accent, 0.28);
+    // The items Copiar or Recortar picked up from this folder, looked up once here rather than
+    // by every row: a pick-up can hold thousands.
+    let clip_ids: std::rc::Rc<std::collections::HashSet<String>> = std::rc::Rc::new(
+        s.clip.as_ref().filter(|c| c.from == pane.loc).map(|c| c.items.iter().map(|it| it.id.clone()).collect()).unwrap_or_default(),
+    );
     let build = move |s: &State, i: usize| -> El {
         let pane = &s.panes[p];
         let e = &pane.entries[i];
         let is_sel = pane.selected.contains(&e.id);
         let found = pane.loc.finds();
-        let clip_match = s.clip.as_ref().filter(|c| c.from == pane.loc && c.items.iter().any(|it| it.id == e.id));
+        let clip_match = s.clip.as_ref().filter(|_| clip_ids.contains(&e.id));
         let is_cut = clip_match.is_some_and(|c| c.mode == ClipMode::Cut);
         // As wide as the columns: past them is empty space, where a drag draws a rectangle.
         let mut r = row().key(row_key(&e.id)).role("row").label(shown(&e.name)).focus_selected(is_sel).w(total).h(row_h).center_y();

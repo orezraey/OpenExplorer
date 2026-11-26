@@ -869,16 +869,18 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             anim_wake = true;
         }
     }
-    // Clipboard Copy/Cut icon wiggle: only wake while copied/cut items are visible in an open pane.
+    // Clipboard Copy/Cut icon wiggle: it runs for a moment after the pick-up, and wakes only
+    // while copied/cut items are visible in an open pane. A copy stays picked up after Colar,
+    // so a wiggle without an end would redraw the window for as long as it shows them.
     if s.main_tab == MainTab::Explore
         && s.settings.clipboard_animated()
         && let Some(clip) = &s.clip
         && !clip.items.is_empty()
-        && (0..2).any(|p| {
-            !s.tabs[p].is_picker()
-                && s.panes[p].loc == clip.from
-                && s.panes[p].entries.iter().any(|e| clip.items.iter().any(|c| c.id == e.id))
-        })
+        && now - clip.picked_at < anim::WIGGLE_TOTAL
+        && {
+            let ids: std::collections::HashSet<&str> = clip.items.iter().map(|c| c.id.as_str()).collect();
+            (0..2).any(|p| !s.tabs[p].is_picker() && s.panes[p].loc == clip.from && s.panes[p].entries.iter().any(|e| ids.contains(e.id.as_str())))
+        }
     {
         changed = true;
         anim_wake = true;
@@ -1986,7 +1988,7 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
     };
     if let Some(i) = to {
         let prev_single = (!ev.mods.cmd && !ev.mods.shift && s.panes[p].selected.len() == 1)
-            .then(|| at)
+            .then_some(at)
             .flatten();
         let id = s.panes[p].entries[i].id.clone();
         // With Ctrl the cursor moves alone and the selection stays, as in Explorer.

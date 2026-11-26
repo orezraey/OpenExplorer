@@ -25,6 +25,9 @@ pub const ZOOM_DURATION: f64 = 0.180;
 pub const LASSO_FADE_DURATION: f64 = 0.140;
 /// Clipboard icon wiggle full oscillation period (360 ms = 2 × 180 ms).
 pub const WIGGLE_PERIOD: f64 = 0.360;
+/// How long the wiggle runs after a pick-up: three swings past the longest start delay. It
+/// then rests, so a copy left picked up doesn't keep the window redrawing.
+pub const WIGGLE_TOTAL: f64 = 3.0 * WIGGLE_PERIOD + 0.120;
 
 /// Standard cubic ease-out: `1 - (1 - t)^3`.
 #[inline]
@@ -65,7 +68,7 @@ pub fn wiggle_amplitude_deg(icon_size: f32) -> f32 {
 /// with a stable per-item 0..120 ms start delay so multiple selected items wiggle organically.
 pub fn wiggle_radians(icon_size: f32, elapsed_secs: f64, id: &str) -> f32 {
     let delay_secs = (stable_hash(id) % 121) as f64 * 0.001;
-    if elapsed_secs <= delay_secs {
+    if elapsed_secs <= delay_secs || elapsed_secs >= delay_secs + 3.0 * WIGGLE_PERIOD {
         return 0.0;
     }
     let amp = wiggle_amplitude_deg(icon_size);
@@ -404,6 +407,9 @@ mod tests {
         assert_eq!(wiggle_amplitude_deg(16.0), 8.0);
         assert!(wiggle_amplitude_deg(40.0) < 8.0 && wiggle_amplitude_deg(40.0) > 1.2);
         assert_eq!(wiggle_radians(16.0, 0.0, "folder-a"), 0.0);
+        // It rests after three swings, so the window stops redrawing for it.
+        assert_eq!(wiggle_radians(16.0, WIGGLE_TOTAL, "folder-a"), 0.0);
+        assert_eq!(wiggle_radians(16.0, 60.0, "folder-b"), 0.0);
         let max_rad = 8.0_f32.to_radians() + 1e-4;
         for step in 0..40 {
             let a = wiggle_radians(16.0, step as f64 * 0.015, "folder-a");
