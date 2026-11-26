@@ -3905,4 +3905,70 @@ mod tests {
         assert!(key(&mut s, 1, &ev(Key::ContextMenu, Mods::default()), &mut tx));
         assert_eq!(s.menu, Some((1, rune::PointerPress { x: 424.0, y: top + 3.0 * ROW_H })));
     }
+
+    #[test]
+    fn finished_downloads_stay_until_cleared_unless_auto_clear_is_on() {
+        let mut s = init();
+        s.settings = settings::Settings::default();
+        assert!(!s.settings.clear_completed);
+
+        let end = |name: &str| transfers::End::local(std::path::Path::new(name));
+        let batch = transfers::queue(
+            &mut s.transfers,
+            None,
+            transfers::Op::Download,
+            [(end(r"C:\a.zip"), end(r"D:\a.zip")), (end(r"C:\b.zip"), end(r"D:\b.zip"))],
+        );
+        s.transfers[0].progress.begin();
+        s.transfers[0].progress.end(Ok(()));
+        s.transfers[1].progress.begin();
+        s.transfers[1].progress.end(Err("falha".into()));
+
+        // By default, completed transfers stay in the queue across `poll` and show the clear button.
+        let mut tx = Tx::default();
+        poll(&mut s, 0.1, &mut tx);
+        assert_eq!(s.transfers.len(), 2);
+
+        let mut rt = rune::Runtime::new(s, ui::view, (1280.0, 800.0), rune::Env::new(false, 1.0));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.elements().into_iter().any(|e| e.key.as_deref() == Some("queue-clear")));
+
+        // Manual clear removes finished rows from the queue.
+        rt.update(|s, _| {
+            actions::clear_transfers(s);
+            assert!(s.transfers.is_empty());
+
+            // With `clear_completed` enabled, `poll` removes Done rows and keeps Failed ones.
+            let batch2 = transfers::queue(
+                &mut s.transfers,
+                None,
+                transfers::Op::Download,
+                [(end(r"C:\c.zip"), end(r"D:\c.zip")), (end(r"C:\d.zip"), end(r"D:\d.zip"))],
+            );
+            s.transfers[0].progress.begin();
+            s.transfers[0].progress.end(Ok(()));
+            s.transfers[1].progress.begin();
+            s.transfers[1].progress.end(Err("falha".into()));
+            s.settings.clear_completed = true;
+            poll(s, 0.2, &mut Tx::default());
+            assert_eq!(s.transfers.len(), 1);
+            assert_eq!(s.transfers[0].progress.stage(), ops::Stage::Failed);
+            drop(batch2);
+        });
+
+        // The auto-clear option lives in Options -> Transfers, not General.
+        rt.update(|s, _| {
+            s.dialog = Some(actions::Dialog::Options(Box::new(settings::OptionsView::open(settings::OptionsTab::General))));
+        });
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.elements().into_iter().any(|e| e.key.as_deref() == Some("opt-clear-done")));
+
+        rt.update(|s, _| {
+            s.dialog = Some(actions::Dialog::Options(Box::new(settings::OptionsView::open(settings::OptionsTab::Transfers))));
+        });
+        rt.frame(1.0 / 60.0);
+        assert!(rt.elements().into_iter().any(|e| e.key.as_deref() == Some("opt-clear-done")));
+
+        drop(batch);
+    }
 }
