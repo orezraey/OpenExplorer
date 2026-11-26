@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.1 - 2026-11-26
+
+### Fixed
+
+* Uploads and downloads at the same time keep to the numbers set in Options › Transfers. Each
+  new copy started while another ran brought as many again, so two batches of 4 uploads sent 8
+  files at once. The limit now counts every batch together, on Google Drive and on the other
+  clouds and servers, and a change to it applies at once.
+* A transfer cancelled while it waits for another to finish ends at once.
+
 ## 0.5.0 - 2026-11-26
 
 ### Added
