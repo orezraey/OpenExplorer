@@ -60,12 +60,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     // Linux: a menu Rune asks for (a text field's Recortar, Copiar, Colar), as the system draws
     // none there.
     if let Some(request) = &s.popup {
-        spaced(rune_kit::Menu::from_popup_menu("popup-fallback", request, |s: &mut State, picked, tx: &mut Tx| {
-            s.popup = None;
-            tx.resolve_popup_menu(picked);
-        }))
-        .label(t("Menu de contexto", "Context menu"))
-        .build(&k, &mut layer);
+        fallback_menu(request, |s| s.popup = None, &k, &mut layer);
     }
     // What the last action said, for a few seconds at the bottom right.
     if !s.status.is_empty() && s.now < s.status_until {
@@ -1286,6 +1281,17 @@ fn spaced(menu: rune_kit::Menu) -> rune_kit::Menu {
     menu.padding(4.0).separator_spacing(4.0, 4.0).inner_border(1.0)
 }
 
+/// Linux: the menu Rune asks a window to draw (a text field's Recortar, Copiar, Colar), as the
+/// system draws none there. `clear` drops the window's request once it is answered.
+fn fallback_menu(request: &rune::PopupMenuRequest, clear: fn(&mut State), k: &Kit, layer: &mut Vec<El>) {
+    spaced(rune_kit::Menu::from_popup_menu("popup-fallback", request, move |s: &mut State, picked, tx: &mut Tx| {
+        clear(s);
+        tx.resolve_popup_menu(picked);
+    }))
+    .label(t("Menu de contexto", "Context menu"))
+    .build(k, layer);
+}
+
 /// The queue's right-click menu: on a row, or on the list as a whole.
 fn transfer_context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     let anchor = el().key("queue-menu-anchor").size(0.0, 0.0);
@@ -1833,6 +1839,10 @@ pub fn account_window_view(s: &State, cx: &mut Cx<State>) -> El {
     } else {
         account_configure_body(s, &k, f, panel_bg, panel_border)
     };
+    // Linux: the fields' Recortar, Copiar, Colar (keys, codes, passwords), drawn in the window.
+    if let Some(request) = &s.account_popup {
+        fallback_menu(request, |s| s.account_popup = None, &k, &mut layer);
+    }
 
     let root = col()
         .key("account-window")

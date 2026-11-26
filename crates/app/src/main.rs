@@ -175,6 +175,8 @@ struct State {
     /// Linux: a menu Rune asks for (a text field's Recortar, Copiar, Colar), drawn in the window
     /// as the system draws none there.
     popup: Option<rune::PopupMenuRequest>,
+    /// The same for the account window (Registrar conta), which shares this state.
+    account_popup: Option<rune::PopupMenuRequest>,
     /// The window opened with the Acrylic background (Opções > Experimental): its page and the
     /// panes' folder trees show the material. Set at start, as the window's transparency is.
     acrylic: bool,
@@ -355,6 +357,7 @@ impl State {
             quit_asked: false,
             quit_app: false,
             popup: None,
+            account_popup: None,
             acrylic: false,
             clash_waiting: Default::default(),
             name_edit: rune::TextEdit::new(""),
@@ -565,6 +568,7 @@ fn init() -> State {
         quit_asked: false,
         quit_app: false,
         popup: None,
+        account_popup: None,
         acrylic: settings.acrylic_window(),
         clash_waiting: Default::default(),
         name_edit: rune::TextEdit::new(""),
@@ -2772,8 +2776,23 @@ fn main() {
     .titlebar(rune::Titlebar::new(36.0))
     .font_smoothing(initial.text_render.smoothing())
     .turn_scope(enter_turn, leave_turn)
+    // Linux has no system pop-up menu: the fields' menu is drawn in the window, as in the main
+    // one. Rune dismisses it when the window loses focus: it goes.
+    .on_popup_menu(|s, request, tx| {
+        if s.is_placeholder {
+            tx.resolve_popup_menu(None);
+        } else {
+            s.account_popup = Some(request);
+        }
+    })
+    .on_focus(|s, focused, _| {
+        if !focused && !s.is_placeholder {
+            s.account_popup = None;
+        }
+    })
     .on_close(|s, _| {
         if !s.is_placeholder {
+            s.account_popup = None;
             s.account_window_closed();
         }
     });
@@ -2920,6 +2939,13 @@ fn rune_args(given: impl Iterator<Item = String>) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// The tests that read or write `RESTART`, shared by the whole process, run one at a time.
+    static RESTART_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn restart_tests() -> std::sync::MutexGuard<'static, ()> {
+        RESTART_TESTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A close the app asked for, whose `on_close` comes after Adicionar conta opened a new
     /// form, keeps that form; the window's own close button drops it.
     #[test]
@@ -2938,6 +2964,7 @@ mod tests {
     /// itself once they end.
     #[test]
     fn closing_asks_only_while_transfers_run() {
+        let _one_at_a_time = restart_tests();
         let mut s = init();
         assert_eq!(actions::close_requested(&mut s), rune::CloseResponse::Close);
         let end = || transfers::End::local(std::path::Path::new(r"C:\x"));
@@ -2971,6 +2998,7 @@ mod tests {
 
     #[test]
     fn quitting_the_app_asks_like_closing() {
+        let _one_at_a_time = restart_tests();
         let mut s = init();
         let mut tx = Tx::default();
         assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Quit);
@@ -2999,6 +3027,14 @@ mod tests {
         assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Quit);
         assert!(!s.quit_asked && !s.quit_app && !actions::transfers_running(&s));
         drop(last);
+
+        // ⌘Q while Reiniciar asks quits, and the app doesn't open again.
+        let again = transfers::queue(&mut s.transfers, None, transfers::Op::Copy, [(end(), end())]);
+        actions::restart(&mut s, &mut tx);
+        assert!(s.quit_asked && actions::restarting());
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Quit);
+        assert!(!s.quit_asked && !actions::restarting());
+        drop(again);
     }
 
     #[test]
