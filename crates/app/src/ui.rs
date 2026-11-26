@@ -6301,6 +6301,9 @@ const GRID_PAD: f32 = 8.0;
 const LIST_COL_W: f32 = 230.0;
 const LIST_COL_GAP: f32 = 8.0;
 const LIST_HORIZ_MAX: usize = 2000;
+/// List's columns built past each side of those in sight, so a scroll of a column or two needs
+/// no view.
+const LIST_SPARE_COLS: usize = 2;
 
 fn grid_columns_for(viewport_w: f32, tile_w: f32, bar_w: f32) -> usize {
     let avail = (viewport_w - bar_w - 2.0 * GRID_PAD + GRID_GAP).max(tile_w + GRID_GAP);
@@ -6551,11 +6554,19 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                     header: 0.0,
                     line_key: None,
                 });
-                let mut cols_row = row().key("rows-list").padding(4.0).pb(bar_strip + 4.0).gap(LIST_COL_GAP).items_start();
-                for c in 0..num_cols {
+                // Only the columns in sight, and two on each side, are built: the rest are room.
+                // Scrolling past them asks for the view again (`on_scroll_offset`).
+                let step = LIST_COL_W + LIST_COL_GAP;
+                let scroll = s.views[p].scroll.get();
+                let built = crate::lasso::column_window(scroll.x, s.views[p].rect[2], 4.0, step, LIST_SPARE_COLS, num_cols);
+                s.views[p].columns.set(built);
+                let width = 8.0 + num_cols as f32 * step - LIST_COL_GAP;
+                let height = 8.0 + rows_per_col as f32 * ROW_H + bar_strip;
+                let mut cols_row = el().key("rows-list").w(width).h(height);
+                for c in built.0..built.1 {
                     let start = c * rows_per_col;
                     let end = (start + rows_per_col).min(n);
-                    let mut column = col().key(format!("lcol-{c}")).w(LIST_COL_W);
+                    let mut column = col().key(format!("lcol-{c}")).absolute(4.0 + c as f32 * step, 4.0).w(LIST_COL_W);
                     for i in start..end {
                         column = column.child(make_item(s, i));
                     }
@@ -6879,21 +6890,17 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
             .children(grips);
         // Gliding hover highlight pill (80 ms ease-out cubic, matching Explorer GPU mod):
         // sits behind the rows and slides smoothly from row to row without leaving a trail.
+        // Where it goes and how much it shows are live values the pointer sets: crossing rows
+        // moves it without running the view.
         let hover_pill = (hover_glides && n > 0 && pane.error.is_none()).then(|| {
-            let active = s.hovered_row[p].filter(|&idx| idx < n && s.lasso.is_none());
-            let row_idx = active.unwrap_or_else(|| s.hover_last_row[p].min(n.saturating_sub(1)));
-            let y = row_idx as f32 * row_h;
             let curve = crate::anim::hover_curve();
+            let view = &s.views[p];
             el().key("hover-pill")
-                .animated_changes()
-                .absolute(2.0, HEADER_H)
-                .size((total - 4.0).max(0.0), row_h)
+                .absolute(0.0, 0.0)
                 .radius(5.0)
                 .fill(hover)
-                .offset(0.0, y)
-                .offset_motion(curve)
-                .opacity(if active.is_some() { 1.0 } else { 0.0 })
-                .opacity_motion(curve)
+                .live_rect(view.hover_rect.smooth_with(curve))
+                .live_opacity(view.hover_alpha.smooth_with(curve))
         });
         // Gliding keyboard selection pill (Cubic Hermite glide on ↑/↓/PageUp/PageDown/Home/End).
         let kbd_sel_pill = kbd_sel_active.then(|| {
@@ -6917,13 +6924,29 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     };
 
     let scrolled = s.views[p].scroll.clone();
+    // List builds only the columns in sight: scrolled past them, the view runs again. The handler
+    // can't change state, so it marks the viewport and wakes `poll`.
+    let list_columns = (mode == ViewMode::List && n <= LIST_HORIZ_MAX).then(|| {
+        let view = &s.views[p];
+        let rows_per_col = view.flow.get().per_line.max(1);
+        (view.columns.clone(), view.columns_stale.clone(), n.div_ceil(rows_per_col), s.waker.clone())
+    });
     let viewport = col()
         .key(list_key(p))
         .instant_changes()
         .w_full()
         .h_full()
         .scroll_xy()
-        .on_scroll_offset(move |at| scrolled.set(at.into()))
+        .on_scroll_offset(move |at| {
+            scrolled.set(at.into());
+            if let Some((built, stale, count, waker)) = &list_columns
+                && !crate::lasso::columns_cover(built.get(), at.offset[0], at.viewport[0], 4.0, LIST_COL_W + LIST_COL_GAP, *count)
+                && !stale.replace(true)
+                && let Some(wake) = waker
+            {
+                wake();
+            }
+        })
         // Track hovered row for the gliding hover highlight; returns live_only when the row
         // doesn't change so pointer motion inside a row triggers zero view rebuilds.
         .on_pointer_move_local(move |s: &mut State, ev: rune::PointerEvent, tx: &mut Tx| {
@@ -6931,31 +6954,31 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                 tx.live_only();
                 return;
             }
-            let scroll = s.views[p].scroll.get();
+            tx.live_only();
+            let view = &s.views[p];
+            let scroll = view.scroll.get();
             let content_x = ev.x + scroll.x;
             let content_y = ev.y + scroll.y - HEADER_H;
             let total_w: f32 = s.layout.columns[p].iter().sum();
             let rh = s.zoom[p].row_height().max(1.0);
-            let next = if ev.y >= HEADER_H && content_y >= 0.0 && content_x >= 0.0 && content_x < total_w && s.lasso.is_none() {
-                let idx = (content_y / rh).floor() as usize;
-                (idx < s.panes[p].entries.len()).then_some(idx)
-            } else {
-                None
-            };
-            if next != s.hovered_row[p] {
-                s.hovered_row[p] = next;
-                if let Some(idx) = next {
-                    s.hover_last_row[p] = idx;
+            let row = (ev.y >= HEADER_H && content_y >= 0.0 && content_x >= 0.0 && content_x < total_w && s.lasso.is_none())
+                .then(|| (content_y / rh).floor() as usize)
+                .filter(|&i| i < s.panes[p].entries.len());
+            match row {
+                Some(i) => {
+                    view.hover_rect.set([2.0, HEADER_H + i as f32 * rh, (total_w - 4.0).max(0.0), rh]);
+                    view.hover_alpha.set(1.0);
                 }
-            } else {
-                tx.live_only();
+                // It fades where it was.
+                None => {
+                    view.hover_alpha.set(0.0);
+                }
             }
         })
         .on_hover_change(move |s: &mut State, inside: bool, tx: &mut Tx| {
-            if !inside && s.hovered_row[p].is_some() {
-                s.hovered_row[p] = None;
-            } else {
-                tx.live_only();
+            tx.live_only();
+            if !inside {
+                s.views[p].hover_alpha.set(0.0);
             }
         })
         // Ctrl + mouse wheel smoothly zooms row height, icons, and text.
@@ -7001,7 +7024,10 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                 // A page: a column's items, or past LIST_HORIZ_MAX, where the items run in rows,
                 // the rows in view.
                 s.page_rows[p] = if s.panes[p].entries.len() > LIST_HORIZ_MAX { new_rows * new_cols } else { new_rows };
-                let needs_relayout = s.list_rows[p] != new_rows || (s.panes[p].entries.len() > LIST_HORIZ_MAX && s.grid_cols[p] != new_cols);
+                let n = s.panes[p].entries.len();
+                let shown = n <= LIST_HORIZ_MAX
+                    && !crate::lasso::columns_cover(s.views[p].columns.get(), s.views[p].scroll.get().x, r[2], 4.0, LIST_COL_W + LIST_COL_GAP, n.div_ceil(new_rows.max(1)));
+                let needs_relayout = s.list_rows[p] != new_rows || shown || (n > LIST_HORIZ_MAX && s.grid_cols[p] != new_cols);
                 s.list_rows[p] = new_rows;
                 if s.panes[p].entries.len() > LIST_HORIZ_MAX {
                     s.grid_cols[p] = new_cols;

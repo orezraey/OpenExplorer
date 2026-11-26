@@ -179,10 +179,6 @@ struct State {
     views: [lasso::Viewport; MAX_PANES],
     /// Smooth Ctrl+wheel / pinch zoom state for each pane's file list.
     zoom: [anim::ZoomState; MAX_PANES],
-    /// Row index currently under the pointer in each pane's file list (for the gliding hover pill).
-    hovered_row: [Option<usize>; MAX_PANES],
-    /// Last hovered row index in each pane so the hover pill fades out in place when leaving.
-    hover_last_row: [usize; MAX_PANES],
     /// Gliding keyboard selection highlight for each pane.
     kbd_sel: [anim::KeyboardSel; MAX_PANES],
     /// Fading marquee/lasso rectangle after mouse release.
@@ -389,8 +385,6 @@ impl State {
             lasso: None,
             views: Default::default(),
             zoom: Default::default(),
-            hovered_row: [None; MAX_PANES],
-            hover_last_row: [0; MAX_PANES],
             kbd_sel: Default::default(),
             lasso_fade: None,
             row_reorder: Default::default(),
@@ -618,8 +612,6 @@ fn init() -> State {
         lasso: None,
         views: Default::default(),
         zoom: Default::default(),
-        hovered_row: [None; MAX_PANES],
-        hover_last_row: [0; MAX_PANES],
         kbd_sel: Default::default(),
         lasso_fade: None,
         row_reorder: Default::default(),
@@ -910,6 +902,10 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     let big = s.panes[..s.settings.pane_layout.count()].iter().any(|p| matches!(p.view_mode, model::ViewMode::LargeIcons | model::ViewMode::ExtraLargeIcons));
     s.icons.set_big(big);
     let mut changed = std::mem::take(&mut s.main_dirty) | s.icons.settle();
+    // List scrolled sideways to columns its view didn't build.
+    for view in &s.views {
+        changed |= view.columns_stale.replace(false);
+    }
     changed |= notice(s, now, &mut |text, how| tx.announce(text, how));
     // Smooth Ctrl+wheel / pinch zoom, keyboard selection glide, and sort row reorder animations.
     let mut anim_wake = false;
@@ -1297,7 +1293,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             pane.selected = [id.clone()].into();
             pane.cursor = Some(id.clone());
             pane.anchor = Some(id.clone());
-            tx.scroll_into_view_in(pane_key(p), s.views[p].flow.get().reveal_key(i, row_key(&id)));
+            reveal(s, p, i, &id, tx);
             changed = true;
         } else if !pane.loading {
             pane.reveal = None;
@@ -2085,7 +2081,7 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             if let Some(i) = keyboard::find(&s.panes[p].entries, at, query) {
                 let id = s.panes[p].entries[i].id.clone();
                 click(s, p, &id, Mods::default());
-                tx.scroll_into_view_in(pane_key(p), flow.reveal_key(i, row_key(&id)));
+                reveal(s, p, i, &id, tx);
             }
             return true;
         }
@@ -2197,9 +2193,21 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
                 tx.wake_at(s.now + 1.0 / 60.0);
             }
         }
-        tx.scroll_into_view_in(pane_key(p), flow.reveal_key(i, row_key(&id)));
+        reveal(s, p, i, &id, tx);
     }
     true
+}
+
+/// Brings item `i` (id `id`) of pane `p` into view. List builds only the columns in sight, so its
+/// items are reached by scrolling to where they sit; the other views reveal the row (or the
+/// virtual line) that holds them.
+fn reveal(s: &State, p: usize, i: usize, id: &str, tx: &mut Tx) {
+    let flow = s.views[p].flow.get();
+    if flow.rows {
+        tx.scroll_into_view_in(pane_key(p), flow.reveal_key(i, row_key(id)));
+    } else if let (_, Some([x, y])) = lasso::menu_point(&s.views[p], Some(i)) {
+        tx.scroll_to_instant(ui::list_key(p), x, y);
+    }
 }
 
 /// The Menu key, or Shift+F10, with nothing else held: the context menu from the keyboard.
@@ -3603,6 +3611,132 @@ mod tests {
 
     fn entries(from: usize, n: usize) -> Vec<Entry> {
         (from..from + n).map(|i| Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false }).collect()
+    }
+
+    /// The median of 9 runs of `per_run` calls to `step`, in µs per call, and the best.
+    fn bench_runs(per_run: usize, mut step: impl FnMut()) -> (f64, f64) {
+        for _ in 0..per_run / 4 {
+            step();
+        }
+        let mut runs = Vec::new();
+        for _ in 0..9 {
+            let started = std::time::Instant::now();
+            for _ in 0..per_run {
+                step();
+            }
+            runs.push(started.elapsed().as_secs_f64() * 1e6 / per_run as f64);
+        }
+        runs.sort_by(f64::total_cmp);
+        (runs[0], runs[4])
+    }
+
+    /// What List view costs the window while transfers run: both panes in List on a folder of
+    /// 1 999 items (just under the count past which List goes virtual), 40 downloads advancing,
+    /// each tick through `poll`, the view and a frame (no GPU). Run it with
+    /// `cargo test --release -p openexplorer -- --ignored --nocapture list_view_progress_cost`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn list_view_progress_cost() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut s = init();
+        for p in 0..2 {
+            s.panes[p].set_entries(Ok(entries(0, 1999)));
+            s.panes[p].view_mode = model::ViewMode::List;
+        }
+        let end = |i: usize| transfers::End::local(std::path::Path::new(&format!(r"C:\Dados\Arquivo {i}.bin")));
+        let batch = transfers::queue(&mut s.transfers, None, transfers::Op::Download, (0..40).map(|i| (end(i), end(i))));
+        for t in &s.transfers {
+            t.progress.size(1 << 34);
+            t.progress.begin();
+        }
+        let rows: Vec<_> = s.transfers.iter().map(|t| t.progress.clone()).collect();
+        let mut rt = rune::Runtime::new(s, ui::view, (1600.0, 1000.0), rune::Env::new(false, 1.0));
+        let mut now = 0.0;
+        let (best, median) = bench_runs(100, || {
+            for p in &rows {
+                p.bytes.fetch_add(3 << 20, Relaxed);
+            }
+            now += 0.1;
+            rt.update_if(|s, tx| poll(s, now, tx));
+            rt.frame(0.1);
+        });
+        println!("List view tick: {best:.0} µs best, {median:.0} µs median of 9 runs of 100");
+        drop(batch);
+    }
+
+    /// The hover highlight follows the pointer to the row under it and fades when it leaves the
+    /// rows, without the view running for it.
+    #[test]
+    fn the_hover_highlight_follows_the_pointer() {
+        let mut s = init();
+        s.panes[0].set_entries(Ok(entries(0, 200)));
+        let mut rt = rune::Runtime::new(s, ui::view, (1600.0, 1000.0), rune::Env::new(false, 1.0));
+        for _ in 0..3 {
+            rt.frame(1.0 / 60.0);
+        }
+        let mut rect = [0.0; 4];
+        rt.update(|s, _| rect = s.views[0].rect);
+        let pill = |rt: &rune::Runtime<State>| rt.elements().into_iter().find(|e| e.key.as_deref() == Some("hover-pill")).map(|e| (e.rect, e.opacity));
+        rt.pointer_move(rect[0] + 60.0, rect[1] + lasso::HEADER_H + 5.5 * ROW_H);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        let (at, shown) = pill(&rt).expect("the hover highlight is there");
+        assert!((at[1] - (rect[1] + lasso::HEADER_H + 5.0 * ROW_H)).abs() < 1.0, "on row 5: {at:?} in {rect:?}");
+        assert!(shown > 0.99, "{shown}");
+        rt.pointer_leave();
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(pill(&rt).expect("still there").1 < 0.01);
+    }
+
+    /// List builds the columns in sight; scrolled sideways, the view builds the ones it reaches.
+    #[test]
+    fn list_builds_the_columns_it_scrolls_to() {
+        let mut s = init();
+        s.panes[0].set_entries(Ok(entries(0, 1999)));
+        s.panes[0].view_mode = model::ViewMode::List;
+        let mut rt = rune::Runtime::new(s, ui::view, (1600.0, 1000.0), rune::Env::new(false, 1.0));
+        for _ in 0..3 {
+            rt.frame(1.0 / 60.0);
+        }
+        let has = |rt: &rune::Runtime<State>, key: &str| rt.elements().iter().any(|e| e.key.as_deref() == Some(key));
+        assert!(has(&rt, "lcol-0") && !has(&rt, "lcol-40"));
+        rt.update(|_, tx| tx.scroll_to_instant(ui::list_key(0), 40.0 * 238.0, 0.0));
+        for i in 0..6 {
+            rt.update_if(|s, tx| poll(s, 1.0 + f64::from(i), tx));
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(has(&rt, "lcol-40") && !has(&rt, "lcol-0"));
+    }
+
+    /// What the pointer costs moving down a Details list with the hover animation on (the
+    /// default): one row further each frame, as a quick sweep crosses them. Run it with
+    /// `cargo test --release -p openexplorer -- --ignored --nocapture hover_sweep_cost`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn hover_sweep_cost() {
+        let mut s = init();
+        for p in 0..2 {
+            s.panes[p].set_entries(Ok(entries(0, 2000)));
+        }
+        let mut rt = rune::Runtime::new(s, ui::view, (1600.0, 1000.0), rune::Env::new(false, 1.0));
+        for _ in 0..3 {
+            rt.frame(1.0 / 60.0);
+        }
+        let mut rect = [0.0; 4];
+        rt.update(|s, _| rect = s.views[0].rect);
+        assert!(rect[3] > 200.0, "the list was laid out: {rect:?}");
+        let rows = ((rect[3] - lasso::HEADER_H) / ROW_H) as usize - 1;
+        let mut i = 0;
+        let (best, median) = bench_runs(300, || {
+            i += 1;
+            let y = rect[1] + lasso::HEADER_H + (i % rows) as f32 * ROW_H + ROW_H / 2.0;
+            rt.pointer_move(rect[0] + 60.0, y);
+            rt.frame(1.0 / 60.0);
+        });
+        println!("hover, one row a frame: {best:.0} µs best, {median:.0} µs median of 9 runs of 300");
     }
 
     /// Dropping items whose names the Drive folder already has asks first, one by one once

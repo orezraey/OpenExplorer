@@ -98,11 +98,52 @@ impl Flow {
 
 /// A pane's list viewport: its rect in window points (from `on_layout`), its scroll, and how
 /// the view last laid out its items.
-#[derive(Default)]
 pub struct Viewport {
     pub rect: [f32; 4],
     pub scroll: Rc<Cell<Scroll>>,
     pub flow: Cell<Flow>,
+    /// List's columns the view built, `start..end`: only those in sight (and one each side) are,
+    /// so a folder of thousands doesn't build thousands of rows on every view.
+    pub columns: Rc<Cell<(usize, usize)>>,
+    /// Scrolling sideways reached a column the view didn't build: `poll` runs the view again.
+    pub columns_stale: Rc<Cell<bool>>,
+    /// Details' hover highlight, where it is and how much it shows: moved without running the
+    /// view, the pointer crossing rows costs a frame and no more.
+    pub hover_rect: rune::Live<[f32; 4]>,
+    pub hover_alpha: rune::Live<f32>,
+}
+
+impl Default for Viewport {
+    fn default() -> Viewport {
+        Viewport {
+            rect: [0.0; 4],
+            scroll: Default::default(),
+            flow: Default::default(),
+            columns: Default::default(),
+            columns_stale: Default::default(),
+            hover_rect: rune::Live::new([0.0; 4]),
+            hover_alpha: rune::Live::new(0.0),
+        }
+    }
+}
+
+/// List's columns to build for a viewport `width` wide scrolled `x` across, columns `step`
+/// apart from `origin`: those in sight and `spare` more on each side, within `count`.
+pub fn column_window(x: f32, width: f32, origin: f32, step: f32, spare: usize, count: usize) -> (usize, usize) {
+    if width <= 0.0 {
+        // Before the first layout: the first screenful, as a wide window would show it.
+        return (0, count.min(12));
+    }
+    let first = ((x - origin) / step).floor().max(0.0) as usize;
+    let last = ((x + width - origin) / step).ceil().max(0.0) as usize;
+    (first.saturating_sub(spare).min(count), (last + spare).min(count))
+}
+
+/// Whether the columns built, `built`, still cover what a viewport `width` wide scrolled `x`
+/// across shows.
+pub fn columns_cover(built: (usize, usize), x: f32, width: f32, origin: f32, step: f32, count: usize) -> bool {
+    let (first, last) = column_window(x, width, origin, step, 0, count);
+    first >= built.0 && last <= built.1
 }
 
 /// A rectangle selection under way.
@@ -494,6 +535,24 @@ mod tests {
 
     /// In the icon views and in List the arrows follow the tiles and columns, and the
     /// keyboard's menu finds its item there, scrolling down or sideways to it.
+    /// List builds the columns in sight and two more on each side, and asks for the view again
+    /// only once scrolling shows one it didn't build.
+    #[test]
+    fn list_builds_the_columns_in_sight() {
+        let step = 238.0;
+        // 600 points wide at the start: columns 0 to 2 show (the third in part), 0..5 are built.
+        assert_eq!(column_window(0.0, 600.0, 4.0, step, 2, 100), (0, 5));
+        // Scrolled 10 columns across: 10 to 12 show, 8..15 are built.
+        assert_eq!(column_window(10.0 * step + 4.0, 600.0, 4.0, step, 2, 100), (8, 15));
+        // Scrolled to the end: never past the last column.
+        assert_eq!(column_window(98.0 * step + 4.0, 600.0, 4.0, step, 2, 100), (96, 100));
+        // Before the first layout: the first screenful.
+        assert_eq!(column_window(0.0, 0.0, 4.0, step, 2, 100), (0, 12));
+        // A column's worth of scrolling stays within what was built; three don't.
+        assert!(columns_cover((8, 15), 11.0 * step + 4.0, 600.0, 4.0, step, 100));
+        assert!(!columns_cover((8, 15), 13.0 * step + 4.0, 600.0, 4.0, step, 100));
+    }
+
     #[test]
     fn tiles_and_columns_step_and_open_the_menu_where_their_items_are() {
         assert_eq!(Flow::default().steps(), (1, 1));
