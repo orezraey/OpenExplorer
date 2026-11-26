@@ -212,7 +212,9 @@ fn read_folders(d: &Drive, list: &[(usize, usize, &str, &Path)], names: &Names) 
             true
         });
         match together {
-            Ok(()) => return list.iter().map(|(_, row, id, dir)| works_in(*row, dir, children.remove(*id).unwrap_or_default(), names)).collect(),
+            // Cloned, not taken: one folder may be here twice (a folder and a shortcut to it,
+            // both selected), and each of its rows gets its contents.
+            Ok(()) => return list.iter().map(|(_, row, id, dir)| works_in(*row, dir, children.get(*id).cloned().unwrap_or_default(), names)).collect(),
             Err(e) => openexplorer_gdrive::log(&format!("download: {} pastas numa listagem só não deu ({e}); uma a uma", list.len())),
         }
     }

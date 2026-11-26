@@ -501,11 +501,13 @@ impl Account {
     /// The items of the folder whose `children` address is `url`, each page given to `each` as
     /// it lands. Graph sends a folder 1,000 items a page, each page about a second and only
     /// after the one before (a page names the next), so a big folder is read from both ends at
-    /// once, by name up and by name down, and the reading ends when the two hold what the folder
-    /// holds: half the time. The way down starts at once when the folder is known to hold more
-    /// than a page (`kids`, 0 when unknown); else when its count of children, asked alongside
-    /// the first page (one item, quick), or the first page says so. A service that won't order
-    /// (`$orderby` refused) is read the plain way.
+    /// once, by name up and by name down, and the reading ends when the two meet (a page brings
+    /// an item the other way already gave): half the time. The way down starts at once when the
+    /// folder is known to hold more than a page (`kids`, 0 when unknown); else when its count of
+    /// children, asked alongside the first page (one item, quick), or the first page says so.
+    /// Only meeting ends it: a count kept from before misses what changed since, and stopping
+    /// at it left out items the middle pages held. A service that won't order (`$orderby`
+    /// refused) is read the plain way.
     fn children_each(&self, url: &str, kids: u32, what: &str, each: &mut dyn FnMut(&[Seen], bool) -> bool) -> Res<Option<Vec<Seen>>> {
         enum Got {
             Page(bool, Res<Value>),
@@ -561,10 +563,6 @@ impl Account {
                             down_started = true;
                             read(true, first("name%20desc"));
                         }
-                        // The pages already in hold it all.
-                        if kids > 0 && out.len() >= kids {
-                            break if each(&[], false) { Ok(Some(())) } else { Ok(None) };
-                        }
                         continue;
                     }
                     Got::Page(down, answer) => (down, answer),
@@ -594,10 +592,8 @@ impl Account {
                         met = true;
                     }
                 }
-                // Done when one way reached its end, or between them they hold what Graph said
-                // the folder holds (what arrives meanwhile comes with the change log), or, with
-                // no count to go by, the two met in the middle.
-                let done = !more || if kids > 0 { out.len() >= kids } else { met };
+                // Done when one way reached its end or the two met in the middle.
+                let done = !more || met;
                 if !each(&out[from..], !done) {
                     break Ok(None);
                 }
@@ -1387,6 +1383,26 @@ mod tests {
         let kept = a.list("/Meus arquivos/Fotos").unwrap();
         assert_eq!(kept.len(), 2500);
         assert!(kept.iter().all(|i| i.is_dir == (i.name == "f2499")));
+    }
+
+    /// A count of children kept from before (the folder grew since) doesn't end the reading:
+    /// only the two ends meeting does, so nothing in the middle is left out.
+    #[test]
+    fn a_count_from_before_doesnt_cut_a_big_folder_short() {
+        let fake = Fake::start();
+        let d = fake.with(|st| {
+            let d = st.add(ROOT, "Fotos", true, &[]);
+            for i in 0..2401 {
+                st.add(&d, &format!("f{i:04}.txt"), false, b"x");
+            }
+            d
+        });
+        let a = on(fake.ends(), Kind::Personal, None).unwrap();
+        let url = format!("/drives/{}/items/{}/children", segment(a.drive()), segment(&d));
+        // 2,000 kept from before: two pages hold that many.
+        let seen = a.children_each(&url, 2000, "test", &mut |_, _| true).unwrap().unwrap();
+        let names: HashSet<String> = seen.iter().filter_map(|s| s.name.clone()).collect();
+        assert_eq!((names.len(), seen.len()), (2401, 2401));
     }
 
     #[test]

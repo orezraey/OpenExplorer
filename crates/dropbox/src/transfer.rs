@@ -306,10 +306,13 @@ impl Account {
             return self.upload(path, &mut &file, len, progress);
         }
         let commit = json!({"path": api_path(path), "mode": "overwrite", "autorename": false, "mute": true, "strict_conflict": false});
+        // The hash stops when the request fails or is cancelled, so Cancelar doesn't wait for it.
+        let failed = std::sync::atomic::AtomicBool::new(false);
         let (sent, hash) = std::thread::scope(|scope| {
-            let hashing = scope.spawn(|| crate::content::of_file(local, &|| false));
+            let hashing = scope.spawn(|| crate::content::of_file(local, &|| failed.load(Ordering::Relaxed)));
             let mut told = |n: usize| progress(n as u64);
             let sent = self.api.upload("files/upload", &commit, &mut Body::File(&file, len, Some(&mut told)));
+            failed.store(sent.is_err(), Ordering::Relaxed);
             (sent, hashing.join())
         });
         let v = sent.map_err(|f| if matches!(&f, Fail::Other(e) if e == CANCELLED) { CANCELLED.to_string() } else { format!("“{}”: {}", last(&api_path(path)), f.text()) })?;
