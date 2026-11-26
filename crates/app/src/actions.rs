@@ -1269,7 +1269,7 @@ pub(crate) fn search_scope(loc: &Location) -> Option<(openexplorer_gdrive::searc
 }
 
 /// A search of the whole account, as its place reads: "“praia” em todo o Drive".
-fn all_of_drive() -> String {
+pub(crate) fn all_of_drive() -> String {
     t("todo o Drive", "all of Drive").into()
 }
 

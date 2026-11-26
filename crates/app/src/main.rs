@@ -1163,7 +1163,8 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             Msg::DragEnded { from, ids, ended } => drive_drag_ended(s, from, ids, ended),
             Msg::SharedDrives { email, names } => {
                 if s.accounts.iter().any(|a| a.email == email) {
-                    s.shared_drive_names.insert(email, names);
+                    s.shared_drive_names.insert(email.clone(), names);
+                    name_shared_drives(s, &email);
                 }
             }
             Msg::DriveSearchWarnings { pane, request, warnings } => {
@@ -1383,6 +1384,50 @@ pub(crate) fn make_drive_origin(email: &str, f: &DriveFile, sd_names: &HashMap<S
         shared_drive,
         owned_by_me: f.owned_by_me.unwrap_or(false),
         label,
+    }
+}
+
+/// Lists `email`'s shared drives on a thread of their own and sends their names
+/// ([`Msg::SharedDrives`]), so a search's results don't wait for them: they show "Drive
+/// compartilhado" until the names come, then take them ([`name_shared_drives`]).
+fn learn_shared_drives(drive: &Arc<Drive>, email: &str, out: &Sender<Msg>, wake: &Option<Waker>) {
+    let (drive, email, out, wake) = (drive.clone(), email.to_string(), out.clone(), wake.clone());
+    std::thread::spawn(move || {
+        if let Ok(list) = drive.shared_drives() {
+            let names = list.into_iter().map(|d| (d.id, d.name)).collect();
+            let _ = out.send(Msg::SharedDrives { email, names });
+            if let Some(w) = wake {
+                w();
+            }
+        }
+    });
+}
+
+/// The results of Drive searches on screen take `email`'s shared drives' names, now known.
+fn name_shared_drives(s: &mut State, email: &str) {
+    let Some(names) = s.shared_drive_names.get(email) else { return };
+    for pane in &mut s.panes {
+        if !pane.loc.is_drive_search() {
+            continue;
+        }
+        let every_account = matches!(pane.loc, Location::DriveSearch(_));
+        let mut renamed = false;
+        for e in &mut pane.entries {
+            let Some(o) = e.drive_origin.as_deref_mut() else { continue };
+            let Some((id, name)) = o.shared_drive.as_mut() else { continue };
+            let Some(real) = names.get(id.as_str()) else { continue };
+            if o.email != email || name == real {
+                continue;
+            }
+            name.clone_from(real);
+            let place = model::shown(real);
+            o.label = if every_account { format!("{email} · {place}") } else { place };
+            renamed = true;
+        }
+        if renamed {
+            pane.sort_entries();
+            pane.version += 1;
+        }
     }
 }
 
@@ -1717,19 +1762,19 @@ fn list(s: &mut State, p: usize, fresh: bool) {
                                 return;
                             }
                         };
-                        let sd_names = match cached_sd {
-                            Some(map) => map,
-                            None => match drive.shared_drives() {
-                                Ok(list) => {
-                                    let map: HashMap<String, String> = list.into_iter().map(|d| (d.id, d.name)).collect();
-                                    emit(Msg::SharedDrives { email: email.clone(), names: map.clone() });
-                                    map
-                                }
-                                Err(_) => HashMap::new(),
-                            },
-                        };
+                        // The shared drives' names come alongside, not ahead of the search;
+                        // asked again once a result names a drive not known yet.
+                        let mut asked = cached_sd.is_none();
+                        if asked {
+                            learn_shared_drives(&drive, &email, &out, &wake);
+                        }
+                        let sd_names = cached_sd.unwrap_or_default();
                         let res = catch_panic(t("pesquisar", "search"), || {
                             drive.search_with_workers(text, &openexplorer_gdrive::search::Within::Everything, per_account_workers, |files, _more| {
+                                if !asked && files.iter().any(|f| f.drive_id.as_ref().is_some_and(|id| !sd_names.contains_key(id))) {
+                                    asked = true;
+                                    learn_shared_drives(&drive, &email, &out, &wake);
+                                }
                                 let entries: Vec<Entry> = {
                                     let mut guard = seen.lock().unwrap();
                                     files
@@ -1847,6 +1892,7 @@ fn list(s: &mut State, p: usize, fresh: bool) {
     }
     let account = AccountRef::of(s, &email);
     let cached_sd = s.shared_drive_names.get(&email).cloned();
+    let (names_out, names_wake) = (s.outbox.clone(), s.waker.clone());
     let key = cache::key(&s.panes[p].loc);
     // A folder seen this session shows at once; the fresh listing then replaces it whole.
     let in_memory = key.as_ref().and_then(|k| s.cache.get(k)).cloned();
@@ -1926,19 +1972,19 @@ fn list(s: &mut State, p: usize, fresh: bool) {
             // folder, in whichever drive it sits.
             (Space::SharedWithMe | Space::Starred | Space::Recent | Space::Search(_), Some(f)) => drive.list(f, None, &mut page),
             (Space::Search(q), None) => {
-                let sd_names = match cached_sd {
-                    Some(map) => map,
-                    None => match drive.shared_drives() {
-                        Ok(list) => {
-                            let map: HashMap<String, String> = list.into_iter().map(|d| (d.id, d.name)).collect();
-                            emit(Msg::SharedDrives { email: email.clone(), names: map.clone() });
-                            map
-                        }
-                        Err(_) => HashMap::new(),
-                    },
-                };
+                // The shared drives' names come alongside, not ahead of the search; asked again
+                // once a result names a drive not known yet.
+                let mut asked = cached_sd.is_none();
+                if asked {
+                    learn_shared_drives(&drive, &email, &names_out, &names_wake);
+                }
+                let sd_names = cached_sd.unwrap_or_default();
                 let mut first_search = true;
                 let mut search_page = |files: Vec<DriveFile>, more: bool| {
+                    if !asked && files.iter().any(|f| f.drive_id.as_ref().is_some_and(|id| !sd_names.contains_key(id))) {
+                        asked = true;
+                        learn_shared_drives(&drive, &email, &names_out, &names_wake);
+                    }
                     let entries: Vec<Entry> = files.into_iter().map(|f| entry_of_search(&email, f, &sd_names, false)).collect();
                     emit(Msg::Listed { pane: p, request, part: Part::Page { first: first_search, more }, result: Ok(entries), at: None });
                     first_search = false;
@@ -2082,16 +2128,14 @@ pub(crate) fn folder_in(at: &Location, e: &Entry) -> Location {
         Location::Mock(segs) => segs.push(e.name.clone()),
         Location::Drive { space: space @ Space::SharedDrives, .. } => *space = Space::Shared { id: e.id.clone(), name: e.name.clone() },
         Location::Drive { path, .. } => path.push((e.target.clone().unwrap_or_else(|| e.id.clone()), e.name.clone())),
-        Location::DriveSearch(_) => {
+        // A folder found in every account opens as one found in its own account does: under
+        // that account's search for the same words, so the address says where it came from and
+        // Up goes back to the results (its real parents aren't known from the search).
+        Location::DriveSearch(q) => {
             if let Some(o) = e.drive_origin.as_deref() {
                 let target_id = e.target.clone().unwrap_or_else(|| e.id.clone());
-                if let Some((sd_id, sd_name)) = &o.shared_drive {
-                    let path = if target_id == *sd_id { Vec::new() } else { vec![(target_id, e.name.clone())] };
-                    loc = Location::Drive { email: o.email.clone(), space: Space::Shared { id: sd_id.clone(), name: sd_name.clone() }, path };
-                } else {
-                    let space = if o.owned_by_me { Space::MyDrive } else { Space::SharedWithMe };
-                    loc = Location::Drive { email: o.email.clone(), space, path: vec![(target_id, e.name.clone())] };
-                }
+                let search = model::Search { text: q.text.clone(), within: openexplorer_gdrive::search::Within::Everything, place: actions::all_of_drive() };
+                loc = Location::Drive { email: o.email.clone(), space: Space::Search(Box::new(search)), path: vec![(target_id, e.name.clone())] };
             }
         }
         // A folder found opens where it is.
@@ -4135,6 +4179,10 @@ mod tests {
         assert_eq!(s.menu, Some((1, rune::PointerPress { x: 424.0, y: top + 3.0 * ROW_H })));
     }
 
+    fn f_my_template() -> DriveFile {
+        DriveFile { id: "f2".into(), name: "Filme.mkv".into(), is_dir: false, size: Some(1), modified: None, mime: "video/x-matroska".into(), target: None, starred: false, md5: None, drive_id: None, owned_by_me: Some(true) }
+    }
+
     #[test]
     fn drive_origin_and_folder_in_for_global_drive_search() {
         let sd = HashMap::from([("0AA".into(), "Séries／HD".into())]);
@@ -4161,47 +4209,33 @@ mod tests {
         let f_swm = DriveFile { drive_id: None, owned_by_me: Some(false), ..f_sd.clone() };
         assert_eq!(make_drive_origin("a@b", &f_swm, &sd, true).label, "a@b · Compartilhados comigo");
 
+        // A folder found in every account opens under that account's search for the same words,
+        // wherever it sits (a shared drive, My Drive, shared with the account).
         let global = Location::DriveSearch(Box::new(model::DriveSearch { text: "lost".into() }));
-        let entry_sd = entry_of_search("a@b", f_sd, &sd, true);
-        assert_eq!(
-            folder_in(&global, &entry_sd),
-            Location::Drive {
-                email: "a@b".into(),
-                space: Space::Shared { id: "0AA".into(), name: "Séries／HD".into() },
-                path: vec![("f1".into(), "Lost".into())],
-            }
-        );
-        let entry_sd_root = entry_of_search(
-            "a@b",
-            DriveFile { id: "0AA".into(), name: "Séries／HD".into(), drive_id: Some("0AA".into()), ..f_my.clone() },
-            &sd,
-            true,
-        );
-        assert_eq!(
-            folder_in(&global, &entry_sd_root),
-            Location::Drive {
-                email: "a@b".into(),
-                space: Space::Shared { id: "0AA".into(), name: "Séries／HD".into() },
-                path: Vec::new(),
-            }
-        );
-        let entry_my = entry_of_search("a@b", f_my, &sd, true);
-        assert_eq!(
-            folder_in(&global, &entry_my),
-            Location::Drive {
-                email: "a@b".into(),
-                space: Space::MyDrive,
-                path: vec![("f1".into(), "Lost".into())],
-            }
-        );
-        let entry_swm = entry_of_search("a@b", f_swm, &sd, true);
-        assert_eq!(
-            folder_in(&global, &entry_swm),
-            Location::Drive {
-                email: "a@b".into(),
-                space: Space::SharedWithMe,
-                path: vec![("f1".into(), "Lost".into())],
-            }
-        );
+        let under_search = |email: &str, id: &str, name: &str| Location::Drive {
+            email: email.into(),
+            space: Space::Search(Box::new(model::Search { text: "lost".into(), within: openexplorer_gdrive::search::Within::Everything, place: actions::all_of_drive() })),
+            path: vec![(id.into(), name.into())],
+        };
+        assert_eq!(folder_in(&global, &entry_of_search("a@b", f_sd, &sd, true)), under_search("a@b", "f1", "Lost"));
+        assert_eq!(folder_in(&global, &entry_of_search("c@d", f_my, &sd, true)), under_search("c@d", "f1", "Lost"));
+        assert_eq!(folder_in(&global, &entry_of_search("a@b", f_swm, &sd, true)), under_search("a@b", "f1", "Lost"));
+        // Up from it goes back to that account's results.
+        let mut opened = under_search("a@b", "f1", "Lost");
+        if let Location::Drive { path, .. } = &mut opened {
+            path.pop();
+        }
+        assert!(opened.is_drive_search());
+
+        // A shared drive's name not known when the results came is taken once it arrives.
+        let mut s = init();
+        s.accounts.push(openexplorer_gdrive::store::StoredAccount { email: "a@b".into(), name: "A".into(), client_id: String::new() });
+        let unknown = DriveFile { drive_id: Some("0BB".into()), owned_by_me: Some(false), ..f_my_template() };
+        s.panes[1].go(global.clone());
+        s.panes[1].set_entries(Ok(vec![entry_of_search("a@b", unknown, &HashMap::new(), true)]));
+        assert_eq!(s.panes[1].entries[0].drive_origin.as_ref().unwrap().label, "a@b · Drive compartilhado");
+        s.shared_drive_names.insert("a@b".into(), HashMap::from([("0BB".into(), "Filmes".into())]));
+        name_shared_drives(&mut s, "a@b");
+        assert_eq!(s.panes[1].entries[0].drive_origin.as_ref().unwrap().label, "a@b · Filmes");
     }
 }
