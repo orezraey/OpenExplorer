@@ -163,6 +163,8 @@ $Rest = 'C:\Windows\Web'
 # the arrow until every file is on disk whole and no program still writes it.
 $Downloads = [ordered]@{
     'download-large'        = @{ Drive = "$Gd/transfer/large"; Files = 1; Dirs = 0; Bytes = 524288000 }
+    # Long enough (about 20 s at 1 Gbit/s) that the line's ups and downs average out.
+    'download-huge'         = @{ Drive = "$Gd/transfer/huge"; Files = 1; Dirs = 0; Bytes = 2147483648 }
     # Air Explorer makes about one local folder every 2 s here, so 100 rather than 1,000.
     'download-100-folders'  = @{ Drive = "$Gd/100 folders"; Files = 0; Dirs = 100; Bytes = 0 }
 }

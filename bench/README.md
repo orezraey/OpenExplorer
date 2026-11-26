@@ -16,6 +16,7 @@ Each measurement runs once untimed, then `-Runs` times (5 by default); the media
 | `<cloud>-1000-folders`, `<cloud>-5000-files` | Enter in the cloud pane's address bar, after `Open Explorer benchmark/1000 folders` (or `5000 files`), a folder the app opened before in this session | the pane shows every item |
 | `<cloud>-1000-folders-uncached`, `<cloud>-5000-files-uncached` | a double click on the folder in `Open Explorer benchmark`, right after the app started with no listing kept from before | the pane shows every item |
 | `download-large` | the arrow between the panes that copies the Drive pane's selection (all of `transfer/large`: one 500 MiB file) into the other pane's empty local folder | the file is on disk whole and no program still writes it |
+| `download-huge` | the same, for `transfer/huge` (one 2 GiB file), long enough that the line's ups and downs average out | the same |
 | `download-100-folders` | the same, for `100 folders` (100 empty folders) | all 100 folders are on disk |
 | `upload-large`, `upload-100-files` | the arrow that copies the left pane's selection (all of `C:\OEBench\up\large`, one file of 100 MiB, or `up\small`, 100 of 512 KiB, made once with random bytes) into an empty Drive folder under `Open Explorer benchmark/uploads` | Drive holds every file (asked every 200 ms by the `upload_target` example; Drive shows a file only once its upload finished) |
 | `memory` | 10 s idle after a start, then after opening the Drive folder | private bytes and working set of the app's processes |
@@ -38,7 +39,7 @@ shows what it kept without checking.
    right one (each of its tabs belongs to one account); the script brings each forward.
 3. Make the test data, once per cloud (run again, each adds only what's missing):
    - Google Drive: `cargo run -p openexplorer-gdrive --release --example bench_data -- <e-mail>`
-     (it needs about 600 MB free in the account). In an account with no room left, `--shortcuts`
+     (it needs about 2.8 GB free in the account; `--huge` makes only the 2 GiB file, skipped without room for it). In an account with no room left, `--shortcuts`
      fills `5000 files` with shortcuts, which take no storage, and moves a leftover
      `openexplorer-speed-500.bin` into `transfer/large`.
    - OneDrive: `cargo run -p openexplorer-onedrive --release --example onedrive_bench -- <drive id>`

@@ -4,6 +4,8 @@
 //! - `5000 files`: 5,000 files of 1 KB, for listing a big folder.
 //! - `1000 folders`: 1,000 empty folders, for listing a folder of folders.
 //! - `transfer/large/large.bin`: one file of 500 MiB, for a big download.
+//! - `transfer/huge/huge.bin`: one file of 2 GiB, for a download long enough that the line's
+//!   ups and downs average out; skipped while the account has no room for it.
 //! - `transfer/small`: 200 files of 512 KiB (100 MiB), for many downloads.
 //!
 //! Run again, it adds only what's missing, so a run cut short picks up where it stopped. Drive
@@ -19,7 +21,9 @@
 //! at the top (left by the upload_speed example) moves into `transfer/large`, which takes no
 //! room either.
 //!
-//! `cargo run -p openexplorer-gdrive --release --example bench_data -- [e-mail] [--shortcuts]`
+//! With `--huge`, only `transfer/huge`.
+//!
+//! `cargo run -p openexplorer-gdrive --release --example bench_data -- [e-mail] [--shortcuts|--huge]`
 //! (without an e-mail, the first connected account)
 
 use std::collections::HashSet;
@@ -51,6 +55,11 @@ fn main() {
     let files = folder(&drive, &root, "5000 files");
     let folders = folder(&drive, &root, "1000 folders");
     let transfer = folder(&drive, &root, "transfer");
+    if std::env::args().any(|a| a == "--huge") {
+        huge(&drive, &transfer);
+        println!("done in {:.0} s", started.elapsed().as_secs_f64());
+        return;
+    }
     let small = folder(&drive, &transfer, "small");
 
     let names: Vec<String> = (1..=5000).map(|i| format!("file {i:04}.txt")).collect();
@@ -98,7 +107,23 @@ fn main() {
     let large = local_file("bench-500m.bin", 500 << 20);
     fill(&drive, &large_dir, &["large.bin".to_string()], |name| Job::Upload(large.clone(), name));
 
+    huge(&drive, &transfer);
+
     println!("done in {:.0} s", started.elapsed().as_secs_f64());
+}
+
+/// `transfer/huge/huge.bin`, when it isn't there and the account has room for it.
+fn huge(drive: &Drive, transfer: &str) {
+    let huge_dir = folder(drive, transfer, "huge");
+    if children(drive, &huge_dir).iter().all(|f| f.name != "huge.bin") {
+        let free = drive.quota().expect("the account's storage").free();
+        if free.is_some_and(|n| n < (2 << 30) + (100 << 20)) {
+            println!("transfer/huge: the account has {} MB free, not enough for 2 GiB", free.unwrap_or(0) >> 20);
+        } else {
+            let huge = local_file("bench-2g.bin", 2 << 30);
+            fill(drive, &huge_dir, &["huge.bin".to_string()], |name| Job::Upload(huge.clone(), name));
+        }
+    }
 }
 
 enum Job {
