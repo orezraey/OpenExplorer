@@ -13,7 +13,7 @@ use rune::{TextEdit, Tx};
 
 use crate::accounts;
 use crate::address::{self, Reached, Target};
-use crate::model::{DriveSearch, Entry, Location, Space, shown, typed};
+use crate::model::{DriveSearch, DriveSearchScope, Entry, Location, Space, shown, typed};
 use crate::transfers::{self, End, Op};
 use crate::undo::{self, Step};
 use crate::uploads::{Clash, Existing, Item, Put};
@@ -1135,8 +1135,8 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
 }
 
 /// Pesquisar: the words in pane `p`'s search field, where the pane is: a folder with what's
-/// under it, a whole shared drive, My Drive; from Drive's views, everything. A search from a
-/// search's results looks where that one did.
+/// under it, a whole shared drive, My Drive; from Drive's views, everything; or the explicit
+/// scope chosen in `s.search_scope[p]`.
 pub fn search(s: &mut State, p: usize) {
     let words = s.search[p].text.clone();
     s.history.add_search(&words);
@@ -1146,14 +1146,27 @@ pub fn search(s: &mut State, p: usize) {
     if let Location::Server { .. } = s.panes[p].loc {
         return search_server(s, p);
     }
-    if let Location::DriveSearch(_) = &s.panes[p].loc {
-        let text = words.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !text.is_empty() {
-            crate::navigate(s, p, Location::DriveSearch(Box::new(DriveSearch { text })));
-        }
+    let text = words.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
         return;
     }
-    if let Some(to) = search_from(&s.panes[p].loc, &s.search[p].text) {
+    let to = match (&s.panes[p].loc, s.search_scope[p]) {
+        (Location::Drive { .. } | Location::DriveSearch(_), DriveSearchScope::AllAccounts) if s.accounts.len() >= 2 => {
+            Some(Location::DriveSearch(Box::new(DriveSearch { text })))
+        }
+        (Location::Drive { email, .. }, DriveSearchScope::Account) => Some(Location::Drive {
+            email: email.clone(),
+            space: Space::Search(Box::new(crate::model::Search {
+                text,
+                within: openexplorer_gdrive::search::Within::Everything,
+                place: all_of_drive(),
+            })),
+            path: Vec::new(),
+        }),
+        (Location::DriveSearch(_), _) => Some(Location::DriveSearch(Box::new(DriveSearch { text }))),
+        (loc, _) => search_from(loc, &text),
+    };
+    if let Some(to) = to {
         crate::navigate(s, p, to);
     }
 }
@@ -1267,8 +1280,96 @@ pub fn search_everywhere(s: &mut State, p: usize) {
         return crate::switch(s, p, to);
     }
     let Location::Drive { email, space: Space::Search(q), .. } = s.panes[p].loc.clone() else { return };
+    s.search_scope[p] = DriveSearchScope::Account;
     let q = crate::model::Search { within: openexplorer_gdrive::search::Within::Everything, place: all_of_drive(), ..*q };
     crate::navigate(s, p, Location::Drive { email, space: Space::Search(Box::new(q)), path: Vec::new() });
+}
+
+/// Searches the current query across every connected Google Drive account.
+pub fn search_all_accounts(s: &mut State, p: usize) {
+    if s.accounts.len() < 2 {
+        return;
+    }
+    let typed = s.search[p].text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = if !typed.is_empty() {
+        typed
+    } else if let Location::Drive { space: Space::Search(q), path, .. } = &s.panes[p].loc
+        && path.is_empty()
+    {
+        q.text.clone()
+    } else {
+        return;
+    };
+    s.search_scope[p] = DriveSearchScope::AllAccounts;
+    crate::navigate(s, p, Location::DriveSearch(Box::new(DriveSearch { text })));
+}
+
+/// Picks a Drive search scope in pane `p`'s dropdown; re-runs active search or focuses input.
+pub fn set_search_scope(s: &mut State, p: usize, scope: DriveSearchScope, tx: &mut Tx) {
+    s.search_scope_menu = None;
+    let scope = if scope == DriveSearchScope::AllAccounts && s.accounts.len() < 2 {
+        DriveSearchScope::Account
+    } else {
+        scope
+    };
+    s.search_scope[p] = scope;
+    let typed = s.search[p].text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let active_query = match &s.panes[p].loc {
+        Location::Drive { space: Space::Search(q), path, .. } if path.is_empty() => Some(q.text.clone()),
+        Location::DriveSearch(q) => Some(q.text.clone()),
+        _ => None,
+    };
+    if let Some(q_text) = active_query {
+        let text = if !typed.is_empty() { typed } else { q_text };
+        if !text.is_empty() {
+            if s.search[p].text.trim().is_empty() {
+                s.search[p] = TextEdit::new(text.clone());
+            }
+            if matches!(s.panes[p].loc, Location::Drive { .. }) {
+                search(s, p);
+                return;
+            }
+        }
+    } else if !typed.is_empty() {
+        search(s, p);
+        return;
+    }
+    tx.focus(crate::ui::search_key(p), false);
+}
+
+/// Narrows a multi-account search directly to `email`'s entire Google Drive account.
+pub fn search_in_account(s: &mut State, p: usize, email: String, tx: &mut Tx) {
+    s.search_scope_menu = None;
+    s.search_scope[p] = DriveSearchScope::Account;
+    let typed = s.search[p].text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = if !typed.is_empty() {
+        typed
+    } else if let Location::DriveSearch(q) = &s.panes[p].loc {
+        q.text.clone()
+    } else if let Location::Drive { space: Space::Search(q), path, .. } = &s.panes[p].loc
+        && path.is_empty()
+    {
+        q.text.clone()
+    } else {
+        String::new()
+    };
+    if text.is_empty() {
+        tx.focus(crate::ui::search_key(p), false);
+        return;
+    }
+    crate::navigate(
+        s,
+        p,
+        Location::Drive {
+            email,
+            space: Space::Search(Box::new(crate::model::Search {
+                text,
+                within: openexplorer_gdrive::search::Within::Everything,
+                place: all_of_drive(),
+            })),
+            path: Vec::new(),
+        },
+    );
 }
 
 /// Cancelar on a row of the queue.
@@ -2381,5 +2482,100 @@ sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa 
         assert!(a.join("nota.txt").exists(), "a copy leaves the original");
         assert!(matches!(&s.clip, Some(Clip { mode: ClipMode::Cut, .. })), "what Recortar picked up stays");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_scopes_and_multi_account_search_operations() {
+        use crate::model::{DriveOrigin, DriveSearch, DriveSearchScope};
+        use openexplorer_gdrive::search::Within;
+        use openexplorer_gdrive::store::StoredAccount;
+
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        s.accounts = vec![
+            StoredAccount { email: "a@b".into(), name: "A".into(), client_id: String::new() },
+            StoredAccount { email: "c@d".into(), name: "C".into(), client_id: String::new() },
+        ];
+        s.panes[0].go(drive(Space::MyDrive, &[("f1")]));
+        s.search[0] = TextEdit::new("serie");
+
+        // Default scope searches only within current folder.
+        search(&mut s, 0);
+        assert!(matches!(
+            &s.panes[0].loc,
+            Location::Drive { email, space: Space::Search(q), path }
+                if email == "a@b" && path.is_empty() && q.text == "serie" && matches!(&q.within, Within::Folder { id, .. } if id == "f1")
+        ));
+
+        // Switching scope to Account searches whole current account (`Within::Everything`).
+        set_search_scope(&mut s, 0, DriveSearchScope::Account, &mut Tx::default());
+        assert!(matches!(
+            &s.panes[0].loc,
+            Location::Drive { email, space: Space::Search(q), path }
+                if email == "a@b" && path.is_empty() && q.text == "serie" && q.within == Within::Everything
+        ));
+
+        // Switching scope to AllAccounts navigates to Location::DriveSearch.
+        set_search_scope(&mut s, 0, DriveSearchScope::AllAccounts, &mut Tx::default());
+        assert_eq!(s.panes[0].loc, Location::DriveSearch(Box::new(DriveSearch { text: "serie".into() })));
+        assert!(!editable(&s.panes[0].loc));
+        assert!(items_editable(&s.panes[0].loc));
+        assert!(shows_results(&s.panes[0].loc));
+
+        // Narrowing from AllAccounts to one account switches to that account's general search.
+        search_in_account(&mut s, 0, "c@d".into(), &mut Tx::default());
+        assert!(matches!(
+            &s.panes[0].loc,
+            Location::Drive { email, space: Space::Search(q), .. }
+                if email == "c@d" && q.text == "serie" && q.within == Within::Everything
+        ));
+
+        // Multi-account item origin, account grouping, and paste compatibility.
+        let global = Location::DriveSearch(Box::new(DriveSearch { text: "serie".into() }));
+        let item_a = Entry {
+            id: "id1".into(),
+            name: "ep1.mkv".into(),
+            is_dir: false,
+            size: Some(10),
+            modified: None,
+            target: None,
+            mime: None,
+            md5: None,
+            starred: false,
+            drive_origin: Some(Box::new(DriveOrigin {
+                email: "a@b".into(),
+                shared_drive: Some(("0AA".into(), "Séries".into())),
+                owned_by_me: false,
+                label: "a@b · Séries".into(),
+            })),
+        };
+        let item_c = Entry {
+            id: "id2".into(),
+            name: "ep2.mkv".into(),
+            is_dir: false,
+            size: Some(10),
+            modified: None,
+            target: None,
+            mime: None,
+            md5: None,
+            starred: false,
+            drive_origin: Some(Box::new(DriveOrigin {
+                email: "c@d".into(),
+                shared_drive: None,
+                owned_by_me: true,
+                label: "c@d · Meu Drive".into(),
+            })),
+        };
+        assert_eq!(item_account(&global, &item_a), Some("a@b"));
+        assert_eq!(item_account(&global, &item_c), Some("c@d"));
+        let groups = group_by_account(&global, vec![item_a.clone(), item_c.clone()]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "a@b");
+        assert_eq!(groups[1].0, "c@d");
+
+        let clip_a = Clip { mode: ClipMode::Copy, from: global.clone(), items: vec![item_a], picked_at: 0.0 };
+        assert!(clip_fits(&clip_a, &Location::Local("C:\\".into())));
+        assert!(clip_fits(&clip_a, &Location::drive("a@b", Space::MyDrive)));
+        assert!(!clip_fits(&clip_a, &Location::drive("c@d", Space::MyDrive)));
     }
 }

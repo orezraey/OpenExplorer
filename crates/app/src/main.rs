@@ -158,6 +158,10 @@ struct State {
     view_menu_open: bool,
     /// Which pane's view-mode dropdown menu is currently open, if any.
     view_mode_menu: Option<usize>,
+    /// Which pane's Drive search scope dropdown is currently open, if any.
+    search_scope_menu: Option<usize>,
+    /// Selected Drive search scope per pane.
+    search_scope: [model::DriveSearchScope; MAX_PANES],
     /// Partial account errors for a multi-account Drive search, per pane.
     drive_search_warnings: [Vec<(String, String)>; MAX_PANES],
     /// Cached shared drive `id -> name` per connected Google Drive account.
@@ -380,6 +384,8 @@ impl State {
             main_tab: MainTab::Explore,
             view_menu_open: false,
             view_mode_menu: None,
+            search_scope_menu: None,
+            search_scope: [model::DriveSearchScope::Here; MAX_PANES],
             drive_search_warnings: Default::default(),
             shared_drive_names: HashMap::new(),
             grid_cols: [1; MAX_PANES],
@@ -609,6 +615,8 @@ fn init() -> State {
         main_tab: MainTab::Explore,
         view_menu_open: false,
         view_mode_menu: None,
+        search_scope_menu: None,
+        search_scope: [model::DriveSearchScope::Here; MAX_PANES],
         drive_search_warnings: Default::default(),
         shared_drive_names: HashMap::new(),
         grid_cols: [1; MAX_PANES],
@@ -1553,6 +1561,7 @@ pub(crate) fn set_main_tab(s: &mut State, tab: MainTab) {
     s.main_tab = tab;
     s.view_menu_open = false;
     s.view_mode_menu = None;
+    s.search_scope_menu = None;
     if tab == MainTab::Accounts {
         ensure_all_quotas(s);
     }
@@ -1565,6 +1574,7 @@ pub(crate) fn set_pane_layout(s: &mut State, layout: settings::PaneLayout) {
     s.settings.save();
     s.view_menu_open = false;
     s.view_mode_menu = None;
+    s.search_scope_menu = None;
     s.menu = None;
     s.tree_menu = None;
     s.address_menu = None;
@@ -1969,6 +1979,18 @@ fn list(s: &mut State, p: usize, fresh: bool) {
 
 fn switch(s: &mut State, p: usize, loc: Location) {
     s.active = p;
+    s.search_scope_menu = None;
+    s.search_scope[p] = match &loc {
+        Location::DriveSearch(_) => model::DriveSearchScope::AllAccounts,
+        Location::Drive { space: Space::Search(q), path, .. } if path.is_empty() => {
+            if q.within == openexplorer_gdrive::search::Within::Everything {
+                model::DriveSearchScope::Account
+            } else {
+                model::DriveSearchScope::Here
+            }
+        }
+        _ => model::DriveSearchScope::Here,
+    };
     if s.renaming.as_ref().is_some_and(|(rp, _)| *rp == p) {
         s.renaming = None;
     }

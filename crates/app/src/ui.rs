@@ -100,9 +100,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT },
         )
         .on_key(|s: &mut State, ev: &KeyEvent, _: &mut Tx| {
-            if ev.key == rune::Key::Escape && (s.view_menu_open || s.view_mode_menu.is_some()) {
+            if ev.key == rune::Key::Escape && (s.view_menu_open || s.view_mode_menu.is_some() || s.search_scope_menu.is_some()) {
                 s.view_menu_open = false;
                 s.view_mode_menu = None;
+                s.search_scope_menu = None;
                 return true;
             }
             if ev.key == rune::Key::Function(5) {
@@ -3825,6 +3826,7 @@ fn toolbar(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             s.tree_menu = None;
             s.address_menu = None;
             s.view_mode_menu = None;
+            s.search_scope_menu = None;
             s.view_menu_open = next;
         })
         .child(icon(&icons::VIEW_MONITOR, 16.0).color(k.c.text_base))
@@ -5388,7 +5390,7 @@ fn pane(s: &State, k: &Kit, p: usize, backdrop: bool, layer: &mut Vec<El>) -> El
             .on_drop_move(move |s: &mut State, at: rune::PointerEvent, tx: &mut Tx| {
                 crate::autoscroll::moved(&mut s.autoscroll, p, (at.window_x, at.window_y), tx.clock(), tx)
             })
-            .child(solid(navbar(s, k, p)))
+            .child(solid(navbar(s, k, p, layer)))
             .child(solid(pane_actions(s, k, p, layer)))
             .child(solid(search_bar(s, k, p)))
             .child({
@@ -5471,6 +5473,7 @@ fn pane_actions(s: &State, k: &Kit, p: usize, layer: &mut Vec<El>) -> El {
             s.menu = None;
             s.tree_menu = None;
             s.address_menu = None;
+            s.search_scope_menu = None;
             s.view_mode_menu = next;
         })
         .child(icon(&icons::CHEVRON_DOWN, 10.0).color(k.c.icon_muted));
@@ -5687,7 +5690,7 @@ pub(crate) fn address_key(p: usize) -> String {
     format!("address-input-{p}")
 }
 
-fn navbar(s: &State, k: &Kit, p: usize) -> El {
+fn navbar(s: &State, k: &Kit, p: usize, layer: &mut Vec<El>) -> El {
     let pane = &s.panes[p];
     row()
         .key("nav")
@@ -5701,30 +5704,86 @@ fn navbar(s: &State, k: &Kit, p: usize) -> El {
         .child(nav_button(k, "forward", &icons::FORWARD, t("Avançar (Alt+→)", "Forward (Alt+→)"), !pane.forward.is_empty(), move |s: &mut State| go_forward(s, p)))
         .child(nav_button(k, "up", &icons::UP, t("Acima (Backspace)", "Up (Backspace)"), can_go_up(&pane.loc), move |s: &mut State| go_up(s, p)))
         .child(path_bar(s, k, p).mx(4.0))
-        .child(search_box(s, k, p))
+        .child(search_box(s, k, p, layer))
         .child(nav_button(k, "reload", &icons::REFRESH, t("Atualizar (Ctrl+R)", "Refresh (Ctrl+R)"), true, move |s: &mut State| refresh(s, p)))
 }
 
-/// The search field of a Drive pane: Enter searches where the pane is (see
-/// [`actions::search`]), Esc empties it; Ctrl+F reaches it from the list. Nothing for the
-/// computer's panes yet.
-fn search_box(s: &State, k: &Kit, p: usize) -> El {
+fn scope_menu_item(
+    k: &Kit,
+    key: String,
+    glyph: &'static Icon,
+    label: String,
+    sub: Option<String>,
+    selected: bool,
+    on_pick: impl Fn(&mut State, &mut Tx) + 'static,
+) -> El {
+    let mut text_col = col().grow(1.0).min_w(0.0).child(
+        text(label.clone())
+            .font(if selected { k.ty.text_small_medium } else { k.ty.text_small })
+            .color(k.c.text_base)
+            .truncate()
+            .shrink()
+            .min_w(0.0),
+    );
+    if let Some(sub) = sub {
+        text_col = text_col.child(text(sub).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0));
+    }
+    row()
+        .key(key)
+        .role("menuitem")
+        .label(label)
+        .checked(selected)
+        .w_full()
+        .px(10.0)
+        .py(6.0)
+        .gap(8.0)
+        .center_y()
+        .radius(k.radius.sm)
+        .fill(if selected { k.alpha(k.c.text_accent, if k.dark { 0.20 } else { 0.10 }) } else { Color::TRANSPARENT })
+        .hover(k.c.hover)
+        .cursor(Cursor::Pointer)
+        .on_press_tx(on_pick)
+        .child(icon(glyph, 15.0).color(if selected { k.c.text_accent } else { k.c.icon_muted }))
+        .child(text_col)
+}
+
+/// The search field of a pane: Enter searches where the pane is (or the chosen Google Drive
+/// scope), Esc empties it; Ctrl+F reaches it from the list.
+fn search_box(s: &State, k: &Kit, p: usize, layer: &mut Vec<El>) -> El {
+    use crate::model::DriveSearchScope;
+    use openexplorer_gdrive::search::Within;
     let loc = &s.panes[p].loc;
-    let place = match loc {
-        Location::Local(dir) => crate::finder::place_of(dir),
-        Location::Found(f) => f.place.clone(),
-        Location::Server { server, path, .. } => path.last().unwrap_or(&server.name).clone(),
-        Location::DriveSearch(_) => t("todas as contas", "all accounts").to_string(),
+    let is_drive = matches!(loc, Location::Drive { .. } | Location::DriveSearch(_));
+    let (here_scope, place) = match loc {
+        Location::Local(dir) => (None, crate::finder::place_of(dir)),
+        Location::Found(f) => (None, f.place.clone()),
+        Location::Server { server, path, .. } => (None, path.last().unwrap_or(&server.name).clone()),
+        Location::DriveSearch(_) => (None, t("todas as contas", "all accounts").to_string()),
         _ => match actions::search_scope(loc) {
-            Some((_, place)) => place,
+            Some((within, place)) => (Some(within), place),
             None => return el().key("search"),
         },
+    };
+    let effective_scope = match (loc, s.search_scope[p]) {
+        (Location::DriveSearch(_), _) => DriveSearchScope::AllAccounts,
+        (_, DriveSearchScope::AllAccounts) if s.accounts.len() >= 2 => DriveSearchScope::AllAccounts,
+        (_, DriveSearchScope::AllAccounts) => DriveSearchScope::Account,
+        (_, other) => other,
+    };
+    let placeholder = if !is_drive {
+        tr!("Pesquisar em {place}", "Search {place}")
+    } else {
+        match effective_scope {
+            DriveSearchScope::AllAccounts => t("Pesquisar em todas as contas", "Search all accounts").to_string(),
+            DriveSearchScope::Account => t("Pesquisar em toda a conta", "Search entire account").to_string(),
+            DriveSearchScope::Here => tr!("Pesquisar em {place}", "Search {place}"),
+        }
     };
     let field = rune::text_input(&s.search[p], k.ty.text_small)
         .single_line()
         .key(search_key(p))
         .label(t("Pesquisar", "Search"))
-        .placeholder(tr!("Pesquisar em {place}", "Search {place}"), k.c.text_faint)
+        .placeholder(placeholder, k.c.text_faint)
         .grow(1.0)
         .shrink()
         .min_w(0.0)
@@ -5742,18 +5801,196 @@ fn search_box(s: &State, k: &Kit, p: usize) -> El {
                 crate::history::search_key(s, p, ev)
             }
         });
+    if !is_drive {
+        return row()
+            .key("search")
+            .w(210.0)
+            .h(26.0)
+            .px(7.0)
+            .gap(5.0)
+            .mr(4.0)
+            .center_y()
+            .radius(k.radius.sm)
+            .border(1.0, k.c.border_weak)
+            .child(icon(&icons::SEARCH, 14.0).color(k.c.icon_faint))
+            .child(field);
+    }
+
+    let (scope_icon, scope_label, scope_help): (&'static Icon, &str, String) = match effective_scope {
+        DriveSearchScope::AllAccounts => (
+            &icons::TAB_ACCOUNTS,
+            t("Todas", "All"),
+            tr!("Pesquisar em todas as {} contas do Google Drive", "Search all {} Google Drive accounts", s.accounts.len()),
+        ),
+        DriveSearchScope::Account => (
+            &icons::PROVIDER_GDRIVE,
+            t("Geral", "Account"),
+            t("Pesquisar em toda a conta (Meu Drive e drives compartilhados)", "Search entire account (My Drive & shared drives)").to_string(),
+        ),
+        DriveSearchScope::Here => match &here_scope {
+            Some(Within::Everything) | None => (
+                &icons::PROVIDER_GDRIVE,
+                t("Geral", "Account"),
+                t("Pesquisar em toda a conta (Meu Drive e drives compartilhados)", "Search entire account (My Drive & shared drives)").to_string(),
+            ),
+            Some(Within::SharedDrive(_)) => (
+                &icons::SHARED,
+                t("Drive", "Drive"),
+                tr!("Pesquisar somente no drive “{place}”", "Search only in shared drive “{place}”"),
+            ),
+            Some(Within::Folder { .. }) => (
+                &icons::FOLDER,
+                t("Pasta", "Folder"),
+                tr!("Pesquisar somente na pasta “{place}”", "Search only in folder “{place}”"),
+            ),
+            Some(Within::MyDrive) => (
+                &icons::FOLDER,
+                t("Meu Drive", "My Drive"),
+                t("Pesquisar somente em Meu Drive", "Search only in My Drive").to_string(),
+            ),
+        },
+    };
+    let scope_open = s.search_scope_menu == Some(p);
+    let scope_anchor = format!("search-scope-{p}");
+    let scope_bg = if scope_open {
+        k.c.hover
+    } else if k.dark {
+        k.alpha(k.c.white, 0.04)
+    } else {
+        k.alpha(k.c.black, 0.03)
+    };
+    let scope_btn = row()
+        .key(scope_anchor.clone())
+        .role("button")
+        .label(scope_label)
+        .help(scope_help)
+        .h_full()
+        .px(7.0)
+        .gap(4.0)
+        .center_y()
+        .corners([k.radius.sm, 0.0, 0.0, k.radius.sm])
+        .fill(scope_bg)
+        .hover(k.c.hover)
+        .press(k.c.pressed)
+        .cursor(Cursor::Pointer)
+        .on_press(move |s: &mut State| {
+            let next = if s.search_scope_menu == Some(p) { None } else { Some(p) };
+            s.active = p;
+            s.view_menu_open = false;
+            s.view_mode_menu = None;
+            crate::tabs::close_picker_filter(s);
+            s.menu = None;
+            s.tree_menu = None;
+            s.address_menu = None;
+            s.search_scope_menu = next;
+        })
+        .child(icon(scope_icon, 13.0).color(k.c.text_base))
+        .child(text(scope_label).font(k.ty.text_xsmall).color(k.c.text_base))
+        .child(icon(&icons::CHEVRON_DOWN, 10.0).color(k.c.icon_muted));
+
+    if scope_open {
+        layer.push(rune_kit::scrim("search-scope-scrim", |s: &mut State| s.search_scope_menu = None));
+        let dropdown_bg = if k.dark { rune::oklch(0.22, 0.008, 255.0) } else { k.c.bg_base };
+        let mut menu = col().key(format!("search-scope-menu-{p}")).w(260.0).padding(4.0).gap(2.0);
+        match loc {
+            Location::Drive { email, .. } => {
+                let has_narrow = here_scope.as_ref().is_some_and(|w| *w != Within::Everything);
+                if has_narrow {
+                    let here_icon = match &here_scope {
+                        Some(Within::SharedDrive(_)) => &icons::SHARED,
+                        _ => &icons::FOLDER,
+                    };
+                    menu = menu.child(scope_menu_item(
+                        k,
+                        format!("scope-here-{p}"),
+                        here_icon,
+                        tr!("Só em “{place}”", "Only in “{place}”"),
+                        None,
+                        effective_scope == DriveSearchScope::Here,
+                        move |s: &mut State, tx: &mut Tx| actions::set_search_scope(s, p, DriveSearchScope::Here, tx),
+                    ));
+                }
+                let account_selected = effective_scope == DriveSearchScope::Account || (!has_narrow && effective_scope == DriveSearchScope::Here);
+                menu = menu.child(scope_menu_item(
+                    k,
+                    format!("scope-account-{p}"),
+                    &icons::PROVIDER_GDRIVE,
+                    t("Geral (toda a conta)", "All of this account").to_string(),
+                    Some(email.clone()),
+                    account_selected,
+                    move |s: &mut State, tx: &mut Tx| actions::set_search_scope(s, p, DriveSearchScope::Account, tx),
+                ));
+                if s.accounts.len() >= 2 {
+                    menu = menu.child(el().w_full().h(1.0).my(3.0).fill(k.c.border_weak));
+                    menu = menu.child(scope_menu_item(
+                        k,
+                        format!("scope-all-{p}"),
+                        &icons::TAB_ACCOUNTS,
+                        tr!("Todas as contas ({})", "All accounts ({})", s.accounts.len()),
+                        Some(t("Meu Drive e drives compartilhados de todas", "My Drive and shared drives of all accounts").to_string()),
+                        effective_scope == DriveSearchScope::AllAccounts,
+                        move |s: &mut State, tx: &mut Tx| actions::set_search_scope(s, p, DriveSearchScope::AllAccounts, tx),
+                    ));
+                }
+            }
+            Location::DriveSearch(_) => {
+                menu = menu.child(scope_menu_item(
+                    k,
+                    format!("scope-all-{p}"),
+                    &icons::TAB_ACCOUNTS,
+                    tr!("Todas as contas ({})", "All accounts ({})", s.accounts.len()),
+                    None,
+                    true,
+                    |s: &mut State, _| s.search_scope_menu = None,
+                ));
+                if !s.accounts.is_empty() {
+                    menu = menu.child(el().w_full().h(1.0).my(3.0).fill(k.c.border_weak));
+                    for (idx, acc) in s.accounts.iter().enumerate() {
+                        let email = acc.email.clone();
+                        let label = email.clone();
+                        menu = menu.child(scope_menu_item(
+                            k,
+                            format!("scope-acc-{p}-{idx}"),
+                            &icons::PROVIDER_GDRIVE,
+                            label,
+                            Some(t("Geral (toda a conta)", "All of this account").to_string()),
+                            false,
+                            move |s: &mut State, tx: &mut Tx| actions::search_in_account(s, p, email.clone(), tx),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        let surface = menu
+            .radius(k.radius.md)
+            .fill(dropdown_bg)
+            .border(1.0, k.c.border_weak)
+            .box_shadow(rune::Shadow { y: 6.0, blur: 18.0, color: k.dark_a(0.32), ..Default::default() });
+        layer.push(rune_kit::popover::anchored(k, surface, &scope_anchor, rune_kit::Placement::BottomStart, 4.0));
+    }
+
     row()
         .key("search")
-        .w(210.0)
+        .w(290.0)
         .h(26.0)
-        .px(7.0)
-        .gap(5.0)
         .mr(4.0)
         .center_y()
         .radius(k.radius.sm)
         .border(1.0, k.c.border_weak)
-        .child(icon(&icons::SEARCH, 14.0).color(k.c.icon_faint))
-        .child(field)
+        .child(scope_btn)
+        .child(el().w(1.0).h(14.0).fill(k.c.border_weak))
+        .child(
+            row()
+                .grow(1.0)
+                .min_w(0.0)
+                .h_full()
+                .px(7.0)
+                .gap(5.0)
+                .center_y()
+                .child(icon(&icons::SEARCH, 14.0).color(k.c.icon_faint))
+                .child(field),
+        )
 }
 
 pub(crate) fn search_key(p: usize) -> String {
@@ -5880,9 +6117,10 @@ fn search_bar(s: &State, k: &Kit, p: usize) -> El {
         .gap(10.0)
         .center_y()
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
-        .child(text(tr!("“{}” em {} · {found}", "“{}” in {} · {found}", q.text, q.place)).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0));
+        .child(text(tr!("“{}” em {} · {found}", "“{}” in {} · {found}", q.text, q.place)).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0))
+        .child(el().grow(1.0));
     if q.within != openexplorer_gdrive::search::Within::Everything {
-        bar = bar.child(el().grow(1.0)).child(
+        bar = bar.child(
             text(t("Pesquisar em toda a conta", "Search all of this account"))
                 .key("search-everywhere")
                 .role("link")
@@ -5890,6 +6128,17 @@ fn search_bar(s: &State, k: &Kit, p: usize) -> El {
                 .color(k.c.text_accent)
                 .cursor(Cursor::Pointer)
                 .on_press(move |s: &mut State| actions::search_everywhere(s, p)),
+        );
+    }
+    if s.accounts.len() >= 2 {
+        bar = bar.child(
+            text(t("Pesquisar em todas as contas", "Search all accounts"))
+                .key("search-all-accounts")
+                .role("link")
+                .font(k.ty.text_xsmall)
+                .color(k.c.text_accent)
+                .cursor(Cursor::Pointer)
+                .on_press(move |s: &mut State| actions::search_all_accounts(s, p)),
         );
     }
     bar

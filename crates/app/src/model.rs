@@ -155,6 +155,18 @@ pub struct DriveSearch {
     pub text: String,
 }
 
+/// Explicit Google Drive search scope chosen in a pane's search bar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DriveSearchScope {
+    /// Scope to the pane's current Drive location (folder, shared drive, My Drive, or whole account for views).
+    #[default]
+    Here,
+    /// Whole current Google Drive account (`Within::Everything`: My Drive + Shared with me + all Shared Drives).
+    Account,
+    /// All connected Google Drive accounts (`Location::DriveSearch`).
+    AllAccounts,
+}
+
 /// A search of the computer: its words, the folder it looks under (everywhere when `None`), and
 /// that place in words.
 #[derive(Clone, Debug, PartialEq)]
