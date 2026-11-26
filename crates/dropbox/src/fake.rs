@@ -47,6 +47,8 @@ struct State {
     pages: HashMap<String, (Vec<Value>, String)>,
     /// Upload sessions: their bytes, and whether they're closed.
     sessions: HashMap<String, (Vec<u8>, bool)>,
+    /// Concurrent upload sessions: their blocks by offset, and whether they're closed.
+    concurrent: HashMap<String, (std::collections::BTreeMap<u64, Vec<u8>>, bool)>,
     /// Folders deleted: lower → display path, which `include_deleted` lists.
     deleted_dirs: HashMap<String, String>,
     /// The next batch entries to fail with `too_many_write_operations`.
@@ -786,7 +788,8 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
                     let data = n.data[from as usize..].to_vec();
                     if let Some(cut) = st.cut_download.take() {
                         drop(st);
-                        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nDropbox-API-Result: {header}\r\nConnection: close\r\n\r\n", data.len());
+                        let status = if from > 0 { "206 Partial Content" } else { "200 OK" };
+                        let head = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nDropbox-API-Result: {header}\r\nConnection: close\r\n\r\n", data.len());
                         let _ = conn.write_all(head.as_bytes());
                         let _ = conn.write_all(&data[..cut as usize]);
                         let _ = conn.flush();
@@ -805,8 +808,17 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
             st.next += 1;
             let id = format!("sess-{}", st.next);
             let close = arg["close"].as_bool().unwrap_or(false);
-            st.sessions.insert(id.clone(), (req.body.clone(), close));
-            ok(json!({"session_id": id}))
+            if arg["session_type"].as_str() == Some("concurrent") && !req.body.is_empty() {
+                // A concurrent session takes no bytes when it starts.
+                (400, vec![], b"Error in call to API function: concurrent sessions start empty".to_vec())
+            } else {
+                if arg["session_type"].as_str() == Some("concurrent") {
+                    st.concurrent.insert(id.clone(), (Default::default(), close));
+                } else {
+                    st.sessions.insert(id.clone(), (req.body.clone(), close));
+                }
+                ok(json!({"session_id": id}))
+            }
         }
         "files/upload_session/start_batch" => {
             let n = arg["num_sessions"].as_u64().unwrap_or(0);
@@ -822,6 +834,29 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
                     })
                     .collect();
                 ok(json!({"session_ids": ids}))
+            }
+        }
+        "files/upload_session/append_v2" if st.concurrent.contains_key(arg.pointer("/cursor/session_id").and_then(Value::as_str).unwrap_or("")) => {
+            let id = arg.pointer("/cursor/session_id").and_then(Value::as_str).unwrap_or("").to_string();
+            let offset = arg.pointer("/cursor/offset").and_then(Value::as_u64).unwrap_or(0);
+            let close = arg["close"].as_bool().unwrap_or(false);
+            // Every block but the closing one a multiple of 4 MiB, as Dropbox asks.
+            if !close && req.body.len() % (4 << 20) != 0 {
+                route_error("incorrect_offset/", json!({".tag": "incorrect_offset"}))
+            } else {
+                let held = st.concurrent.get_mut(&id).unwrap();
+                if held.1 {
+                    route_error("closed/", json!({".tag": "closed"}))
+                } else {
+                    held.0.insert(offset, req.body.clone());
+                    held.1 = close;
+                    if std::mem::take(&mut st.drop_append) {
+                        drop(st);
+                        let _ = conn.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                    ok(Value::Null)
+                }
             }
         }
         "files/upload_session/append_v2" => {
@@ -881,6 +916,23 @@ fn serve(state: &Arc<(Mutex<State>, Condvar)>, mut conn: TcpStream) {
                     return;
                 }
                 ok(json!({"entries": results}))
+            }
+        }
+        "files/upload_session/finish" if st.concurrent.contains_key(arg.pointer("/cursor/session_id").and_then(Value::as_str).unwrap_or("")) => {
+            let id = arg.pointer("/cursor/session_id").and_then(Value::as_str).unwrap_or("").to_string();
+            let (blocks, closed) = st.concurrent.remove(&id).unwrap();
+            let mut data = Vec::new();
+            let whole = blocks.iter().all(|(at, b)| {
+                let fits = *at == data.len() as u64;
+                data.extend_from_slice(b);
+                fits
+            });
+            if !closed || !whole || Some(data.len() as u64) != arg.pointer("/cursor/offset").and_then(Value::as_u64) {
+                route_error("lookup_failed/incorrect_offset/", json!({".tag": "lookup_failed", "lookup_failed": {".tag": "incorrect_offset"}}))
+            } else {
+                let path = arg.pointer("/commit/path").and_then(Value::as_str).unwrap_or("").to_string();
+                let m = st.put(&path, data);
+                ok(untagged(m))
             }
         }
         "files/upload_session/finish" => {

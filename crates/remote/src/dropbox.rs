@@ -81,7 +81,7 @@ impl Conn for Dropbox {
             let len = std::fs::metadata(local).map(|m| m.len()).unwrap_or(0);
             return if progress(len) { Ok(()) } else { Err(CANCELLED.into()) };
         }
-        crate::send_file(self, path, local, progress)
+        self.account.upload_file(path, local, &mut onward(progress)).map(|_| ()).map_err(same_cancel)
     }
 
     fn home(&mut self) -> Result<String> {

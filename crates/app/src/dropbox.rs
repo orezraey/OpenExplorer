@@ -1019,7 +1019,7 @@ mod batches {
         for i in 0..300 {
             write(&local.join(format!("f{i:03}.bin")), 1000 + i, i);
         }
-        // Too big for a batch: alone, in its own session.
+        // Too big for a batch: alone, in one request of its own.
         write(&local.join("grande.bin"), (8 << 20) + 10, 1);
         for i in 0..5 {
             write(&local.join(format!("Pasta/p{i}.bin")), 500, i);
@@ -1035,9 +1035,9 @@ mod batches {
         let finished = fake.batch_sizes("files/upload_session/finish_batch_v2");
         assert!(finished.iter().all(|n| *n <= 250), "{finished:?}");
         // The 300 rows, and the folder's five in a batch of their own; a run a worker was left
-        // with a single row of goes in one request, as one by one.
+        // with a single row of goes in one request, as one by one, and so does the big one.
         let alone = fake.count_since(&0, "files/upload");
-        assert_eq!(finished.iter().sum::<usize>() + alone, 305, "{finished:?} + {alone}");
+        assert_eq!(finished.iter().sum::<usize>() + alone, 306, "{finished:?} + {alone}");
         assert!(finished.len() < 20, "{finished:?}");
         assert_eq!(fake.content("/U/f000 (2).bin"), std::fs::read(local.join("f000.bin")).unwrap());
         assert_eq!(fake.content("/U/f000.bin"), b"outro");
