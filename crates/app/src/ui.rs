@@ -86,9 +86,11 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         // The mouse's side buttons anywhere else in Explorar: Voltar and Avançar in the active
         // pane (over a pane, its own handler took them first).
         .on_button(|s: &mut State, button, _: &mut Tx| crate::side_button_in_window(s, button))
-        // Hover lands and leaves with the pointer, as in the system's file lists: the default
-        // 100 ms fade on leaving left a trail of lit rows behind a fast pointer.
-        .hover_motion_within(Anim::INSTANT, Anim::INSTANT)
+        // Fluid 80 ms hover transition when hover animations are on; instant otherwise.
+        .hover_motion_within(
+            if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT },
+            if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT },
+        )
         .on_key(|s: &mut State, ev: &KeyEvent, _: &mut Tx| {
             if ev.key == rune::Key::Function(5) {
                 match s.main_tab {
@@ -535,6 +537,101 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .child(section_head(t("Geral", "General"), t("Aparência, fonte da interface e comportamento de arquivos e transferências.", "Appearance, interface font, and how files and transfers behave.")))
                 .child(appearance)
                 .child(files_card)
+        }
+        OptionsTab::Animations => {
+            let master_badge = Some(if st.animations {
+                (t("Ativado", "On"), rune_kit::BadgeVariant::Accent)
+            } else {
+                (t("Desativado", "Off"), rune_kit::BadgeVariant::Neutral)
+            });
+            let master_card = card_box("card-anim-master").child(switch_row(
+                "opt-animations",
+                t("Ativar animações", "Enable animations"),
+                t(
+                    "Ativa ou desativa todas as animações fluidas da interface de uma só vez.",
+                    "Turns all fluid interface animations on or off at once.",
+                ),
+                master_badge,
+                st.animations,
+                |s| change_settings(s, |c| c.animations = !c.animations),
+            ));
+
+            let effects_card = card_box("card-anim-effects")
+                .opacity(if st.animations { 1.0 } else { 0.55 })
+                .child(switch_row(
+                    "opt-anim-hover",
+                    t("Realce fluido ao passar o mouse", "Fluid hover highlight"),
+                    t(
+                        "Desliza suavemente o destaque entre pastas, arquivos e controles conforme o ponteiro se move.",
+                        "Smoothly glides the highlight across folders, files, and controls as the pointer moves.",
+                    ),
+                    None,
+                    st.animate_hover,
+                    |s| change_settings(s, |c| c.animate_hover = !c.animate_hover),
+                ))
+                .child(divider())
+                .child(switch_row(
+                    "opt-anim-clipboard",
+                    t("Animação ao copiar e recortar (Ctrl+C / Ctrl+X)", "Copy & cut icon animation (Ctrl+C / Ctrl+X)"),
+                    t(
+                        "Anima os ícones das pastas e arquivos copiados ou recortados até você colar ou pressionar Esc.",
+                        "Gently wiggles icons of copied or cut folders and files until you paste or press Esc.",
+                    ),
+                    None,
+                    st.animate_clipboard,
+                    |s| change_settings(s, |c| c.animate_clipboard = !c.animate_clipboard),
+                ))
+                .child(divider())
+                .child(switch_row(
+                    "opt-anim-zoom",
+                    t("Zoom suave na lista (Ctrl + Scroll)", "Smooth list zoom (Ctrl + Scroll)"),
+                    t(
+                        "Redimensiona ícones, linhas e texto suavemente ao usar Ctrl + roda do mouse, pinça ou Ctrl + / − / 0.",
+                        "Fluidly resizes icons, rows, and text when using Ctrl + mouse wheel, pinch, or Ctrl + / − / 0.",
+                    ),
+                    None,
+                    st.animate_zoom,
+                    |s| change_settings(s, |c| c.animate_zoom = !c.animate_zoom),
+                ))
+                .child(divider())
+                .child(switch_row(
+                    "opt-anim-selection",
+                    t("Transições suaves de seleção, ordenação e árvore", "Smooth selection, sort & tree transitions"),
+                    t(
+                        "Suaviza o destaque de seleção (incluindo setas do teclado e retângulo de seleção), a reordenação ao ordenar colunas e a rotação das setas.",
+                        "Smooths selection highlights (including keyboard arrows and marquee fade), row reordering on sort, and chevron rotation.",
+                    ),
+                    None,
+                    st.animate_selection,
+                    |s| change_settings(s, |c| c.animate_selection = !c.animate_selection),
+                ));
+
+            let visual_card = card_box("card-anim-visual").child(switch_row(
+                "opt-zebra-stripes",
+                t("Listras alternadas nas linhas (zebra)", "Alternating row stripes (zebra)"),
+                t(
+                    "Aplica um fundo sutil em linhas alternadas da lista de arquivos para facilitar a leitura entre colunas.",
+                    "Applies a subtle alternating background tint across file list rows to make scanning columns easier.",
+                ),
+                None,
+                st.zebra_stripes,
+                |s| change_settings(s, |c| c.zebra_stripes = !c.zebra_stripes),
+            ));
+
+            col()
+                .key("page-animations")
+                .w_full()
+                .gap(12.0)
+                .child(section_head(
+                    t("Animações", "Animations"),
+                    t(
+                        "Efeitos visuais fluidos para navegação, cópia de arquivos, ordenação e zoom. Todos vêm ativados por padrão.",
+                        "Fluid visual effects for browsing, copying files, sorting, and zooming. All are enabled by default.",
+                    ),
+                ))
+                .child(master_card)
+                .child(effects_card)
+                .child(visual_card)
         }
         OptionsTab::Experimental => {
             let banner = row()
@@ -1785,7 +1882,10 @@ pub fn account_window_view(s: &State, cx: &mut Cx<State>) -> El {
         .fill(window_bg)
         .child(titlebar)
         .child(content)
-        .hover_motion_within(Anim::INSTANT, Anim::INSTANT);
+        .hover_motion_within(
+            if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT },
+            if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT },
+        );
 
     rune_kit::root(root, layer)
 }

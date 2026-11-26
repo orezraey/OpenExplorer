@@ -11,6 +11,7 @@
 mod accounts;
 mod actions;
 mod address;
+mod anim;
 mod autoscroll;
 mod b2;
 mod cache;
