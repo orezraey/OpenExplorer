@@ -70,13 +70,14 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         MainTab::Explore => panes(s, &k, backdrop, &mut layer),
         MainTab::Accounts => accounts_hub(s, &k),
     };
+    let toolbar_el = toolbar(s, &k, &mut layer);
     let body = col()
         .key("window")
         .w_full()
         .h_full()
         .fill(if backdrop { Color::TRANSPARENT } else { k.c.page })
         .child(titlebar)
-        .child(toolbar(s, &k))
+        .child(toolbar_el)
         .child(main_content)
         .child(transfers(s, &k))
         .child(menu)
@@ -90,6 +91,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         // 100 ms fade on leaving left a trail of lit rows behind a fast pointer.
         .hover_motion_within(Anim::INSTANT, Anim::INSTANT)
         .on_key(|s: &mut State, ev: &KeyEvent, _: &mut Tx| {
+            if ev.key == rune::Key::Escape && s.view_menu_open {
+                s.view_menu_open = false;
+                return true;
+            }
             if ev.key == rune::Key::Function(5) {
                 match s.main_tab {
                     MainTab::Explore => {
@@ -147,7 +152,7 @@ fn change_settings(s: &mut State, f: impl FnOnce(&mut crate::settings::Settings)
 
 fn reload_hidden_views(s: &mut State) {
     crate::tree::refresh_hidden(s);
-    for p in 0..2 {
+    for p in 0..layout::MAX_PANES {
         if matches!(s.panes[p].loc, Location::Local(_) | Location::Server { .. } | Location::Found(_)) {
             load(s, p);
         }
@@ -3308,7 +3313,7 @@ fn tool<F: Fn(&mut State, &mut Tx) + 'static>(k: &Kit, key: &str, glyph: &'stati
     b
 }
 
-fn toolbar(s: &State, k: &Kit) -> El {
+fn toolbar(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     let sep = || el().w(1.0).h(20.0).mx(6.0).fill(k.c.border_weak);
     let waiting_oauth = s.login.is_some() || s.servers.onedrive.login.is_some() || s.servers.dropbox_login.is_some();
     let total_accounts = s.accounts.len() + s.servers.list.len();
@@ -3377,6 +3382,68 @@ fn toolbar(s: &State, k: &Kit) -> El {
         MainTab::Accounts => t("Atualizar o espaço utilizado nas contas (F5)", "Refresh storage usage across accounts (F5)"),
     };
 
+    let view_label = t("Visualizar", "View");
+    let view_anchor = "toolbar-view";
+    let view_open = s.view_menu_open;
+    let view_btn = row()
+        .key(view_anchor)
+        .role("button")
+        .label(view_label)
+        .help(t("Escolher a disposição dos painéis (1, 2 ou 4)", "Choose the pane layout (1, 2, or 4)"))
+        .h(30.0)
+        .px(8.0)
+        .gap(6.0)
+        .center_y()
+        .radius(k.radius.sm)
+        .fill(if view_open { k.c.hover } else { Color::TRANSPARENT })
+        .hover(k.c.hover)
+        .press(k.c.pressed)
+        .cursor(Cursor::Pointer)
+        .on_press(|s: &mut State| {
+            let next = !s.view_menu_open;
+            crate::tabs::close_picker_filter(s);
+            s.menu = None;
+            s.tree_menu = None;
+            s.address_menu = None;
+            s.view_menu_open = next;
+        })
+        .child(icon(&icons::VIEW_MONITOR, 16.0).color(k.c.text_base))
+        .child(text(view_label).font(k.ty.text_small).color(k.c.text_base))
+        .child(icon(&icons::CHEVRON_DOWN, 12.0).color(k.c.icon_muted));
+
+    if view_open {
+        layer.push(rune_kit::scrim("view-menu-scrim", |s: &mut State| s.view_menu_open = false));
+        let dropdown_bg = if k.dark { rune::oklch(0.22, 0.008, 255.0) } else { k.c.bg_base };
+        let mut menu = col().key("view-menu").w(196.0).padding(4.0).gap(2.0);
+        for layout in crate::settings::PaneLayout::ALL {
+            let selected = s.settings.pane_layout == layout;
+            let item = row()
+                .key(format!("view-opt-{layout:?}"))
+                .role("menuitem")
+                .label(layout.label())
+                .checked(selected)
+                .w_full()
+                .h(32.0)
+                .px(10.0)
+                .gap(10.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .fill(if selected { k.alpha(k.c.text_accent, if k.dark { 0.20 } else { 0.10 }) } else { Color::TRANSPARENT })
+                .hover(k.c.hover)
+                .cursor(Cursor::Pointer)
+                .on_press(move |s: &mut State| crate::set_pane_layout(s, layout))
+                .child(icon(layout.icon(), 16.0).color(if selected { k.c.text_accent } else { k.c.icon_muted }))
+                .child(text(layout.label()).font(if selected { k.ty.text_small_medium } else { k.ty.text_small }).color(k.c.text_base).grow(1.0));
+            menu = menu.child(item);
+        }
+        let surface = menu
+            .radius(k.radius.md)
+            .fill(dropdown_bg)
+            .border(1.0, k.c.border_weak)
+            .box_shadow(rune::Shadow { y: 6.0, blur: 18.0, color: k.dark_a(0.32), ..Default::default() });
+        layer.push(rune_kit::popover::anchored(k, surface, view_anchor, rune_kit::Placement::BottomStart, 4.0));
+    }
+
     row()
         .key("toolbar")
         .w_full()
@@ -3400,6 +3467,7 @@ fn toolbar(s: &State, k: &Kit) -> El {
             })
             .help(refresh_help),
         )
+        .child(view_btn)
         .child(el().grow(1.0))
         .child(tool(k, "options", &icons::SETTINGS, t("Opções", "Options"), true, |s: &mut State, _| {
             s.dialog = Some(Dialog::Options(Box::new(crate::settings::OptionsView::open(crate::settings::OptionsTab::General))));
@@ -3425,8 +3493,7 @@ pub(crate) struct HubCard {
     pub email_or_addr: String,
     pub quota: HubQuota,
     pub open_loc: Location,
-    pub in_left: bool,
-    pub in_right: bool,
+    pub in_pane: [bool; layout::MAX_PANES],
     pub edit_id: Option<String>,
     pub remove_target: actions::AccountTarget,
 }
@@ -3476,8 +3543,7 @@ pub(crate) fn hub_cards(s: &State) -> Vec<HubCard> {
             email_or_addr: a.email.clone(),
             quota,
             open_loc: Location::drive(&a.email, Space::MyDrive),
-            in_left: in_pane(0),
-            in_right: in_pane(1),
+            in_pane: std::array::from_fn(&in_pane),
             edit_id: None,
             remove_target: actions::AccountTarget::GoogleDrive(a.email.clone()),
         });
@@ -3519,8 +3585,7 @@ pub(crate) fn hub_cards(s: &State) -> Vec<HubCard> {
                     email_or_addr: email,
                     quota,
                     open_loc: crate::onedrive::files(sv),
-                    in_left: in_pane(0),
-                    in_right: in_pane(1),
+                    in_pane: std::array::from_fn(&in_pane),
                     edit_id: None,
                     remove_target: actions::AccountTarget::Server(sv.id.clone()),
                 });
@@ -3555,8 +3620,7 @@ pub(crate) fn hub_cards(s: &State) -> Vec<HubCard> {
                     email_or_addr: sv.user.clone(),
                     quota,
                     open_loc: crate::dropbox::top(sv),
-                    in_left: in_pane(0),
-                    in_right: in_pane(1),
+                    in_pane: std::array::from_fn(&in_pane),
                     edit_id: None,
                     remove_target: actions::AccountTarget::Server(sv.id.clone()),
                 });
@@ -3586,8 +3650,7 @@ pub(crate) fn hub_cards(s: &State) -> Vec<HubCard> {
                     email_or_addr: sv.user.clone(),
                     quota,
                     open_loc: crate::mega::cloud(sv),
-                    in_left: in_pane(0),
-                    in_right: in_pane(1),
+                    in_pane: std::array::from_fn(&in_pane),
                     edit_id: None,
                     remove_target: actions::AccountTarget::Server(sv.id.clone()),
                 });
@@ -3602,8 +3665,7 @@ pub(crate) fn hub_cards(s: &State) -> Vec<HubCard> {
                     email_or_addr: sv.user.clone(),
                     quota: HubQuota::Info(t("Armazenamento sob demanda · Buckets B2", "Pay-as-you-go storage · B2 Buckets").into()),
                     open_loc: crate::b2::top(sv),
-                    in_left: in_pane(0),
-                    in_right: in_pane(1),
+                    in_pane: std::array::from_fn(&in_pane),
                     edit_id: None,
                     remove_target: actions::AccountTarget::Server(sv.id.clone()),
                 });
@@ -3618,8 +3680,7 @@ pub(crate) fn hub_cards(s: &State) -> Vec<HubCard> {
                     email_or_addr: format!("ID {}", sv.user),
                     quota: HubQuota::Info(t("Armazenamento ilimitado · Canal privado", "Unlimited storage · Private channel").into()),
                     open_loc: crate::servers::folder(sv, Vec::new()),
-                    in_left: in_pane(0),
-                    in_right: in_pane(1),
+                    in_pane: std::array::from_fn(&in_pane),
                     edit_id: None,
                     remove_target: actions::AccountTarget::Server(sv.id.clone()),
                 });
@@ -3650,8 +3711,7 @@ pub(crate) fn hub_cards(s: &State) -> Vec<HubCard> {
                     email_or_addr: user_or_addr,
                     quota: HubQuota::Info(addr),
                     open_loc: crate::servers::folder(sv, Vec::new()),
-                    in_left: in_pane(0),
-                    in_right: in_pane(1),
+                    in_pane: std::array::from_fn(&in_pane),
                     edit_id: Some(sv.id.clone()),
                     remove_target: actions::AccountTarget::Server(sv.id.clone()),
                 });
@@ -4000,27 +4060,52 @@ fn accounts_hub(s: &State, k: &Kit) -> El {
                 .on_press(move |s: &mut State| crate::open_account_in_pane(s, pane, loc.clone()))
             };
 
-            let mut actions_bar = row()
-                .gap(6.0)
-                .center_y()
-                .child(pane_btn(
-                    "open-left",
-                    0,
-                    &icons::OPEN_LEFT_PANE,
-                    t("Esquerda", "Left"),
-                    t("Abrir este drive no painel esquerdo", "Open this drive in the left pane"),
-                    c.in_left,
-                    c.open_loc.clone(),
-                ))
-                .child(pane_btn(
-                    "open-right",
-                    1,
-                    &icons::OPEN_RIGHT_PANE,
-                    t("Direita", "Right"),
-                    t("Abrir este drive no painel direito", "Open this drive in the right pane"),
-                    c.in_right,
-                    c.open_loc.clone(),
-                ));
+            let mut actions_bar = row().gap(6.0).center_y();
+            match s.settings.pane_layout {
+                crate::settings::PaneLayout::One => {
+                    actions_bar = actions_bar.child(pane_btn(
+                        "open-left",
+                        0,
+                        &icons::VIEW_ONE_PANE,
+                        t("Abrir", "Open"),
+                        t("Abrir este drive no painel", "Open this drive in the pane"),
+                        c.in_pane[0],
+                        c.open_loc.clone(),
+                    ));
+                }
+                crate::settings::PaneLayout::Two => {
+                    actions_bar = actions_bar
+                        .child(pane_btn(
+                            "open-left",
+                            0,
+                            &icons::OPEN_LEFT_PANE,
+                            t("Esquerda", "Left"),
+                            t("Abrir este drive no painel esquerdo", "Open this drive in the left pane"),
+                            c.in_pane[0],
+                            c.open_loc.clone(),
+                        ))
+                        .child(pane_btn(
+                            "open-right",
+                            1,
+                            &icons::OPEN_RIGHT_PANE,
+                            t("Direita", "Right"),
+                            t("Abrir este drive no painel direito", "Open this drive in the right pane"),
+                            c.in_pane[1],
+                            c.open_loc.clone(),
+                        ));
+                }
+                crate::settings::PaneLayout::Four => {
+                    let targets = [
+                        ("open-p0", 0, &icons::OPEN_LEFT_PANE, "1", t("Abrir no painel superior esquerdo", "Open in top-left pane")),
+                        ("open-p1", 1, &icons::OPEN_RIGHT_PANE, "2", t("Abrir no painel superior direito", "Open in top-right pane")),
+                        ("open-p2", 2, &icons::OPEN_LEFT_PANE, "3", t("Abrir no painel inferior esquerdo", "Open in bottom-left pane")),
+                        ("open-p3", 3, &icons::OPEN_RIGHT_PANE, "4", t("Abrir no painel inferior direito", "Open in bottom-right pane")),
+                    ];
+                    for (side_key, idx, glyph, short, help_text) in targets {
+                        actions_bar = actions_bar.child(pane_btn(side_key, idx, glyph, short, help_text, c.in_pane[idx], c.open_loc.clone()));
+                    }
+                }
+            }
 
             if let Some(edit_id) = &c.edit_id {
                 let id = edit_id.clone();
@@ -4197,28 +4282,59 @@ fn splitter(k: &Kit, key: &str, thick: f32, way: Split, size: impl Fn(&mut State
         })
 }
 
-/// The two panes, side by side in equal halves.
+/// The explore panes: one full-width pane, two side by side (default), or four in a 2×2 grid.
 /// `backdrop`: Mica shows behind the window (Opções, Experimental).
 fn panes(s: &State, k: &Kit, backdrop: bool, layer: &mut Vec<El>) -> El {
-    row()
-        .key("panes")
-        .w_full()
-        .grow(1.0)
-        .min_h(160.0)
-        .padding(6.0)
-        .child(pane(s, k, 0, backdrop, layer))
-        .child(gutter(s, k))
-        .child(pane(s, k, 1, backdrop, layer))
+    match s.settings.pane_layout {
+        crate::settings::PaneLayout::One => row()
+            .key("panes")
+            .w_full()
+            .grow(1.0)
+            .min_h(160.0)
+            .padding(6.0)
+            .child(pane(s, k, 0, backdrop, layer)),
+        crate::settings::PaneLayout::Two => row()
+            .key("panes")
+            .w_full()
+            .grow(1.0)
+            .min_h(160.0)
+            .padding(6.0)
+            .child(pane(s, k, 0, backdrop, layer))
+            .child(gutter(s, k, 0, 1, false))
+            .child(pane(s, k, 1, backdrop, layer)),
+        crate::settings::PaneLayout::Four => {
+            let pair = |row_key: &'static str, left: usize, right: usize, layer: &mut Vec<El>| {
+                row()
+                    .key(row_key)
+                    .w_full()
+                    .grow(1.0)
+                    .h(0.0)
+                    .min_h(120.0)
+                    .child(pane(s, k, left, backdrop, layer))
+                    .child(gutter(s, k, left, right, true))
+                    .child(pane(s, k, right, backdrop, layer))
+            };
+            col()
+                .key("panes")
+                .w_full()
+                .grow(1.0)
+                .min_h(260.0)
+                .padding(6.0)
+                .gap(6.0)
+                .child(pair("panes-top", 0, 1, layer))
+                .child(pair("panes-bottom", 2, 3, layer))
+        }
+    }
 }
 
-/// The strip between the panes, as in Air Explorer: the window's own background, empty but
-/// for two small triangles near the top that copy the selection of one pane into the folder
-/// the other shows. A triangle is blue while its pane has something selected, grey otherwise.
-fn gutter(s: &State, k: &Kit) -> El {
-    let arrow = |key: &str, glyph: &'static Icon, help: &str, from: usize, to: usize| {
+/// The strip between two horizontal panes, as in Air Explorer: the window's own background, empty
+/// but for two small triangles that copy the selection of one pane into the folder the other
+/// shows. A triangle is blue while its pane has something selected, grey otherwise.
+fn gutter(s: &State, k: &Kit, left: usize, right: usize, centered: bool) -> El {
+    let arrow = |key: String, glyph: &'static Icon, help: &str, from: usize, to: usize| {
         let ready = !s.tabs[from].is_picker() && !s.tabs[to].is_picker() && !s.panes[from].selected.is_empty();
         let ink = if ready { k.alpha(k.c.text_accent, 0.7) } else { k.alpha(k.c.icon_faint, 0.6) };
-        let b = el().key(key.to_string()).role("button").label(help.to_string()).help(help.to_string()).size(28.0, 28.0).center().radius(k.radius.sm);
+        let b = el().key(key).role("button").label(help.to_string()).help(help.to_string()).size(28.0, 28.0).center().radius(k.radius.sm);
         let b = if ready { b.hover(k.c.hover).press(k.c.pressed).cursor(Cursor::Pointer) } else { b };
         b.on_press(move |s: &mut State| {
             if !s.tabs[from].is_picker() && !s.tabs[to].is_picker() {
@@ -4227,15 +4343,15 @@ fn gutter(s: &State, k: &Kit) -> El {
         })
         .child(icon(glyph, 16.0).color(ink))
     };
-    col()
-        .key("gutter")
-        .w(40.0)
-        .h_full()
-        .items_center()
-        .pt(126.0)
-        .gap(6.0)
-        .child(arrow("copy-right", &icons::COPY_RIGHT, t("Copiar a seleção do painel esquerdo para o direito", "Copy the selection from the left pane to the right"), 0, 1))
-        .child(arrow("copy-left", &icons::COPY_LEFT, t("Copiar a seleção do painel direito para o esquerdo", "Copy the selection from the right pane to the left"), 1, 0))
+    let (gutter_key, right_key, left_key) = if (left, right) == (0, 1) {
+        ("gutter".to_string(), "copy-right".to_string(), "copy-left".to_string())
+    } else {
+        (format!("gutter-{left}-{right}"), format!("copy-right-{left}-{right}"), format!("copy-left-{left}-{right}"))
+    };
+    let mut g = col().key(gutter_key).w(40.0).h_full().items_center().gap(6.0);
+    g = if centered { g.justify_center() } else { g.pt(126.0) };
+    g.child(arrow(right_key, &icons::COPY_RIGHT, t("Copiar a seleção do painel esquerdo para o direito", "Copy the selection from the left pane to the right"), left, right))
+        .child(arrow(left_key, &icons::COPY_LEFT, t("Copiar a seleção do painel direito para o esquerdo", "Copy the selection from the right pane to the left"), right, left))
 }
 
 // ---------------------------------------------------------------------------------------------
