@@ -699,6 +699,7 @@ fn chain(s: &State, loc: &Location) -> Vec<Node> {
         Location::Local(path) => local_chain(s, path),
         Location::Found(f) => f.within.as_ref().map(|w| local_chain(s, w)).unwrap_or_default(),
         Location::Mock(segs) => (0..=segs.len()).map(|i| mock_node(segs[..i].to_vec())).collect(),
+        Location::DriveSearch(_) => Vec::new(),
         Location::Server { server, path, .. } => (0..=path.len()).map(|i| remote_node(server, path[..i].to_vec())).collect(),
         Location::Drive { email, space, path } => {
             let mut out = vec![account_node(email)];
@@ -1171,7 +1172,7 @@ mod tests {
 
         // A listing of `\\nas` gives `\\NAS` its folders under Rede's spelling, so they match
         // the way down to them.
-        let dir = |name: &str| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let dir = |name: &str| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         s.tree.kids.insert(local(r"\\NAS"), Kids::Ready(Vec::new()));
         s.panes[0].go(Location::Local(PathBuf::from(r"\\nas")));
         s.panes[0].set_entries(Ok(vec![dir("Fotos")]));
@@ -1271,6 +1272,8 @@ mod tests {
             target: None,
             starred: false,
             md5: None,
+            drive_id: None,
+            owned_by_me: None,
         };
         let change = |id: &str, dir: bool, parent: &str| openexplorer_gdrive::Change { file_id: id.into(), file: Some(folder(id, dir)), parents: vec![parent.into()], trashed: false, drive: false };
         drive_changed(&mut s, "a@b", &[change("x", false, "p3")], Some("R"));

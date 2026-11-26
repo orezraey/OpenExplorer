@@ -69,6 +69,20 @@ impl End {
         };
         End { text: format!("{}{account}", parts.join("\\")), disk: None }
     }
+
+    /// One Drive item `e` at `loc`, using its `drive_origin` when coming from search results.
+    pub fn drive_item(loc: &Location, e: &crate::model::Entry) -> End {
+        if let Some(origin) = &e.drive_origin {
+            let name = crate::model::shown(&e.name);
+            let account = if origin.label.contains(&origin.email) {
+                String::new()
+            } else {
+                format!(" [{}]", origin.email)
+            };
+            return End { text: format!("{}\\{name}{account}", origin.label), disk: None };
+        }
+        End::drive(loc, Some(&e.name))
+    }
 }
 
 /// A row of the queue.

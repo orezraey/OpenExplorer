@@ -415,12 +415,18 @@ fn up(c: &mut dyn Conn, d: &Drive, path: &str, is_dir: bool, parent: &str, name:
 /// shows, each file through a temporary one. Google's own formats (Docs, Sheets...) go as the
 /// files they export to, as a download does.
 pub fn drive_to_server(s: &mut State, from: &Location, items: Vec<Entry>, to: &Location, cut: bool, reload: Vec<Location>) {
-    let (Location::Drive { email, .. }, Some((server, dir))) = (from, target(to)) else { return };
-    let (email, server) = (email.clone(), server.clone());
+    for (email, group) in crate::actions::group_by_account(from, items) {
+        drive_to_server_account(s, &email, from, group, to, cut, reload.clone());
+    }
+}
+
+fn drive_to_server_account(s: &mut State, email: &str, from: &Location, items: Vec<Entry>, to: &Location, cut: bool, reload: Vec<Location>) {
+    let Some((server, dir)) = target(to) else { return };
+    let (email, server) = (email.to_string(), server.clone());
     let shared = shared_drive(from);
     let files: Vec<DriveFile> = items.iter().map(crate::actions::drive_file).collect();
     let op = if cut { Op::Move } else { Op::Copy };
-    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, items.iter().map(|e| (End::drive(from, Some(&e.name)), end(to, None))));
+    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, items.iter().map(|e| (End::drive_item(from, e), end(to, None))));
     let pool = s.servers.pool.clone();
     let work = move |d: &Drive| {
         with(&pool, &server, |c| {
@@ -440,7 +446,8 @@ pub fn drive_to_server(s: &mut State, from: &Location, items: Vec<Entry>, to: &L
                 if !fetchable(f) {
                     return Err(tr!("\"{}\" é um item do Google que não vira arquivo (formulário, atalho para arquivo…): não dá para copiá-lo.", "\"{}\" is a Google item that can't become a file (a form, a shortcut to a file…): it can't be copied.", f.name));
                 }
-                let left_out = match down(c, d, f, &target, shared.as_deref(), p, 0) {
+                let item_shared = f.drive_id.as_deref().or(shared.as_deref());
+                let left_out = match down(c, d, f, &target, item_shared, p, 0) {
                     Ok(n) => n,
                     Err(e) => {
                         let _ = c.remove(&target, is_dir);

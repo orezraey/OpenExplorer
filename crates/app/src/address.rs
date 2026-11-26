@@ -113,6 +113,7 @@ pub fn text(loc: &Location) -> String {
             parts.extend(path.iter().map(|(_, name)| shown(name)));
             parts.join("/")
         }
+        Location::DriveSearch(_) => String::new(),
         Location::Server { .. } => crate::servers::address_text(loc),
     }
 }
@@ -509,7 +510,7 @@ mod tests {
         use crate::cache::{Cache, Listing, key};
         use crate::model::Entry;
         use crate::watch::Watch;
-        let entry = |id: &str, name: &str, dir: bool| Entry { id: id.into(), name: name.into(), is_dir: dir, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let entry = |id: &str, name: &str, dir: bool| Entry { id: id.into(), name: name.into(), is_dir: dir, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         let at = |path: Vec<(String, String)>| Location::Drive { email: "ana@gmail.com".into(), space: Space::MyDrive, path };
         // The log, read since before the listings below: nothing changed.
         let log = Watch::reading("root-id", &[]);

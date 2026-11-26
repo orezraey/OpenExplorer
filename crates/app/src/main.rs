@@ -127,6 +127,10 @@ enum Msg {
     DragEnded { from: usize, ids: Vec<String>, ended: dragout::Ended },
     /// Built-in updater check, download progress or completion.
     Update(updater::Answer),
+    /// Shared drive id -> name map learned when listing or searching a Drive account.
+    SharedDrives { email: String, names: HashMap<String, String> },
+    /// Partial account failures during a multi-account Google Drive search.
+    DriveSearchWarnings { pane: usize, request: u64, warnings: Vec<(String, String)> },
 }
 
 /// Which part of a listing a [`Msg::Listed`] is.
@@ -155,6 +159,14 @@ struct State {
     view_menu_open: bool,
     /// Which pane's view-mode dropdown menu is currently open, if any.
     view_mode_menu: Option<usize>,
+    /// Which pane's Drive search scope dropdown is currently open, if any.
+    search_scope_menu: Option<usize>,
+    /// Selected Drive search scope per pane.
+    search_scope: [model::DriveSearchScope; MAX_PANES],
+    /// Partial account errors for a multi-account Drive search, per pane.
+    drive_search_warnings: [Vec<(String, String)>; MAX_PANES],
+    /// Cached shared drive `id -> name` per connected Google Drive account.
+    shared_drive_names: HashMap<String, HashMap<String, String>>,
     /// Number of columns per pane in icon-grid view modes (updated from viewport width).
     grid_cols: [usize; MAX_PANES],
     /// Number of rows per column in multi-column List view mode (updated from viewport height).
@@ -377,6 +389,10 @@ impl State {
             main_tab: MainTab::Explore,
             view_menu_open: false,
             view_mode_menu: None,
+            search_scope_menu: None,
+            search_scope: [model::DriveSearchScope::Here; MAX_PANES],
+            drive_search_warnings: Default::default(),
+            shared_drive_names: HashMap::new(),
             grid_cols: [1; MAX_PANES],
             list_rows: [1; MAX_PANES],
             accounts_filter: None,
@@ -607,6 +623,10 @@ fn init() -> State {
         main_tab: MainTab::Explore,
         view_menu_open: false,
         view_mode_menu: None,
+        search_scope_menu: None,
+        search_scope: [model::DriveSearchScope::Here; MAX_PANES],
+        drive_search_warnings: Default::default(),
+        shared_drive_names: HashMap::new(),
         grid_cols: [1; MAX_PANES],
         list_rows: [1; MAX_PANES],
         accounts_filter: None,
@@ -1152,6 +1172,17 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             Msg::Link(answer) => sharing::link_answer(s, answer, tx),
             #[cfg(windows)]
             Msg::DragEnded { from, ids, ended } => drive_drag_ended(s, from, ids, ended),
+            Msg::SharedDrives { email, names } => {
+                if s.accounts.iter().any(|a| a.email == email) {
+                    s.shared_drive_names.insert(email.clone(), names);
+                    name_shared_drives(s, &email);
+                }
+            }
+            Msg::DriveSearchWarnings { pane, request, warnings } => {
+                if s.live[pane].load(Ordering::Relaxed) == request {
+                    s.drive_search_warnings[pane] = warnings;
+                }
+            }
             Msg::Found { pane, request, result, info } => {
                 if s.live[pane].load(Ordering::Relaxed) != request {
                     continue;
@@ -1344,7 +1375,76 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
 }
 
 fn entry_of(f: DriveFile) -> Entry {
-    Entry { id: f.id, name: f.name, is_dir: f.is_dir, size: f.size, modified: f.modified, target: f.target, mime: Some(f.mime), md5: f.md5, starred: f.starred }
+    Entry { id: f.id, name: f.name, is_dir: f.is_dir, size: f.size, modified: f.modified, target: f.target, mime: Some(f.mime), md5: f.md5, starred: f.starred, drive_origin: None }
+}
+
+/// Builds the column-4 origin metadata for a Google Drive search hit.
+pub(crate) fn make_drive_origin(email: &str, f: &DriveFile, sd_names: &HashMap<String, String>, include_account: bool) -> model::DriveOrigin {
+    let (shared_drive, place) = if let Some(sd_id) = &f.drive_id {
+        let raw_name = sd_names.get(sd_id).cloned().unwrap_or_else(|| t("Drive compartilhado", "Shared drive").into());
+        let shown_name = model::shown(&raw_name);
+        (Some((sd_id.clone(), raw_name)), shown_name)
+    } else if f.owned_by_me == Some(true) {
+        (None, t("Meu Drive", "My Drive").into())
+    } else {
+        (None, t("Compartilhados comigo", "Shared with me").into())
+    };
+    let label = if include_account { format!("{email} · {place}") } else { place };
+    model::DriveOrigin {
+        email: email.to_string(),
+        shared_drive,
+        owned_by_me: f.owned_by_me.unwrap_or(false),
+        label,
+    }
+}
+
+/// Lists `email`'s shared drives on a thread of their own and sends their names
+/// ([`Msg::SharedDrives`]), so a search's results don't wait for them: they show "Drive
+/// compartilhado" until the names come, then take them ([`name_shared_drives`]).
+fn learn_shared_drives(drive: &Arc<Drive>, email: &str, out: &Sender<Msg>, wake: &Option<Waker>) {
+    let (drive, email, out, wake) = (drive.clone(), email.to_string(), out.clone(), wake.clone());
+    std::thread::spawn(move || {
+        if let Ok(list) = drive.shared_drives() {
+            let names = list.into_iter().map(|d| (d.id, d.name)).collect();
+            let _ = out.send(Msg::SharedDrives { email, names });
+            if let Some(w) = wake {
+                w();
+            }
+        }
+    });
+}
+
+/// The results of Drive searches on screen take `email`'s shared drives' names, now known.
+fn name_shared_drives(s: &mut State, email: &str) {
+    let Some(names) = s.shared_drive_names.get(email) else { return };
+    for pane in &mut s.panes {
+        if !pane.loc.is_drive_search() {
+            continue;
+        }
+        let every_account = matches!(pane.loc, Location::DriveSearch(_));
+        let mut renamed = false;
+        for e in &mut pane.entries {
+            let Some(o) = e.drive_origin.as_deref_mut() else { continue };
+            let Some((id, name)) = o.shared_drive.as_mut() else { continue };
+            let Some(real) = names.get(id.as_str()) else { continue };
+            if o.email != email || name == real {
+                continue;
+            }
+            name.clone_from(real);
+            let place = model::shown(real);
+            o.label = if every_account { format!("{email} · {place}") } else { place };
+            renamed = true;
+        }
+        if renamed {
+            pane.sort_entries();
+            pane.version += 1;
+        }
+    }
+}
+
+fn entry_of_search(email: &str, f: DriveFile, sd_names: &HashMap<String, String>, include_account: bool) -> Entry {
+    let origin = make_drive_origin(email, &f, sd_names, include_account);
+    Entry { drive_origin: Some(Box::new(origin)), ..entry_of(f) }
 }
 
 fn pane_key(p: usize) -> String {
@@ -1449,6 +1549,7 @@ fn disconnect(s: &mut State, email: &str) {
         return;
     }
     s.drives.remove(email);
+    s.shared_drive_names.remove(email);
     s.quotas.remove(email);
     s.cache.forget(email);
     s.tree.forget(email);
@@ -1458,11 +1559,22 @@ fn disconnect(s: &mut State, email: &str) {
         let gone = |l: &Location| matches!(l, Location::Drive { email: e, .. } if e == email);
         s.panes[p].back.retain(|l| !gone(l));
         s.panes[p].forward.retain(|l| !gone(l));
-        if !s.tabs[p].is_picker() && matches!(&s.panes[p].loc, Location::Drive { email: e, .. } if e == email) {
-            switch(s, p, Location::Mock(Vec::new()));
+        if !s.tabs[p].is_picker() {
+            if matches!(&s.panes[p].loc, Location::Drive { email: e, .. } if e == email) {
+                switch(s, p, Location::Mock(Vec::new()));
+            } else if matches!(&s.panes[p].loc, Location::DriveSearch(_)) {
+                if s.accounts.is_empty() {
+                    switch(s, p, Location::Mock(Vec::new()));
+                } else {
+                    load(s, p);
+                }
+            }
         }
     }
     tabs::purge_locations(s, |l| matches!(l, Location::Drive { email: e, .. } if e == email), &Location::Mock(Vec::new()));
+    if s.accounts.is_empty() {
+        tabs::purge_locations(s, |l| matches!(l, Location::DriveSearch(_)), &Location::Mock(Vec::new()));
+    }
     s.status = tr!("Conta desconectada: {email}", "Account disconnected: {email}");
 }
 
@@ -1505,6 +1617,7 @@ pub(crate) fn set_main_tab(s: &mut State, tab: MainTab) {
     s.main_tab = tab;
     s.view_menu_open = false;
     s.view_mode_menu = None;
+    s.search_scope_menu = None;
     if tab == MainTab::Accounts {
         ensure_all_quotas(s);
     }
@@ -1517,6 +1630,7 @@ pub(crate) fn set_pane_layout(s: &mut State, layout: settings::PaneLayout) {
     s.settings.save();
     s.view_menu_open = false;
     s.view_mode_menu = None;
+    s.search_scope_menu = None;
     s.menu = None;
     s.tree_menu = None;
     s.address_menu = None;
@@ -1609,6 +1723,114 @@ fn list(s: &mut State, p: usize, fresh: bool) {
     // Every load gets a new number, so a Drive answer for a folder left since is dropped,
     // whatever the pane shows now.
     let request = s.live[p].fetch_add(1, Ordering::Relaxed) + 1;
+    s.drive_search_warnings[p].clear();
+    // Multi-account Google Drive search across every connected account.
+    if let Location::DriveSearch(q) = &s.panes[p].loc {
+        let text = q.text.clone();
+        if s.accounts.is_empty() {
+            let pane = &mut s.panes[p];
+            pane.loading = false;
+            pane.error = Some(t("Conecte pelo menos uma conta do Google Drive para pesquisar.", "Connect at least one Google Drive account to search.").into());
+            pane.entries.clear();
+            pane.version += 1;
+            return;
+        }
+        let targets: Vec<(AccountRef, Option<HashMap<String, String>>)> = s
+            .accounts
+            .iter()
+            .map(|a| (AccountRef::of(s, &a.email), s.shared_drive_names.get(&a.email).cloned()))
+            .collect();
+        let pane = &mut s.panes[p];
+        pane.loading = true;
+        pane.error = None;
+        pane.free = None;
+        let live = s.live[p].clone();
+        let (out, wake) = (s.outbox.clone(), s.waker.clone());
+        let per_account_workers = 16usize.div_ceil(targets.len().max(1)).clamp(4, 16);
+        std::thread::spawn(move || {
+            let send = |out: &Sender<Msg>, wake: &Option<Waker>, msg: Msg| {
+                let _ = out.send(msg);
+                if let Some(w) = wake {
+                    w();
+                }
+            };
+            let seen = std::sync::Mutex::new(std::collections::HashSet::<String>::new());
+            let sent_first = std::sync::Mutex::new(false);
+            let warnings = std::sync::Mutex::new(Vec::<(String, String)>::new());
+            let succeeded = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|scope| {
+                for (account, cached_sd) in targets {
+                    let email = account.email.clone();
+                    let text = text.as_str();
+                    let (out, wake) = (out.clone(), wake.clone());
+                    let (live, seen, sent_first, warnings, succeeded) = (&live, &seen, &sent_first, &warnings, &succeeded);
+                    scope.spawn(move || {
+                        let emit = |msg: Msg| send(&out, &wake, msg);
+                        let drive = match catch_panic(t("abrir conta", "open account"), || account.open(&emit)) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                warnings.lock().unwrap().push((email, e));
+                                return;
+                            }
+                        };
+                        // The shared drives' names come alongside, not ahead of the search;
+                        // asked again once a result names a drive not known yet.
+                        let mut asked = cached_sd.is_none();
+                        if asked {
+                            learn_shared_drives(&drive, &email, &out, &wake);
+                        }
+                        let sd_names = cached_sd.unwrap_or_default();
+                        let res = catch_panic(t("pesquisar", "search"), || {
+                            drive.search_with_workers(text, &openexplorer_gdrive::search::Within::Everything, per_account_workers, |files, _more| {
+                                if !asked && files.iter().any(|f| f.drive_id.as_ref().is_some_and(|id| !sd_names.contains_key(id))) {
+                                    asked = true;
+                                    learn_shared_drives(&drive, &email, &out, &wake);
+                                }
+                                let entries: Vec<Entry> = {
+                                    let mut guard = seen.lock().unwrap();
+                                    files
+                                        .into_iter()
+                                        .filter(|f| guard.insert(f.id.clone()))
+                                        .map(|f| entry_of_search(&email, f, &sd_names, true))
+                                        .collect()
+                                };
+                                if !entries.is_empty() {
+                                    // Hold `sent_first` across `emit` so the `first: true` page strictly precedes any `first: false` page.
+                                    let mut first_guard = sent_first.lock().unwrap();
+                                    let first = !*first_guard;
+                                    *first_guard = true;
+                                    emit(Msg::Listed { pane: p, request, part: Part::Page { first, more: true }, result: Ok(entries), at: None });
+                                }
+                                live.load(Ordering::Relaxed) == request
+                            })
+                        });
+                        match res {
+                            Ok(()) => {
+                                succeeded.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(e) => warnings.lock().unwrap().push((email, e)),
+                        }
+                    });
+                }
+            });
+            if live.load(Ordering::Relaxed) != request {
+                return;
+            }
+            let warns = warnings.into_inner().unwrap();
+            let ok_count = succeeded.into_inner();
+            let first = !*sent_first.lock().unwrap();
+            if ok_count == 0 && !warns.is_empty() {
+                let combined = warns.iter().map(|(e, msg)| format!("{e}: {msg}")).collect::<Vec<_>>().join(" · ");
+                send(&out, &wake, Msg::Listed { pane: p, request, part: Part::Page { first, more: false }, result: Err(combined), at: None });
+            } else {
+                if !warns.is_empty() {
+                    send(&out, &wake, Msg::DriveSearchWarnings { pane: p, request, warnings: warns });
+                }
+                send(&out, &wake, Msg::Listed { pane: p, request, part: Part::Page { first, more: false }, result: Ok(Vec::new()), at: None });
+            }
+        });
+        return;
+    }
     // A search of the computer asks the index service, on a thread: milliseconds.
     if let Location::Found(f) = &s.panes[p].loc {
         let (f, show_hidden) = ((**f).clone(), s.settings.show_hidden);
@@ -1680,6 +1902,8 @@ fn list(s: &mut State, p: usize, fresh: bool) {
         ask_quota(s, &email);
     }
     let account = AccountRef::of(s, &email);
+    let cached_sd = s.shared_drive_names.get(&email).cloned();
+    let (names_out, names_wake) = (s.outbox.clone(), s.waker.clone());
     let key = cache::key(&s.panes[p].loc);
     // A folder seen this session shows at once; the fresh listing then replaces it whole.
     let in_memory = key.as_ref().and_then(|k| s.cache.get(k)).cloned();
@@ -1758,13 +1982,35 @@ fn list(s: &mut State, p: usize, fresh: bool) {
             // A folder opened from Compartilhados comigo, Com estrela or Recentes lists as any
             // folder, in whichever drive it sits.
             (Space::SharedWithMe | Space::Starred | Space::Recent | Space::Search(_), Some(f)) => drive.list(f, None, &mut page),
-            (Space::Search(q), None) => drive.search(&q.text, &q.within, &mut page),
+            (Space::Search(q), None) => {
+                // The shared drives' names come alongside, not ahead of the search; asked again
+                // once a result names a drive not known yet.
+                let mut asked = cached_sd.is_none();
+                if asked {
+                    learn_shared_drives(&drive, &email, &names_out, &names_wake);
+                }
+                let sd_names = cached_sd.unwrap_or_default();
+                let mut first_search = true;
+                let mut search_page = |files: Vec<DriveFile>, more: bool| {
+                    if !asked && files.iter().any(|f| f.drive_id.as_ref().is_some_and(|id| !sd_names.contains_key(id))) {
+                        asked = true;
+                        learn_shared_drives(&drive, &email, &names_out, &names_wake);
+                    }
+                    let entries: Vec<Entry> = files.into_iter().map(|f| entry_of_search(&email, f, &sd_names, false)).collect();
+                    emit(Msg::Listed { pane: p, request, part: Part::Page { first: first_search, more }, result: Ok(entries), at: None });
+                    first_search = false;
+                    live.load(Ordering::Relaxed) == request
+                };
+                drive.search(&q.text, &q.within, &mut search_page)
+            }
             (Space::SharedWithMe | Space::Starred | Space::Recent | Space::Trash, None) => match space.view() {
                 Some(v) => drive.view(v, &mut page),
                 None => Ok(()),
             },
             // The shared drives show as folders.
             (Space::SharedDrives, _) => drive.shared_drives().map(|list| {
+                let map: HashMap<String, String> = list.iter().map(|d| (d.id.clone(), d.name.clone())).collect();
+                emit(Msg::SharedDrives { email: email.clone(), names: map });
                 list.into_iter()
                     .map(|d| Entry {
                         name: if d.hidden { tr!("{} (oculto)", "{} (hidden)", d.name) } else { d.name },
@@ -1776,6 +2022,7 @@ fn list(s: &mut State, p: usize, fresh: bool) {
                         mime: None,
                         md5: None,
                         starred: false,
+                        drive_origin: None,
                     })
                     .collect::<Vec<_>>()
             }).map(|entries| emit(listed(Part::WHOLE, Ok(entries)))),
@@ -1789,6 +2036,18 @@ fn list(s: &mut State, p: usize, fresh: bool) {
 
 fn switch(s: &mut State, p: usize, loc: Location) {
     s.active = p;
+    s.search_scope_menu = None;
+    s.search_scope[p] = match &loc {
+        Location::DriveSearch(_) => model::DriveSearchScope::AllAccounts,
+        Location::Drive { space: Space::Search(q), path, .. } if path.is_empty() => {
+            if q.within == openexplorer_gdrive::search::Within::Everything {
+                model::DriveSearchScope::Account
+            } else {
+                model::DriveSearchScope::Here
+            }
+        }
+        _ => model::DriveSearchScope::Here,
+    };
     if s.renaming.as_ref().is_some_and(|(rp, _)| *rp == p) {
         s.renaming = None;
     }
@@ -1880,6 +2139,16 @@ pub(crate) fn folder_in(at: &Location, e: &Entry) -> Location {
         Location::Mock(segs) => segs.push(e.name.clone()),
         Location::Drive { space: space @ Space::SharedDrives, .. } => *space = Space::Shared { id: e.id.clone(), name: e.name.clone() },
         Location::Drive { path, .. } => path.push((e.target.clone().unwrap_or_else(|| e.id.clone()), e.name.clone())),
+        // A folder found in every account opens as one found in its own account does: under
+        // that account's search for the same words, so the address says where it came from and
+        // Up goes back to the results (its real parents aren't known from the search).
+        Location::DriveSearch(q) => {
+            if let Some(o) = e.drive_origin.as_deref() {
+                let target_id = e.target.clone().unwrap_or_else(|| e.id.clone());
+                let search = model::Search { text: q.text.clone(), within: openexplorer_gdrive::search::Within::Everything, place: actions::all_of_drive() };
+                loc = Location::Drive { email: o.email.clone(), space: Space::Search(Box::new(search)), path: vec![(target_id, e.name.clone())] };
+            }
+        }
         // A folder found opens where it is.
         Location::Server { server, .. } => {
             let segs = servers::segs_of(at, e);
@@ -1901,7 +2170,7 @@ fn go_up(s: &mut State, p: usize) {
             name
         }
         Location::Mock(segs) => segs.pop(),
-        Location::Found(_) => None,
+        Location::Found(_) | Location::DriveSearch(_) => None,
         // From a search's results back to the folder searched.
         Location::Server { find: find @ Some(_), .. } => {
             *find = None;
@@ -2322,7 +2591,7 @@ fn paths_for(s: &State, p: usize, ids: &[String], materialize: bool) -> Vec<Path
     let pane = &s.panes[p];
     match &pane.loc {
         Location::Local(_) | Location::Found(_) => ids.iter().filter_map(|id| pane.entry(id)).filter_map(|e| pane.loc.local_path(e)).collect(),
-        Location::Drive { .. } | Location::Server { .. } => Vec::new(),
+        Location::Drive { .. } | Location::DriveSearch(_) | Location::Server { .. } => Vec::new(),
         Location::Mock(segs) => {
             let dir = s.temp.join(if segs.is_empty() { "Meu Drive".to_string() } else { segs.join("_") });
             if materialize && std::fs::create_dir_all(&dir).is_err() {
@@ -2359,6 +2628,14 @@ fn start_drive_drag(s: &State, p: usize, ids: Vec<String>) {
     let source: Arc<dyn dragout::Files> = match &pane.loc {
         Location::Drive { email, .. } => {
             let Some(drive) = s.drives.get(email).cloned() else { return };
+            Arc::new(dragout::DriveSource { drive, files: items.iter().map(|e| actions::drive_file(e)).collect() })
+        }
+        Location::DriveSearch(_) => {
+            let Some(first_email) = items.first().and_then(|e| actions::item_account(&pane.loc, e)) else { return };
+            if !items.iter().all(|e| actions::item_account(&pane.loc, e) == Some(first_email)) {
+                return;
+            }
+            let Some(drive) = s.drives.get(first_email).cloned() else { return };
             Arc::new(dragout::DriveSource { drive, files: items.iter().map(|e| actions::drive_file(e)).collect() })
         }
         Location::Server { server, .. } => {
@@ -2434,7 +2711,7 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
     let loc = s.panes[p].loc.clone();
     let (mut done, mut skipped) = (0, 0);
     match &loc {
-        Location::Found(_) | Location::Server { find: Some(_), .. } => {
+        Location::Found(_) | Location::DriveSearch(_) | Location::Server { find: Some(_), .. } => {
             s.status = t("Os resultados da pesquisa não são uma pasta: solte os arquivos numa pasta.", "Search results aren't a folder: drop the files in a folder.").into();
             return;
         }
@@ -2495,6 +2772,7 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
                     mime: None,
                     md5: None,
                     starred: false,
+                    drive_origin: None,
                 };
                 if s.mock.add(segs, entry) { done += 1 } else { skipped += 1 }
             }
@@ -2530,6 +2808,7 @@ fn clash_scene(s: &mut State, all: bool) {
         mime: Some(mime.into()),
         md5: None,
         starred: false,
+        drive_origin: None,
     };
     let existing = vec![e("a", "Relatório.pdf", "application/pdf"), e("b", "foto.jpg", "image/jpeg"), e("c", "Projetos", openexplorer_gdrive::api::FOLDER_MIME)];
     s.panes[1].set_entries(Ok(existing.clone()));
@@ -2587,6 +2866,7 @@ fn view_sample() -> Vec<Entry> {
         mime: mime.map(str::to_string),
         md5: None,
         starred: false,
+        drive_origin: None,
     };
     vec![
         e("f1", "Projetos antigos", true, None, 40, None),
@@ -2996,7 +3276,7 @@ fn main() {
             ("shared", |s| {
                 s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::SharedDrives));
-                let d = |id: &str, name: &str| Entry { id: id.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+                let d = |id: &str, name: &str| Entry { id: id.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
                 s.panes[1].set_entries(Ok(vec![d("0AAa", "Equipe de design"), d("0AAb", "Financeiro"), d("0AAc", "Projetos 2026")]));
             }),
             ("accounts-hub", accounts_hub_scene),
@@ -3630,7 +3910,7 @@ mod tests {
     }
 
     fn entries(from: usize, n: usize) -> Vec<Entry> {
-        (from..from + n).map(|i| Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false }).collect()
+        (from..from + n).map(|i| Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }).collect()
     }
 
     /// The median of 9 runs of `per_run` calls to `step`, in µs per call, and the best.
@@ -3917,5 +4197,65 @@ mod tests {
         s.panes[1].cursor = Some("f9".into());
         assert!(key(&mut s, 1, &ev(Key::ContextMenu, Mods::default()), &mut tx));
         assert_eq!(s.menu, Some((1, rune::PointerPress { x: 424.0, y: top + 3.0 * ROW_H })));
+    }
+
+    fn f_my_template() -> DriveFile {
+        DriveFile { id: "f2".into(), name: "Filme.mkv".into(), is_dir: false, size: Some(1), modified: None, mime: "video/x-matroska".into(), target: None, starred: false, md5: None, drive_id: None, owned_by_me: Some(true) }
+    }
+
+    #[test]
+    fn drive_origin_and_folder_in_for_global_drive_search() {
+        let sd = HashMap::from([("0AA".into(), "Séries／HD".into())]);
+        let f_sd = DriveFile {
+            id: "f1".into(),
+            name: "Lost".into(),
+            is_dir: true,
+            size: None,
+            modified: None,
+            mime: openexplorer_gdrive::api::FOLDER_MIME.into(),
+            target: None,
+            starred: false,
+            md5: None,
+            drive_id: Some("0AA".into()),
+            owned_by_me: Some(false),
+        };
+        let o_single = make_drive_origin("a@b", &f_sd, &sd, false);
+        assert_eq!(o_single.label, "Séries／HD");
+        let o_multi = make_drive_origin("a@b", &f_sd, &sd, true);
+        assert_eq!(o_multi.label, "a@b · Séries／HD");
+
+        let f_my = DriveFile { drive_id: None, owned_by_me: Some(true), ..f_sd.clone() };
+        assert_eq!(make_drive_origin("a@b", &f_my, &sd, false).label, "Meu Drive");
+        let f_swm = DriveFile { drive_id: None, owned_by_me: Some(false), ..f_sd.clone() };
+        assert_eq!(make_drive_origin("a@b", &f_swm, &sd, true).label, "a@b · Compartilhados comigo");
+
+        // A folder found in every account opens under that account's search for the same words,
+        // wherever it sits (a shared drive, My Drive, shared with the account).
+        let global = Location::DriveSearch(Box::new(model::DriveSearch { text: "lost".into() }));
+        let under_search = |email: &str, id: &str, name: &str| Location::Drive {
+            email: email.into(),
+            space: Space::Search(Box::new(model::Search { text: "lost".into(), within: openexplorer_gdrive::search::Within::Everything, place: actions::all_of_drive() })),
+            path: vec![(id.into(), name.into())],
+        };
+        assert_eq!(folder_in(&global, &entry_of_search("a@b", f_sd, &sd, true)), under_search("a@b", "f1", "Lost"));
+        assert_eq!(folder_in(&global, &entry_of_search("c@d", f_my, &sd, true)), under_search("c@d", "f1", "Lost"));
+        assert_eq!(folder_in(&global, &entry_of_search("a@b", f_swm, &sd, true)), under_search("a@b", "f1", "Lost"));
+        // Up from it goes back to that account's results.
+        let mut opened = under_search("a@b", "f1", "Lost");
+        if let Location::Drive { path, .. } = &mut opened {
+            path.pop();
+        }
+        assert!(opened.is_drive_search());
+
+        // A shared drive's name not known when the results came is taken once it arrives.
+        let mut s = init();
+        s.accounts.push(openexplorer_gdrive::store::StoredAccount { email: "a@b".into(), name: "A".into(), client_id: String::new() });
+        let unknown = DriveFile { drive_id: Some("0BB".into()), owned_by_me: Some(false), ..f_my_template() };
+        s.panes[1].go(global.clone());
+        s.panes[1].set_entries(Ok(vec![entry_of_search("a@b", unknown, &HashMap::new(), true)]));
+        assert_eq!(s.panes[1].entries[0].drive_origin.as_ref().unwrap().label, "a@b · Drive compartilhado");
+        s.shared_drive_names.insert("a@b".into(), HashMap::from([("0BB".into(), "Filmes".into())]));
+        name_shared_drives(&mut s, "a@b");
+        assert_eq!(s.panes[1].entries[0].drive_origin.as_ref().unwrap().label, "a@b · Filmes");
     }
 }

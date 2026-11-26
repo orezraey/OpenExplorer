@@ -462,7 +462,7 @@ mod tests {
     fn a_drag_selects_scrolls_and_escape_restores() {
         let mut s = crate::init();
         s.cache = crate::cache::Cache::memory_only();
-        s.panes[1].set_entries(Ok((0..200).map(|i| crate::model::Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false }).collect()));
+        s.panes[1].set_entries(Ok((0..200).map(|i| crate::model::Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }).collect()));
         s.panes[1].selected = ids(&["f150"]);
         s.views[1].scroll.set(Scroll { x: 0.0, y: 0.0, max_x: 0.0, max_y: 200.0 * ROW_H, h: 300.0 });
         let mut tx = Tx::default();
@@ -498,7 +498,7 @@ mod tests {
     fn the_keyboard_goes_on_from_the_rectangle() {
         let mut s = crate::init();
         s.cache = crate::cache::Cache::memory_only();
-        s.panes[1].set_entries(Ok((0..20).map(|i| crate::model::Entry { id: format!("f{i}"), name: format!("arquivo {i:02}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false }).collect()));
+        s.panes[1].set_entries(Ok((0..20).map(|i| crate::model::Entry { id: format!("f{i}"), name: format!("arquivo {i:02}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }).collect()));
         s.views[1].scroll.set(Scroll { x: 0.0, y: 0.0, max_x: 0.0, max_y: 0.0, h: 600.0 });
         s.panes[1].cursor = Some("f15".into());
         press(&mut s, 1, [30.0, HEADER_H + 2.5 * ROW_H], false);

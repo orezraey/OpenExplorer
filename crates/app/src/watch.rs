@@ -346,7 +346,7 @@ mod tests {
     use openexplorer_gdrive::DriveFile;
 
     fn file(id: &str, name: &str) -> DriveFile {
-        DriveFile { id: id.into(), name: name.into(), is_dir: false, size: Some(3), modified: None, mime: "text/plain".into(), target: None, starred: false, md5: None }
+        DriveFile { id: id.into(), name: name.into(), is_dir: false, size: Some(3), modified: None, mime: "text/plain".into(), target: None, starred: false, md5: None, drive_id: None, owned_by_me: None }
     }
 
     fn change(f: DriveFile, parents: &[&str]) -> Change {
