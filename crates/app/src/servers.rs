@@ -324,11 +324,11 @@ fn transfer<P: Send + Sync + 'static>(
                         if done() {
                             return;
                         }
-                        let _slot = slots.acquire();
-                        if done() {
-                            return;
-                        }
                         let ran = with(&pool, &server, |c| {
+                            // The slot comes once the connection is held: a worker waiting for
+                            // the server's pool (two batches on one server) holds none, so it
+                            // doesn't keep another transfer from starting.
+                            let Some(_slot) = slots.acquire_unless(done) else { return Ok(()) };
                             let most = c.batches().0.max(1);
                             // A row taken that doesn't join the run before it starts the next.
                             let mut held = None;

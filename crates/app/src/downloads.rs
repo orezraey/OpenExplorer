@@ -121,7 +121,7 @@ pub fn run(
             scope.spawn(|| {
                 while let Some((work, _finished)) = queue.next() {
                     let skip = |row: usize| rows[row].cancelled() || state[row].error.lock().map(|e| e.is_some()).unwrap_or(true);
-                    let _slot = (!skip(work.row())).then(|| slots.acquire());
+                    let _slot = slots.acquire_unless(|| skip(work.row()));
                     // Other folders waiting are read with this one, in one listing.
                     let mut group = vec![work];
                     if _slot.is_some() && matches!(group[0], Work::Folder { .. }) {

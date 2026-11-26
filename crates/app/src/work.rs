@@ -93,13 +93,24 @@ impl Slots {
     }
 
     /// Waits until a slot is free and takes it. Drop the returned [`Slot`] when the work ends.
+    #[cfg(test)]
     pub fn acquire(&self) -> Slot<'_> {
+        self.acquire_unless(|| false).expect("a wait that never gives up")
+    }
+
+    /// [`Self::acquire`], giving up (`None`) once `stop` says the work needs no slot any more: a
+    /// batch cancelled while it waits behind another ends at once, not when that one frees a
+    /// slot. `stop` is asked about every tenth of a second while it waits.
+    pub fn acquire_unless(&self, stop: impl Fn() -> bool) -> Option<Slot<'_>> {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         while s.0 >= s.1 {
-            s = self.ready.wait(s).unwrap_or_else(|e| e.into_inner());
+            if stop() {
+                return None;
+            }
+            s = self.ready.wait_timeout(s, std::time::Duration::from_millis(100)).unwrap_or_else(|e| e.into_inner()).0;
         }
         s.0 += 1;
-        Slot(self)
+        Some(Slot(self))
     }
 
     fn release(&self) {
@@ -198,21 +209,42 @@ mod tests {
         assert!(peak.load(Ordering::SeqCst) <= 4, "peak was {}", peak.load(Ordering::SeqCst));
         assert_eq!(peak.load(Ordering::SeqCst), 4);
 
-        // Raising the limit wakes a blocked acquirer.
+        // Raising the limit wakes a blocked acquirer. It's waited for with a deadline, not a
+        // fixed sleep, so a busy machine doesn't fail the test.
+        let soon = |what: &dyn Fn() -> bool| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !what() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            what()
+        };
         let live = Slots::new(1);
         let first = live.acquire();
-        let acquired = AtomicUsize::new(0);
+        let (waiting, acquired) = (AtomicUsize::new(0), AtomicUsize::new(0));
         std::thread::scope(|scope| {
             scope.spawn(|| {
+                waiting.store(1, Ordering::SeqCst);
                 let _second = live.acquire();
                 acquired.store(1, Ordering::SeqCst);
             });
+            assert!(soon(&|| waiting.load(Ordering::SeqCst) == 1));
             std::thread::sleep(std::time::Duration::from_millis(20));
-            assert_eq!(acquired.load(Ordering::SeqCst), 0);
+            assert_eq!(acquired.load(Ordering::SeqCst), 0, "a second slot while the limit is 1");
             live.set_limit(2);
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            assert_eq!(acquired.load(Ordering::SeqCst), 1);
+            assert!(soon(&|| acquired.load(Ordering::SeqCst) == 1), "raising the limit didn't wake it");
             drop(first);
         });
+
+        // A wait that's no longer needed gives up: the batch was cancelled while it waited.
+        let full = Slots::new(1);
+        let held = full.acquire();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| full.acquire_unless(|| cancelled.load(Ordering::SeqCst)).is_none());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cancelled.store(true, Ordering::SeqCst);
+            assert!(waiter.join().unwrap(), "a cancelled wait took a slot");
+        });
+        drop(held);
     }
 }

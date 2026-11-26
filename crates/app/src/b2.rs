@@ -849,7 +849,7 @@ fn resume_upload(s: &mut State, id: &str) {
     background(s, move |emit| {
         let result = catch_panic(t("retomar o envio", "resume the upload"), || {
             batch.rows()[0].size(size);
-            let _slot = (!batch.rows()[0].over()).then(|| slots.acquire());
+            let _slot = slots.acquire_unless(|| batch.rows()[0].over());
             batch.run(|_, p| {
                 crate::servers::with(&pool, &server, |c| {
                     let mut last = 0;

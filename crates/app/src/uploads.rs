@@ -213,7 +213,7 @@ pub fn run(d: &Drive, batch: &Batch, items: &[Item], parent: &str, remove: bool,
                     let row = work.row();
                     let (p, st) = (&rows[row], &state[row]);
                     let skip = || p.cancelled() || st.error.lock().map(|e| e.is_some()).unwrap_or(true);
-                    let _slot = (!skip()).then(|| slots.acquire());
+                    let _slot = slots.acquire_unless(skip);
                     if skip() {
                         st.skipped.store(true, Ordering::Relaxed);
                     } else {
