@@ -84,6 +84,10 @@ Air Explorer keeps unfinished transfers and resumes them at its next start: if a
 while it copies, cancel what's left in its queue (select the rows, Shift+End, right click,
 Cancelar) before running again.
 
+The README's comparison comes from `results/comparison.csv`, the medians of the runs each row
+names; `readme-chart.ps1` draws its chart from that file into `docs/bench` (run it again after
+changing the file).
+
 `uia-dump.ps1` (an app's UI Automation tree) and `list-count.ps1` (Air Explorer's list counts) are
 the read-only tools the script was written with. The examples `drive_ls` (a Drive folder's
 contents and sizes) and `download_speed` (one file in one stream and in segments) helped choose

@@ -5,6 +5,59 @@ Written in Rust.
 
 [Português](README.pt-BR.md)
 
+<table align="center">
+  <tr>
+    <td align="center" width="200"><h1>37 of 37</h1><b>Benchmarks won</b><br><sub>against Air Explorer 6.0, on the same PC and connection</sub></td>
+    <td align="center" width="200"><h1>4.8×</h1><b>Less time</b><br><sub>the median of the 36 timed measurements</sub></td>
+    <td align="center" width="200"><h1>0.17 s</h1><b>To start</b><br><sub>Air Explorer takes 3.1 s</sub></td>
+    <td align="center" width="200"><h1>189 MB</h1><b>Memory, idle</b><br><sub>Air Explorer uses 240 MB</sub></td>
+  </tr>
+</table>
+
+## Compared with Air Explorer
+
+**Faster than Air Explorer in all 37 measurements: opening folders, downloading, uploading,
+starting and memory.**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/bench/speed-en-dark.svg">
+  <img src="docs/bench/speed-en-light.svg" alt="Time to finish nine tasks, Open Explorer against Air Explorer: from 1.1 to 25 times faster." width="880">
+</picture>
+
+Measured on 25 and 26 November 2026, on one Windows 11 PC and one internet connection of about
+1 Gbit/s, against the free version of Air Explorer 6.0.0. Both apps moved 2 files at a time, the
+free version's limit. The script [`bench/compare.ps1`](bench/compare.ps1) drives both apps
+through Windows UI Automation, as a screen reader would, so neither app was changed, and anyone
+can run it again. Each number is the median of several runs; downloads were timed in
+alternating pairs, because the connection's speed changes from minute to minute. The closest
+result, a 500 MiB download from Dropbox, won 4 of 5 alternating rounds rather than all of them.
+
+Open Explorer's time in bold, then Air Explorer's:
+
+| | Google Drive | OneDrive | Dropbox | MEGA |
+| --- | --- | --- | --- | --- |
+| Open a folder of 5,000 files, first time | **4.7 s** · 20.3 s | **6.6 s** · 37.3 s | **2.7 s** · 6.0 s | **0.03 s** · 0.18 s |
+| Open a folder of 1,000 folders, first time | **1.1 s** · 4.0 s | **0.03 s** · 12.1 s | **0.55 s** · 1.17 s | **0.03 s** · 0.17 s |
+| Download a 500 MiB file | **6.1 s** · 8.3 s | **16.2 s** · 80.2 s | **7.9 s** · 8.5 s | **9.9 s** · 20.2 s |
+| Download 100 folders | **0.47 s** · 2.3 s | **0.09 s** · 2.3 s | **0.10 s** · 2.4 s | **0.10 s** · 2.4 s |
+| Upload a 100 MiB file | **4.6 s** · 7.3 s | **7.5 s** · 12.8 s | **3.0 s** · 4.9 s | **4.9 s** · 11.0 s |
+| Upload 100 files of 512 KiB | **79 s** · 109 s | **44 s** · 87 s | **6.0 s** · 41 s | **66 s** · 108 s |
+
+| | Open Explorer | Air Explorer 6.0 (free) |
+| --- | --- | --- |
+| Start | **0.17 s** | 3.1 s |
+| Memory, idle | **189 MB** | 240 MB |
+| Open `C:\Windows\System32` (5,040 items) | **0.03 s** | 0.21 s |
+| Open `C:\Windows\WinSxS` (28,491 items) | **0.16 s** | 1.09 s |
+| Open a cloud folder of 5,000 files again | **0.03 to 0.06 s** | 0.16 to 0.17 s |
+| Download a 2 GiB file from Google Drive | **19.9 s** | 33.1 s |
+| Accounts in each cloud | **As many as you like** | One |
+| Files moved at once | **You choose, 1 to 10** | 2 |
+
+Every measurement, with how it was taken, is in
+[`bench/results/comparison.csv`](bench/results/comparison.csv); how to run the comparison is in
+[`bench/README.md`](bench/README.md).
+
 ## Features
 
 * Two panes, each with its own folder tree.
