@@ -28,7 +28,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let title_leading = row()
         .gap(8.0)
         .center_y()
-        .child(icon(&icons::TAB_EXPLORE, 15.0).color(k.c.text_accent))
+        .child(icon(&icons::APP_ICON, 18.0))
         .child(text("Open Explorer").font(k.ty.text_small).color(k.c.text_base));
     // Under Mica (Opções, Experimental) the title bar lets the backdrop through, as the page does.
     // Turned off in Opções, the view paints the window's own background at once, and Mica leaves
@@ -162,6 +162,8 @@ fn stepper(k: &Kit, key: &str, value: u8, set: fn(&mut State, i32)) -> El {
 
 fn change_settings(s: &mut State, f: impl FnOnce(&mut crate::settings::Settings)) {
     f(&mut s.settings);
+    s.upload_slots.set_limit(usize::from(s.settings.uploads));
+    s.download_slots.set_limit(usize::from(s.settings.downloads));
     s.settings.save();
 }
 
@@ -197,6 +199,7 @@ fn reset_settings(s: &mut State, tx: &mut Tx) {
     }
     s.settings.save();
     s.settings.language.apply();
+    crate::tray::refresh_menu(s);
     let (sans, mono) = s.settings.font.families();
     tx.set_font_families(sans, mono);
     tx.set_font_smoothing(s.settings.text_render.smoothing());
@@ -411,6 +414,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
             pills = pills.child(seg_btn(format!("lang-{l:?}"), l.label(), on).on_press(move |s: &mut State| {
                 change_settings(s, |c| c.language = l);
                 l.apply();
+                crate::tray::refresh_menu(s);
             }));
         }
         pills
@@ -3895,7 +3899,14 @@ fn toolbar(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         .child(tool(k, "options", &icons::SETTINGS, t("Opções", "Options"), true, |s: &mut State, _| {
             s.dialog = Some(Dialog::Options(Box::new(crate::settings::OptionsView::open(crate::settings::OptionsTab::General))));
         }))
-        .child(text("Open Explorer").font(k.ty.text_small_medium).color(k.c.text_faint).mx(8.0))
+        .child(
+            row()
+                .gap(6.0)
+                .center_y()
+                .mx(8.0)
+                .child(icon(&icons::APP_ICON, 16.0))
+                .child(text("Open Explorer").font(k.ty.text_small_medium).color(k.c.text_faint)),
+        )
 }
 
 fn update_toolbar_pill(s: &State, k: &Kit) -> El {

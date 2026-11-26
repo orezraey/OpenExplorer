@@ -15,6 +15,9 @@ macro_rules! icon32 {
     };
 }
 
+// Application brand icon (rendered in full colour via resvg's raster-images).
+icon32!(APP_ICON, "app-icon", include_str!("../assets/app-icon.svgfrag"));
+
 // The copy arrows between the panes, in `currentColor`.
 icon!(COPY_RIGHT, "copy-right", r##"<path d="M4.5 1.5L11.5 8L4.5 14.5Z" fill="currentColor"/>"##);
 icon!(COPY_LEFT, "copy-left", r##"<path d="M11.5 1.5L4.5 8L11.5 14.5Z" fill="currentColor"/>"##);
@@ -227,7 +230,7 @@ mod tests {
     /// its 32 x 32 pixels come out coloured.
     #[test]
     fn brand_logos_draw() {
-        for icon in [&super::PROVIDER_B2, &super::PROVIDER_KOOFR, &super::PROVIDER_MAILRU, &super::PROVIDER_YANDEX, &super::PROVIDER_ONLIME] {
+        for icon in [&super::APP_ICON, &super::PROVIDER_B2, &super::PROVIDER_KOOFR, &super::PROVIDER_MAILRU, &super::PROVIDER_YANDEX, &super::PROVIDER_ONLIME] {
             let svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">{}</svg>"#, icon.body);
             let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default()).unwrap();
             let mut pixmap = resvg::tiny_skia::Pixmap::new(32, 32).unwrap();

@@ -71,6 +71,64 @@ impl<W> Drop for Finished<'_, W> {
     }
 }
 
+/// A shared limit on how many transfers run at the same time across all batches (uploads or
+/// downloads), so starting a second batch while one is under way still honours the cap in
+/// Opções instead of multiplying it.
+pub struct Slots {
+    state: Mutex<(usize, usize)>,
+    ready: Condvar,
+}
+
+impl Slots {
+    pub fn new(limit: usize) -> Slots {
+        Slots { state: Mutex::new((0, limit.max(1))), ready: Condvar::new() }
+    }
+
+    /// Updates the cap (from Opções). Raising it wakes waiting workers at once; lowering it
+    /// lets those already running finish before more start.
+    pub fn set_limit(&self, limit: usize) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.1 = limit.max(1);
+        self.ready.notify_all();
+    }
+
+    /// Waits until a slot is free and takes it. Drop the returned [`Slot`] when the work ends.
+    #[cfg(test)]
+    pub fn acquire(&self) -> Slot<'_> {
+        self.acquire_unless(|| false).expect("a wait that never gives up")
+    }
+
+    /// [`Self::acquire`], giving up (`None`) once `stop` says the work needs no slot any more: a
+    /// batch cancelled while it waits behind another ends at once, not when that one frees a
+    /// slot. `stop` is asked about every tenth of a second while it waits.
+    pub fn acquire_unless(&self, stop: impl Fn() -> bool) -> Option<Slot<'_>> {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while s.0 >= s.1 {
+            if stop() {
+                return None;
+            }
+            s = self.ready.wait_timeout(s, std::time::Duration::from_millis(100)).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        s.0 += 1;
+        Some(Slot(self))
+    }
+
+    fn release(&self) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.0 -= 1;
+        self.ready.notify_one();
+    }
+}
+
+/// Releases a slot taken from [`Slots`] however the work ends, a panic included.
+pub struct Slot<'a>(&'a Slots);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +173,78 @@ mod tests {
             }
         });
         assert_eq!(taken.load(Ordering::Relaxed), 1 + 3 + 4 * 5);
+    }
+
+    /// Two concurrent batches sharing `Slots` never exceed the total cap (e.g. 2 × 4 workers
+    /// on 2 × 10 items still run at most 4 at once), and raising the limit wakes waiting workers.
+    #[test]
+    fn slots_cap_concurrency_across_batches_and_update_live() {
+        let slots = Slots::new(4);
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let done = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let (slots, active, peak, done) = (&slots, &active, &peak, &done);
+            for _ in 0..2 {
+                let queue = Queue::new(0..10);
+                scope.spawn(move || {
+                    std::thread::scope(|inner| {
+                        for _ in 0..4 {
+                            inner.spawn(|| {
+                                while let Some((_, _finished)) = queue.next() {
+                                    let _slot = slots.acquire();
+                                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                                    peak.fetch_max(now, Ordering::SeqCst);
+                                    std::thread::sleep(std::time::Duration::from_millis(15));
+                                    active.fetch_sub(1, Ordering::SeqCst);
+                                    done.fetch_add(1, Ordering::SeqCst);
+                                }
+                            });
+                        }
+                    });
+                });
+            }
+        });
+        assert_eq!(done.load(Ordering::SeqCst), 20);
+        assert!(peak.load(Ordering::SeqCst) <= 4, "peak was {}", peak.load(Ordering::SeqCst));
+        assert_eq!(peak.load(Ordering::SeqCst), 4);
+
+        // Raising the limit wakes a blocked acquirer. It's waited for with a deadline, not a
+        // fixed sleep, so a busy machine doesn't fail the test.
+        let soon = |what: &dyn Fn() -> bool| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !what() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            what()
+        };
+        let live = Slots::new(1);
+        let first = live.acquire();
+        let (waiting, acquired) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                waiting.store(1, Ordering::SeqCst);
+                let _second = live.acquire();
+                acquired.store(1, Ordering::SeqCst);
+            });
+            assert!(soon(&|| waiting.load(Ordering::SeqCst) == 1));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert_eq!(acquired.load(Ordering::SeqCst), 0, "a second slot while the limit is 1");
+            live.set_limit(2);
+            assert!(soon(&|| acquired.load(Ordering::SeqCst) == 1), "raising the limit didn't wake it");
+            drop(first);
+        });
+
+        // A wait that's no longer needed gives up: the batch was cancelled while it waited.
+        let full = Slots::new(1);
+        let held = full.acquire();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| full.acquire_unless(|| cancelled.load(Ordering::SeqCst)).is_none());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cancelled.store(true, Ordering::SeqCst);
+            assert!(waiter.join().unwrap(), "a cancelled wait took a slot");
+        });
+        drop(held);
     }
 }
