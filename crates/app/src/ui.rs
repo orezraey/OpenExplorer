@@ -192,6 +192,9 @@ fn reset_settings(s: &mut State, tx: &mut Tx) {
     let (was_hidden, had_mica) = (s.settings.show_hidden, s.settings.mica);
     // Where the window was isn't an option: it stays.
     s.settings = crate::settings::Settings { window: s.settings.window, ..Default::default() };
+    // The limits on transfers at once go back too, for those running now as well.
+    s.upload_slots.set_limit(usize::from(s.settings.uploads));
+    s.download_slots.set_limit(usize::from(s.settings.downloads));
     // The window stays transparent until it opens again: the material's tint follows the
     // theme back.
     if had_mica || s.acrylic {
