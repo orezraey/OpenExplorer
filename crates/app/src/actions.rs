@@ -30,6 +30,8 @@ pub struct Clip {
     pub mode: ClipMode,
     pub from: Location,
     pub items: Vec<Entry>,
+    /// App clock (`State::now`) when picked up, driving the clipboard icon wiggle phase.
+    pub picked_at: f64,
 }
 
 /// Target of a connected account or server removal in the Central de Contas.
@@ -70,6 +72,8 @@ pub enum Dialog {
     OneDriveLink(Box<crate::onedrive::MakeLink>),
     /// Envios inacabados of a B2 bucket.
     B2Unfinished(Box<crate::b2::Unfinished>),
+    /// Built-in update dialog (release info, download progress, restart to update).
+    Update,
 }
 
 /// The main window's close button, Alt+F4 or the taskbar's Fechar janela: with transfers still
@@ -132,6 +136,7 @@ pub fn quit_question_done(s: &mut State) -> bool {
     // A Reiniciar put off by the transfers goes with the question: else a later plain close
     // would open the app again.
     crate::RESTART.store(false, Ordering::Relaxed);
+    update_stays(s);
     s.quit_app = false;
     true
 }
@@ -141,6 +146,58 @@ pub fn keep_running(s: &mut State) {
     s.quit_asked = false;
     crate::RESTART.store(false, Ordering::Relaxed);
     s.quit_app = false;
+    update_stays(s);
+}
+
+/// The app stays open after Reiniciar para atualizar asked to close: the update isn't handed
+/// off, and is ready to install again.
+fn update_stays(s: &mut State) {
+    if let Some(staged) = crate::updater::cancel_handoff() {
+        s.updater.download = crate::updater::DownloadState::Ready(staged);
+    }
+}
+
+/// Opens the built-in update modal.
+pub fn open_update_dialog(s: &mut State) {
+    s.dialog = Some(Dialog::Update);
+}
+
+/// Checks GitHub Releases for a newer version on a background thread.
+pub fn check_updates(s: &mut State, manual: bool) {
+    if s.updater.checking {
+        return;
+    }
+    s.updater.checking = true;
+    s.updater.check_error = None;
+    let kind = s.updater.support.as_ref().ok().cloned();
+    background(s, move |emit| {
+        let result = crate::updater::check_latest(kind.as_ref());
+        emit(Msg::Update(crate::updater::Answer::Checked { manual, result }));
+    });
+}
+
+/// Downloads the discovered update in the background, reporting progress back to the UI.
+pub fn download_update(s: &mut State) {
+    let Some(release) = s.updater.release.clone() else { return };
+    let Ok(kind) = s.updater.support.clone() else { return };
+    if matches!(s.updater.download, crate::updater::DownloadState::Downloading { .. } | crate::updater::DownloadState::Installing) {
+        return;
+    }
+    s.updater.download = crate::updater::DownloadState::Downloading { received: 0, total: release.size };
+    background(s, move |emit| {
+        let result = crate::updater::download_release(&release, &kind, |received, total| {
+            emit(Msg::Update(crate::updater::Answer::Progress { received, total }));
+        });
+        emit(Msg::Update(crate::updater::Answer::Downloaded(result)));
+    });
+}
+
+/// Hands off a downloaded update on quit and closes the window (respecting running transfers).
+pub fn install_update(s: &mut State, tx: &mut Tx) {
+    let crate::updater::DownloadState::Ready(staged) = s.updater.download.clone() else { return };
+    crate::updater::schedule_handoff(staged);
+    s.updater.download = crate::updater::DownloadState::Installing;
+    tx.close_window();
 }
 
 /// Reiniciar (Opções): the app closes as Fechar would, asking first while transfers run, and
@@ -593,7 +650,7 @@ pub fn pick_up(s: &mut State, p: usize, mode: ClipMode) {
     } else {
         tr!("Copiado: {n} — use Colar (Ctrl+V) na pasta de destino.", "Copied: {n} — use Paste (Ctrl+V) in the destination folder.")
     };
-    s.clip = Some(Clip { mode, from: loc, items });
+    s.clip = Some(Clip { mode, from: loc, items, picked_at: s.now });
 }
 
 /// Whether items of `from` can be copied or moved into `to` as it is: same disk, same Drive
@@ -1226,7 +1283,7 @@ pub fn pick_up_item(s: &mut State, parent: Location, item: Entry, mode: ClipMode
         return;
     }
     let what = shown(&item.name);
-    s.clip = Some(Clip { mode, from: parent, items: vec![item] });
+    s.clip = Some(Clip { mode, from: parent, items: vec![item], picked_at: s.now });
     s.status = match mode {
         ClipMode::Copy => tr!("Copiado: {what}.", "Copied: {what}."),
         ClipMode::Cut => tr!("Recortado: {what}.", "Cut: {what}."),
@@ -2005,7 +2062,7 @@ sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa 
         ask_new_folder(&mut s, 1, &mut Tx::default());
         assert!(s.dialog.is_none());
         assert!(s.status.starts_with("Com estrela é uma lista do Google Drive"), "{}", s.status);
-        s.clip = Some(Clip { mode: ClipMode::Copy, from: drive(Space::MyDrive, &[]), items: vec![] });
+        s.clip = Some(Clip { mode: ClipMode::Copy, from: drive(Space::MyDrive, &[]), items: vec![], picked_at: 0.0 });
         s.status.clear();
         paste(&mut s, 1);
         assert!(s.status.starts_with("Com estrela é uma lista"), "{}", s.status);
@@ -2213,7 +2270,7 @@ sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa 
         for p in &mut s.panes {
             p.load_now(&s.mock, s.settings.show_hidden);
         }
-        s.clip = Some(Clip { mode: ClipMode::Cut, from: Location::Local(b.clone()), items: Vec::new() });
+        s.clip = Some(Clip { mode: ClipMode::Cut, from: Location::Local(b.clone()), items: Vec::new(), picked_at: 0.0 });
 
         copy_across(&mut s, 1, 0);
         assert!(s.status.contains("Selecione"), "nothing selected on the right: {}", s.status);

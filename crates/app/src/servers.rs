@@ -1959,7 +1959,7 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
             }
         }
     };
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         let pane = &mut s.panes[p];
         pane.back.iter_mut().chain(pane.forward.iter_mut()).for_each(renew);
     }
@@ -1968,7 +1968,7 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
     }
     s.tree.server_changed(&server.id);
     // The panes on it show it again, read with its new settings.
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         let mut here = s.panes[p].loc.clone();
         let before = here.clone();
         renew(&mut here);
@@ -2017,7 +2017,7 @@ pub fn remove(s: &mut State, id: &str) {
     if s.clip.as_ref().is_some_and(|c| on(&c.from)) {
         s.clip = None;
     }
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         s.panes[p].back.retain(|l| !on(l));
         s.panes[p].forward.retain(|l| !on(l));
         if !s.tabs[p].is_picker() && on(&s.panes[p].loc) {
@@ -2268,7 +2268,7 @@ pub(crate) mod tests {
         s.servers.list = vec![sv.clone()];
         s.panes[0].loc = folder(&sv, vec!["x".into()]);
         s.panes[1].back.push(folder(&sv, vec![]));
-        s.clip = Some(crate::actions::Clip { mode: crate::actions::ClipMode::Copy, from: folder(&sv, vec![]), items: Vec::new() });
+        s.clip = Some(crate::actions::Clip { mode: crate::actions::ClipMode::Copy, from: folder(&sv, vec![]), items: Vec::new(), picked_at: 0.0 });
         remove(&mut s, &sv.id);
         assert!(s.servers.store.servers().is_empty() && s.servers.list.is_empty());
         assert!(!matches!(s.panes[0].loc, Location::Server { .. }) && s.panes[1].back.is_empty() && s.clip.is_none());
@@ -2565,7 +2565,7 @@ mod real {
         // Up from the computer: a folder and a file, into the server's root.
         s.status.clear();
         let items = s.panes[1].entries.clone();
-        s.clip = Some(Clip { mode: ClipMode::Copy, from: s.panes[1].loc.clone(), items });
+        s.clip = Some(Clip { mode: ClipMode::Copy, from: s.panes[1].loc.clone(), items, picked_at: 0.0 });
         actions::paste(&mut s, 0);
         settle(&mut s);
         assert!(s.status.starts_with("Enviado"), "{}", s.status);
@@ -2582,7 +2582,7 @@ mod real {
         crate::switch(&mut s, 1, Location::Local(local.join("baixados")));
         let fotos = s.panes[0].entries.iter().find(|e| e.name == "Fotos").cloned().unwrap();
         s.status.clear();
-        s.clip = Some(Clip { mode: ClipMode::Copy, from: s.panes[0].loc.clone(), items: vec![fotos] });
+        s.clip = Some(Clip { mode: ClipMode::Copy, from: s.panes[0].loc.clone(), items: vec![fotos], picked_at: 0.0 });
         actions::paste(&mut s, 1);
         settle(&mut s);
         assert_eq!(std::fs::read(local.join("baixados/Fotos/praia.jpg")).unwrap(), b"areia", "{}", s.status);
@@ -2598,7 +2598,7 @@ mod real {
         let velhas = s.panes[0].entries.iter().find(|e| e.name == "velhas.txt").cloned().unwrap();
         crate::switch(&mut s, 1, folder(&server, vec!["Arquivo".into()]));
         s.status.clear();
-        s.clip = Some(Clip { mode: ClipMode::Cut, from: s.panes[0].loc.clone(), items: vec![velhas] });
+        s.clip = Some(Clip { mode: ClipMode::Cut, from: s.panes[0].loc.clone(), items: vec![velhas], picked_at: 0.0 });
         actions::paste(&mut s, 1);
         settle(&mut s);
         assert!(served.join("Arquivo/velhas.txt").is_file(), "{}", s.status);
@@ -2860,7 +2860,7 @@ mod real {
             s.status = "listado".into();
             settle(s);
             s.status.clear();
-            s.clip = Some(Clip { mode, from: from.clone(), items });
+            s.clip = Some(Clip { mode, from: from.clone(), items, picked_at: 0.0 });
             actions::paste(s, 1);
             settle(s);
         };

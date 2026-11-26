@@ -32,7 +32,7 @@ pub struct Watch {
     resync: bool,
     /// Per pane, the place it was still listing when changes came: its listing may have
     /// fetched the changed folder before they happened, so it's read again once done there.
-    redo: [Option<Location>; 2],
+    redo: [Option<Location>; crate::layout::MAX_PANES],
     /// When this unbroken run of the change log began (its first token), and when it was last
     /// read: what changed in between is all in `touched`.
     began: Option<Instant>,
@@ -81,7 +81,7 @@ pub fn tick(s: &mut State, now: f64) -> bool {
     let accounts = &s.accounts;
     s.watch.retain(|email, _| accounts.iter().any(|a| &a.email == email));
     let mut reloaded = false;
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         let pane = &s.panes[p];
         let mut again = false;
         for w in s.watch.values_mut() {
@@ -164,7 +164,7 @@ pub fn arrived(s: &mut State, email: String, result: Result<Fetched, String>, no
     let root = w.root.clone();
     wake_in(s, EVERY);
     if resync {
-        for p in 0..2 {
+        for p in 0..crate::layout::MAX_PANES {
             if shows(&s.panes[p], &email) {
                 crate::load(s, p);
             }
@@ -174,7 +174,7 @@ pub fn arrived(s: &mut State, email: String, result: Result<Fetched, String>, no
         return;
     }
     openexplorer_gdrive::log(&format!("mudanças de {email}: {} itens", changes.len()));
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         if !shows(&s.panes[p], &email) {
             continue;
         }

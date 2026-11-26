@@ -11,6 +11,7 @@
 mod accounts;
 mod actions;
 mod address;
+mod anim;
 mod autoscroll;
 mod b2;
 mod cache;
@@ -42,6 +43,7 @@ mod telegram;
 mod transfers;
 mod tree;
 mod undo;
+mod updater;
 mod uploads;
 mod ui;
 mod watch;
@@ -60,6 +62,7 @@ use openexplorer_gdrive::{ClientConfig, Drive, DriveFile, Quota, oauth};
 use openexplorer_i18n::{t, tr};
 use rune::{AppSpec, DragItem, Key, KeyEvent, LiveRegion, Mods, Tx, Waker};
 
+use layout::MAX_PANES;
 use model::{Entry, Location, MockDrive, Pane, SortCol, Space};
 
 const ROW_H: f32 = 22.0;
@@ -121,6 +124,8 @@ enum Msg {
     /// A drag of Drive items `ids` out of pane `from` ended.
     #[cfg(windows)]
     DragEnded { from: usize, ids: Vec<String>, ended: dragout::Ended },
+    /// Built-in updater check, download progress or completion.
+    Update(updater::Answer),
 }
 
 /// Which part of a listing a [`Msg::Listed`] is.
@@ -146,12 +151,19 @@ pub enum MainTab {
 
 struct State {
     main_tab: MainTab,
+    view_menu_open: bool,
+    /// Which pane's view-mode dropdown menu is currently open, if any.
+    view_mode_menu: Option<usize>,
+    /// Number of columns per pane in icon-grid view modes (updated from viewport width).
+    grid_cols: [usize; MAX_PANES],
+    /// Number of rows per column in multi-column List view mode (updated from viewport height).
+    list_rows: [usize; MAX_PANES],
     accounts_filter: Option<servers::Provider>,
     accounts_search: rune::TextEdit,
-    panes: [Pane; 2],
-    tabs: [tabs::PaneTabs; 2],
+    panes: [Pane; MAX_PANES],
+    tabs: [tabs::PaneTabs; MAX_PANES],
     /// Whether each pane's left folder tree is shown.
-    show_tree: [bool; 2],
+    show_tree: [bool; MAX_PANES],
     /// The context menu: the pane it was opened in and where.
     menu: Option<(usize, rune::PointerPress)>,
     /// The tree's right-click menu: pane, node, whether it's open, whether it's empty, and where.
@@ -164,7 +176,21 @@ struct State {
     lasso: Option<lasso::Lasso>,
     /// Where each pane's file list viewport is and how far it's scrolled, for the rectangle
     /// selection and the menu the keyboard opens.
-    views: [lasso::Viewport; 2],
+    views: [lasso::Viewport; MAX_PANES],
+    /// Smooth Ctrl+wheel / pinch zoom state for each pane's file list.
+    zoom: [anim::ZoomState; MAX_PANES],
+    /// Row index currently under the pointer in each pane's file list (for the gliding hover pill).
+    hovered_row: [Option<usize>; MAX_PANES],
+    /// Last hovered row index in each pane so the hover pill fades out in place when leaving.
+    hover_last_row: [usize; MAX_PANES],
+    /// Gliding keyboard selection highlight for each pane.
+    kbd_sel: [anim::KeyboardSel; MAX_PANES],
+    /// Fading marquee/lasso rectangle after mouse release.
+    lasso_fade: Option<anim::LassoFade>,
+    /// Smooth row reorder glide when sorting a pane's file list.
+    row_reorder: [anim::RowReorder; MAX_PANES],
+    /// Active header column drag-to-reorder state.
+    col_drag: Option<anim::ColDrag>,
     dialog: Option<actions::Dialog>,
     /// The window was asked to close while transfers ran: Fechar o Open Explorer? shows over
     /// everything, the dialog under it untouched (see [`actions::close_requested`]).
@@ -187,25 +213,25 @@ struct State {
     /// The item being renamed in place, and its pane.
     renaming: Option<(usize, Entry)>,
     /// Each pane's search field.
-    search: [rune::TextEdit; 2],
+    search: [rune::TextEdit; MAX_PANES],
     /// Each pane's path bar while it's a field to type an address in.
-    address: [Option<rune::TextEdit>; 2],
+    address: [Option<rune::TextEdit>; MAX_PANES],
     /// The addresses reached and searches run, which ↑ and ↓ bring back in those fields.
     history: history::History,
     /// The path bar's right-click menu: the pane it was opened in and where.
     address_menu: Option<(usize, rune::PointerPress)>,
     /// Each local pane's field as last seen, and when it may be searched: typing searches the
     /// computer once the keys stop for a moment.
-    typed: [(String, f64); 2],
+    typed: [(String, f64); MAX_PANES],
     /// The words each pane last searched the computer for.
-    searched: [String; 2],
+    searched: [String; MAX_PANES],
     /// What the index said with each pane's search results.
-    found: [Option<finder::Info>; 2],
+    found: [Option<finder::Info>; MAX_PANES],
     /// The search service is being installed.
     installing_finder: bool,
     /// When each pane's search of the computer is asked again, while a disk is still being read
     /// or the service is starting (0: not).
-    found_again: [f64; 2],
+    found_again: [f64; MAX_PANES],
     /// Counts Propriedades dialogs, to tell their background answers apart.
     props_seq: u64,
     /// What Copiar or Recortar picked up.
@@ -222,7 +248,7 @@ struct State {
     tree: tree::Tree,
     /// Each pane's current listing request, bumped by every load: `poll` drops answers for an
     /// older one, and the listing thread stops fetching pages once the pane has moved on.
-    live: [Arc<AtomicU64>; 2],
+    live: [Arc<AtomicU64>; MAX_PANES],
     cache: cache::Cache,
     mock: MockDrive,
     accounts: Vec<StoredAccount>,
@@ -243,14 +269,14 @@ struct State {
     /// The start of a name typed in a list, to reach it.
     typeahead: keyboard::Typeahead,
     /// How many rows each pane's list shows, for Page Up and Page Down (0 before its layout).
-    page_rows: [usize; 2],
+    page_rows: [usize; MAX_PANES],
     /// The pane a drag started in and the files it carried, so a drop back on the same pane
     /// is ignored (the drop can arrive after the drag's end).
     last_drag: Option<(usize, Vec<PathBuf>)>,
     /// A drag of files over a pane, which scrolls its list or tree near their edges, and where
     /// each pane's list and tree are and how far they've scrolled.
     autoscroll: Option<autoscroll::Drag>,
-    edges: [autoscroll::Pane; 2],
+    edges: [autoscroll::Pane; MAX_PANES],
     /// What the last action said ("Copiado: 3 itens.", an error...), shown for a few seconds
     /// in a notice at the bottom right.
     status: String,
@@ -282,7 +308,7 @@ struct State {
     /// Windows' own icons, as Explorer shows them.
     icons: sysicons::SysIcons,
     /// The listing version each pane's icons were last asked for.
-    icons_for: [u64; 2],
+    icons_for: [u64; MAX_PANES],
     /// State of the independent "Registrar conta" window when open.
     account_form: Option<Box<servers::Form>>,
     account_win: Option<rune::AppHandle<State>>,
@@ -299,7 +325,12 @@ struct State {
     account_synced_font: Option<settings::TextFont>,
     account_synced_render: Option<settings::TextRender>,
     is_placeholder: bool,
+    /// Built-in updater state (latest release, download progress, staged file).
+    updater: updater::UpdateState,
 }
+
+/// Receipt or error passed via `--update-receipt` / `--update-error` on relaunch after an update.
+static STARTUP_UPDATE_NOTICE: std::sync::Mutex<Option<Result<String, String>>> = std::sync::Mutex::new(None);
 
 /// Whether the main window was created for Mica (Opções, Experimental): only then can Windows
 /// show it, and Opções says whether it did.
@@ -343,16 +374,27 @@ impl State {
         let loc = Location::Mock(Vec::new());
         State {
             main_tab: MainTab::Explore,
+            view_menu_open: false,
+            view_mode_menu: None,
+            grid_cols: [1; MAX_PANES],
+            list_rows: [1; MAX_PANES],
             accounts_filter: None,
             accounts_search: rune::TextEdit::new(""),
-            panes: [Pane::new(loc.clone()), Pane::new(loc)],
-            tabs: [tabs::PaneTabs::initial(), tabs::PaneTabs::initial()],
-            show_tree: [true, true],
+            panes: std::array::from_fn(|_| Pane::new(loc.clone())),
+            tabs: std::array::from_fn(|_| tabs::PaneTabs::initial()),
+            show_tree: [true; MAX_PANES],
             menu: None,
             tree_menu: None,
             renamed: Vec::new(),
             lasso: None,
             views: Default::default(),
+            zoom: Default::default(),
+            hovered_row: [None; MAX_PANES],
+            hover_last_row: [0; MAX_PANES],
+            kbd_sel: Default::default(),
+            lasso_fade: None,
+            row_reorder: Default::default(),
+            col_drag: None,
             dialog: None,
             quit_asked: false,
             quit_app: false,
@@ -362,7 +404,7 @@ impl State {
             clash_waiting: Default::default(),
             name_edit: rune::TextEdit::new(""),
             renaming: None,
-            search: [rune::TextEdit::new(""), rune::TextEdit::new("")],
+            search: std::array::from_fn(|_| rune::TextEdit::new("")),
             address: Default::default(),
             history: Default::default(),
             address_menu: None,
@@ -370,7 +412,7 @@ impl State {
             searched: Default::default(),
             found: Default::default(),
             installing_finder: false,
-            found_again: [0.0; 2],
+            found_again: [0.0; MAX_PANES],
             props_seq: 0,
             clip: None,
             undo: Default::default(),
@@ -414,7 +456,7 @@ impl State {
             logins: 0,
             active: 0,
             typeahead: Default::default(),
-            page_rows: [0; 2],
+            page_rows: [0; MAX_PANES],
             last_drag: None,
             autoscroll: None,
             edges: Default::default(),
@@ -434,7 +476,7 @@ impl State {
             queue_looks: Vec::new(),
             queue_totals: Default::default(),
             icons: Default::default(),
-            icons_for: [u64::MAX; 2],
+            icons_for: [u64::MAX; MAX_PANES],
             account_form: None,
             account_win: None,
             main_win: None,
@@ -446,6 +488,7 @@ impl State {
             account_synced_font: None,
             account_synced_render: None,
             is_placeholder: true,
+            updater: updater::UpdateState::idle(),
         }
     }
 
@@ -546,24 +589,41 @@ fn init() -> State {
     // run was is kept. The simulated drive stays in the tree, for trying things out.
     let places = places::places();
     let start = places.desktop.as_ref().map_or_else(Location::home, |(dir, _)| Location::Local(dir.clone()));
-    let mut panes = [Pane::new(start.clone()), Pane::new(start)];
-    for p in &mut panes {
-        p.load_now(&mock, settings.show_hidden);
-    }
+    // The folder is read once: every pane, shown or not, starts with that listing.
+    let mut first = Pane::new(start.clone());
+    first.load_now(&mock, settings.show_hidden);
+    let mut panes: [Pane; MAX_PANES] = std::array::from_fn(|_| {
+        let mut pane = Pane::new(start.clone());
+        pane.free = first.free;
+        pane.set_entries(first.error.clone().map_or_else(|| Ok(first.entries.clone()), Err));
+        pane
+    });
+    panes[0] = first;
     let accounts = store::accounts();
     let tree = tree::Tree::new(accounts.iter().map(|a| a.email.clone()));
-    State {
+    let mut state = State {
         main_tab: MainTab::Explore,
+        view_menu_open: false,
+        view_mode_menu: None,
+        grid_cols: [1; MAX_PANES],
+        list_rows: [1; MAX_PANES],
         accounts_filter: None,
         accounts_search: rune::TextEdit::new(""),
         panes,
-        tabs: [tabs::PaneTabs::initial(), tabs::PaneTabs::initial()],
-        show_tree: [true, true],
+        tabs: std::array::from_fn(|_| tabs::PaneTabs::initial()),
+        show_tree: [true; MAX_PANES],
         menu: None,
         tree_menu: None,
         renamed: Vec::new(),
         lasso: None,
         views: Default::default(),
+        zoom: Default::default(),
+        hovered_row: [None; MAX_PANES],
+        hover_last_row: [0; MAX_PANES],
+        kbd_sel: Default::default(),
+        lasso_fade: None,
+        row_reorder: Default::default(),
+        col_drag: None,
         dialog: None,
         quit_asked: false,
         quit_app: false,
@@ -573,7 +633,7 @@ fn init() -> State {
         clash_waiting: Default::default(),
         name_edit: rune::TextEdit::new(""),
         renaming: None,
-        search: [rune::TextEdit::new(""), rune::TextEdit::new("")],
+        search: std::array::from_fn(|_| rune::TextEdit::new("")),
         address: Default::default(),
         history: history::History::load(),
         address_menu: None,
@@ -581,7 +641,7 @@ fn init() -> State {
         searched: Default::default(),
         found: Default::default(),
         installing_finder: false,
-        found_again: [0.0; 2],
+        found_again: [0.0; MAX_PANES],
         props_seq: 0,
         clip: None,
         undo: Default::default(),
@@ -601,7 +661,7 @@ fn init() -> State {
         logins: 0,
         active: 0,
         typeahead: Default::default(),
-        page_rows: [0; 2],
+        page_rows: [0; MAX_PANES],
         last_drag: None,
         autoscroll: None,
         edges: Default::default(),
@@ -621,7 +681,7 @@ fn init() -> State {
         queue_looks: Vec::new(),
         queue_totals: Default::default(),
         icons: Default::default(),
-        icons_for: [u64::MAX; 2],
+        icons_for: [u64::MAX; MAX_PANES],
         account_form: None,
         account_win: None,
         main_win: None,
@@ -633,7 +693,22 @@ fn init() -> State {
         account_synced_font: None,
         account_synced_render: None,
         is_placeholder: false,
+        updater: updater::UpdateState::new(),
+    };
+    if let Some(notice) = STARTUP_UPDATE_NOTICE.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        match notice {
+            Ok(ver) => {
+                updater::clear_staged();
+                openexplorer_gdrive::log(&format!("atualização concluída: v{ver}"));
+                state.status = tr!("Open Explorer atualizado para a versão {ver}.", "Open Explorer updated to version {ver}.");
+            }
+            Err(code) => {
+                openexplorer_gdrive::log(&format!("erro atualização: {code}"));
+                fail(&mut state, updater::error_text(&code));
+            }
+        }
     }
+    state
 }
 
 fn setup(s: &mut State, waker: Waker) {
@@ -647,8 +722,12 @@ fn setup(s: &mut State, waker: Waker) {
     });
     s.waker = Some(combined);
     // Each tree opens down to the folder its pane starts in.
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         tree::follow(s, p);
+    }
+    // Check for updates in the background (at most once per 24 h automatically).
+    if !rune::is_headless() && s.updater.should_auto_check(updater::now_unix()) {
+        actions::check_updates(s, false);
     }
 }
 
@@ -818,7 +897,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     // Each listing's file types get their icons asked for once.
     let versions = s.panes.each_ref().map(|p| p.version);
     if s.icons_for != versions {
-        let relisted: Vec<usize> = (0..2).filter(|&p| s.icons_for[p] != versions[p]).collect();
+        let relisted: Vec<usize> = (0..MAX_PANES).filter(|&p| s.icons_for[p] != versions[p]).collect();
         s.icons_for = versions;
         let keys = s.panes.iter().flat_map(|p| sysicons::keys_of(&p.entries, &p.loc)).collect();
         s.icons.show(keys);
@@ -827,12 +906,64 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             tree::learn(s, p);
         }
     }
+    // The 256 px icons only while a pane in view shows Large or Extra large icons.
+    let big = s.panes[..s.settings.pane_layout.count()].iter().any(|p| matches!(p.view_mode, model::ViewMode::LargeIcons | model::ViewMode::ExtraLargeIcons));
+    s.icons.set_big(big);
     let mut changed = std::mem::take(&mut s.main_dirty) | s.icons.settle();
     changed |= notice(s, now, &mut |text, how| tx.announce(text, how));
+    // Smooth Ctrl+wheel / pinch zoom, keyboard selection glide, and sort row reorder animations.
+    let mut anim_wake = false;
+    for p in 0..MAX_PANES {
+        if s.zoom[p].tick(now) {
+            changed = true;
+            if s.zoom[p].is_animating() {
+                anim_wake = true;
+            }
+        }
+        if s.kbd_sel[p].tick(now) {
+            changed = true;
+            if s.kbd_sel[p].is_active() {
+                anim_wake = true;
+            }
+        }
+        if s.row_reorder[p].tick(now) {
+            changed = true;
+            if s.row_reorder[p].is_active() {
+                anim_wake = true;
+            }
+        }
+    }
+    if let Some(fade) = s.lasso_fade {
+        changed = true;
+        if fade.done(now) {
+            s.lasso_fade = None;
+        } else {
+            anim_wake = true;
+        }
+    }
+    // Clipboard Copy/Cut icon wiggle: it runs for a moment after the pick-up, and wakes only
+    // while copied/cut items are visible in an open pane. A copy stays picked up after Colar,
+    // so a wiggle without an end would redraw the window for as long as it shows them.
+    if s.main_tab == MainTab::Explore
+        && s.settings.clipboard_animated()
+        && let Some(clip) = &s.clip
+        && !clip.items.is_empty()
+        && now - clip.picked_at < anim::WIGGLE_TOTAL
+        && {
+            let ids: std::collections::HashSet<&str> = clip.items.iter().map(|c| c.id.as_str()).collect();
+            (0..s.settings.pane_layout.count()).any(|p| !s.tabs[p].is_picker() && s.panes[p].loc == clip.from && s.panes[p].entries.iter().any(|e| ids.contains(e.id.as_str())))
+        }
+    {
+        changed = true;
+        anim_wake = true;
+    }
+    if anim_wake {
+        tx.wake_at(now + 1.0 / 60.0);
+    }
     // A rectangle selection held past the list's edge scrolls it.
     changed |= lasso::step(s, now, tx);
     // A local pane searches the computer as its field is typed in, once the keys pause.
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         if s.search[p].text != s.typed[p].0 {
             s.typed[p] = (s.search[p].text.clone(), now + TYPING_PAUSE);
             tx.wake_at(now + TYPING_PAUSE);
@@ -959,7 +1090,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                         tabs::repoint(s, &from, Some(&to));
                     }
                 }
-                for p in 0..2 {
+                for p in 0..MAX_PANES {
                     if reload.contains(&s.panes[p].loc) {
                         load(s, p);
                     }
@@ -1033,7 +1164,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     Ok(m) => s.status = m,
                     Err(m) => fail(s, m),
                 }
-                for p in 0..2 {
+                for p in 0..MAX_PANES {
                     if reload.contains(&s.panes[p].loc) {
                         load(s, p);
                     }
@@ -1083,6 +1214,66 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     Err(e) => fail(s, e),
                 }
             }
+            Msg::Update(ans) => match ans {
+                updater::Answer::Checked { manual, result } => {
+                    s.updater.checking = false;
+                    s.updater.checked_once = true;
+                    let now_unix = updater::now_unix();
+                    s.updater.last_checked = Some(now_unix);
+                    updater::record_check(now_unix);
+                    match result {
+                        Ok(Some(rel)) => {
+                            openexplorer_gdrive::log(&format!("atualização disponível: v{}", rel.version));
+                            let already_staged_same = matches!(
+                                &s.updater.download,
+                                updater::DownloadState::Ready(st) if st.version == rel.version
+                            );
+                            // A download or install under way stays: a second one would write
+                            // the same file.
+                            let busy = matches!(s.updater.download, updater::DownloadState::Downloading { .. } | updater::DownloadState::Installing);
+                            s.updater.release = Some(rel);
+                            if !already_staged_same && !busy {
+                                s.updater.download = updater::DownloadState::Idle;
+                                if s.updater.support.is_ok()
+                                    && s.updater.offer(s.settings.auto_update) == Some(updater::Offer::Automatic)
+                                {
+                                    actions::download_update(s);
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            s.updater.check_error = None;
+                            if manual {
+                                s.status = tr!(
+                                    "Você já está na versão mais recente (v{}).",
+                                    "You're already on the latest version (v{}).",
+                                    updater::VERSION
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            openexplorer_gdrive::log(&format!("erro verificar atualizações: {e}"));
+                            s.updater.check_error = Some(e.clone());
+                            if manual {
+                                fail(s, e);
+                            }
+                        }
+                    }
+                }
+                updater::Answer::Progress { received, total } => {
+                    s.updater.download = updater::DownloadState::Downloading { received, total };
+                }
+                updater::Answer::Downloaded(result) => match result {
+                    Ok(staged) => {
+                        openexplorer_gdrive::log(&format!("atualização baixada e verificada: v{}", staged.version));
+                        s.updater.download = updater::DownloadState::Ready(staged);
+                    }
+                    Err(e) => {
+                        openexplorer_gdrive::log(&format!("erro baixar atualização: {e}"));
+                        s.updater.download = updater::DownloadState::Failed(e);
+                    }
+                },
+            },
         }
     }
     // Accounts on screen are asked what changed elsewhere, every few seconds; after the
@@ -1092,7 +1283,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     if let Some(at) = accounts::next_ask(s) {
         tx.wake_at(at);
     }
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         // The address field closes when the keyboard leaves it (a click elsewhere).
         if s.address[p].as_ref().is_some_and(|a| !a.focused) {
             s.address[p] = None;
@@ -1101,12 +1292,12 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         // Mostrar na pasta: the item is selected and brought into view once its folder lists it.
         let pane = &mut s.panes[p];
         let Some((id, name)) = pane.reveal.clone() else { continue };
-        if pane.entry(&id).is_some() {
+        if let Some(i) = pane.index_of(&id) {
             pane.reveal = None;
             pane.selected = [id.clone()].into();
             pane.cursor = Some(id.clone());
             pane.anchor = Some(id.clone());
-            tx.scroll_into_view_in(pane_key(p), row_key(&id));
+            tx.scroll_into_view_in(pane_key(p), s.views[p].flow.get().reveal_key(i, row_key(&id)));
             changed = true;
         } else if !pane.loading {
             pane.reveal = None;
@@ -1118,7 +1309,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     // A tree shows its keyboard row's ring while it has focus, however it got it (Tab from the
     // search field, a click), and stops once focus left it.
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         let on = tx.focused() == Some(ui::tree_key(p).as_str());
         if s.tree.focused[p] != on {
             tree::focus(s, p, on);
@@ -1126,7 +1317,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
     }
     // Each tree brings the folder its pane shows into view, once that's in the tree.
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         if tree::following(s, p) {
             let lines = tree::lines(s, p);
             if let Some(key) = tree::to_reveal(s, p, &lines) {
@@ -1256,7 +1447,7 @@ fn disconnect(s: &mut State, email: &str) {
     s.tree.forget(email);
     s.watch.remove(email);
     s.accounts.retain(|a| a.email != email);
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         let gone = |l: &Location| matches!(l, Location::Drive { email: e, .. } if e == email);
         s.panes[p].back.retain(|l| !gone(l));
         s.panes[p].forward.retain(|l| !gone(l));
@@ -1305,9 +1496,56 @@ pub(crate) fn refresh_all_quotas(s: &mut State) {
 
 pub(crate) fn set_main_tab(s: &mut State, tab: MainTab) {
     s.main_tab = tab;
+    s.view_menu_open = false;
+    s.view_mode_menu = None;
     if tab == MainTab::Accounts {
         ensure_all_quotas(s);
     }
+}
+
+/// Switches between 1, 2, and 4 visible panes in `Explorar`, persisting the choice.
+pub(crate) fn set_pane_layout(s: &mut State, layout: settings::PaneLayout) {
+    let before = s.settings.pane_layout.count();
+    s.settings.pane_layout = layout;
+    s.settings.save();
+    s.view_menu_open = false;
+    s.view_mode_menu = None;
+    s.menu = None;
+    s.tree_menu = None;
+    s.address_menu = None;
+    let count = layout.count();
+    if s.active >= count {
+        s.active = 0;
+    }
+    // A pane shown again is read again: while hidden it wasn't watched (B2's polling skips it).
+    for p in before..count {
+        if !s.tabs[p].is_picker() {
+            load(s, p);
+        }
+    }
+    if s.renaming.as_ref().is_some_and(|(p, _)| *p >= count) {
+        s.renaming = None;
+    }
+    if s.lasso.as_ref().is_some_and(|l| l.pane >= count) {
+        s.lasso = None;
+    }
+    s.main_tab = MainTab::Explore;
+}
+
+/// Sets the file display mode (Extra large / Large / Medium icons, List, Details) for pane `p`.
+pub(crate) fn set_view_mode(s: &mut State, p: usize, mode: model::ViewMode) {
+    s.active = p;
+    s.panes[p].view_mode = mode;
+    s.view_mode_menu = None;
+    if s.lasso.as_ref().is_some_and(|l| l.pane == p) {
+        s.lasso = None;
+    }
+}
+
+/// Cycles pane `p` directly to the next file display mode.
+pub(crate) fn cycle_view_mode(s: &mut State, p: usize) {
+    let next = s.panes[p].view_mode.next();
+    set_view_mode(s, p, next);
 }
 
 /// Opens `loc` in pane `p` (0 = left, 1 = right) and switches to `Explorar`.
@@ -1699,6 +1937,7 @@ fn click(s: &mut State, p: usize, id: &str, mods: Mods) {
         }
     }
     s.active = p;
+    s.kbd_sel[p].stop();
     let pane = &mut s.panes[p];
     if mods.cmd {
         if !pane.selected.remove(id) {
@@ -1763,6 +2002,8 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         })
     };
     let page = keyboard::page(s.page_rows[p]) as isize;
+    let flow = s.views[p].flow.get();
+    let (across, down) = flow.steps();
     let owns = keyboard::list_has_keys(s, p, tx.focused());
     // Any other key ends a name being typed: Enter into a folder and a letter starts anew.
     let plain = !(ev.mods.cmd || ev.mods.ctrl || ev.mods.alt);
@@ -1844,13 +2085,36 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             if let Some(i) = keyboard::find(&s.panes[p].entries, at, query) {
                 let id = s.panes[p].entries[i].id.clone();
                 click(s, p, &id, Mods::default());
-                tx.scroll_into_view_in(pane_key(p), row_key(&id));
+                tx.scroll_into_view_in(pane_key(p), flow.reveal_key(i, row_key(&id)));
             }
             return true;
         }
-        // Esc lets go of the selection; the cursor stays.
+        // Ctrl+0 resets list zoom; Ctrl+= / Ctrl++ zooms in; Ctrl+- zooms out.
+        _ if ev.is_command('0') => {
+            if s.zoom[p].reset(s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+            return true;
+        }
+        _ if ev.is_command('=') || ev.is_command('+') => {
+            if s.zoom[p].step_by(1.0, s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+            return true;
+        }
+        _ if ev.is_command('-') => {
+            if s.zoom[p].step_by(-1.0, s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+            return true;
+        }
+        // Esc lets go of the selection (the cursor stays), or clears a pending copy/cut.
         Key::Escape if owns && !s.panes[p].selected.is_empty() => {
             s.panes[p].selected.clear();
+            return true;
+        }
+        Key::Escape if owns && s.clip.is_some() => {
+            s.clip = None;
             return true;
         }
         Key::Enter if ev.mods.alt => {
@@ -1865,8 +2129,12 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             go_forward(s, p);
             return true;
         }
-        Key::Up => step(-1),
-        Key::Down => step(1),
+        // The arrows follow the items as the view laid them out: tiles in rows, List's
+        // columns, Details' rows (where Left and Right don't move).
+        Key::Left if flow.sideways() => step(-across),
+        Key::Right if flow.sideways() => step(across),
+        Key::Up => step(-down),
+        Key::Down => step(down),
         Key::PageUp => step(-page),
         Key::PageDown => step(page),
         Key::Home => step(-(n as isize)),
@@ -1886,8 +2154,12 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             return true;
         }
         Key::Tab => {
-            s.active = 1 - p;
-            tx.focus(pane_key(1 - p), true);
+            let count = s.settings.pane_layout.count();
+            if count > 1 {
+                let next = (p + 1) % count;
+                s.active = next;
+                tx.focus(pane_key(next), true);
+            }
             return true;
         }
         _ if ev.is_command('a') => {
@@ -1906,15 +2178,26 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         _ => return false,
     };
     if let Some(i) = to {
+        let prev_single = (!ev.mods.cmd && !ev.mods.shift && s.panes[p].selected.len() == 1)
+            .then_some(at)
+            .flatten();
         let id = s.panes[p].entries[i].id.clone();
         // With Ctrl the cursor moves alone and the selection stays, as in Explorer.
         if ev.mods.cmd && !ev.mods.shift {
             s.active = p;
+            s.kbd_sel[p].stop();
             s.panes[p].cursor = Some(id.clone());
         } else {
             click(s, p, &id, Mods { shift: ev.mods.shift, ..Mods::default() });
+            if let Some(from_i) = prev_single
+                && from_i != i
+                && s.settings.selection_animated()
+            {
+                s.kbd_sel[p].start(from_i, i, s.now);
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
         }
-        tx.scroll_into_view_in(pane_key(p), row_key(&id));
+        tx.scroll_into_view_in(pane_key(p), flow.reveal_key(i, row_key(&id)));
     }
     true
 }
@@ -1940,16 +2223,50 @@ fn menu_from_keys(s: &mut State, p: usize, tx: &mut Tx) {
         cursor.or_else(|| pane.entries.iter().position(|e| pane.selected.contains(&e.id)))
     };
     let (at, scroll) = lasso::menu_point(&s.views[p], row);
-    if let Some(y) = scroll {
-        tx.scroll_to_instant(ui::list_key(p), s.views[p].scroll.get().x, y);
+    if let Some([x, y]) = scroll {
+        tx.scroll_to_instant(ui::list_key(p), x, y);
     }
     s.menu = Some((p, at));
 }
 
 fn set_sort(s: &mut State, p: usize, col: SortCol) {
+    s.kbd_sel[p].stop();
+    let animate = s.settings.selection_animated() && !s.panes[p].entries.is_empty();
+    let (old_indices, vis_start, vis_end) = if animate {
+        let scroll = s.views[p].scroll.get();
+        let row_h = s.zoom[p].row_height().max(1.0);
+        let first = (scroll.y / row_h).floor().max(0.0) as usize;
+        let vis_count = ((scroll.h / row_h).ceil().max(24.0) as usize).min(120);
+        let len = s.panes[p].entries.len();
+        let win_start = first.saturating_sub(40);
+        let win_end = (first + vis_count + 40).min(len);
+        let mut map = HashMap::with_capacity(win_end.saturating_sub(win_start));
+        for (i, e) in s.panes[p].entries[win_start..win_end].iter().enumerate() {
+            map.insert(e.id.clone(), win_start + i);
+        }
+        (map, win_start, win_end)
+    } else {
+        (HashMap::new(), 0, 0)
+    };
     let pane = &mut s.panes[p];
     pane.sort = if pane.sort.0 == col { (col, !pane.sort.1) } else { (col, true) };
     pane.sort_entries();
+    if animate && !old_indices.is_empty() {
+        let end = vis_end.min(pane.entries.len());
+        let mut deltas = HashMap::new();
+        for (offset, e) in pane.entries[vis_start..end].iter().enumerate() {
+            let new_i = vis_start + offset;
+            if let Some(&old_i) = old_indices.get(&e.id)
+                && old_i != new_i
+            {
+                let d = (old_i as f32 - new_i as f32).clamp(-24.0, 24.0);
+                deltas.insert(e.id.clone(), d);
+            }
+        }
+        s.row_reorder[p].start(deltas, s.now);
+    } else {
+        s.row_reorder[p].clear();
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2329,10 +2646,24 @@ fn main() {
             }
         });
     }
+    let cli = updater::intercept_cli(args);
+    if let Some(notice) = cli.notice {
+        *STARTUP_UPDATE_NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(notice);
+    }
     let initial = settings::Settings::load();
     // Rune's own words (a text field's menu, the window buttons' names for screen readers) in
     // the app's language.
     rune::set_labels(rune_labels);
+    // Apply an update downloaded in an earlier run before opening the window. Not when this start
+    // is the helper reporting that installing it failed: trying again at once would bring the
+    // same refusal (a declined UAC prompt, a locked file) back at every start, the window never
+    // opening. That update goes; the dialog can fetch and install it again.
+    let install_failed = matches!(STARTUP_UPDATE_NOTICE.lock().unwrap_or_else(|e| e.into_inner()).as_ref(), Some(Err(_)));
+    if install_failed {
+        updater::clear_staged();
+    } else if !rune::is_headless() && updater::install_kept(initial.auto_update) {
+        std::process::exit(0);
+    }
     accounts::start();
     let main_spec = AppSpec::<State> {
         min_size: Some((900.0, 420.0)),
@@ -2651,6 +2982,58 @@ fn main() {
                 accounts_hub_scene(s);
                 s.settings.theme = settings::Theme::Light;
             }),
+            ("update-available", |s| {
+                s.updater.support = Ok(updater::InstallKind::WindowsInstalled { install_dir: PathBuf::from(r"C:\Program Files\OpenExplorer") });
+                s.updater.release = Some(updater::Release {
+                    version: "0.5.0".into(),
+                    url: "https://github.com/orezraey/OpenExplorer/releases/tag/v0.5.0".into(),
+                    notes: "- Atualização integrada no aplicativo\n- Melhorias de desempenho na listagem".into(),
+                    asset_name: "OpenExplorer-0.5.0-windows-x64-setup.exe".into(),
+                    download_url: "https://example.invalid/setup.exe".into(),
+                    size: 18_400_000,
+                    sha256: None,
+                    signed: None,
+                });
+                s.updater.download = updater::DownloadState::Idle;
+                s.dialog = Some(actions::Dialog::Update);
+            }),
+            ("update-downloading", |s| {
+                s.updater.support = Ok(updater::InstallKind::WindowsInstalled { install_dir: PathBuf::from(r"C:\Program Files\OpenExplorer") });
+                s.updater.release = Some(updater::Release {
+                    version: "0.5.0".into(),
+                    url: "https://github.com/orezraey/OpenExplorer/releases/tag/v0.5.0".into(),
+                    notes: String::new(),
+                    asset_name: "OpenExplorer-0.5.0-windows-x64-setup.exe".into(),
+                    download_url: "https://example.invalid/setup.exe".into(),
+                    size: 18_400_000,
+                    sha256: None,
+                    signed: None,
+                });
+                s.updater.download = updater::DownloadState::Downloading { received: 11_200_000, total: 18_400_000 };
+                s.dialog = Some(actions::Dialog::Update);
+            }),
+            ("update-ready", |s| {
+                s.updater.support = Ok(updater::InstallKind::WindowsInstalled { install_dir: PathBuf::from(r"C:\Program Files\OpenExplorer") });
+                s.updater.release = Some(updater::Release {
+                    version: "0.5.0".into(),
+                    url: "https://github.com/orezraey/OpenExplorer/releases/tag/v0.5.0".into(),
+                    notes: "- Atualização integrada no aplicativo\n- Melhorias de desempenho na listagem".into(),
+                    asset_name: "OpenExplorer-0.5.0-windows-x64-setup.exe".into(),
+                    download_url: "https://example.invalid/setup.exe".into(),
+                    size: 18_400_000,
+                    sha256: None,
+                    signed: None,
+                });
+                s.updater.download = updater::DownloadState::Ready(updater::Staged {
+                    version: "0.5.0".into(),
+                    file_path: PathBuf::from("staged.exe"),
+                    sha256: "0".repeat(64),
+                    install_kind: updater::InstallKind::WindowsInstalled { install_dir: PathBuf::from(r"C:\Program Files\OpenExplorer") },
+                    release_url: "https://github.com/orezraey/OpenExplorer/releases/tag/v0.5.0".into(),
+                    signed: Default::default(),
+                });
+                s.dialog = Some(actions::Dialog::Update);
+            }),
         ],
         ..AppSpec::new("Open Explorer", (1280.0, 760.0), init, ui::view)
     };
@@ -2802,7 +3185,7 @@ fn main() {
     let mut main_app = rune::App::new(main_spec)
         .titlebar(rune::Titlebar::new(34.0))
         .font_smoothing(initial.text_render.smoothing())
-        .args(rune_args(std::env::args().skip(1)))
+        .args(rune_args(cli.args.into_iter()))
         .turn_scope(enter_turn, leave_turn)
         // B2 folders and Telegram accounts on screen look for changes only while the window is in
         // front.
@@ -2821,7 +3204,7 @@ fn main() {
         // trees and listings were last kept is kept here, so the next start has less to catch up on.
         .on_quit(|_, _| {
             accounts::save_caches();
-            if RESTART.load(Ordering::Relaxed) {
+            if !updater::run_pending_handoff() && RESTART.load(Ordering::Relaxed) {
                 relaunch();
             }
         })
@@ -3359,7 +3742,7 @@ mod tests {
         s.panes[1].selected.clear();
         let h = lasso::HEADER_H + 10.0 * ROW_H;
         s.views[1].rect = [400.0, 100.0, 600.0, h];
-        s.views[1].scroll.set(lasso::Scroll { x: 0.0, y: 0.0, max_y: 40.0 * ROW_H + 2.0 * ROW_H, h });
+        s.views[1].scroll.set(lasso::Scroll { x: 0.0, y: 0.0, max_x: 0.0, max_y: 40.0 * ROW_H + 2.0 * ROW_H, h });
         let mut tx = Tx::default();
         let ev = |key, mods| KeyEvent { key, mods };
         let shift = Mods { shift: true, ..Mods::default() };

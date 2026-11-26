@@ -21,6 +21,12 @@ serde_json = "1"
 # Deleting local files sends them to the Recycle Bin.
 trash = "5"
 md-5 = "0.10"
+# Built-in updater (all already in Cargo.lock).
+ureq = "3"
+sha2 = "0.10"
+semver = "1"
+hex = "0.4"
+ring = "0.17"
 # The resvg Rune draws colour icons with, the version it uses, made to draw raster images inside
 # an SVG too: Koofr's logo comes only as a PNG, which its brand terms say not to redraw.
 resvg = { version = "0.45", default-features = false, features = ["raster-images"] }

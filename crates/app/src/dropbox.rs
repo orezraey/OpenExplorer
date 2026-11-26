@@ -767,7 +767,7 @@ fn changes_arrived(s: &mut State, id: String, wait: u64, result: Result<Changes,
     }
     let Some(server) = s.servers.list.iter().find(|sv| sv.id == id).cloned() else { return };
     let stale = |path: &[String]| changes.touches(&server.path(path));
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         let reload = matches!(&s.panes[p].loc, Location::Server { server: sv, path, find: None } if sv.id == id && stale(path));
         if reload && !s.panes[p].loading {
             crate::load(s, p);
@@ -883,7 +883,7 @@ mod batches {
     fn paste_now(s: &mut State, names: &[&str], mode: ClipMode) {
         let items: Vec<Entry> = s.panes[0].entries.iter().filter(|e| names.is_empty() || names.contains(&e.name.as_str())).cloned().collect();
         s.status.clear();
-        s.clip = Some(Clip { mode, from: s.panes[0].loc.clone(), items });
+        s.clip = Some(Clip { mode, from: s.panes[0].loc.clone(), items, picked_at: 0.0 });
         actions::paste(s, 1);
     }
 

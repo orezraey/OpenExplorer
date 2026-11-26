@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use rune::{Align, Anim, Color, Cursor, Cx, Drag, DragOutcome, El, GrowthSpec, Icon, KeyEvent, LiveRegion, Phase, ScrollSpec, Span, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, ScrollBar, ScrollBarStyle, Toast, ToastRegion, context_menu};
 
-use crate::model::{Kind, Location, SortCol, Space, crumbs, format_bytes, format_long, format_size, format_time, shown};
+use crate::model::{Kind, Location, SortCol, Space, ViewMode, crumbs, format_bytes, format_long, format_size, format_time, shown};
 use crate::actions::{self, ClipMode, Dialog};
 use crate::{MainTab, State, click, drag_item, dragged_ids, dropped, go_back, go_forward, go_up, key, load, navigate, open, pane_key, paths_for, refresh, row_key, set_sort};
 use crate::icons;
@@ -77,13 +77,14 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         MainTab::Explore => panes(s, &k, see_through, &mut layer),
         MainTab::Accounts => accounts_hub(s, &k),
     };
+    let toolbar_el = toolbar(s, &k, &mut layer);
     let body = col()
         .key("window")
         .w_full()
         .h_full()
         .fill(if see_through { Color::TRANSPARENT } else { k.c.page })
         .child(titlebar)
-        .child(toolbar(s, &k))
+        .child(toolbar_el)
         .child(main_content)
         .child(transfers(s, &k))
         .child(menu)
@@ -93,10 +94,17 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         // The mouse's side buttons anywhere else in Explorar: Voltar and Avançar in the active
         // pane (over a pane, its own handler took them first).
         .on_button(|s: &mut State, button, _: &mut Tx| crate::side_button_in_window(s, button))
-        // Hover lands and leaves with the pointer, as in the system's file lists: the default
-        // 100 ms fade on leaving left a trail of lit rows behind a fast pointer.
-        .hover_motion_within(Anim::INSTANT, Anim::INSTANT)
+        // Fluid 80 ms hover transition when hover animations are on; instant otherwise.
+        .hover_motion_within(
+            if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT },
+            if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT },
+        )
         .on_key(|s: &mut State, ev: &KeyEvent, _: &mut Tx| {
+            if ev.key == rune::Key::Escape && (s.view_menu_open || s.view_mode_menu.is_some()) {
+                s.view_menu_open = false;
+                s.view_mode_menu = None;
+                return true;
+            }
             if ev.key == rune::Key::Function(5) {
                 match s.main_tab {
                     MainTab::Explore => {
@@ -158,7 +166,7 @@ fn change_settings(s: &mut State, f: impl FnOnce(&mut crate::settings::Settings)
 
 fn reload_hidden_views(s: &mut State) {
     crate::tree::refresh_hidden(s);
-    for p in 0..2 {
+    for p in 0..layout::MAX_PANES {
         if matches!(s.panes[p].loc, Location::Local(_) | Location::Server { .. } | Location::Found(_)) {
             load(s, p);
         }
@@ -540,6 +548,61 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                     |s| change_settings(s, |c| c.skip_recycle_bin = !c.skip_recycle_bin),
                 ));
 
+            let update_desc = if s.updater.checking {
+                t("Verificando novas versões no GitHub…", "Checking GitHub for new versions…").to_string()
+            } else if let Some(rel) = &s.updater.release {
+                if s.updater.is_ready() {
+                    tr!("Versão {} baixada e pronta para instalar.", "Version {} downloaded and ready to install.", rel.version)
+                } else {
+                    tr!("Nova versão {} disponível.", "New version {} available.", rel.version)
+                }
+            } else if let Some(err) = &s.updater.check_error {
+                err.clone()
+            } else if s.updater.checked_once {
+                t("Você já está na versão mais recente.", "You're already on the latest version.").to_string()
+            } else {
+                t("Verifica lançamentos oficiais no GitHub.", "Checks official releases on GitHub.").to_string()
+            };
+            let update_btn = if s.updater.release.is_some() {
+                Button::new(if s.updater.is_ready() {
+                    t("Reiniciar para atualizar", "Restart to update")
+                } else {
+                    t("Ver atualização", "View update")
+                })
+                .variant(ButtonVariant::Submit)
+                .on_press(actions::open_update_dialog)
+                .build(k)
+                .cursor(Cursor::Pointer)
+                .key("opt-open-update")
+            } else {
+                Button::new(if s.updater.checking {
+                    t("Verificando…", "Checking…")
+                } else {
+                    t("Verificar atualizações", "Check for updates")
+                })
+                .variant(ButtonVariant::Neutral)
+                .disabled(s.updater.checking)
+                .on_press(|s: &mut State| actions::check_updates(s, true))
+                .build(k)
+                .cursor(Cursor::Pointer)
+                .key("opt-check-updates")
+            };
+            let version_title = tr!("Open Explorer v{}", "Open Explorer v{}", crate::updater::VERSION);
+            let updates_card = card_box("card-updates")
+                .child(switch_row(
+                    "opt-auto-update",
+                    t("Atualizar automaticamente", "Update automatically"),
+                    t(
+                        "Baixa novas versões em segundo plano e instala na próxima vez que o Open Explorer abrir.",
+                        "Downloads new versions in the background and installs them the next time Open Explorer starts.",
+                    ),
+                    None,
+                    st.auto_update,
+                    |s| change_settings(s, |c| c.auto_update = !c.auto_update),
+                ))
+                .child(divider())
+                .child(control_row("row-update-check", &version_title, &update_desc, update_btn));
+
             col()
                 .key("page-general")
                 .w_full()
@@ -547,6 +610,102 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .child(section_head(t("Geral", "General"), t("Aparência, fonte da interface e comportamento de arquivos e transferências.", "Appearance, interface font, and how files and transfers behave.")))
                 .child(appearance)
                 .child(files_card)
+                .child(updates_card)
+        }
+        OptionsTab::Animations => {
+            let master_badge = Some(if st.animations {
+                (t("Ativado", "On"), rune_kit::BadgeVariant::Accent)
+            } else {
+                (t("Desativado", "Off"), rune_kit::BadgeVariant::Neutral)
+            });
+            let master_card = card_box("card-anim-master").child(switch_row(
+                "opt-animations",
+                t("Ativar animações", "Enable animations"),
+                t(
+                    "Ativa ou desativa todas as animações fluidas da interface de uma só vez.",
+                    "Turns all fluid interface animations on or off at once.",
+                ),
+                master_badge,
+                st.animations,
+                |s| change_settings(s, |c| c.animations = !c.animations),
+            ));
+
+            let effects_card = card_box("card-anim-effects")
+                .opacity(if st.animations { 1.0 } else { 0.55 })
+                .child(switch_row(
+                    "opt-anim-hover",
+                    t("Realce fluido ao passar o mouse", "Fluid hover highlight"),
+                    t(
+                        "Desliza suavemente o destaque entre pastas, arquivos e controles conforme o ponteiro se move.",
+                        "Smoothly glides the highlight across folders, files, and controls as the pointer moves.",
+                    ),
+                    None,
+                    st.animate_hover,
+                    |s| change_settings(s, |c| c.animate_hover = !c.animate_hover),
+                ))
+                .child(divider())
+                .child(switch_row(
+                    "opt-anim-clipboard",
+                    t("Animação ao copiar e recortar (Ctrl+C / Ctrl+X)", "Copy & cut icon animation (Ctrl+C / Ctrl+X)"),
+                    t(
+                        "Anima os ícones das pastas e arquivos copiados ou recortados até você colar ou pressionar Esc.",
+                        "Gently wiggles icons of copied or cut folders and files until you paste or press Esc.",
+                    ),
+                    None,
+                    st.animate_clipboard,
+                    |s| change_settings(s, |c| c.animate_clipboard = !c.animate_clipboard),
+                ))
+                .child(divider())
+                .child(switch_row(
+                    "opt-anim-zoom",
+                    t("Zoom suave na lista (Ctrl + Scroll)", "Smooth list zoom (Ctrl + Scroll)"),
+                    t(
+                        "Redimensiona ícones, linhas e texto suavemente ao usar Ctrl + roda do mouse, pinça ou Ctrl + / − / 0.",
+                        "Fluidly resizes icons, rows, and text when using Ctrl + mouse wheel, pinch, or Ctrl + / − / 0.",
+                    ),
+                    None,
+                    st.animate_zoom,
+                    |s| change_settings(s, |c| c.animate_zoom = !c.animate_zoom),
+                ))
+                .child(divider())
+                .child(switch_row(
+                    "opt-anim-selection",
+                    t("Transições suaves de seleção, ordenação e árvore", "Smooth selection, sort & tree transitions"),
+                    t(
+                        "Suaviza o destaque de seleção (incluindo setas do teclado e retângulo de seleção), a reordenação ao ordenar colunas e a rotação das setas.",
+                        "Smooths selection highlights (including keyboard arrows and marquee fade), row reordering on sort, and chevron rotation.",
+                    ),
+                    None,
+                    st.animate_selection,
+                    |s| change_settings(s, |c| c.animate_selection = !c.animate_selection),
+                ));
+
+            let visual_card = card_box("card-anim-visual").child(switch_row(
+                "opt-zebra-stripes",
+                t("Listras alternadas nas linhas (zebra)", "Alternating row stripes (zebra)"),
+                t(
+                    "Aplica um fundo sutil em linhas alternadas da lista de arquivos para facilitar a leitura entre colunas.",
+                    "Applies a subtle alternating background tint across file list rows to make scanning columns easier.",
+                ),
+                None,
+                st.zebra_stripes,
+                |s| change_settings(s, |c| c.zebra_stripes = !c.zebra_stripes),
+            ));
+
+            col()
+                .key("page-animations")
+                .w_full()
+                .gap(12.0)
+                .child(section_head(
+                    t("Animações", "Animations"),
+                    t(
+                        "Efeitos visuais fluidos para navegação, cópia de arquivos, ordenação e zoom. Todos vêm ativados por padrão.",
+                        "Fluid visual effects for browsing, copying files, sorting, and zooming. All are enabled by default.",
+                    ),
+                ))
+                .child(master_card)
+                .child(effects_card)
+                .child(visual_card)
         }
         OptionsTab::Experimental => {
             let banner = row()
@@ -1771,7 +1930,199 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, backdrop: bool, layer: &mut
         Dialog::DropboxDeleted(v) => crate::dropbox::deleted_dialog(k, v, layer),
         Dialog::OneDriveLink(m) => crate::onedrive::link_dialog(k, m, layer),
         Dialog::B2Unfinished(d) => crate::b2::unfinished_dialog(k, d, layer),
+        Dialog::Update => update_dialog(s, k, layer),
     }
+}
+
+fn update_dialog(s: &State, k: &Kit, layer: &mut Vec<El>) {
+    use crate::updater::{DownloadState, Offer};
+
+    let Some(rel) = &s.updater.release else { return };
+    let pad = |e: El| col().key("content").w_full().px(16.0).pb(16.0).child(e);
+    let version_line = text(format!("v{} → v{}", crate::updater::VERSION, rel.version))
+        .font(k.ty.text_small_medium)
+        .color(k.c.text_muted);
+
+    let mut body = col().w_full().gap(12.0).child(version_line);
+
+    if !rel.notes.is_empty() {
+        let notes_box = col()
+            .key("update-notes")
+            .w_full()
+            .max_h(150.0)
+            .scroll(ScrollSpec { stick_bottom: false })
+            .px(12.0)
+            .py(10.0)
+            .radius(k.radius.md)
+            .fill(k.alpha(k.c.text_base, if k.dark { 0.04 } else { 0.03 }))
+            .border(1.0, k.c.border_weak)
+            .child(text(rel.notes.clone()).font(k.ty.caption()).color(k.c.text_muted).wrap().w_full().min_w(0.0));
+        body = body.child(notes_box);
+    }
+
+    let mut primary: Option<El> = None;
+    match &s.updater.download {
+        DownloadState::Downloading { received, total } => {
+            let checking = *total > 0 && received >= total;
+            let status_label = if checking {
+                t("Verificando download…", "Checking download…")
+            } else {
+                t("Baixando atualização…", "Downloading update…")
+            };
+            let frac = if *total > 0 { (*received as f32 / *total as f32).clamp(0.0, 1.0) } else { 0.0 };
+            let track = row()
+                .w_full()
+                .h(6.0)
+                .radius(3.0)
+                .fill(k.alpha(k.c.text_base, if k.dark { 0.14 } else { 0.10 }))
+                .child(el().w(frac * 412.0).h(6.0).radius(3.0).fill(k.c.text_accent));
+            let mut progress_col = col()
+                .w_full()
+                .gap(6.0)
+                .child(text(status_label).font(k.ty.text_small_medium).color(k.c.text_base))
+                .child(track);
+            if *total > 0 {
+                let rec_mb = format!("{:.1}", *received as f64 / 1_000_000.0);
+                let tot_mb = format!("{:.1}", *total as f64 / 1_000_000.0);
+                progress_col = progress_col.child(
+                    text(tr!("{rec_mb} de {tot_mb} MB", "{rec_mb} of {tot_mb} MB"))
+                        .font(k.ty.caption())
+                        .color(k.c.text_muted),
+                );
+            }
+            body = body.child(progress_col);
+        }
+        DownloadState::Ready(_) => {
+            let mut ready_col = col()
+                .w_full()
+                .gap(4.0)
+                .child(text(t("Pronto para instalar", "Ready to install")).font(k.ty.text_small_medium).color(k.c.text_base));
+            if s.updater.offer(s.settings.auto_update) == Some(Offer::Automatic) {
+                ready_col = ready_col.child(
+                    text(t(
+                        "Se você não reiniciar agora, a atualização será instalada na próxima vez que o Open Explorer abrir.",
+                        "If you don't restart now, the update will install the next time Open Explorer starts.",
+                    ))
+                    .font(k.ty.caption())
+                    .color(k.c.text_muted)
+                    .wrap()
+                    .w_full()
+                    .min_w(0.0),
+                );
+            }
+            body = body.child(ready_col);
+            primary = Some(
+                Button::new(t("Reiniciar para atualizar", "Restart to update"))
+                    .variant(ButtonVariant::Submit)
+                    .on_press_tx(actions::install_update)
+                    .build(k)
+                    .cursor(Cursor::Pointer)
+                    .key("update-restart"),
+            );
+        }
+        DownloadState::Installing => {
+            body = body.child(
+                text(t("Preparando para reiniciar…", "Preparing to restart…"))
+                    .font(k.ty.text_small)
+                    .color(k.c.text_muted),
+            );
+        }
+        DownloadState::Idle | DownloadState::Failed(_) => {
+            if let DownloadState::Failed(err) = &s.updater.download {
+                body = body.child(
+                    text(err.clone())
+                        .font(k.ty.text_small)
+                        .color(k.c.danger.fg)
+                        .wrap()
+                        .w_full()
+                        .min_w(0.0),
+                );
+            }
+            match &s.updater.support {
+                Ok(_) => {
+                    let label = if matches!(s.updater.download, DownloadState::Failed(_)) {
+                        t("Tentar novamente", "Retry download")
+                    } else {
+                        t("Baixar atualização", "Download update")
+                    };
+                    primary = Some(
+                        Button::new(label)
+                            .variant(ButtonVariant::Submit)
+                            .on_press(actions::download_update)
+                            .build(k)
+                            .cursor(Cursor::Pointer)
+                            .key("update-download"),
+                    );
+                }
+                Err(reason) => {
+                    body = body.child(
+                        text(reason.clone())
+                            .font(k.ty.text_small)
+                            .color(k.c.text_muted)
+                            .wrap()
+                            .w_full()
+                            .min_w(0.0),
+                    );
+                    let gh_url = rel.url.clone();
+                    primary = Some(
+                        Button::new(t("Baixar no GitHub", "Download from GitHub"))
+                            .variant(ButtonVariant::Submit)
+                            .on_press_tx(move |_: &mut State, tx: &mut Tx| {
+                                let _ = tx.open_url(&gh_url);
+                            })
+                            .build(k)
+                            .cursor(Cursor::Pointer)
+                            .key("update-open-github"),
+                    );
+                }
+            }
+        }
+    }
+
+    let notes_url = rel.url.clone();
+    let notes_link = k
+        .interactive(
+            row()
+                .key("update-release-notes")
+                .role("button")
+                .label(t("Notas da versão", "Release notes"))
+                .focusable(true)
+                .focus_ring(2.0, 1.0, k.c.border_focus)
+                .h(28.0)
+                .px(8.0)
+                .gap(5.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .hover(k.c.hover)
+                .cursor(Cursor::Pointer),
+        )
+        .on_press_tx(move |_: &mut State, tx: &mut Tx| {
+            let _ = tx.open_url(&notes_url);
+        })
+        .child(icon(&icons::EXTERNAL_LINK, 13.0).color(k.c.text_muted))
+        .child(text(t("Notas da versão", "Release notes")).font(k.ty.text_small).color(k.c.text_muted));
+
+    let mut footer = row().w_full().center_y().gap(8.0).child(notes_link).child(el().grow(1.0));
+    footer = footer.child(
+        Button::new(t("Fechar", "Close"))
+            .variant(ButtonVariant::Neutral)
+            .on_press(close)
+            .build(k)
+            .cursor(Cursor::Pointer)
+            .key("update-close"),
+    );
+    if let Some(btn) = primary {
+        footer = footer.child(btn);
+    }
+    body = body.child(footer);
+
+    Modal::new("update", t("Atualizar o Open Explorer", "Update Open Explorer"))
+        .open(true)
+        .child(pad(body))
+        .width(444.0)
+        .fit()
+        .on_close(close)
+        .build(k, layer);
 }
 
 /// A certificate's fingerprint, which has no spaces to wrap at, as two halves on two lines.
@@ -1851,7 +2202,10 @@ pub fn account_window_view(s: &State, cx: &mut Cx<State>) -> El {
         .fill(window_bg)
         .child(titlebar)
         .child(content)
-        .hover_motion_within(Anim::INSTANT, Anim::INSTANT);
+        .hover_motion_within(
+            if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT },
+            if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT },
+        );
 
     rune_kit::root(root, layer)
 }
@@ -3302,8 +3656,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
 
 /// Windows' icon for `key` once it has loaded, else the app's own `fallback`.
 fn shell_icon(s: &State, key: Option<&IconKey>, fallback: &'static Icon, size: f32) -> El {
-    let large = size > 24.0;
-    match key.and_then(|k| s.icons.get(k, large)).filter(|i| i.is_ready() && i.error().is_none()) {
+    match key.and_then(|k| s.icons.get_sized(k, size)).filter(|i| i.is_ready() && i.error().is_none()) {
         Some(image) => el().size(size, size).pixels(image.pixels()),
         None => icon(fallback, size),
     }
@@ -3323,8 +3676,7 @@ fn entry_icon(s: &State, loc: &Location, e: &crate::model::Entry, size: f32) -> 
         && let Some(path) = loc.local_path(e)
     {
         let key = IconKey::Dir(path);
-        let large = size > 24.0;
-        if let Some(image) = s.icons.get(&key, large).filter(|i| i.is_ready() && i.error().is_none()) {
+        if let Some(image) = s.icons.get_sized(&key, size).filter(|i| i.is_ready() && i.error().is_none()) {
             return el().size(size, size).pixels(image.pixels());
         }
     }
@@ -3374,7 +3726,7 @@ fn tool<F: Fn(&mut State, &mut Tx) + 'static>(k: &Kit, key: &str, glyph: &'stati
     b
 }
 
-fn toolbar(s: &State, k: &Kit) -> El {
+fn toolbar(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     let sep = || el().w(1.0).h(20.0).mx(6.0).fill(k.c.border_weak);
     let waiting_oauth = s.login.is_some() || s.servers.onedrive.login.is_some() || s.servers.dropbox_login.is_some();
     let total_accounts = s.accounts.len() + s.servers.list.len();
@@ -3443,6 +3795,69 @@ fn toolbar(s: &State, k: &Kit) -> El {
         MainTab::Accounts => t("Atualizar o espaço utilizado nas contas (F5)", "Refresh storage usage across accounts (F5)"),
     };
 
+    let view_label = t("Visualizar", "View");
+    let view_anchor = "toolbar-view";
+    let view_open = s.view_menu_open;
+    let view_btn = row()
+        .key(view_anchor)
+        .role("button")
+        .label(view_label)
+        .help(t("Escolher a disposição dos painéis (1, 2 ou 4)", "Choose the pane layout (1, 2, or 4)"))
+        .h(30.0)
+        .px(8.0)
+        .gap(6.0)
+        .center_y()
+        .radius(k.radius.sm)
+        .fill(if view_open { k.c.hover } else { Color::TRANSPARENT })
+        .hover(k.c.hover)
+        .press(k.c.pressed)
+        .cursor(Cursor::Pointer)
+        .on_press(|s: &mut State| {
+            let next = !s.view_menu_open;
+            crate::tabs::close_picker_filter(s);
+            s.menu = None;
+            s.tree_menu = None;
+            s.address_menu = None;
+            s.view_mode_menu = None;
+            s.view_menu_open = next;
+        })
+        .child(icon(&icons::VIEW_MONITOR, 16.0).color(k.c.text_base))
+        .child(text(view_label).font(k.ty.text_small).color(k.c.text_base))
+        .child(icon(&icons::CHEVRON_DOWN, 12.0).color(k.c.icon_muted));
+
+    if view_open {
+        layer.push(rune_kit::scrim("view-menu-scrim", |s: &mut State| s.view_menu_open = false));
+        let dropdown_bg = if k.dark { rune::oklch(0.22, 0.008, 255.0) } else { k.c.bg_base };
+        let mut menu = col().key("view-menu").w(196.0).padding(4.0).gap(2.0);
+        for layout in crate::settings::PaneLayout::ALL {
+            let selected = s.settings.pane_layout == layout;
+            let item = row()
+                .key(format!("view-opt-{layout:?}"))
+                .role("menuitem")
+                .label(layout.label())
+                .checked(selected)
+                .w_full()
+                .h(32.0)
+                .px(10.0)
+                .gap(10.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .fill(if selected { k.alpha(k.c.text_accent, if k.dark { 0.20 } else { 0.10 }) } else { Color::TRANSPARENT })
+                .hover(k.c.hover)
+                .cursor(Cursor::Pointer)
+                .on_press(move |s: &mut State| crate::set_pane_layout(s, layout))
+                .child(icon(layout.icon(), 16.0).color(if selected { k.c.text_accent } else { k.c.icon_muted }))
+                .child(text(layout.label()).font(if selected { k.ty.text_small_medium } else { k.ty.text_small }).color(k.c.text_base).grow(1.0));
+            menu = menu.child(item);
+        }
+        let surface = menu
+            .radius(k.radius.md)
+            .fill(dropdown_bg)
+            .border(1.0, k.c.border_weak)
+            .box_shadow(rune::Shadow { y: 6.0, blur: 18.0, color: k.dark_a(0.32), ..Default::default() });
+        layer.push(rune_kit::popover::anchored(k, surface, view_anchor, rune_kit::Placement::BottomStart, 4.0));
+    }
+
     row()
         .key("toolbar")
         .w_full()
@@ -3466,11 +3881,48 @@ fn toolbar(s: &State, k: &Kit) -> El {
             })
             .help(refresh_help),
         )
+        .child(view_btn)
         .child(el().grow(1.0))
+        .child(update_toolbar_pill(s, k))
         .child(tool(k, "options", &icons::SETTINGS, t("Opções", "Options"), true, |s: &mut State, _| {
             s.dialog = Some(Dialog::Options(Box::new(crate::settings::OptionsView::open(crate::settings::OptionsTab::General))));
         }))
         .child(text("Open Explorer").font(k.ty.text_small_medium).color(k.c.text_faint).mx(8.0))
+}
+
+fn update_toolbar_pill(s: &State, k: &Kit) -> El {
+    let Some(rel) = &s.updater.release else {
+        return el();
+    };
+    let label = if s.updater.is_ready() {
+        t("Reiniciar para atualizar", "Restart to update").to_string()
+    } else {
+        tr!("Atualizar v{}", "Update v{}", rel.version)
+    };
+    let fill = k.alpha(k.c.text_accent, if k.dark { 0.22 } else { 0.12 });
+    let hover = k.alpha(k.c.text_accent, if k.dark { 0.30 } else { 0.18 });
+    let border = k.alpha(k.c.text_accent, 0.45);
+    k.interactive(
+        row()
+            .key("toolbar-update")
+            .role("button")
+            .label(label.clone())
+            .focusable(true)
+            .focus_ring(2.0, 1.0, k.c.border_focus)
+            .h(26.0)
+            .px(10.0)
+            .mr(4.0)
+            .gap(6.0)
+            .center_y()
+            .radius(13.0)
+            .fill(fill)
+            .hover(hover)
+            .border(1.0, border)
+            .cursor(Cursor::Pointer),
+    )
+    .on_press(actions::open_update_dialog)
+    .child(icon(&icons::DOWNLOAD, 13.0).color(k.c.text_accent))
+    .child(text(label).font(k.ty.caption()).color(k.c.text_accent))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3491,8 +3943,7 @@ pub(crate) struct HubCard {
     pub email_or_addr: String,
     pub quota: HubQuota,
     pub open_loc: Location,
-    pub in_left: bool,
-    pub in_right: bool,
+    pub in_pane: [bool; layout::MAX_PANES],
     pub edit_id: Option<String>,
     pub remove_target: actions::AccountTarget,
 }
@@ -3542,8 +3993,7 @@ pub(crate) fn hub_cards(s: &State) -> Vec<HubCard> {
             email_or_addr: a.email.clone(),
             quota,
             open_loc: Location::drive(&a.email, Space::MyDrive),
-            in_left: in_pane(0),
-            in_right: in_pane(1),
+            in_pane: std::array::from_fn(&in_pane),
             edit_id: None,
             remove_target: actions::AccountTarget::GoogleDrive(a.email.clone()),
         });
@@ -3585,8 +4035,7 @@ pub(crate) fn hub_cards(s: &State) -> Vec<HubCard> {
                     email_or_addr: email,
                     quota,
                     open_loc: crate::onedrive::files(sv),
-                    in_left: in_pane(0),
-                    in_right: in_pane(1),
+                    in_pane: std::array::from_fn(&in_pane),
                     edit_id: None,
                     remove_target: actions::AccountTarget::Server(sv.id.clone()),
                 });
@@ -3621,8 +4070,7 @@ pub(crate) fn hub_cards(s: &State) -> Vec<HubCard> {
                     email_or_addr: sv.user.clone(),
                     quota,
                     open_loc: crate::dropbox::top(sv),
-                    in_left: in_pane(0),
-                    in_right: in_pane(1),
+                    in_pane: std::array::from_fn(&in_pane),
                     edit_id: None,
                     remove_target: actions::AccountTarget::Server(sv.id.clone()),
                 });
@@ -3652,8 +4100,7 @@ pub(crate) fn hub_cards(s: &State) -> Vec<HubCard> {
                     email_or_addr: sv.user.clone(),
                     quota,
                     open_loc: crate::mega::cloud(sv),
-                    in_left: in_pane(0),
-                    in_right: in_pane(1),
+                    in_pane: std::array::from_fn(&in_pane),
                     edit_id: None,
                     remove_target: actions::AccountTarget::Server(sv.id.clone()),
                 });
@@ -3668,8 +4115,7 @@ pub(crate) fn hub_cards(s: &State) -> Vec<HubCard> {
                     email_or_addr: sv.user.clone(),
                     quota: HubQuota::Info(t("Armazenamento sob demanda · Buckets B2", "Pay-as-you-go storage · B2 Buckets").into()),
                     open_loc: crate::b2::top(sv),
-                    in_left: in_pane(0),
-                    in_right: in_pane(1),
+                    in_pane: std::array::from_fn(&in_pane),
                     edit_id: None,
                     remove_target: actions::AccountTarget::Server(sv.id.clone()),
                 });
@@ -3684,8 +4130,7 @@ pub(crate) fn hub_cards(s: &State) -> Vec<HubCard> {
                     email_or_addr: format!("ID {}", sv.user),
                     quota: HubQuota::Info(t("Armazenamento ilimitado · Canal privado", "Unlimited storage · Private channel").into()),
                     open_loc: crate::servers::folder(sv, Vec::new()),
-                    in_left: in_pane(0),
-                    in_right: in_pane(1),
+                    in_pane: std::array::from_fn(&in_pane),
                     edit_id: None,
                     remove_target: actions::AccountTarget::Server(sv.id.clone()),
                 });
@@ -3716,8 +4161,7 @@ pub(crate) fn hub_cards(s: &State) -> Vec<HubCard> {
                     email_or_addr: user_or_addr,
                     quota: HubQuota::Info(addr),
                     open_loc: crate::servers::folder(sv, Vec::new()),
-                    in_left: in_pane(0),
-                    in_right: in_pane(1),
+                    in_pane: std::array::from_fn(&in_pane),
                     edit_id: Some(sv.id.clone()),
                     remove_target: actions::AccountTarget::Server(sv.id.clone()),
                 });
@@ -4066,27 +4510,52 @@ fn accounts_hub(s: &State, k: &Kit) -> El {
                 .on_press(move |s: &mut State| crate::open_account_in_pane(s, pane, loc.clone()))
             };
 
-            let mut actions_bar = row()
-                .gap(6.0)
-                .center_y()
-                .child(pane_btn(
-                    "open-left",
-                    0,
-                    &icons::OPEN_LEFT_PANE,
-                    t("Esquerda", "Left"),
-                    t("Abrir este drive no painel esquerdo", "Open this drive in the left pane"),
-                    c.in_left,
-                    c.open_loc.clone(),
-                ))
-                .child(pane_btn(
-                    "open-right",
-                    1,
-                    &icons::OPEN_RIGHT_PANE,
-                    t("Direita", "Right"),
-                    t("Abrir este drive no painel direito", "Open this drive in the right pane"),
-                    c.in_right,
-                    c.open_loc.clone(),
-                ));
+            let mut actions_bar = row().gap(6.0).center_y();
+            match s.settings.pane_layout {
+                crate::settings::PaneLayout::One => {
+                    actions_bar = actions_bar.child(pane_btn(
+                        "open-left",
+                        0,
+                        &icons::VIEW_ONE_PANE,
+                        t("Abrir", "Open"),
+                        t("Abrir este drive no painel", "Open this drive in the pane"),
+                        c.in_pane[0],
+                        c.open_loc.clone(),
+                    ));
+                }
+                crate::settings::PaneLayout::Two => {
+                    actions_bar = actions_bar
+                        .child(pane_btn(
+                            "open-left",
+                            0,
+                            &icons::OPEN_LEFT_PANE,
+                            t("Esquerda", "Left"),
+                            t("Abrir este drive no painel esquerdo", "Open this drive in the left pane"),
+                            c.in_pane[0],
+                            c.open_loc.clone(),
+                        ))
+                        .child(pane_btn(
+                            "open-right",
+                            1,
+                            &icons::OPEN_RIGHT_PANE,
+                            t("Direita", "Right"),
+                            t("Abrir este drive no painel direito", "Open this drive in the right pane"),
+                            c.in_pane[1],
+                            c.open_loc.clone(),
+                        ));
+                }
+                crate::settings::PaneLayout::Four => {
+                    let targets = [
+                        ("open-p0", 0, &icons::OPEN_LEFT_PANE, "1", t("Abrir no painel superior esquerdo", "Open in top-left pane")),
+                        ("open-p1", 1, &icons::OPEN_RIGHT_PANE, "2", t("Abrir no painel superior direito", "Open in top-right pane")),
+                        ("open-p2", 2, &icons::OPEN_LEFT_PANE, "3", t("Abrir no painel inferior esquerdo", "Open in bottom-left pane")),
+                        ("open-p3", 3, &icons::OPEN_RIGHT_PANE, "4", t("Abrir no painel inferior direito", "Open in bottom-right pane")),
+                    ];
+                    for (side_key, idx, glyph, short, help_text) in targets {
+                        actions_bar = actions_bar.child(pane_btn(side_key, idx, glyph, short, help_text, c.in_pane[idx], c.open_loc.clone()));
+                    }
+                }
+            }
 
             if let Some(edit_id) = &c.edit_id {
                 let id = edit_id.clone();
@@ -4263,28 +4732,59 @@ fn splitter(k: &Kit, key: &str, thick: f32, way: Split, size: impl Fn(&mut State
         })
 }
 
-/// The two panes, side by side in equal halves.
+/// The explore panes: one full-width pane, two side by side (default), or four in a 2×2 grid.
 /// `backdrop`: Mica shows behind the window (Opções, Experimental).
 fn panes(s: &State, k: &Kit, backdrop: bool, layer: &mut Vec<El>) -> El {
-    row()
-        .key("panes")
-        .w_full()
-        .grow(1.0)
-        .min_h(160.0)
-        .padding(6.0)
-        .child(pane(s, k, 0, backdrop, layer))
-        .child(gutter(s, k))
-        .child(pane(s, k, 1, backdrop, layer))
+    match s.settings.pane_layout {
+        crate::settings::PaneLayout::One => row()
+            .key("panes")
+            .w_full()
+            .grow(1.0)
+            .min_h(160.0)
+            .padding(6.0)
+            .child(pane(s, k, 0, backdrop, layer)),
+        crate::settings::PaneLayout::Two => row()
+            .key("panes")
+            .w_full()
+            .grow(1.0)
+            .min_h(160.0)
+            .padding(6.0)
+            .child(pane(s, k, 0, backdrop, layer))
+            .child(gutter(s, k, 0, 1, false))
+            .child(pane(s, k, 1, backdrop, layer)),
+        crate::settings::PaneLayout::Four => {
+            let pair = |row_key: &'static str, left: usize, right: usize, layer: &mut Vec<El>| {
+                row()
+                    .key(row_key)
+                    .w_full()
+                    .grow(1.0)
+                    .h(0.0)
+                    .min_h(120.0)
+                    .child(pane(s, k, left, backdrop, layer))
+                    .child(gutter(s, k, left, right, true))
+                    .child(pane(s, k, right, backdrop, layer))
+            };
+            col()
+                .key("panes")
+                .w_full()
+                .grow(1.0)
+                .min_h(260.0)
+                .padding(6.0)
+                .gap(6.0)
+                .child(pair("panes-top", 0, 1, layer))
+                .child(pair("panes-bottom", 2, 3, layer))
+        }
+    }
 }
 
-/// The strip between the panes, as in Air Explorer: the window's own background, empty but
-/// for two small triangles near the top that copy the selection of one pane into the folder
-/// the other shows. A triangle is blue while its pane has something selected, grey otherwise.
-fn gutter(s: &State, k: &Kit) -> El {
-    let arrow = |key: &str, glyph: &'static Icon, help: &str, from: usize, to: usize| {
+/// The strip between two horizontal panes, as in Air Explorer: the window's own background, empty
+/// but for two small triangles that copy the selection of one pane into the folder the other
+/// shows. A triangle is blue while its pane has something selected, grey otherwise.
+fn gutter(s: &State, k: &Kit, left: usize, right: usize, centered: bool) -> El {
+    let arrow = |key: String, glyph: &'static Icon, help: &str, from: usize, to: usize| {
         let ready = !s.tabs[from].is_picker() && !s.tabs[to].is_picker() && !s.panes[from].selected.is_empty();
         let ink = if ready { k.alpha(k.c.text_accent, 0.7) } else { k.alpha(k.c.icon_faint, 0.6) };
-        let b = el().key(key.to_string()).role("button").label(help.to_string()).help(help.to_string()).size(28.0, 28.0).center().radius(k.radius.sm);
+        let b = el().key(key).role("button").label(help.to_string()).help(help.to_string()).size(28.0, 28.0).center().radius(k.radius.sm);
         let b = if ready { b.hover(k.c.hover).press(k.c.pressed).cursor(Cursor::Pointer) } else { b };
         b.on_press(move |s: &mut State| {
             if !s.tabs[from].is_picker() && !s.tabs[to].is_picker() {
@@ -4293,15 +4793,15 @@ fn gutter(s: &State, k: &Kit) -> El {
         })
         .child(icon(glyph, 16.0).color(ink))
     };
-    col()
-        .key("gutter")
-        .w(40.0)
-        .h_full()
-        .items_center()
-        .pt(126.0)
-        .gap(6.0)
-        .child(arrow("copy-right", &icons::COPY_RIGHT, t("Copiar a seleção do painel esquerdo para o direito", "Copy the selection from the left pane to the right"), 0, 1))
-        .child(arrow("copy-left", &icons::COPY_LEFT, t("Copiar a seleção do painel direito para o esquerdo", "Copy the selection from the right pane to the left"), 1, 0))
+    let (gutter_key, right_key, left_key) = if (left, right) == (0, 1) {
+        ("gutter".to_string(), "copy-right".to_string(), "copy-left".to_string())
+    } else {
+        (format!("gutter-{left}-{right}"), format!("copy-right-{left}-{right}"), format!("copy-left-{left}-{right}"))
+    };
+    let mut g = col().key(gutter_key).w(40.0).h_full().items_center().gap(6.0);
+    g = if centered { g.justify_center() } else { g.pt(126.0) };
+    g.child(arrow(right_key, &icons::COPY_RIGHT, t("Copiar a seleção do painel esquerdo para o direito", "Copy the selection from the left pane to the right"), left, right))
+        .child(arrow(left_key, &icons::COPY_LEFT, t("Copiar a seleção do painel direito para o esquerdo", "Copy the selection from the right pane to the left"), right, left))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4883,7 +5383,7 @@ fn pane(s: &State, k: &Kit, p: usize, backdrop: bool, layer: &mut Vec<El>) -> El
                 crate::autoscroll::moved(&mut s.autoscroll, p, (at.window_x, at.window_y), tx.clock(), tx)
             })
             .child(solid(navbar(s, k, p)))
-            .child(solid(pane_actions(s, k, p)))
+            .child(solid(pane_actions(s, k, p, layer)))
             .child(solid(search_bar(s, k, p)))
             .child({
                 let mut body = row().key("body").instant_changes().w_full().grow(1.0).min_h(0.0);
@@ -4910,9 +5410,111 @@ fn pane(s: &State, k: &Kit, p: usize, backdrop: bool, layer: &mut Vec<El>) -> El
         .child(card)
 }
 
-/// Action strip directly beneath the navigation bar: toggle folder tree visibility and create
-/// a new folder in pane `p`.
-fn pane_actions(s: &State, k: &Kit, p: usize) -> El {
+/// Action strip directly beneath the navigation bar: split view-mode button (click icon to cycle,
+/// click chevron to pick exact mode), toggle folder tree visibility, and create a new folder.
+fn pane_actions(s: &State, k: &Kit, p: usize, layer: &mut Vec<El>) -> El {
+    let cur_mode = s.panes[p].view_mode;
+    let menu_open = s.view_mode_menu == Some(p);
+    let split_anchor = format!("view-mode-split-{p}");
+    let cycle_help = tr!(
+        "Alterar visualização (atual: {})",
+        "Switch view mode (current: {})",
+        cur_mode.label()
+    );
+    let pick_help = t("Escolher modo de visualização", "Choose view mode");
+
+    let split_bg = if menu_open {
+        k.c.hover
+    } else if k.dark {
+        k.alpha(k.c.white, 0.04)
+    } else {
+        k.alpha(k.c.black, 0.03)
+    };
+    let view_cycle_btn = row()
+        .key(format!("view-mode-cycle-{p}"))
+        .role("button")
+        .label(cycle_help.clone())
+        .help(cycle_help)
+        .w(24.0)
+        .h_full()
+        .center()
+        .corners([k.radius.sm, 0.0, 0.0, k.radius.sm])
+        .hover(k.c.hover)
+        .press(k.c.pressed)
+        .cursor(Cursor::Pointer)
+        .on_press(move |s: &mut State| crate::cycle_view_mode(s, p))
+        .child(icon(cur_mode.icon(), 15.0).color(k.c.text_base));
+
+    let view_drop_btn = row()
+        .key(format!("view-mode-drop-{p}"))
+        .role("button")
+        .label(pick_help.to_string())
+        .help(pick_help.to_string())
+        .w(16.0)
+        .h_full()
+        .center()
+        .corners([0.0, k.radius.sm, k.radius.sm, 0.0])
+        .hover(k.c.hover)
+        .press(k.c.pressed)
+        .cursor(Cursor::Pointer)
+        .on_press(move |s: &mut State| {
+            let next = if s.view_mode_menu == Some(p) { None } else { Some(p) };
+            s.active = p;
+            s.view_menu_open = false;
+            crate::tabs::close_picker_filter(s);
+            s.menu = None;
+            s.tree_menu = None;
+            s.address_menu = None;
+            s.view_mode_menu = next;
+        })
+        .child(icon(&icons::CHEVRON_DOWN, 10.0).color(k.c.icon_muted));
+
+    let view_split = row()
+        .key(split_anchor.clone())
+        .h(24.0)
+        .radius(k.radius.sm)
+        .fill(split_bg)
+        .border(1.0, k.c.border_weak)
+        .child(view_cycle_btn)
+        .child(el().w(1.0).h(14.0).fill(k.c.border_weak))
+        .child(view_drop_btn);
+
+    if menu_open {
+        layer.push(rune_kit::scrim("view-mode-scrim", |s: &mut State| s.view_mode_menu = None));
+        let dropdown_bg = if k.dark { rune::oklch(0.22, 0.008, 255.0) } else { k.c.bg_base };
+        let mut menu = col().key(format!("view-mode-menu-{p}")).w(210.0).padding(4.0).gap(2.0);
+        for mode in ViewMode::ALL {
+            if mode == ViewMode::List {
+                menu = menu.child(el().w_full().h(1.0).my(3.0).fill(k.c.border_weak));
+            }
+            let selected = cur_mode == mode;
+            let item = row()
+                .key(format!("vm-opt-{p}-{mode:?}"))
+                .role("menuitem")
+                .label(mode.label())
+                .checked(selected)
+                .w_full()
+                .h(30.0)
+                .px(10.0)
+                .gap(10.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .fill(if selected { k.alpha(k.c.text_accent, if k.dark { 0.20 } else { 0.10 }) } else { Color::TRANSPARENT })
+                .hover(k.c.hover)
+                .cursor(Cursor::Pointer)
+                .on_press(move |s: &mut State| crate::set_view_mode(s, p, mode))
+                .child(icon(mode.icon(), 16.0).color(if selected { k.c.text_accent } else { k.c.icon_muted }))
+                .child(text(mode.label()).font(if selected { k.ty.text_small_medium } else { k.ty.text_small }).color(k.c.text_base).grow(1.0));
+            menu = menu.child(item);
+        }
+        let surface = menu
+            .radius(k.radius.md)
+            .fill(dropdown_bg)
+            .border(1.0, k.c.border_weak)
+            .box_shadow(rune::Shadow { y: 6.0, blur: 18.0, color: k.dark_a(0.32), ..Default::default() });
+        layer.push(rune_kit::popover::anchored(k, surface, &split_anchor, rune_kit::Placement::BottomEnd, 4.0));
+    }
+
     let tree_on = s.show_tree[p];
     let tree_help = if tree_on {
         t("Ocultar árvore", "Hide tree")
@@ -4980,6 +5582,8 @@ fn pane_actions(s: &State, k: &Kit, p: usize) -> El {
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
         .child(tree_btn)
         .child(new_btn)
+        .child(el().grow(1.0))
+        .child(view_split)
 }
 
 /// A square icon button for the navigation bar.
@@ -5286,6 +5890,15 @@ fn tree_line(s: &State, k: &Kit, p: usize, line: &crate::tree::Line) -> El {
     };
     let arrow = if node.opens && !empty {
         let n = node.clone();
+        let chevron = if s.settings.selection_animated() {
+            icon(&icons::CHEVRON, 12.0)
+                .color(k.c.icon_faint)
+                .origin(0.5, 0.5)
+                .rotate(if open { std::f32::consts::FRAC_PI_2 } else { 0.0 })
+                .rotate_motion(crate::anim::ui_spring())
+        } else {
+            icon(if open { &icons::CHEVRON_DOWN } else { &icons::CHEVRON }, 12.0).color(k.c.icon_faint)
+        };
         row()
             .key("arrow")
             .size(16.0, 16.0)
@@ -5294,7 +5907,7 @@ fn tree_line(s: &State, k: &Kit, p: usize, line: &crate::tree::Line) -> El {
             .hover(k.alpha(k.c.text_base, 0.08))
             .cursor(Cursor::Pointer)
             .on_press(move |s: &mut State| crate::tree::toggle(s, p, &n))
-            .child(icon(if open { &icons::CHEVRON_DOWN } else { &icons::CHEVRON }, 12.0).color(k.c.icon_faint))
+            .child(chevron)
     } else {
         el().size(16.0, 16.0)
     };
@@ -5652,63 +6265,120 @@ fn searched_words(loc: &Location) -> Vec<Vec<u8>> {
 }
 
 /// The rectangle a lasso in pane `p` draws, in the list's content (so it scrolls with the
-/// rows), cut to what the viewport shows.
+/// rows), cut to what the viewport shows. Also draws the smooth fade-out on release.
 fn lasso_rect(s: &State, k: &Kit, p: usize) -> Option<El> {
-    let l = s.lasso.as_ref().filter(|l| l.pane == p && l.moved)?;
     let view = &s.views[p];
     let scroll = view.scroll.get();
-    let [x0, y0, x1, y1] = l.rect(scroll);
+    let (rect, alpha) = if let Some(l) = s.lasso.as_ref().filter(|l| l.pane == p && l.moved) {
+        (l.rect(scroll), 1.0)
+    } else {
+        let fade = s.lasso_fade.filter(|f| f.pane == p)?;
+        let a = fade.opacity(s.now);
+        if a <= 0.01 {
+            return None;
+        }
+        (fade.rect, a)
+    };
+    let [x0, y0, x1, y1] = rect;
     // Before the first layout says how big the viewport is, nothing is cut.
     let known = |size: f32, minus: f32| if size > 0.0 { (size - minus).max(0.0) } else { f32::MAX / 4.0 };
     let (left, right) = (scroll.x, scroll.x + known(view.rect[2], 0.0));
     let (top, bottom) = (scroll.y, scroll.y + known(scroll.h, HEADER_H));
     let (x0, x1) = (x0.clamp(left, right), x1.clamp(left, right));
     let (y0, y1) = (y0.clamp(top, bottom), y1.clamp(top, bottom));
-    Some(el().key("lasso").absolute(x0, HEADER_H + y0).size(x1 - x0, y1 - y0).fill(k.alpha(k.c.text_accent, 0.14)).border(1.0, k.alpha(k.c.text_accent, 0.7)))
+    Some(
+        el().key("lasso")
+            .absolute(x0, HEADER_H + y0)
+            .size(x1 - x0, y1 - y0)
+            .radius(2.0)
+            .fill(k.alpha(k.c.text_accent, 0.14 * alpha))
+            .border(1.0, k.alpha(k.c.text_accent, 0.7 * alpha)),
+    )
+}
+
+const GRID_GAP: f32 = 8.0;
+const GRID_PAD: f32 = 8.0;
+const LIST_COL_W: f32 = 230.0;
+const LIST_COL_GAP: f32 = 8.0;
+const LIST_HORIZ_MAX: usize = 2000;
+
+fn grid_columns_for(viewport_w: f32, tile_w: f32, bar_w: f32) -> usize {
+    let avail = (viewport_w - bar_w - 2.0 * GRID_PAD + GRID_GAP).max(tile_w + GRID_GAP);
+    (avail / (tile_w + GRID_GAP)).floor().max(1.0) as usize
+}
+
+fn list_rows_for(viewport_h: f32, bar_w: f32) -> usize {
+    ((viewport_h - bar_w - 8.0) / ROW_H).floor().max(1.0) as usize
+}
+
+fn wire_entry_interactions(el: El, p: usize, id: &str) -> El {
+    let (id_press, id_open, id_drag, id_start, id_menu) = (id.to_string(), id.to_string(), id.to_string(), id.to_string(), id.to_string());
+    el.on_press_tx(move |s: &mut State, tx: &mut Tx| {
+        click(s, p, &id_press, tx.mods());
+        tx.focus(pane_key(p), false);
+    })
+    .on_secondary_press(move |s: &mut State, at: rune::PointerPress, tx: &mut Tx| {
+        s.active = p;
+        let pane = &mut s.panes[p];
+        if !pane.selected.contains(&id_menu) {
+            pane.selected = [id_menu.clone()].into();
+            pane.anchor = Some(id_menu.clone());
+        }
+        pane.cursor = Some(id_menu.clone());
+        tx.focus(pane_key(p), false);
+        s.menu = Some((p, at));
+    })
+    .on_double_press(move |s: &mut State| open(s, p, &id_open))
+    .drag_out(move |s: &State| drag_item(s, p, &id_drag))
+    .on_drag_start(move |s: &mut State, _| {
+        s.active = p;
+        let pane = &mut s.panes[p];
+        if !pane.selected.contains(&id_start) {
+            pane.selected = [id_start.clone()].into();
+            pane.anchor = Some(id_start.clone());
+            pane.cursor = Some(id_start.clone());
+        }
+        let paths = paths_for(s, p, &dragged_ids(&s.panes[p], &id_start), false);
+        s.last_drag = Some((p, paths));
+    })
+    .on_drag_end(move |s: &mut State, outcome: DragOutcome, _| {
+        s.status = match outcome {
+            DragOutcome::Cancelled => t("Arrastar cancelado.", "Drag canceled.").into(),
+            o => tr!("Arrastar terminou: {o:?}", "Drag ended: {o:?}"),
+        };
+    })
 }
 
 fn list(s: &State, k: &Kit, p: usize) -> El {
     let pane = &s.panes[p];
+    let mode = pane.view_mode;
     let w = s.layout.columns[p];
     let total: f32 = w.iter().sum();
-    let arrow = |c: SortCol| if pane.sort.0 == c { if pane.sort.1 { "  ▲" } else { "  ▼" } } else { "" };
-    let head = |i: usize, key: &str, label: &str, c: SortCol, end: bool| {
-        let mut h = row()
-            .key(key.to_string())
-            .w(w[i])
-            .h_full()
-            .px(8.0)
-            .center_y()
-            .hover(k.c.hover)
-            .cursor(Cursor::Pointer)
-            .on_press(move |s: &mut State| set_sort(s, p, c))
-            .child(text(format!("{label}{}", arrow(c))).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0))
-            .border_sides([0.0, 1.0, 0.0, 0.0], k.c.border_weak);
-        if end {
-            h = h.justify_end();
-        }
-        h
-    };
-    // The grips sit over the header, one at each column's right edge.
-    let grips = (0..4).map(|i| col_grip(k, p, i, w[..=i].iter().sum()));
-    let header = row()
-        .key("header")
-        .w_full()
-        .h(HEADER_H)
-        .fill(k.c.bg_base)
-        .sticky_top(0.0)
-        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
-        .child(head(0, "h-name", t("Nome", "Name"), SortCol::Name, false))
-        .child(head(1, "h-size", t("Tamanho", "Size"), SortCol::Size, true))
-        .child(head(2, "h-mod", crate::onedrive::bin_columns(&pane.loc).map_or(t("Data", "Date modified"), |c| c.0), SortCol::Modified, false))
-        .child(head(3, "h-kind", if let Some(c) = crate::onedrive::bin_columns(&pane.loc) { c.1 } else if pane.loc.finds() { t("Pasta", "Folder") } else { t("Tipo", "Type") }, SortCol::Kind, false))
-        .children(grips);
+    let order = s.layout.col_order[p];
+
+    // Details only: the list zoom (Ctrl+wheel, pinch) and the animations of Opções > Animações.
+    let row_h = s.zoom[p].row_height();
+    let icon_sz = s.zoom[p].icon_size();
+    let hover_glides = s.settings.hover_animated();
+    let sel_anim = s.settings.selection_animated();
+    let clip_anim = s.settings.clipboard_animated();
+    let zebra = s.settings.zebra_stripes;
 
     let selected = k.alpha(k.c.text_accent, if k.dark { 0.26 } else { 0.18 });
-    let hover = k.alpha(k.c.text_base, 0.045);
+    let hover = k.alpha(k.c.text_base, if k.dark { 0.065 } else { 0.05 });
+    let zebra_bg = k.alpha(k.c.text_base, if k.dark { 0.028 } else { 0.024 });
     let ring = k.c.border_focus;
+    let kbd_sel_active = sel_anim
+        && mode == ViewMode::Details
+        && s.kbd_sel[p].is_active()
+        && pane.selected.len() == 1
+        && pane.entries.get(s.kbd_sel[p].target_row()).is_some_and(|e| pane.selected.contains(&e.id));
     let (text_c, muted_c) = (k.c.text_base, k.c.text_muted);
-    let font = k.ty.text_small;
+    let mut font = k.ty.text_small;
+    if mode == ViewMode::Details {
+        font.size = s.zoom[p].font_size(font.size);
+    }
+    let tile_font = k.ty.text_xsmall;
     let rename_look = RenameLook { font, ink: text_c, fill: k.c.bg_base, edge: k.c.border_focus, selection: k.selection() };
     // A search's results show what matched each name in the accent colour: a colour-only span,
     // so the name keeps its shape and width. The words are folded once here; each row finds
@@ -5716,36 +6386,146 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let words = std::rc::Rc::new(searched_words(&pane.loc));
     let accent = k.c.text_accent;
     let marker = k.alpha(k.c.text_accent, 0.28);
-    let build = move |s: &State, i: usize| -> El {
-        let pane = &s.panes[p];
-        let e = &pane.entries[i];
-        let is_sel = pane.selected.contains(&e.id);
-        let found = pane.loc.finds();
-        // As wide as the columns: past them is empty space, where a drag draws a rectangle.
-        let mut r = row().key(row_key(&e.id)).role("row").label(shown(&e.name)).focus_selected(is_sel).w(total).h(ROW_H).center_y();
-        r = if is_sel { r.fill(selected) } else { r.hover(hover) };
-        // The keyboard's row is outlined only when it isn't selected (Ctrl+arrows moved it
-        // alone): a selected row already shows, and an outline on the end of a Shift range
-        // reads as a second kind of selection.
-        if s.active == p && !is_sel && pane.cursor.as_deref() == Some(e.id.as_str()) {
-            r = r.outline(1.0, -1.0, ring);
+    // The items Copiar or Recortar picked up from this folder, looked up once here rather than
+    // by every row: a pick-up can hold thousands.
+    let clip_ids: std::rc::Rc<std::collections::HashSet<String>> = std::rc::Rc::new(
+        s.clip.as_ref().filter(|c| c.from == pane.loc).map(|c| c.items.iter().map(|it| it.id.clone()).collect()).unwrap_or_default(),
+    );
+
+    let n = pane.entries.len();
+    let show_header = mode == ViewMode::Details;
+    let header_h = if show_header { HEADER_H } else { 0.0 };
+    let bar = bar_style(k).track_offset(header_h, 0.0);
+    let bar_strip = bar.strip();
+
+    // How the items are laid out, for the keyboard and its menu (`lasso::Flow`).
+    let flow = &s.views[p].flow;
+    let rows = match mode {
+        ViewMode::Details => {
+            // Rows as tall as the zoom makes them.
+            flow.set(crate::lasso::Flow { step: [0.0, row_h], item: [0.0, row_h], ..Default::default() });
+            let build = move |s: &State, i: usize| -> El {
+                let pane = &s.panes[p];
+                let e = &pane.entries[i];
+                let is_sel = pane.selected.contains(&e.id);
+                let found = pane.loc.finds();
+                let clip_match = s.clip.as_ref().filter(|_| clip_ids.contains(&e.id));
+                let is_cut = clip_match.is_some_and(|c| c.mode == ClipMode::Cut);
+                // As wide as the columns: past them is empty space, where a drag draws a rectangle.
+                let mut r = row().key(row_key(&e.id)).role("row").label(shown(&e.name)).focus_selected(is_sel).w(total).h(row_h).center_y();
+                if sel_anim {
+                    r = r.radius(4.0).animated_changes().motion(crate::anim::ui_spring());
+                } else if clip_anim {
+                    r = r.animated_changes();
+                }
+                let stripe = if zebra && i % 2 == 1 { zebra_bg } else { Color::TRANSPARENT };
+                r = if is_sel && !kbd_sel_active {
+                    r.fill(selected)
+                } else if hover_glides {
+                    r.fill(stripe)
+                } else {
+                    r.fill(stripe).hover(hover)
+                };
+                if clip_anim {
+                    r = r.opacity(if is_cut { 0.55 } else { 1.0 }).opacity_motion(crate::anim::hover_curve());
+                } else if is_cut {
+                    r = r.opacity(0.55);
+                }
+                if s.row_reorder[p].is_active() {
+                    let dy = s.row_reorder[p].offset_px(&e.id, row_h);
+                    if dy.abs() > 0.25 {
+                        r = r.offset(0.0, dy).offset_motion(Anim::INSTANT);
+                    }
+                }
+                // The keyboard's row is outlined only when it isn't selected (Ctrl+arrows moved it
+                // alone): a selected row already shows, and an outline on the end of a Shift range
+                // reads as a second kind of selection.
+                if s.active == p && !is_sel && pane.cursor.as_deref() == Some(e.id.as_str()) {
+                    r = r.outline(1.0, -1.0, ring);
+                }
+                let cell = |i: usize| row().w(w[i]).h_full().px(8.0).center_y().clip_soft(0.0);
+                let muted = |t: String| text(t).font(font).color(muted_c).truncate().shrink().min_w(0.0);
+                let mut ico = entry_icon(s, &pane.loc, e, icon_sz);
+                if clip_anim
+                    && let Some(clip) = clip_match
+                {
+                    let elapsed = (s.now - clip.picked_at).max(0.0);
+                    let angle = crate::anim::wiggle_radians(icon_sz, elapsed, &e.id);
+                    ico = ico.origin(0.5, 0.5).rotate(angle).rotate_motion(Anim::INSTANT);
+                }
+                let mut cells = Vec::with_capacity(4);
+                let mut ico_opt = Some(ico);
+                for col_id in order {
+                    let c = match col_id {
+                        0 => cell(0)
+                            .px(6.0)
+                            .gap(6.0)
+                            .child(ico_opt.take().unwrap_or_else(|| entry_icon(s, &pane.loc, e, icon_sz)))
+                            .child(match &s.renaming {
+                                Some((rp, item)) if *rp == p && item.id == e.id => rename_field(s, rename_look),
+                                _ => {
+                                    let name = shown(&e.name);
+                                    let ranges = crate::finder::match_ranges(&words, &name);
+                                    if s.settings.search_marker {
+                                        // Experimental: as a highlighter marks them, painted under the
+                                        // glyphs without reshaping the name.
+                                        let marks = ranges.into_iter().map(|r| rune::TextHighlight::new(r, marker));
+                                        text(name).font(font).color(text_c).text_highlights(marks).truncate().shrink().min_w(0.0)
+                                    } else {
+                                        let spans: Vec<Span> = ranges.into_iter().map(|r| Span::new(r.start, r.end).color(accent)).collect();
+                                        text(name).font(font).color(text_c).spans(spans).truncate().shrink().min_w(0.0)
+                                    }
+                                }
+                            }),
+                        1 => cell(1).justify_end().child(muted(e.size.map(format_size).unwrap_or_default()).align(Align::End)),
+                        2 => cell(2).child(muted(e.modified.map(format_time).unwrap_or_default())),
+                        _ => cell(3).child(muted(if found {
+                            crate::finder::folder_of(e)
+                        } else {
+                            crate::onedrive::origin_of(&pane.loc, e).unwrap_or_else(|| e.kind_label())
+                        })),
+                    };
+                    cells.push(c);
+                }
+                wire_entry_interactions(r.children(cells), p, &e.id)
+            };
+            col()
+                .key("rows")
+                .w_full()
+                .pr(bar_strip)
+                .pb(2.0 * row_h)
+                .growth(GrowthSpec::default())
+                .virtual_rows(n, row_h, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
+                .virtual_rows_version((pane.version, mode, w.map(f32::to_bits), order, row_h.to_bits(), s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))))
         }
-        let (id_press, id_open, id_drag, id_start) = (e.id.clone(), e.id.clone(), e.id.clone(), e.id.clone());
-        let cell = |i: usize| row().w(w[i]).h_full().px(8.0).center_y().clip_soft(0.0);
-        let muted = |t: String| text(t).font(font).color(muted_c).truncate().shrink().min_w(0.0);
-        r.child(
-            cell(0)
-                .px(6.0)
-                .gap(6.0)
-                .child(entry_icon(s, &pane.loc, e, 16.0))
-                .child(match &s.renaming {
+        ViewMode::List => {
+            let radius = k.radius.sm;
+            let make_item = move |s: &State, i: usize| -> El {
+                let pane = &s.panes[p];
+                let e = &pane.entries[i];
+                let is_sel = pane.selected.contains(&e.id);
+                let mut r = row()
+                    .key(row_key(&e.id))
+                    .role("row")
+                    .label(shown(&e.name))
+                    .focus_selected(is_sel)
+                    .w(LIST_COL_W)
+                    .h(ROW_H)
+                    .px(6.0)
+                    .gap(6.0)
+                    .center_y()
+                    .radius(radius)
+                    .clip_soft(radius);
+                r = if is_sel { r.fill(selected) } else { r.hover(hover) };
+                if s.active == p && !is_sel && pane.cursor.as_deref() == Some(e.id.as_str()) {
+                    r = r.outline(1.0, -1.0, ring);
+                }
+                let r = r.child(entry_icon(s, &pane.loc, e, 16.0)).child(match &s.renaming {
                     Some((rp, item)) if *rp == p && item.id == e.id => rename_field(s, rename_look),
                     _ => {
                         let name = shown(&e.name);
                         let ranges = crate::finder::match_ranges(&words, &name);
                         if s.settings.search_marker {
-                            // Experimental: as a highlighter marks them, painted under the
-                            // glyphs without reshaping the name.
                             let marks = ranges.into_iter().map(|r| rune::TextHighlight::new(r, marker));
                             text(name).font(font).color(text_c).text_highlights(marks).truncate().shrink().min_w(0.0)
                         } else {
@@ -5753,66 +6533,143 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                             text(name).font(font).color(text_c).spans(spans).truncate().shrink().min_w(0.0)
                         }
                     }
-                }),
-        )
-        .child(cell(1).justify_end().child(muted(e.size.map(format_size).unwrap_or_default()).align(Align::End)))
-        .child(cell(2).child(muted(e.modified.map(format_time).unwrap_or_default())))
-        // A search's results show the folder each is in where the type goes.
-        .child(cell(3).child(muted(if found { crate::finder::folder_of(e) } else { crate::onedrive::origin_of(&pane.loc, e).unwrap_or_else(|| e.kind_label()) })))
-        .on_press_tx(move |s: &mut State, tx: &mut Tx| {
-            click(s, p, &id_press, tx.mods());
-            tx.focus(pane_key(p), false);
-        })
-        .on_secondary_press({
-            let id = e.id.clone();
-            // As in Explorer: a right click on an unselected row selects just that row first.
-            move |s: &mut State, at: rune::PointerPress, tx: &mut Tx| {
-                s.active = p;
-                let pane = &mut s.panes[p];
-                if !pane.selected.contains(&id) {
-                    pane.selected = [id.clone()].into();
-                    pane.anchor = Some(id.clone());
-                }
-                pane.cursor = Some(id.clone());
-                tx.focus(pane_key(p), false);
-                s.menu = Some((p, at));
-            }
-        })
-        .on_double_press(move |s: &mut State| open(s, p, &id_open))
-        .drag_out(move |s: &State| drag_item(s, p, &id_drag))
-        .on_drag_start(move |s: &mut State, _| {
-            s.active = p;
-            let pane = &mut s.panes[p];
-            if !pane.selected.contains(&id_start) {
-                pane.selected = [id_start.clone()].into();
-                pane.anchor = Some(id_start.clone());
-                pane.cursor = Some(id_start.clone());
-            }
-            // `drag_out` already wrote the files; this only names them.
-            let paths = paths_for(s, p, &dragged_ids(&s.panes[p], &id_start), false);
-            s.last_drag = Some((p, paths));
-        })
-        .on_drag_end(move |s: &mut State, outcome: DragOutcome, _| {
-            s.status = match outcome {
-                DragOutcome::Cancelled => t("Arrastar cancelado.", "Drag canceled.").into(),
-                o => tr!("Arrastar terminou: {o:?}", "Drag ended: {o:?}"),
+                });
+                wire_entry_interactions(r, p, &e.id)
             };
-        })
+            if n <= LIST_HORIZ_MAX {
+                // Windows Explorer List view: flows top-to-bottom per column and left-to-right
+                // across columns, scrolling horizontally when there are more columns than fit.
+                let vp_h = s.views[p].rect[3];
+                let rows_per_col = if vp_h > 0.0 { list_rows_for(vp_h, bar_strip) } else { s.list_rows[p].max(1) };
+                let num_cols = n.div_ceil(rows_per_col);
+                flow.set(crate::lasso::Flow {
+                    per_line: rows_per_col,
+                    rows: false,
+                    origin: [4.0, 4.0],
+                    step: [LIST_COL_W + LIST_COL_GAP, ROW_H],
+                    item: [LIST_COL_W, ROW_H],
+                    header: 0.0,
+                    line_key: None,
+                });
+                let mut cols_row = row().key("rows-list").padding(4.0).pb(bar_strip + 4.0).gap(LIST_COL_GAP).items_start();
+                for c in 0..num_cols {
+                    let start = c * rows_per_col;
+                    let end = (start + rows_per_col).min(n);
+                    let mut column = col().key(format!("lcol-{c}")).w(LIST_COL_W);
+                    for i in start..end {
+                        column = column.child(make_item(s, i));
+                    }
+                    cols_row = cols_row.child(column);
+                }
+                cols_row
+            } else {
+                // Very large folders stay virtualized in multi-column rows.
+                let vp_w = s.views[p].rect[2];
+                let cols = if vp_w > 0.0 { grid_columns_for(vp_w, LIST_COL_W, bar_strip) } else { s.grid_cols[p].max(1) };
+                let vrows = n.div_ceil(cols);
+                flow.set(crate::lasso::Flow {
+                    per_line: cols,
+                    rows: true,
+                    origin: [4.0, 4.0],
+                    step: [LIST_COL_W + LIST_COL_GAP, ROW_H],
+                    item: [LIST_COL_W, ROW_H],
+                    header: 0.0,
+                    line_key: Some("lr-"),
+                });
+                let build = move |s: &State, row_idx: usize| -> El {
+                    let start = row_idx * cols;
+                    let end = (start + cols).min(s.panes[p].entries.len());
+                    let mut line = row().key(format!("lr-{row_idx}")).w_full().h(ROW_H).px(4.0).gap(LIST_COL_GAP).center_y();
+                    for i in start..end {
+                        line = line.child(make_item(s, i));
+                    }
+                    line
+                };
+                col()
+                    .key("rows-list-virt")
+                    .w_full()
+                    .pt(4.0)
+                    .pr(bar_strip)
+                    .pb(2.0 * ROW_H)
+                    .growth(GrowthSpec::default())
+                    .virtual_rows(vrows, ROW_H, move |_, row_idx| Cow::Owned(format!("lr-{row_idx}")), build)
+                    .virtual_rows_version((pane.version, mode, cols, s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))))
+            }
+        }
+        ViewMode::ExtraLargeIcons | ViewMode::LargeIcons | ViewMode::MediumIcons => {
+            let (tile_w, tile_h, icon_size) = mode.tile_metrics();
+            let vp_w = s.views[p].rect[2];
+            let cols = if vp_w > 0.0 { grid_columns_for(vp_w, tile_w, bar_strip) } else { s.grid_cols[p].max(1) };
+            let grid_rows = n.div_ceil(cols);
+            flow.set(crate::lasso::Flow {
+                per_line: cols,
+                rows: true,
+                origin: [GRID_PAD, GRID_PAD],
+                step: [tile_w + GRID_GAP, tile_h + GRID_GAP],
+                item: [tile_w, tile_h],
+                header: 0.0,
+                line_key: Some("gr-"),
+            });
+            let row_h = tile_h + GRID_GAP;
+            let radius = k.radius.sm;
+            let build = move |s: &State, row_idx: usize| -> El {
+                let pane = &s.panes[p];
+                let start = row_idx * cols;
+                let end = (start + cols).min(pane.entries.len());
+                let mut line = row().key(format!("gr-{row_idx}")).w_full().h(row_h).px(GRID_PAD).gap(GRID_GAP).items_start();
+                for i in start..end {
+                    let e = &pane.entries[i];
+                    let is_sel = pane.selected.contains(&e.id);
+                    let mut tile = col()
+                        .key(row_key(&e.id))
+                        .role("row")
+                        .label(shown(&e.name))
+                        .focus_selected(is_sel)
+                        .w(tile_w)
+                        .h(tile_h)
+                        .padding(6.0)
+                        .gap(5.0)
+                        .items_center()
+                        .radius(radius)
+                        .clip_soft(radius);
+                    tile = if is_sel { tile.fill(selected) } else { tile.hover(hover) };
+                    if s.active == p && !is_sel && pane.cursor.as_deref() == Some(e.id.as_str()) {
+                        tile = tile.outline(1.0, -1.0, ring);
+                    }
+                    let label_el = match &s.renaming {
+                        Some((rp, item)) if *rp == p && item.id == e.id => rename_field(s, rename_look),
+                        _ => {
+                            let name = shown(&e.name);
+                            let ranges = crate::finder::match_ranges(&words, &name);
+                            let t_el = if s.settings.search_marker {
+                                let marks = ranges.into_iter().map(|r| rune::TextHighlight::new(r, marker));
+                                text(name).font(tile_font).color(text_c).text_highlights(marks)
+                            } else {
+                                let spans: Vec<Span> = ranges.into_iter().map(|r| Span::new(r.start, r.end).color(accent)).collect();
+                                text(name).font(tile_font).color(text_c).spans(spans)
+                            };
+                            t_el.wrap().align(Align::Center).w_full().min_w(0.0)
+                        }
+                    };
+                    let tile = tile
+                        .child(entry_icon(s, &pane.loc, e, icon_size))
+                        .child(col().w_full().grow(1.0).min_h(0.0).clip_soft(0.0).child(label_el));
+                    line = line.child(wire_entry_interactions(tile, p, &e.id));
+                }
+                line
+            };
+            col()
+                .key("rows-grid")
+                .w_full()
+                .pt(GRID_PAD)
+                .pr(bar_strip)
+                .pb(2.0 * GRID_PAD)
+                .growth(GrowthSpec::default())
+                .virtual_rows(grid_rows, row_h, move |_, row_idx| Cow::Owned(format!("gr-{row_idx}")), build)
+                .virtual_rows_version((pane.version, mode, cols, s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))))
+        }
     };
 
-    let n = pane.entries.len();
-    // The rows end where the scroll bar starts; the header runs on above it.
-    let bar = bar_style(k).track_offset(HEADER_H, 0.0);
-    // Room under the last row, so a list that scrolls still has empty space to start a
-    // rectangle selection from.
-    let rows = col()
-        .key("rows")
-        .w_full()
-        .pr(bar.strip())
-        .pb(2.0 * ROW_H)
-        .growth(GrowthSpec::default())
-        .virtual_rows(n, ROW_H, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
-        .virtual_rows_version((pane.version, w.map(f32::to_bits), s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))));
     let notice = |msg: String, color| col().key("notice").w_full().grow(1.0).padding(16.0).child(text(msg).font(k.ty.text_small).color(color).wrap());
     let body = if let Some(consent) = crate::onedrive::bin_notice(s, k, p) {
         consent
@@ -5854,14 +6711,211 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     } else {
         rows
     };
-    // One viewport scrolls both ways: sideways when the columns are wider than the pane,
-    // header and rows together, and up and down with the header stuck to the top. Its
-    // vertical bar sits on the pane's right edge, wherever the columns end.
-    let table = col().key("table").w_full().min_w(total + bar.strip()).child(header).child(body).children(lasso_rect(s, k, p));
-    // A right click on empty space opens the folder's menu (Colar, Nova pasta); a drag there
-    // selects with a rectangle (see `crate::lasso`), which needs where the viewport is.
-    // Its key is the pane's own: the scroll bar keeps its state, and finds the viewport it
-    // scrolls, by this key, so with one key for both panes each bar moved the left pane.
+
+    let table = if show_header {
+        let col_meta: [(&'static str, &str, SortCol, bool); 4] = [
+            ("h-name", t("Nome", "Name"), SortCol::Name, false),
+            ("h-size", t("Tamanho", "Size"), SortCol::Size, true),
+            ("h-mod", crate::onedrive::bin_columns(&pane.loc).map_or(t("Data", "Date modified"), |c| c.0), SortCol::Modified, false),
+            (
+                "h-kind",
+                if let Some(c) = crate::onedrive::bin_columns(&pane.loc) {
+                    c.1
+                } else if pane.loc.finds() {
+                    t("Pasta", "Folder")
+                } else {
+                    t("Tipo", "Type")
+                },
+                SortCol::Kind,
+                false,
+            ),
+        ];
+
+        let active_drag = s.col_drag.filter(|d| d.pane == p);
+        let mut header_cells = Vec::with_capacity(4);
+        let mut slot_x = 0.0_f32;
+        for (slot, &col_id) in order.iter().enumerate() {
+            let (key, label, c, end) = col_meta[col_id];
+            let is_dragged = active_drag.is_some_and(|d| d.col_id == col_id && d.moved);
+            let drag_dx = active_drag.filter(|d| d.col_id == col_id && d.moved).map_or(0.0, |d| d.visual_dx);
+            let start_x = slot_x;
+            slot_x += w[col_id];
+
+            let mut h = row()
+                .key(key.to_string())
+                .w(w[col_id])
+                .h_full()
+                .px(8.0)
+                .gap(4.0)
+                .center_y()
+                .hover(k.c.hover)
+                .cursor(if is_dragged { Cursor::Grabbing } else { Cursor::Pointer })
+                .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                    set_sort(s, p, c);
+                    if s.row_reorder[p].is_active() {
+                        tx.wake_at(s.now + 1.0 / 60.0);
+                    }
+                })
+                .on_drag(move |s: &mut State, d: &mut Drag, _tx: &mut Tx| match d.phase {
+                    Phase::Down => {
+                        let cur_order = s.layout.col_order[p];
+                        let cur_w = s.layout.columns[p];
+                        let mut x = 0.0;
+                        for &cid in &cur_order {
+                            if cid == col_id {
+                                break;
+                            }
+                            x += cur_w[cid];
+                        }
+                        s.col_drag = Some(crate::anim::ColDrag {
+                            pane: p,
+                            col_id,
+                            original_order: cur_order,
+                            start_x: x,
+                            visual_dx: 0.0,
+                            moved: false,
+                        });
+                    }
+                    Phase::Move => {
+                        let Some(drag) = s.col_drag.as_mut().filter(|cd| cd.pane == p && cd.col_id == col_id) else {
+                            return;
+                        };
+                        if !drag.moved && d.dx.abs() < 5.0 {
+                            return;
+                        }
+                        drag.moved = true;
+                        let cur_w = s.layout.columns[p];
+                        let mut ord = s.layout.col_order[p];
+                        let cur_slot = ord.iter().position(|&id| id == col_id).unwrap_or(slot);
+                        let dragged_center = drag.start_x + d.dx + cur_w[col_id] * 0.5;
+                        let mut acc = 0.0;
+                        let mut target_slot = cur_slot;
+                        for (idx, &cid) in ord.iter().enumerate() {
+                            let cw = cur_w[cid];
+                            let mid = acc + cw * 0.5;
+                            if idx < cur_slot && dragged_center < mid {
+                                target_slot = idx;
+                                break;
+                            }
+                            if idx > cur_slot && dragged_center > mid {
+                                target_slot = idx;
+                            }
+                            acc += cw;
+                        }
+                        if target_slot != cur_slot {
+                            let mut v = ord.to_vec();
+                            v.remove(cur_slot);
+                            v.insert(target_slot, col_id);
+                            ord = [v[0], v[1], v[2], v[3]];
+                            s.layout.col_order[p] = ord;
+                        }
+                        let mut new_slot_x = 0.0;
+                        for &cid in &ord {
+                            if cid == col_id {
+                                break;
+                            }
+                            new_slot_x += cur_w[cid];
+                        }
+                        drag.visual_dx = (drag.start_x + d.dx) - new_slot_x;
+                    }
+                    Phase::Up => {
+                        if let Some(drag) = s.col_drag.take() {
+                            if d.cancelled() {
+                                s.layout.col_order[p] = drag.original_order;
+                            } else if drag.moved {
+                                s.layout.save();
+                            }
+                        }
+                    }
+                })
+                .child(text(label.to_string()).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0))
+                .border_sides([0.0, 1.0, 0.0, 0.0], k.c.border_weak);
+
+            if pane.sort.0 == c {
+                let angle = if pane.sort.1 { -std::f32::consts::FRAC_PI_2 } else { std::f32::consts::FRAC_PI_2 };
+                let chev = icon(&icons::CHEVRON, 10.0)
+                    .key(format!("sort-chev-{c:?}"))
+                    .animated_changes()
+                    .color(k.c.text_muted)
+                    .origin(0.5, 0.5)
+                    .rotate(angle)
+                    .rotate_motion(if sel_anim { crate::anim::hover_curve() } else { Anim::INSTANT });
+                h = h.child(chev);
+            }
+            if end {
+                h = h.justify_end();
+            }
+            if is_dragged {
+                h = h
+                    .raise()
+                    .fill(k.c.bg_base)
+                    .border(1.0, k.alpha(k.c.text_accent, 0.55))
+                    .radius(4.0)
+                    .box_shadow(rune::Shadow { y: 2.0, blur: 6.0, color: k.dark_a(0.28), ..Default::default() })
+                    .offset(drag_dx, 0.0)
+                    .offset_motion(Anim::INSTANT);
+            } else if sel_anim {
+                h = h.animated_changes().motion(crate::anim::ui_spring());
+            }
+            let _ = start_x;
+            header_cells.push(h);
+        }
+
+        // The grips sit over the header, one at each column's right edge in visual order.
+        let mut grip_edge = 0.0_f32;
+        let mut grips = Vec::with_capacity(4);
+        for &col_id in &order {
+            grip_edge += w[col_id];
+            grips.push(col_grip(k, p, col_id, grip_edge));
+        }
+        let header = row()
+            .key("header")
+            .w_full()
+            .h(HEADER_H)
+            .fill(k.c.bg_base)
+            .sticky_top(0.0)
+            .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+            .children(header_cells)
+            .children(grips);
+        // Gliding hover highlight pill (80 ms ease-out cubic, matching Explorer GPU mod):
+        // sits behind the rows and slides smoothly from row to row without leaving a trail.
+        let hover_pill = (hover_glides && n > 0 && pane.error.is_none()).then(|| {
+            let active = s.hovered_row[p].filter(|&idx| idx < n && s.lasso.is_none());
+            let row_idx = active.unwrap_or_else(|| s.hover_last_row[p].min(n.saturating_sub(1)));
+            let y = row_idx as f32 * row_h;
+            let curve = crate::anim::hover_curve();
+            el().key("hover-pill")
+                .animated_changes()
+                .absolute(2.0, HEADER_H)
+                .size((total - 4.0).max(0.0), row_h)
+                .radius(5.0)
+                .fill(hover)
+                .offset(0.0, y)
+                .offset_motion(curve)
+                .opacity(if active.is_some() { 1.0 } else { 0.0 })
+                .opacity_motion(curve)
+        });
+        // Gliding keyboard selection pill (Cubic Hermite glide on ↑/↓/PageUp/PageDown/Home/End).
+        let kbd_sel_pill = kbd_sel_active.then(|| {
+            let y = s.kbd_sel[p].presented_row() * row_h;
+            el().key("kbd-sel-pill").absolute(0.0, HEADER_H + y).size(total, row_h).radius(4.0).fill(selected)
+        });
+        // One viewport scrolls both ways: sideways when the columns are wider than the pane,
+        // header and rows together, and up and down with the header stuck to the top. Its
+        // vertical bar sits on the pane's right edge, wherever the columns end.
+        col()
+            .key("table")
+            .w_full()
+            .min_w(total + bar_strip)
+            .children(hover_pill)
+            .children(kbd_sel_pill)
+            .child(header)
+            .child(body)
+            .children(lasso_rect(s, k, p))
+    } else {
+        col().key("table").w_full().child(body).children(lasso_rect(s, k, p))
+    };
+
     let scrolled = s.views[p].scroll.clone();
     let viewport = col()
         .key(list_key(p))
@@ -5870,12 +6924,96 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .h_full()
         .scroll_xy()
         .on_scroll_offset(move |at| scrolled.set(at.into()))
+        // Track hovered row for the gliding hover highlight; returns live_only when the row
+        // doesn't change so pointer motion inside a row triggers zero view rebuilds.
+        .on_pointer_move_local(move |s: &mut State, ev: rune::PointerEvent, tx: &mut Tx| {
+            if !s.settings.hover_animated() || s.panes[p].view_mode != ViewMode::Details {
+                tx.live_only();
+                return;
+            }
+            let scroll = s.views[p].scroll.get();
+            let content_x = ev.x + scroll.x;
+            let content_y = ev.y + scroll.y - HEADER_H;
+            let total_w: f32 = s.layout.columns[p].iter().sum();
+            let rh = s.zoom[p].row_height().max(1.0);
+            let next = if ev.y >= HEADER_H && content_y >= 0.0 && content_x >= 0.0 && content_x < total_w && s.lasso.is_none() {
+                let idx = (content_y / rh).floor() as usize;
+                (idx < s.panes[p].entries.len()).then_some(idx)
+            } else {
+                None
+            };
+            if next != s.hovered_row[p] {
+                s.hovered_row[p] = next;
+                if let Some(idx) = next {
+                    s.hover_last_row[p] = idx;
+                }
+            } else {
+                tx.live_only();
+            }
+        })
+        .on_hover_change(move |s: &mut State, inside: bool, tx: &mut Tx| {
+            if !inside && s.hovered_row[p].is_some() {
+                s.hovered_row[p] = None;
+            } else {
+                tx.live_only();
+            }
+        })
+        // Ctrl + mouse wheel smoothly zooms row height, icons, and text.
+        .on_wheel(move |s: &mut State, e: rune::WheelEvent, tx: &mut Tx| {
+            // The zoom is Details': the other views keep their sizes.
+            if !(e.mods.ctrl || e.mods.cmd) || s.panes[p].view_mode != ViewMode::Details {
+                return false;
+            }
+            let delta = if e.dy > 0.0 { 1.0 } else if e.dy < 0.0 { -1.0 } else { 0.0 };
+            if delta != 0.0 && s.zoom[p].step_by(delta, s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+            true
+        })
+        // Trackpad pinch-to-zoom.
+        .on_magnify(move |s: &mut State, e: rune::MagnifyEvent, tx: &mut Tx| {
+            if s.panes[p].view_mode != ViewMode::Details {
+                return false;
+            }
+            if s.zoom[p].scale_by(1.0 + e.delta, s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+            true
+        })
         // Where the viewport is, for the lasso, and the rows in view below the header, which
         // Page Up and Page Down move by. Only handlers read them, so the view needn't run again.
         .on_layout_tx(move |s: &mut State, r: [f32; 4], tx: &mut Tx| {
             s.views[p].rect = r;
-            s.page_rows[p] = ((r[3] - HEADER_H) / ROW_H).floor().max(1.0) as usize;
-            tx.live_only();
+            let mode = s.panes[p].view_mode;
+            if mode.is_grid() {
+                let (tile_w, tile_h, _) = mode.tile_metrics();
+                let new_cols = grid_columns_for(r[2], tile_w, bar_strip);
+                let visible_rows = (r[3] / (tile_h + GRID_GAP)).floor().max(1.0) as usize;
+                s.page_rows[p] = (visible_rows * new_cols).max(1);
+                if s.grid_cols[p] != new_cols {
+                    s.grid_cols[p] = new_cols;
+                } else {
+                    tx.live_only();
+                }
+            } else if mode == ViewMode::List {
+                let new_rows = list_rows_for(r[3], bar_strip);
+                let new_cols = grid_columns_for(r[2], LIST_COL_W, bar_strip);
+                // A page: a column's items, or past LIST_HORIZ_MAX, where the items run in rows,
+                // the rows in view.
+                s.page_rows[p] = if s.panes[p].entries.len() > LIST_HORIZ_MAX { new_rows * new_cols } else { new_rows };
+                let needs_relayout = s.list_rows[p] != new_rows || (s.panes[p].entries.len() > LIST_HORIZ_MAX && s.grid_cols[p] != new_cols);
+                s.list_rows[p] = new_rows;
+                if s.panes[p].entries.len() > LIST_HORIZ_MAX {
+                    s.grid_cols[p] = new_cols;
+                }
+                if !needs_relayout {
+                    tx.live_only();
+                }
+            } else {
+                let rh = s.zoom[p].row_height().max(1.0);
+                s.page_rows[p] = ((r[3] - HEADER_H) / rh).floor().max(1.0) as usize;
+                tx.live_only();
+            }
         })
         .on_drag(move |s: &mut State, d: &mut Drag, tx: &mut Tx| crate::lasso::drag(s, p, d, tx))
         .on_secondary_press(move |s: &mut State, at: rune::PointerPress, tx: &mut Tx| {
@@ -5885,11 +7023,13 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
             s.menu = Some((p, at));
         })
         .child(table);
-    // The bar runs below the header, which stays put, as Explorer's does.
     let key = list_key(p);
     let viewport = s.edges[p].list.on(viewport);
     col().key("list").w(0.0).grow(1.0).h_full().min_w(0.0).child(with_scroll_bars(k, &key, viewport, bar, true))
 }
+
+// ---------------------------------------------------------------------------------------------
+// Status bar
 
 // ---------------------------------------------------------------------------------------------
 // Status bar
@@ -5942,6 +7082,30 @@ fn statusbar(s: &State, k: &Kit, p: usize) -> El {
         .center_y()
         .border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_weak)
         .child(text(left).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0).grow(1.0));
+    let zoom_pct = s.zoom[p].percent();
+    if zoom_pct != 100 {
+        bar = bar.child(
+            row()
+                .key("zoom-reset")
+                .role("button")
+                .label(t("Redefinir zoom (Ctrl+0)", "Reset zoom (Ctrl+0)"))
+                .help(t("Clique ou pressione Ctrl+0 para voltar a 100%", "Click or press Ctrl+0 to reset to 100%"))
+                .h(16.0)
+                .px(5.0)
+                .mr(8.0)
+                .center()
+                .radius(4.0)
+                .fill(k.alpha(k.c.text_accent, if k.dark { 0.16 } else { 0.10 }))
+                .hover(k.alpha(k.c.text_accent, if k.dark { 0.24 } else { 0.16 }))
+                .cursor(Cursor::Pointer)
+                .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                    if s.zoom[p].reset(s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                        tx.wake_at(s.now + 1.0 / 60.0);
+                    }
+                })
+                .child(text(format!("{zoom_pct}%")).font(k.ty.caption()).color(k.c.text_accent)),
+        );
+    }
     if let Some(m) = meter {
         bar = bar.child(m);
     }
