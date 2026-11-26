@@ -94,7 +94,8 @@ pub fn close_requested(s: &mut State) -> rune::CloseResponse {
 
 /// macOS quitting the whole app (⌘Q, Encerrar in the Dock, logging out or shutting down): with
 /// transfers still running it asks first, as closing the window does, and the quit waits.
-/// Asked again while it asks, it quits as Fechar mesmo assim does.
+/// Asked again while it asks, it quits as Fechar mesmo assim does. A quit runs no window's
+/// `on_close`, where the window keeps its place, so each one let through keeps it here.
 pub fn quit_requested(s: &mut State, _: &mut Tx) -> rune::QuitResponse {
     if s.is_placeholder {
         return rune::QuitResponse::Quit;
@@ -102,9 +103,11 @@ pub fn quit_requested(s: &mut State, _: &mut Tx) -> rune::QuitResponse {
     if std::mem::take(&mut s.quit_asked) {
         s.quit_app = false;
         cancel_all_transfers(s);
+        crate::window_place::remember(s);
         return rune::QuitResponse::Quit;
     }
     if !transfers_running(s) {
+        crate::window_place::remember(s);
         return rune::QuitResponse::Quit;
     }
     s.quit_asked = true;
