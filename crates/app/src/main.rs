@@ -1169,7 +1169,8 @@ fn row_key(id: &str) -> String {
 /// Opens a stored account: reads the client file and the credential store, so it runs off the
 /// UI thread.
 fn open_drive(email: &str) -> Result<Arc<Drive>, String> {
-    let cfg = ClientConfig::load()?;
+    // The client it signed in with: its refresh token is that client's.
+    let cfg = ClientConfig::for_account(&store::client_of(email))?;
     let token = store::refresh_token(email)?;
     Ok(Arc::new(Drive::new(cfg, token)))
 }
@@ -1232,9 +1233,10 @@ pub(crate) fn connect_with(s: &mut State, p: usize, cfg: ClientConfig, tx: &mut 
     background(s, move |emit| {
         let result = catch_panic(t("conectar", "connect"), || {
             let tokens = pending.finish(&cfg)?;
+            let client_id = cfg.client_id.clone();
             let drive = Drive::from_login(cfg, &tokens)?;
             let who = drive.about()?;
-            let account = StoredAccount { email: who.email, name: who.name };
+            let account = StoredAccount { email: who.email, name: who.name, client_id };
             store::save(account.clone(), drive.refresh_token())?;
             Ok((account, Arc::new(drive)))
         });
@@ -2179,7 +2181,7 @@ fn clash_scene(s: &mut State, all: bool) {
         let _ = std::fs::write(dir.join(name), name);
     }
     let to = Location::Drive { email: "voce@gmail.com".into(), space: Space::MyDrive, path: vec![("x".into(), "Trabalho".into())] };
-    s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+    s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
     switch(s, 0, Location::Local(dir.clone()));
     s.panes[1].go(to.clone());
     let e = |id: &str, name: &str, mime: &str| Entry {
@@ -2341,7 +2343,7 @@ fn main() {
             ("stress", |s| switch(s, 1, Location::Mock(vec!["Teste 50.000 arquivos".into()]))),
             // How a connected account looks, without a network: a fake account and a listing.
             ("account", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::Drive { email: "voce@gmail.com".into(), space: Space::MyDrive, path: vec![("x".into(), "Projetos".into())] });
                 s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
                 s.status = "Conta conectada: voce@gmail.com".into();
@@ -2419,7 +2421,7 @@ fn main() {
             // Drive names holding `/`, shown with `／` in the path bar, the list and the rename
             // field, without a network.
             ("slash", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::Drive { email: "voce@gmail.com".into(), space: Space::MyDrive, path: vec![("x".into(), "Séries/Filmes".into())] });
                 let mut entries = view_sample();
                 entries[0].name = "tes/test".into();
@@ -2434,7 +2436,7 @@ fn main() {
             // The path bar's menu over a Drive folder (with Copiar link do Drive), without a
             // network.
             ("address-menu", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::Drive { email: "voce@gmail.com".into(), space: Space::MyDrive, path: vec![("x".into(), "Projetos".into())] });
                 s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
                 s.address_menu = Some((1, rune::PointerPress { x: 820.0, y: 92.0 }));
@@ -2490,7 +2492,7 @@ fn main() {
             }),
             // Lixeira of an account with its menu open on an item, without a network.
             ("trash", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::Trash));
                 s.panes[1].set_entries(Ok(view_sample()));
                 s.panes[1].selected = ["f2".to_string()].into();
@@ -2498,7 +2500,7 @@ fn main() {
             }),
             // Excluir permanentemente asking to confirm.
             ("purge", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::Trash));
                 s.panes[1].set_entries(Ok(view_sample()));
                 s.panes[1].selected = ["f2".to_string(), "f3".to_string()].into();
@@ -2506,14 +2508,14 @@ fn main() {
             }),
             // Esvaziar lixeira asking to confirm.
             ("empty-trash", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::Trash));
                 s.panes[1].set_entries(Ok(view_sample()));
                 actions::ask_empty_trash(s, 1);
             }),
             // Com estrela with the menu on a starred file, and the views in the tree.
             ("starred", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::Starred));
                 s.panes[1].set_entries(Ok(view_sample().into_iter().map(|e| Entry { starred: true, ..e }).collect()));
                 s.panes[1].selected = ["f3".to_string()].into();
@@ -2521,7 +2523,7 @@ fn main() {
             }),
             // An account's storage in its status bar, without a network.
             ("quota", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.quotas.insert("voce@gmail.com".into(), Some(Quota { limit: Some(16_106_127_360), usage: 2_898_000_000, in_drive: 2_100_000_000, in_trash: 12_000_000 }));
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::MyDrive));
                 s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
@@ -2601,7 +2603,7 @@ fn main() {
             }),
             // Compartilhar on a file shared with a few people and the link, without a network.
             ("share", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.quotas.insert("voce@gmail.com".into(), Some(Quota { limit: None, usage: 734_003_200, in_drive: 600_000_000, in_trash: 0 }));
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::MyDrive));
                 s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
@@ -2634,7 +2636,7 @@ fn main() {
             }),
             // The shared drives list of an account, without a network.
             ("shared", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::SharedDrives));
                 let d = |id: &str, name: &str| Entry { id: id.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
                 s.panes[1].set_entries(Ok(vec![d("0AAa", "Equipe de design"), d("0AAb", "Financeiro"), d("0AAc", "Projetos 2026")]));
@@ -2875,7 +2877,7 @@ fn main() {
 /// Central de Contas with connected cloud accounts and servers, without a network.
 fn accounts_hub_scene(s: &mut State) {
     s.accounts = vec![
-        StoredAccount { email: "caua@gmail.com".into(), name: "Cauã Silva".into() },
+        StoredAccount { email: "caua@gmail.com".into(), name: "Cauã Silva".into(), client_id: String::new() },
     ];
     s.quotas.insert(
         "caua@gmail.com".into(),
@@ -3117,7 +3119,7 @@ mod tests {
     #[test]
     fn accounts_hub_lists_filters_opens_panes_and_removes() {
         let mut s = init();
-        s.accounts = vec![StoredAccount { email: "ana@gmail.com".into(), name: "Ana Souza".into() }];
+        s.accounts = vec![StoredAccount { email: "ana@gmail.com".into(), name: "Ana Souza".into(), client_id: String::new() }];
         s.quotas.insert(
             "ana@gmail.com".into(),
             Some(Quota { limit: Some(15_000_000_000), usage: 5_000_000_000, in_drive: 4_000_000_000, in_trash: 0 }),

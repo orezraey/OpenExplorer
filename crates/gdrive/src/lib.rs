@@ -60,6 +60,24 @@ impl ClientConfig {
         Self::resolve(from_file, from_env, Self::built_in(), &path)
     }
 
+    /// The client for an account that signed in with `client_id`: a refresh token only works with
+    /// the client it was issued to, so an account of the built-in client keeps it after the user
+    /// saves a client of their own, and the other way round. An empty id (an account saved before
+    /// the id was kept) takes [`Self::load`]'s.
+    pub fn for_account(client_id: &str) -> Result<ClientConfig> {
+        Self::pick(client_id, Self::load(), Self::built_in())
+    }
+
+    fn pick(client_id: &str, loaded: Result<ClientConfig>, built_in: Option<ClientConfig>) -> Result<ClientConfig> {
+        if client_id.is_empty() || loaded.as_ref().is_ok_and(|c| c.client_id == client_id) {
+            return loaded;
+        }
+        match built_in {
+            Some(b) if b.client_id == client_id => Ok(b),
+            _ => loaded,
+        }
+    }
+
     /// OAuth client baked into the binary at compile time when `OPENEXPLORER_GOOGLE_CLIENT_ID` and
     /// `OPENEXPLORER_GOOGLE_CLIENT_SECRET` were both set during the build.
     pub fn built_in() -> Option<ClientConfig> {
@@ -314,5 +332,21 @@ mod tests {
         // Missing everywhere returns an error pointing to the file.
         let r = ClientConfig::resolve(None, (None, None), None, path);
         assert!(r.unwrap_err().contains("google-client.json"));
+    }
+
+    /// An account keeps the client it signed in with: the built-in one after the user saved a
+    /// client of their own, and theirs while the built-in one is the default.
+    #[test]
+    fn an_account_keeps_the_client_it_signed_in_with() {
+        let own = ClientConfig { client_id: "own-id".into(), client_secret: "own-sec".into() };
+        let built_in = ClientConfig { client_id: "built-id".into(), client_secret: "built-sec".into() };
+        assert_eq!(ClientConfig::pick("built-id", Ok(own.clone()), Some(built_in.clone())).unwrap(), built_in);
+        assert_eq!(ClientConfig::pick("own-id", Ok(own.clone()), Some(built_in.clone())).unwrap(), own);
+        // Saved before the id was kept: the loaded client, as before.
+        assert_eq!(ClientConfig::pick("", Ok(own.clone()), Some(built_in.clone())).unwrap(), own);
+        // A client neither one is: the loaded one, whose refresh then says what's wrong.
+        assert_eq!(ClientConfig::pick("gone-id", Ok(own.clone()), Some(built_in.clone())).unwrap(), own);
+        // The built-in one when no file or variable is set.
+        assert_eq!(ClientConfig::pick("built-id", Err("none".into()), Some(built_in.clone())).unwrap(), built_in);
     }
 }
