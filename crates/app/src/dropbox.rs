@@ -767,7 +767,7 @@ fn changes_arrived(s: &mut State, id: String, wait: u64, result: Result<Changes,
     }
     let Some(server) = s.servers.list.iter().find(|sv| sv.id == id).cloned() else { return };
     let stale = |path: &[String]| changes.touches(&server.path(path));
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         let reload = matches!(&s.panes[p].loc, Location::Server { server: sv, path, find: None } if sv.id == id && stale(path));
         if reload && !s.panes[p].loading {
             crate::load(s, p);

@@ -60,6 +60,7 @@ use openexplorer_gdrive::{ClientConfig, Drive, DriveFile, Quota, oauth};
 use openexplorer_i18n::{t, tr};
 use rune::{AppSpec, DragItem, Key, KeyEvent, LiveRegion, Mods, Tx, Waker};
 
+use layout::MAX_PANES;
 use model::{Entry, Location, MockDrive, Pane, SortCol, Space};
 
 const ROW_H: f32 = 22.0;
@@ -146,12 +147,19 @@ pub enum MainTab {
 
 struct State {
     main_tab: MainTab,
+    view_menu_open: bool,
+    /// Which pane's view-mode dropdown menu is currently open, if any.
+    view_mode_menu: Option<usize>,
+    /// Number of columns per pane in icon-grid view modes (updated from viewport width).
+    grid_cols: [usize; MAX_PANES],
+    /// Number of rows per column in multi-column List view mode (updated from viewport height).
+    list_rows: [usize; MAX_PANES],
     accounts_filter: Option<servers::Provider>,
     accounts_search: rune::TextEdit,
-    panes: [Pane; 2],
-    tabs: [tabs::PaneTabs; 2],
+    panes: [Pane; MAX_PANES],
+    tabs: [tabs::PaneTabs; MAX_PANES],
     /// Whether each pane's left folder tree is shown.
-    show_tree: [bool; 2],
+    show_tree: [bool; MAX_PANES],
     /// The context menu: the pane it was opened in and where.
     menu: Option<(usize, rune::PointerPress)>,
     /// The tree's right-click menu: pane, node, whether it's open, whether it's empty, and where.
@@ -164,7 +172,7 @@ struct State {
     lasso: Option<lasso::Lasso>,
     /// Where each pane's file list viewport is and how far it's scrolled, for the rectangle
     /// selection and the menu the keyboard opens.
-    views: [lasso::Viewport; 2],
+    views: [lasso::Viewport; MAX_PANES],
     dialog: Option<actions::Dialog>,
     /// The window was asked to close while transfers ran: Fechar o Open Explorer? shows over
     /// everything, the dialog under it untouched (see [`actions::close_requested`]).
@@ -187,25 +195,25 @@ struct State {
     /// The item being renamed in place, and its pane.
     renaming: Option<(usize, Entry)>,
     /// Each pane's search field.
-    search: [rune::TextEdit; 2],
+    search: [rune::TextEdit; MAX_PANES],
     /// Each pane's path bar while it's a field to type an address in.
-    address: [Option<rune::TextEdit>; 2],
+    address: [Option<rune::TextEdit>; MAX_PANES],
     /// The addresses reached and searches run, which ↑ and ↓ bring back in those fields.
     history: history::History,
     /// The path bar's right-click menu: the pane it was opened in and where.
     address_menu: Option<(usize, rune::PointerPress)>,
     /// Each local pane's field as last seen, and when it may be searched: typing searches the
     /// computer once the keys stop for a moment.
-    typed: [(String, f64); 2],
+    typed: [(String, f64); MAX_PANES],
     /// The words each pane last searched the computer for.
-    searched: [String; 2],
+    searched: [String; MAX_PANES],
     /// What the index said with each pane's search results.
-    found: [Option<finder::Info>; 2],
+    found: [Option<finder::Info>; MAX_PANES],
     /// The search service is being installed.
     installing_finder: bool,
     /// When each pane's search of the computer is asked again, while a disk is still being read
     /// or the service is starting (0: not).
-    found_again: [f64; 2],
+    found_again: [f64; MAX_PANES],
     /// Counts Propriedades dialogs, to tell their background answers apart.
     props_seq: u64,
     /// What Copiar or Recortar picked up.
@@ -222,7 +230,7 @@ struct State {
     tree: tree::Tree,
     /// Each pane's current listing request, bumped by every load: `poll` drops answers for an
     /// older one, and the listing thread stops fetching pages once the pane has moved on.
-    live: [Arc<AtomicU64>; 2],
+    live: [Arc<AtomicU64>; MAX_PANES],
     cache: cache::Cache,
     mock: MockDrive,
     accounts: Vec<StoredAccount>,
@@ -243,14 +251,14 @@ struct State {
     /// The start of a name typed in a list, to reach it.
     typeahead: keyboard::Typeahead,
     /// How many rows each pane's list shows, for Page Up and Page Down (0 before its layout).
-    page_rows: [usize; 2],
+    page_rows: [usize; MAX_PANES],
     /// The pane a drag started in and the files it carried, so a drop back on the same pane
     /// is ignored (the drop can arrive after the drag's end).
     last_drag: Option<(usize, Vec<PathBuf>)>,
     /// A drag of files over a pane, which scrolls its list or tree near their edges, and where
     /// each pane's list and tree are and how far they've scrolled.
     autoscroll: Option<autoscroll::Drag>,
-    edges: [autoscroll::Pane; 2],
+    edges: [autoscroll::Pane; MAX_PANES],
     /// What the last action said ("Copiado: 3 itens.", an error...), shown for a few seconds
     /// in a notice at the bottom right.
     status: String,
@@ -282,7 +290,7 @@ struct State {
     /// Windows' own icons, as Explorer shows them.
     icons: sysicons::SysIcons,
     /// The listing version each pane's icons were last asked for.
-    icons_for: [u64; 2],
+    icons_for: [u64; MAX_PANES],
     /// State of the independent "Registrar conta" window when open.
     account_form: Option<Box<servers::Form>>,
     account_win: Option<rune::AppHandle<State>>,
@@ -343,11 +351,15 @@ impl State {
         let loc = Location::Mock(Vec::new());
         State {
             main_tab: MainTab::Explore,
+            view_menu_open: false,
+            view_mode_menu: None,
+            grid_cols: [1; MAX_PANES],
+            list_rows: [1; MAX_PANES],
             accounts_filter: None,
             accounts_search: rune::TextEdit::new(""),
-            panes: [Pane::new(loc.clone()), Pane::new(loc)],
-            tabs: [tabs::PaneTabs::initial(), tabs::PaneTabs::initial()],
-            show_tree: [true, true],
+            panes: std::array::from_fn(|_| Pane::new(loc.clone())),
+            tabs: std::array::from_fn(|_| tabs::PaneTabs::initial()),
+            show_tree: [true; MAX_PANES],
             menu: None,
             tree_menu: None,
             renamed: Vec::new(),
@@ -362,7 +374,7 @@ impl State {
             clash_waiting: Default::default(),
             name_edit: rune::TextEdit::new(""),
             renaming: None,
-            search: [rune::TextEdit::new(""), rune::TextEdit::new("")],
+            search: std::array::from_fn(|_| rune::TextEdit::new("")),
             address: Default::default(),
             history: Default::default(),
             address_menu: None,
@@ -370,7 +382,7 @@ impl State {
             searched: Default::default(),
             found: Default::default(),
             installing_finder: false,
-            found_again: [0.0; 2],
+            found_again: [0.0; MAX_PANES],
             props_seq: 0,
             clip: None,
             undo: Default::default(),
@@ -414,7 +426,7 @@ impl State {
             logins: 0,
             active: 0,
             typeahead: Default::default(),
-            page_rows: [0; 2],
+            page_rows: [0; MAX_PANES],
             last_drag: None,
             autoscroll: None,
             edges: Default::default(),
@@ -434,7 +446,7 @@ impl State {
             queue_looks: Vec::new(),
             queue_totals: Default::default(),
             icons: Default::default(),
-            icons_for: [u64::MAX; 2],
+            icons_for: [u64::MAX; MAX_PANES],
             account_form: None,
             account_win: None,
             main_win: None,
@@ -546,19 +558,29 @@ fn init() -> State {
     // run was is kept. The simulated drive stays in the tree, for trying things out.
     let places = places::places();
     let start = places.desktop.as_ref().map_or_else(Location::home, |(dir, _)| Location::Local(dir.clone()));
-    let mut panes = [Pane::new(start.clone()), Pane::new(start)];
-    for p in &mut panes {
-        p.load_now(&mock, settings.show_hidden);
-    }
+    // The folder is read once: every pane, shown or not, starts with that listing.
+    let mut first = Pane::new(start.clone());
+    first.load_now(&mock, settings.show_hidden);
+    let mut panes: [Pane; MAX_PANES] = std::array::from_fn(|_| {
+        let mut pane = Pane::new(start.clone());
+        pane.free = first.free;
+        pane.set_entries(first.error.clone().map_or_else(|| Ok(first.entries.clone()), Err));
+        pane
+    });
+    panes[0] = first;
     let accounts = store::accounts();
     let tree = tree::Tree::new(accounts.iter().map(|a| a.email.clone()));
     State {
         main_tab: MainTab::Explore,
+        view_menu_open: false,
+        view_mode_menu: None,
+        grid_cols: [1; MAX_PANES],
+        list_rows: [1; MAX_PANES],
         accounts_filter: None,
         accounts_search: rune::TextEdit::new(""),
         panes,
-        tabs: [tabs::PaneTabs::initial(), tabs::PaneTabs::initial()],
-        show_tree: [true, true],
+        tabs: std::array::from_fn(|_| tabs::PaneTabs::initial()),
+        show_tree: [true; MAX_PANES],
         menu: None,
         tree_menu: None,
         renamed: Vec::new(),
@@ -573,7 +595,7 @@ fn init() -> State {
         clash_waiting: Default::default(),
         name_edit: rune::TextEdit::new(""),
         renaming: None,
-        search: [rune::TextEdit::new(""), rune::TextEdit::new("")],
+        search: std::array::from_fn(|_| rune::TextEdit::new("")),
         address: Default::default(),
         history: history::History::load(),
         address_menu: None,
@@ -581,7 +603,7 @@ fn init() -> State {
         searched: Default::default(),
         found: Default::default(),
         installing_finder: false,
-        found_again: [0.0; 2],
+        found_again: [0.0; MAX_PANES],
         props_seq: 0,
         clip: None,
         undo: Default::default(),
@@ -601,7 +623,7 @@ fn init() -> State {
         logins: 0,
         active: 0,
         typeahead: Default::default(),
-        page_rows: [0; 2],
+        page_rows: [0; MAX_PANES],
         last_drag: None,
         autoscroll: None,
         edges: Default::default(),
@@ -621,7 +643,7 @@ fn init() -> State {
         queue_looks: Vec::new(),
         queue_totals: Default::default(),
         icons: Default::default(),
-        icons_for: [u64::MAX; 2],
+        icons_for: [u64::MAX; MAX_PANES],
         account_form: None,
         account_win: None,
         main_win: None,
@@ -647,7 +669,7 @@ fn setup(s: &mut State, waker: Waker) {
     });
     s.waker = Some(combined);
     // Each tree opens down to the folder its pane starts in.
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         tree::follow(s, p);
     }
 }
@@ -818,7 +840,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     // Each listing's file types get their icons asked for once.
     let versions = s.panes.each_ref().map(|p| p.version);
     if s.icons_for != versions {
-        let relisted: Vec<usize> = (0..2).filter(|&p| s.icons_for[p] != versions[p]).collect();
+        let relisted: Vec<usize> = (0..MAX_PANES).filter(|&p| s.icons_for[p] != versions[p]).collect();
         s.icons_for = versions;
         let keys = s.panes.iter().flat_map(|p| sysicons::keys_of(&p.entries, &p.loc)).collect();
         s.icons.show(keys);
@@ -827,12 +849,15 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             tree::learn(s, p);
         }
     }
+    // The 256 px icons only while a pane in view shows Large or Extra large icons.
+    let big = s.panes[..s.settings.pane_layout.count()].iter().any(|p| matches!(p.view_mode, model::ViewMode::LargeIcons | model::ViewMode::ExtraLargeIcons));
+    s.icons.set_big(big);
     let mut changed = std::mem::take(&mut s.main_dirty) | s.icons.settle();
     changed |= notice(s, now, &mut |text, how| tx.announce(text, how));
     // A rectangle selection held past the list's edge scrolls it.
     changed |= lasso::step(s, now, tx);
     // A local pane searches the computer as its field is typed in, once the keys pause.
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         if s.search[p].text != s.typed[p].0 {
             s.typed[p] = (s.search[p].text.clone(), now + TYPING_PAUSE);
             tx.wake_at(now + TYPING_PAUSE);
@@ -959,7 +984,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                         tabs::repoint(s, &from, Some(&to));
                     }
                 }
-                for p in 0..2 {
+                for p in 0..MAX_PANES {
                     if reload.contains(&s.panes[p].loc) {
                         load(s, p);
                     }
@@ -1033,7 +1058,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     Ok(m) => s.status = m,
                     Err(m) => fail(s, m),
                 }
-                for p in 0..2 {
+                for p in 0..MAX_PANES {
                     if reload.contains(&s.panes[p].loc) {
                         load(s, p);
                     }
@@ -1092,7 +1117,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     if let Some(at) = accounts::next_ask(s) {
         tx.wake_at(at);
     }
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         // The address field closes when the keyboard leaves it (a click elsewhere).
         if s.address[p].as_ref().is_some_and(|a| !a.focused) {
             s.address[p] = None;
@@ -1101,12 +1126,12 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         // Mostrar na pasta: the item is selected and brought into view once its folder lists it.
         let pane = &mut s.panes[p];
         let Some((id, name)) = pane.reveal.clone() else { continue };
-        if pane.entry(&id).is_some() {
+        if let Some(i) = pane.index_of(&id) {
             pane.reveal = None;
             pane.selected = [id.clone()].into();
             pane.cursor = Some(id.clone());
             pane.anchor = Some(id.clone());
-            tx.scroll_into_view_in(pane_key(p), row_key(&id));
+            tx.scroll_into_view_in(pane_key(p), s.views[p].flow.get().reveal_key(i, row_key(&id)));
             changed = true;
         } else if !pane.loading {
             pane.reveal = None;
@@ -1118,7 +1143,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     // A tree shows its keyboard row's ring while it has focus, however it got it (Tab from the
     // search field, a click), and stops once focus left it.
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         let on = tx.focused() == Some(ui::tree_key(p).as_str());
         if s.tree.focused[p] != on {
             tree::focus(s, p, on);
@@ -1126,7 +1151,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
     }
     // Each tree brings the folder its pane shows into view, once that's in the tree.
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         if tree::following(s, p) {
             let lines = tree::lines(s, p);
             if let Some(key) = tree::to_reveal(s, p, &lines) {
@@ -1254,7 +1279,7 @@ fn disconnect(s: &mut State, email: &str) {
     s.tree.forget(email);
     s.watch.remove(email);
     s.accounts.retain(|a| a.email != email);
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         let gone = |l: &Location| matches!(l, Location::Drive { email: e, .. } if e == email);
         s.panes[p].back.retain(|l| !gone(l));
         s.panes[p].forward.retain(|l| !gone(l));
@@ -1303,9 +1328,56 @@ pub(crate) fn refresh_all_quotas(s: &mut State) {
 
 pub(crate) fn set_main_tab(s: &mut State, tab: MainTab) {
     s.main_tab = tab;
+    s.view_menu_open = false;
+    s.view_mode_menu = None;
     if tab == MainTab::Accounts {
         ensure_all_quotas(s);
     }
+}
+
+/// Switches between 1, 2, and 4 visible panes in `Explorar`, persisting the choice.
+pub(crate) fn set_pane_layout(s: &mut State, layout: settings::PaneLayout) {
+    let before = s.settings.pane_layout.count();
+    s.settings.pane_layout = layout;
+    s.settings.save();
+    s.view_menu_open = false;
+    s.view_mode_menu = None;
+    s.menu = None;
+    s.tree_menu = None;
+    s.address_menu = None;
+    let count = layout.count();
+    if s.active >= count {
+        s.active = 0;
+    }
+    // A pane shown again is read again: while hidden it wasn't watched (B2's polling skips it).
+    for p in before..count {
+        if !s.tabs[p].is_picker() {
+            load(s, p);
+        }
+    }
+    if s.renaming.as_ref().is_some_and(|(p, _)| *p >= count) {
+        s.renaming = None;
+    }
+    if s.lasso.as_ref().is_some_and(|l| l.pane >= count) {
+        s.lasso = None;
+    }
+    s.main_tab = MainTab::Explore;
+}
+
+/// Sets the file display mode (Extra large / Large / Medium icons, List, Details) for pane `p`.
+pub(crate) fn set_view_mode(s: &mut State, p: usize, mode: model::ViewMode) {
+    s.active = p;
+    s.panes[p].view_mode = mode;
+    s.view_mode_menu = None;
+    if s.lasso.as_ref().is_some_and(|l| l.pane == p) {
+        s.lasso = None;
+    }
+}
+
+/// Cycles pane `p` directly to the next file display mode.
+pub(crate) fn cycle_view_mode(s: &mut State, p: usize) {
+    let next = s.panes[p].view_mode.next();
+    set_view_mode(s, p, next);
 }
 
 /// Opens `loc` in pane `p` (0 = left, 1 = right) and switches to `Explorar`.
@@ -1761,6 +1833,8 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         })
     };
     let page = keyboard::page(s.page_rows[p]) as isize;
+    let flow = s.views[p].flow.get();
+    let (across, down) = flow.steps();
     let owns = keyboard::list_has_keys(s, p, tx.focused());
     // Any other key ends a name being typed: Enter into a folder and a letter starts anew.
     let plain = !(ev.mods.cmd || ev.mods.ctrl || ev.mods.alt);
@@ -1842,7 +1916,7 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             if let Some(i) = keyboard::find(&s.panes[p].entries, at, query) {
                 let id = s.panes[p].entries[i].id.clone();
                 click(s, p, &id, Mods::default());
-                tx.scroll_into_view_in(pane_key(p), row_key(&id));
+                tx.scroll_into_view_in(pane_key(p), flow.reveal_key(i, row_key(&id)));
             }
             return true;
         }
@@ -1863,8 +1937,12 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             go_forward(s, p);
             return true;
         }
-        Key::Up => step(-1),
-        Key::Down => step(1),
+        // The arrows follow the items as the view laid them out: tiles in rows, List's
+        // columns, Details' rows (where Left and Right don't move).
+        Key::Left if flow.sideways() => step(-across),
+        Key::Right if flow.sideways() => step(across),
+        Key::Up => step(-down),
+        Key::Down => step(down),
         Key::PageUp => step(-page),
         Key::PageDown => step(page),
         Key::Home => step(-(n as isize)),
@@ -1884,8 +1962,12 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             return true;
         }
         Key::Tab => {
-            s.active = 1 - p;
-            tx.focus(pane_key(1 - p), true);
+            let count = s.settings.pane_layout.count();
+            if count > 1 {
+                let next = (p + 1) % count;
+                s.active = next;
+                tx.focus(pane_key(next), true);
+            }
             return true;
         }
         _ if ev.is_command('a') => {
@@ -1912,7 +1994,7 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         } else {
             click(s, p, &id, Mods { shift: ev.mods.shift, ..Mods::default() });
         }
-        tx.scroll_into_view_in(pane_key(p), row_key(&id));
+        tx.scroll_into_view_in(pane_key(p), flow.reveal_key(i, row_key(&id)));
     }
     true
 }
@@ -1938,8 +2020,8 @@ fn menu_from_keys(s: &mut State, p: usize, tx: &mut Tx) {
         cursor.or_else(|| pane.entries.iter().position(|e| pane.selected.contains(&e.id)))
     };
     let (at, scroll) = lasso::menu_point(&s.views[p], row);
-    if let Some(y) = scroll {
-        tx.scroll_to_instant(ui::list_key(p), s.views[p].scroll.get().x, y);
+    if let Some([x, y]) = scroll {
+        tx.scroll_to_instant(ui::list_key(p), x, y);
     }
     s.menu = Some((p, at));
 }
@@ -3357,7 +3439,7 @@ mod tests {
         s.panes[1].selected.clear();
         let h = lasso::HEADER_H + 10.0 * ROW_H;
         s.views[1].rect = [400.0, 100.0, 600.0, h];
-        s.views[1].scroll.set(lasso::Scroll { x: 0.0, y: 0.0, max_y: 40.0 * ROW_H + 2.0 * ROW_H, h });
+        s.views[1].scroll.set(lasso::Scroll { x: 0.0, y: 0.0, max_x: 0.0, max_y: 40.0 * ROW_H + 2.0 * ROW_H, h });
         let mut tx = Tx::default();
         let ev = |key, mods| KeyEvent { key, mods };
         let shift = Mods { shift: true, ..Mods::default() };

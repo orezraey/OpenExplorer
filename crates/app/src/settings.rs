@@ -197,6 +197,45 @@ impl Language {
     }
 }
 
+/// How many file panes are shown in the Explore view: 1 (single pane with tree on the left and
+/// files on the right), 2 (side by side, default), or 4 (2×2 grid).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneLayout {
+    One,
+    Four,
+    #[default]
+    #[serde(other)]
+    Two,
+}
+
+impl PaneLayout {
+    pub const ALL: [PaneLayout; 3] = [PaneLayout::One, PaneLayout::Two, PaneLayout::Four];
+
+    pub fn count(self) -> usize {
+        match self {
+            PaneLayout::One => 1,
+            PaneLayout::Two => 2,
+            PaneLayout::Four => 4,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PaneLayout::One => t("Um painel", "One pane"),
+            PaneLayout::Two => t("Dois painéis", "Two panes"),
+            PaneLayout::Four => t("Quatro painéis", "Four panes"),
+        }
+    }
+
+    pub fn icon(self) -> &'static Icon {
+        match self {
+            PaneLayout::One => &crate::icons::VIEW_ONE_PANE,
+            PaneLayout::Two => &crate::icons::VIEW_TWO_PANES,
+            PaneLayout::Four => &crate::icons::VIEW_FOUR_PANES,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -204,6 +243,8 @@ pub struct Settings {
     pub theme: Theme,
     pub font: TextFont,
     pub text_render: TextRender,
+    /// Number of visible panes in Explore (1, 2, or 4).
+    pub pane_layout: PaneLayout,
     /// Files sent to the cloud or server at the same time.
     pub uploads: u8,
     /// Files fetched from the cloud or server at the same time.
@@ -262,6 +303,7 @@ impl Default for Settings {
             theme: Theme::Auto,
             font: TextFont::System,
             text_render: TextRender::Smooth,
+            pane_layout: PaneLayout::Two,
             uploads: 4,
             downloads: 4,
             segmented_downloads: true,
@@ -419,6 +461,13 @@ mod tests {
         assert!(s.segmented_downloads);
         let off: Settings = serde_json::from_str(r#"{"big_files_in_segments":false}"#).unwrap();
         assert!(!off.segmented_downloads);
+        assert_eq!(Settings::default().pane_layout, PaneLayout::Two);
+        let one: Settings = serde_json::from_str(r#"{"pane_layout":"One"}"#).unwrap();
+        assert_eq!((one.pane_layout, one.pane_layout.count()), (PaneLayout::One, 1));
+        let four: Settings = serde_json::from_str(r#"{"pane_layout":"Four"}"#).unwrap();
+        assert_eq!((four.pane_layout, four.pane_layout.count()), (PaneLayout::Four, 4));
+        let unknown: Settings = serde_json::from_str(r#"{"pane_layout":"Six"}"#).unwrap();
+        assert_eq!(unknown.pane_layout, PaneLayout::Two);
     }
 
     #[test]
