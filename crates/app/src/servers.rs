@@ -1959,7 +1959,7 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
             }
         }
     };
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         let pane = &mut s.panes[p];
         pane.back.iter_mut().chain(pane.forward.iter_mut()).for_each(renew);
     }
@@ -1968,7 +1968,7 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
     }
     s.tree.server_changed(&server.id);
     // The panes on it show it again, read with its new settings.
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         let mut here = s.panes[p].loc.clone();
         let before = here.clone();
         renew(&mut here);
@@ -2017,7 +2017,7 @@ pub fn remove(s: &mut State, id: &str) {
     if s.clip.as_ref().is_some_and(|c| on(&c.from)) {
         s.clip = None;
     }
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         s.panes[p].back.retain(|l| !on(l));
         s.panes[p].forward.retain(|l| !on(l));
         if !s.tabs[p].is_picker() && on(&s.panes[p].loc) {

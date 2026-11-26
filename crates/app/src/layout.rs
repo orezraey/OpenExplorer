@@ -2,7 +2,10 @@
 //! how tall the transfer queue is and how wide its columns.
 //! Kept in `layout.json` under the config folder so they survive a restart.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Maximum number of panes supported (1, 2, or 4 in a 2×2 grid).
+pub const MAX_PANES: usize = 4;
 
 pub const TREE_W: f32 = 190.0;
 pub const TREE_MIN: f32 = 120.0;
@@ -27,15 +30,35 @@ pub const QUEUE_COL_MIN: f32 = 50.0;
 /// Default visual order of the 4 list columns: Nome (0), Tamanho (1), Data (2), Tipo (3).
 pub const COL_ORDER: [usize; 4] = [0, 1, 2, 3];
 
+fn deserialize_tree<'de, D: Deserializer<'de>>(d: D) -> Result<[f32; MAX_PANES], D::Error> {
+    let v = Vec::<f32>::deserialize(d)?;
+    Ok(std::array::from_fn(|i| v.get(i).copied().unwrap_or(TREE_W)))
+}
+
+fn deserialize_columns<'de, D: Deserializer<'de>>(d: D) -> Result<[[f32; 4]; MAX_PANES], D::Error> {
+    let v = Vec::<[f32; 4]>::deserialize(d)?;
+    Ok(std::array::from_fn(|i| v.get(i).copied().unwrap_or(COLS)))
+}
+
+/// The column orders saved, one per pane: a file from when there were two panes gives the
+/// others the default order.
+fn deserialize_col_order<'de, D: Deserializer<'de>>(d: D) -> Result<[[usize; 4]; MAX_PANES], D::Error> {
+    let v = Vec::<[usize; 4]>::deserialize(d)?;
+    Ok(std::array::from_fn(|i| v.get(i).copied().unwrap_or(COL_ORDER)))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Layout {
-    pub tree: [f32; 2],
+    #[serde(deserialize_with = "deserialize_tree")]
+    pub tree: [f32; MAX_PANES],
     /// Per pane, the widths of Nome, Tamanho, Data and Tipo. (`cols`, from an earlier
     /// version that had three, is ignored.)
-    pub columns: [[f32; 4]; 2],
+    #[serde(deserialize_with = "deserialize_columns")]
+    pub columns: [[f32; 4]; MAX_PANES],
     /// Per pane, the visual order of the four columns (a permutation of `0..4`).
-    pub col_order: [[usize; 4]; 2],
+    #[serde(deserialize_with = "deserialize_col_order")]
+    pub col_order: [[usize; 4]; MAX_PANES],
     pub queue_h: f32,
     pub queue_cols: [f32; 8],
 }
@@ -43,9 +66,9 @@ pub struct Layout {
 impl Default for Layout {
     fn default() -> Layout {
         Layout {
-            tree: [TREE_W; 2],
-            columns: [COLS; 2],
-            col_order: [COL_ORDER; 2],
+            tree: [TREE_W; MAX_PANES],
+            columns: [COLS; MAX_PANES],
+            col_order: [COL_ORDER; MAX_PANES],
             queue_h: QUEUE_H,
             queue_cols: QUEUE_COLS,
         }
@@ -125,10 +148,13 @@ mod tests {
 
     #[test]
     fn a_saved_layout_from_an_older_version_still_loads() {
-        // The pane split it held is gone; the tree widths stay.
+        // The pane split it held is gone; the 2 saved tree widths stay and the new panes get defaults.
         let l: Layout = serde_json::from_str(r#"{"split":0.62,"tree":[150.0,300.0],"cols":[[61.0,138.0,124.0],[86.0,132.0,124.0]]}"#).unwrap();
-        assert_eq!(l, Layout { tree: [150.0, 300.0], ..Layout::default() });
+        assert_eq!(l, Layout { tree: [150.0, 300.0, TREE_W, TREE_W], ..Layout::default() });
         let l: Layout = serde_json::from_str("{}").unwrap();
         assert_eq!(l, Layout::default());
+        // A column order saved with two panes: the other two take the default one.
+        let l: Layout = serde_json::from_str(r#"{"col_order":[[1,0,2,3],[3,2,1,0]]}"#).unwrap();
+        assert_eq!(l.col_order, [[1, 0, 2, 3], [3, 2, 1, 0], COL_ORDER, COL_ORDER]);
     }
 }

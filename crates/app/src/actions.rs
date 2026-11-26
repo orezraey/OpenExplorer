@@ -82,6 +82,7 @@ pub fn close_requested(s: &mut State) -> rune::CloseResponse {
         return rune::CloseResponse::Close;
     }
     if std::mem::take(&mut s.quit_asked) {
+        s.quit_app = false;
         cancel_all_transfers(s);
         return rune::CloseResponse::Close;
     }
@@ -89,7 +90,33 @@ pub fn close_requested(s: &mut State) -> rune::CloseResponse {
         return rune::CloseResponse::Close;
     }
     s.quit_asked = true;
+    s.quit_app = false;
     rune::CloseResponse::Defer
+}
+
+/// macOS quitting the whole app (⌘Q, Encerrar in the Dock, logging out or shutting down): with
+/// transfers still running it asks first, as closing the window does, and the quit waits.
+/// Asked again while it asks, it quits as Fechar mesmo assim does, and a Reiniciar that asked
+/// is dropped: the app quits, it doesn't open again. A quit let through runs the window's
+/// `on_close` too; keeping the window's place here as well costs nothing.
+pub fn quit_requested(s: &mut State, _: &mut Tx) -> rune::QuitResponse {
+    if s.is_placeholder {
+        return rune::QuitResponse::Quit;
+    }
+    if std::mem::take(&mut s.quit_asked) {
+        s.quit_app = false;
+        crate::RESTART.store(false, Ordering::Relaxed);
+        cancel_all_transfers(s);
+        crate::window_place::remember(s);
+        return rune::QuitResponse::Quit;
+    }
+    if !transfers_running(s) {
+        crate::window_place::remember(s);
+        return rune::QuitResponse::Quit;
+    }
+    s.quit_asked = true;
+    s.quit_app = true;
+    rune::QuitResponse::Defer
 }
 
 /// Whether any row of the queue is still waiting or running.
@@ -107,6 +134,7 @@ pub fn quit_question_done(s: &mut State) -> bool {
     // A Reiniciar put off by the transfers goes with the question: else a later plain close
     // would open the app again.
     crate::RESTART.store(false, Ordering::Relaxed);
+    s.quit_app = false;
     true
 }
 
@@ -114,6 +142,7 @@ pub fn quit_question_done(s: &mut State) -> bool {
 pub fn keep_running(s: &mut State) {
     s.quit_asked = false;
     crate::RESTART.store(false, Ordering::Relaxed);
+    s.quit_app = false;
 }
 
 /// Reiniciar (Opções): the app closes as Fechar would, asking first while transfers run, and
@@ -132,12 +161,18 @@ pub fn restarting() -> bool {
     crate::RESTART.load(Ordering::Relaxed)
 }
 
-/// Fechar mesmo assim: the transfers are told to stop, and the window closes (a close the app
-/// asks for doesn't ask again).
+/// Fechar mesmo assim: the transfers are told to stop, and the window closes, or the whole app
+/// quits when quitting it asked (a close or quit the app asks for doesn't ask again).
 pub fn quit_anyway(s: &mut State, tx: &mut Tx) {
     cancel_all_transfers(s);
     s.quit_asked = false;
-    tx.close_window();
+    if std::mem::take(&mut s.quit_app) {
+        // A quit runs no window's `on_close`, where the window keeps its place.
+        crate::window_place::remember(s);
+        tx.quit();
+    } else {
+        tx.close_window();
+    }
 }
 
 pub fn selected(s: &State, p: usize) -> Vec<Entry> {

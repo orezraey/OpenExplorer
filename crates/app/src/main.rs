@@ -61,6 +61,7 @@ use openexplorer_gdrive::{ClientConfig, Drive, DriveFile, Quota, oauth};
 use openexplorer_i18n::{t, tr};
 use rune::{AppSpec, DragItem, Key, KeyEvent, LiveRegion, Mods, Tx, Waker};
 
+use layout::MAX_PANES;
 use model::{Entry, Location, MockDrive, Pane, SortCol, Space};
 
 const ROW_H: f32 = 22.0;
@@ -147,12 +148,19 @@ pub enum MainTab {
 
 struct State {
     main_tab: MainTab,
+    view_menu_open: bool,
+    /// Which pane's view-mode dropdown menu is currently open, if any.
+    view_mode_menu: Option<usize>,
+    /// Number of columns per pane in icon-grid view modes (updated from viewport width).
+    grid_cols: [usize; MAX_PANES],
+    /// Number of rows per column in multi-column List view mode (updated from viewport height).
+    list_rows: [usize; MAX_PANES],
     accounts_filter: Option<servers::Provider>,
     accounts_search: rune::TextEdit,
-    panes: [Pane; 2],
-    tabs: [tabs::PaneTabs; 2],
+    panes: [Pane; MAX_PANES],
+    tabs: [tabs::PaneTabs; MAX_PANES],
     /// Whether each pane's left folder tree is shown.
-    show_tree: [bool; 2],
+    show_tree: [bool; MAX_PANES],
     /// The context menu: the pane it was opened in and where.
     menu: Option<(usize, rune::PointerPress)>,
     /// The tree's right-click menu: pane, node, whether it's open, whether it's empty, and where.
@@ -165,25 +173,36 @@ struct State {
     lasso: Option<lasso::Lasso>,
     /// Where each pane's file list viewport is and how far it's scrolled, for the rectangle
     /// selection and the menu the keyboard opens.
-    views: [lasso::Viewport; 2],
+    views: [lasso::Viewport; MAX_PANES],
     /// Smooth Ctrl+wheel / pinch zoom state for each pane's file list.
-    zoom: [anim::ZoomState; 2],
+    zoom: [anim::ZoomState; MAX_PANES],
     /// Row index currently under the pointer in each pane's file list (for the gliding hover pill).
-    hovered_row: [Option<usize>; 2],
+    hovered_row: [Option<usize>; MAX_PANES],
     /// Last hovered row index in each pane so the hover pill fades out in place when leaving.
-    hover_last_row: [usize; 2],
+    hover_last_row: [usize; MAX_PANES],
     /// Gliding keyboard selection highlight for each pane.
-    kbd_sel: [anim::KeyboardSel; 2],
+    kbd_sel: [anim::KeyboardSel; MAX_PANES],
     /// Fading marquee/lasso rectangle after mouse release.
     lasso_fade: Option<anim::LassoFade>,
     /// Smooth row reorder glide when sorting a pane's file list.
-    row_reorder: [anim::RowReorder; 2],
+    row_reorder: [anim::RowReorder; MAX_PANES],
     /// Active header column drag-to-reorder state.
     col_drag: Option<anim::ColDrag>,
     dialog: Option<actions::Dialog>,
     /// The window was asked to close while transfers ran: Fechar o Open Explorer? shows over
     /// everything, the dialog under it untouched (see [`actions::close_requested`]).
     quit_asked: bool,
+    /// The question came from quitting the whole app (macOS: ⌘Q, Encerrar in the Dock, logging
+    /// out), not from closing the window: Fechar mesmo assim then quits it.
+    quit_app: bool,
+    /// Linux: a menu Rune asks for (a text field's Recortar, Copiar, Colar), drawn in the window
+    /// as the system draws none there.
+    popup: Option<rune::PopupMenuRequest>,
+    /// The same for the account window (Registrar conta), which shares this state.
+    account_popup: Option<rune::PopupMenuRequest>,
+    /// The window opened with the Acrylic background (Opções > Experimental): its page and the
+    /// panes' folder trees show the material. Set at start, as the window's transparency is.
+    acrylic: bool,
     /// Uploads whose clash dialog waits for the one open (or another dialog) to close.
     clash_waiting: std::collections::VecDeque<actions::ClashAsk>,
     /// The name typed in Renomear or Nova pasta, or the e-mail typed in Compartilhar.
@@ -191,25 +210,25 @@ struct State {
     /// The item being renamed in place, and its pane.
     renaming: Option<(usize, Entry)>,
     /// Each pane's search field.
-    search: [rune::TextEdit; 2],
+    search: [rune::TextEdit; MAX_PANES],
     /// Each pane's path bar while it's a field to type an address in.
-    address: [Option<rune::TextEdit>; 2],
+    address: [Option<rune::TextEdit>; MAX_PANES],
     /// The addresses reached and searches run, which ↑ and ↓ bring back in those fields.
     history: history::History,
     /// The path bar's right-click menu: the pane it was opened in and where.
     address_menu: Option<(usize, rune::PointerPress)>,
     /// Each local pane's field as last seen, and when it may be searched: typing searches the
     /// computer once the keys stop for a moment.
-    typed: [(String, f64); 2],
+    typed: [(String, f64); MAX_PANES],
     /// The words each pane last searched the computer for.
-    searched: [String; 2],
+    searched: [String; MAX_PANES],
     /// What the index said with each pane's search results.
-    found: [Option<finder::Info>; 2],
+    found: [Option<finder::Info>; MAX_PANES],
     /// The search service is being installed.
     installing_finder: bool,
     /// When each pane's search of the computer is asked again, while a disk is still being read
     /// or the service is starting (0: not).
-    found_again: [f64; 2],
+    found_again: [f64; MAX_PANES],
     /// Counts Propriedades dialogs, to tell their background answers apart.
     props_seq: u64,
     /// What Copiar or Recortar picked up.
@@ -226,7 +245,7 @@ struct State {
     tree: tree::Tree,
     /// Each pane's current listing request, bumped by every load: `poll` drops answers for an
     /// older one, and the listing thread stops fetching pages once the pane has moved on.
-    live: [Arc<AtomicU64>; 2],
+    live: [Arc<AtomicU64>; MAX_PANES],
     cache: cache::Cache,
     mock: MockDrive,
     accounts: Vec<StoredAccount>,
@@ -247,14 +266,14 @@ struct State {
     /// The start of a name typed in a list, to reach it.
     typeahead: keyboard::Typeahead,
     /// How many rows each pane's list shows, for Page Up and Page Down (0 before its layout).
-    page_rows: [usize; 2],
+    page_rows: [usize; MAX_PANES],
     /// The pane a drag started in and the files it carried, so a drop back on the same pane
     /// is ignored (the drop can arrive after the drag's end).
     last_drag: Option<(usize, Vec<PathBuf>)>,
     /// A drag of files over a pane, which scrolls its list or tree near their edges, and where
     /// each pane's list and tree are and how far they've scrolled.
     autoscroll: Option<autoscroll::Drag>,
-    edges: [autoscroll::Pane; 2],
+    edges: [autoscroll::Pane; MAX_PANES],
     /// What the last action said ("Copiado: 3 itens.", an error...), shown for a few seconds
     /// in a notice at the bottom right.
     status: String,
@@ -286,7 +305,7 @@ struct State {
     /// Windows' own icons, as Explorer shows them.
     icons: sysicons::SysIcons,
     /// The listing version each pane's icons were last asked for.
-    icons_for: [u64; 2],
+    icons_for: [u64; MAX_PANES],
     /// State of the independent "Registrar conta" window when open.
     account_form: Option<Box<servers::Form>>,
     account_win: Option<rune::AppHandle<State>>,
@@ -347,29 +366,37 @@ impl State {
         let loc = Location::Mock(Vec::new());
         State {
             main_tab: MainTab::Explore,
+            view_menu_open: false,
+            view_mode_menu: None,
+            grid_cols: [1; MAX_PANES],
+            list_rows: [1; MAX_PANES],
             accounts_filter: None,
             accounts_search: rune::TextEdit::new(""),
-            panes: [Pane::new(loc.clone()), Pane::new(loc)],
-            tabs: [tabs::PaneTabs::initial(), tabs::PaneTabs::initial()],
-            show_tree: [true, true],
+            panes: std::array::from_fn(|_| Pane::new(loc.clone())),
+            tabs: std::array::from_fn(|_| tabs::PaneTabs::initial()),
+            show_tree: [true; MAX_PANES],
             menu: None,
             tree_menu: None,
             renamed: Vec::new(),
             lasso: None,
             views: Default::default(),
             zoom: Default::default(),
-            hovered_row: [None; 2],
-            hover_last_row: [0; 2],
+            hovered_row: [None; MAX_PANES],
+            hover_last_row: [0; MAX_PANES],
             kbd_sel: Default::default(),
             lasso_fade: None,
             row_reorder: Default::default(),
             col_drag: None,
             dialog: None,
             quit_asked: false,
+            quit_app: false,
+            popup: None,
+            account_popup: None,
+            acrylic: false,
             clash_waiting: Default::default(),
             name_edit: rune::TextEdit::new(""),
             renaming: None,
-            search: [rune::TextEdit::new(""), rune::TextEdit::new("")],
+            search: std::array::from_fn(|_| rune::TextEdit::new("")),
             address: Default::default(),
             history: Default::default(),
             address_menu: None,
@@ -377,7 +404,7 @@ impl State {
             searched: Default::default(),
             found: Default::default(),
             installing_finder: false,
-            found_again: [0.0; 2],
+            found_again: [0.0; MAX_PANES],
             props_seq: 0,
             clip: None,
             undo: Default::default(),
@@ -421,7 +448,7 @@ impl State {
             logins: 0,
             active: 0,
             typeahead: Default::default(),
-            page_rows: [0; 2],
+            page_rows: [0; MAX_PANES],
             last_drag: None,
             autoscroll: None,
             edges: Default::default(),
@@ -441,7 +468,7 @@ impl State {
             queue_looks: Vec::new(),
             queue_totals: Default::default(),
             icons: Default::default(),
-            icons_for: [u64::MAX; 2],
+            icons_for: [u64::MAX; MAX_PANES],
             account_form: None,
             account_win: None,
             main_win: None,
@@ -553,37 +580,51 @@ fn init() -> State {
     // run was is kept. The simulated drive stays in the tree, for trying things out.
     let places = places::places();
     let start = places.desktop.as_ref().map_or_else(Location::home, |(dir, _)| Location::Local(dir.clone()));
-    let mut panes = [Pane::new(start.clone()), Pane::new(start)];
-    for p in &mut panes {
-        p.load_now(&mock, settings.show_hidden);
-    }
+    // The folder is read once: every pane, shown or not, starts with that listing.
+    let mut first = Pane::new(start.clone());
+    first.load_now(&mock, settings.show_hidden);
+    let mut panes: [Pane; MAX_PANES] = std::array::from_fn(|_| {
+        let mut pane = Pane::new(start.clone());
+        pane.free = first.free;
+        pane.set_entries(first.error.clone().map_or_else(|| Ok(first.entries.clone()), Err));
+        pane
+    });
+    panes[0] = first;
     let accounts = store::accounts();
     let tree = tree::Tree::new(accounts.iter().map(|a| a.email.clone()));
     State {
         main_tab: MainTab::Explore,
+        view_menu_open: false,
+        view_mode_menu: None,
+        grid_cols: [1; MAX_PANES],
+        list_rows: [1; MAX_PANES],
         accounts_filter: None,
         accounts_search: rune::TextEdit::new(""),
         panes,
-        tabs: [tabs::PaneTabs::initial(), tabs::PaneTabs::initial()],
-        show_tree: [true, true],
+        tabs: std::array::from_fn(|_| tabs::PaneTabs::initial()),
+        show_tree: [true; MAX_PANES],
         menu: None,
         tree_menu: None,
         renamed: Vec::new(),
         lasso: None,
         views: Default::default(),
         zoom: Default::default(),
-        hovered_row: [None; 2],
-        hover_last_row: [0; 2],
+        hovered_row: [None; MAX_PANES],
+        hover_last_row: [0; MAX_PANES],
         kbd_sel: Default::default(),
         lasso_fade: None,
         row_reorder: Default::default(),
         col_drag: None,
         dialog: None,
         quit_asked: false,
+        quit_app: false,
+        popup: None,
+        account_popup: None,
+        acrylic: settings.acrylic_window(),
         clash_waiting: Default::default(),
         name_edit: rune::TextEdit::new(""),
         renaming: None,
-        search: [rune::TextEdit::new(""), rune::TextEdit::new("")],
+        search: std::array::from_fn(|_| rune::TextEdit::new("")),
         address: Default::default(),
         history: history::History::load(),
         address_menu: None,
@@ -591,7 +632,7 @@ fn init() -> State {
         searched: Default::default(),
         found: Default::default(),
         installing_finder: false,
-        found_again: [0.0; 2],
+        found_again: [0.0; MAX_PANES],
         props_seq: 0,
         clip: None,
         undo: Default::default(),
@@ -611,7 +652,7 @@ fn init() -> State {
         logins: 0,
         active: 0,
         typeahead: Default::default(),
-        page_rows: [0; 2],
+        page_rows: [0; MAX_PANES],
         last_drag: None,
         autoscroll: None,
         edges: Default::default(),
@@ -631,7 +672,7 @@ fn init() -> State {
         queue_looks: Vec::new(),
         queue_totals: Default::default(),
         icons: Default::default(),
-        icons_for: [u64::MAX; 2],
+        icons_for: [u64::MAX; MAX_PANES],
         account_form: None,
         account_win: None,
         main_win: None,
@@ -657,7 +698,7 @@ fn setup(s: &mut State, waker: Waker) {
     });
     s.waker = Some(combined);
     // Each tree opens down to the folder its pane starts in.
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         tree::follow(s, p);
     }
 }
@@ -828,7 +869,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     // Each listing's file types get their icons asked for once.
     let versions = s.panes.each_ref().map(|p| p.version);
     if s.icons_for != versions {
-        let relisted: Vec<usize> = (0..2).filter(|&p| s.icons_for[p] != versions[p]).collect();
+        let relisted: Vec<usize> = (0..MAX_PANES).filter(|&p| s.icons_for[p] != versions[p]).collect();
         s.icons_for = versions;
         let keys = s.panes.iter().flat_map(|p| sysicons::keys_of(&p.entries, &p.loc)).collect();
         s.icons.show(keys);
@@ -837,11 +878,14 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             tree::learn(s, p);
         }
     }
+    // The 256 px icons only while a pane in view shows Large or Extra large icons.
+    let big = s.panes[..s.settings.pane_layout.count()].iter().any(|p| matches!(p.view_mode, model::ViewMode::LargeIcons | model::ViewMode::ExtraLargeIcons));
+    s.icons.set_big(big);
     let mut changed = std::mem::take(&mut s.main_dirty) | s.icons.settle();
     changed |= notice(s, now, &mut |text, how| tx.announce(text, how));
     // Smooth Ctrl+wheel / pinch zoom, keyboard selection glide, and sort row reorder animations.
     let mut anim_wake = false;
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         if s.zoom[p].tick(now) {
             changed = true;
             if s.zoom[p].is_animating() {
@@ -879,7 +923,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         && now - clip.picked_at < anim::WIGGLE_TOTAL
         && {
             let ids: std::collections::HashSet<&str> = clip.items.iter().map(|c| c.id.as_str()).collect();
-            (0..2).any(|p| !s.tabs[p].is_picker() && s.panes[p].loc == clip.from && s.panes[p].entries.iter().any(|e| ids.contains(e.id.as_str())))
+            (0..s.settings.pane_layout.count()).any(|p| !s.tabs[p].is_picker() && s.panes[p].loc == clip.from && s.panes[p].entries.iter().any(|e| ids.contains(e.id.as_str())))
         }
     {
         changed = true;
@@ -891,7 +935,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     // A rectangle selection held past the list's edge scrolls it.
     changed |= lasso::step(s, now, tx);
     // A local pane searches the computer as its field is typed in, once the keys pause.
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         if s.search[p].text != s.typed[p].0 {
             s.typed[p] = (s.search[p].text.clone(), now + TYPING_PAUSE);
             tx.wake_at(now + TYPING_PAUSE);
@@ -1018,7 +1062,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                         tabs::repoint(s, &from, Some(&to));
                     }
                 }
-                for p in 0..2 {
+                for p in 0..MAX_PANES {
                     if reload.contains(&s.panes[p].loc) {
                         load(s, p);
                     }
@@ -1092,7 +1136,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     Ok(m) => s.status = m,
                     Err(m) => fail(s, m),
                 }
-                for p in 0..2 {
+                for p in 0..MAX_PANES {
                     if reload.contains(&s.panes[p].loc) {
                         load(s, p);
                     }
@@ -1151,7 +1195,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     if let Some(at) = accounts::next_ask(s) {
         tx.wake_at(at);
     }
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         // The address field closes when the keyboard leaves it (a click elsewhere).
         if s.address[p].as_ref().is_some_and(|a| !a.focused) {
             s.address[p] = None;
@@ -1160,12 +1204,12 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         // Mostrar na pasta: the item is selected and brought into view once its folder lists it.
         let pane = &mut s.panes[p];
         let Some((id, name)) = pane.reveal.clone() else { continue };
-        if pane.entry(&id).is_some() {
+        if let Some(i) = pane.index_of(&id) {
             pane.reveal = None;
             pane.selected = [id.clone()].into();
             pane.cursor = Some(id.clone());
             pane.anchor = Some(id.clone());
-            tx.scroll_into_view_in(pane_key(p), row_key(&id));
+            tx.scroll_into_view_in(pane_key(p), s.views[p].flow.get().reveal_key(i, row_key(&id)));
             changed = true;
         } else if !pane.loading {
             pane.reveal = None;
@@ -1177,7 +1221,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     // A tree shows its keyboard row's ring while it has focus, however it got it (Tab from the
     // search field, a click), and stops once focus left it.
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         let on = tx.focused() == Some(ui::tree_key(p).as_str());
         if s.tree.focused[p] != on {
             tree::focus(s, p, on);
@@ -1185,7 +1229,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
     }
     // Each tree brings the folder its pane shows into view, once that's in the tree.
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         if tree::following(s, p) {
             let lines = tree::lines(s, p);
             if let Some(key) = tree::to_reveal(s, p, &lines) {
@@ -1313,7 +1357,7 @@ fn disconnect(s: &mut State, email: &str) {
     s.tree.forget(email);
     s.watch.remove(email);
     s.accounts.retain(|a| a.email != email);
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         let gone = |l: &Location| matches!(l, Location::Drive { email: e, .. } if e == email);
         s.panes[p].back.retain(|l| !gone(l));
         s.panes[p].forward.retain(|l| !gone(l));
@@ -1362,9 +1406,56 @@ pub(crate) fn refresh_all_quotas(s: &mut State) {
 
 pub(crate) fn set_main_tab(s: &mut State, tab: MainTab) {
     s.main_tab = tab;
+    s.view_menu_open = false;
+    s.view_mode_menu = None;
     if tab == MainTab::Accounts {
         ensure_all_quotas(s);
     }
+}
+
+/// Switches between 1, 2, and 4 visible panes in `Explorar`, persisting the choice.
+pub(crate) fn set_pane_layout(s: &mut State, layout: settings::PaneLayout) {
+    let before = s.settings.pane_layout.count();
+    s.settings.pane_layout = layout;
+    s.settings.save();
+    s.view_menu_open = false;
+    s.view_mode_menu = None;
+    s.menu = None;
+    s.tree_menu = None;
+    s.address_menu = None;
+    let count = layout.count();
+    if s.active >= count {
+        s.active = 0;
+    }
+    // A pane shown again is read again: while hidden it wasn't watched (B2's polling skips it).
+    for p in before..count {
+        if !s.tabs[p].is_picker() {
+            load(s, p);
+        }
+    }
+    if s.renaming.as_ref().is_some_and(|(p, _)| *p >= count) {
+        s.renaming = None;
+    }
+    if s.lasso.as_ref().is_some_and(|l| l.pane >= count) {
+        s.lasso = None;
+    }
+    s.main_tab = MainTab::Explore;
+}
+
+/// Sets the file display mode (Extra large / Large / Medium icons, List, Details) for pane `p`.
+pub(crate) fn set_view_mode(s: &mut State, p: usize, mode: model::ViewMode) {
+    s.active = p;
+    s.panes[p].view_mode = mode;
+    s.view_mode_menu = None;
+    if s.lasso.as_ref().is_some_and(|l| l.pane == p) {
+        s.lasso = None;
+    }
+}
+
+/// Cycles pane `p` directly to the next file display mode.
+pub(crate) fn cycle_view_mode(s: &mut State, p: usize) {
+    let next = s.panes[p].view_mode.next();
+    set_view_mode(s, p, next);
 }
 
 /// Opens `loc` in pane `p` (0 = left, 1 = right) and switches to `Explorar`.
@@ -1821,6 +1912,8 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         })
     };
     let page = keyboard::page(s.page_rows[p]) as isize;
+    let flow = s.views[p].flow.get();
+    let (across, down) = flow.steps();
     let owns = keyboard::list_has_keys(s, p, tx.focused());
     // Any other key ends a name being typed: Enter into a folder and a letter starts anew.
     let plain = !(ev.mods.cmd || ev.mods.ctrl || ev.mods.alt);
@@ -1902,7 +1995,7 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             if let Some(i) = keyboard::find(&s.panes[p].entries, at, query) {
                 let id = s.panes[p].entries[i].id.clone();
                 click(s, p, &id, Mods::default());
-                tx.scroll_into_view_in(pane_key(p), row_key(&id));
+                tx.scroll_into_view_in(pane_key(p), flow.reveal_key(i, row_key(&id)));
             }
             return true;
         }
@@ -1946,8 +2039,12 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             go_forward(s, p);
             return true;
         }
-        Key::Up => step(-1),
-        Key::Down => step(1),
+        // The arrows follow the items as the view laid them out: tiles in rows, List's
+        // columns, Details' rows (where Left and Right don't move).
+        Key::Left if flow.sideways() => step(-across),
+        Key::Right if flow.sideways() => step(across),
+        Key::Up => step(-down),
+        Key::Down => step(down),
         Key::PageUp => step(-page),
         Key::PageDown => step(page),
         Key::Home => step(-(n as isize)),
@@ -1967,8 +2064,12 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             return true;
         }
         Key::Tab => {
-            s.active = 1 - p;
-            tx.focus(pane_key(1 - p), true);
+            let count = s.settings.pane_layout.count();
+            if count > 1 {
+                let next = (p + 1) % count;
+                s.active = next;
+                tx.focus(pane_key(next), true);
+            }
             return true;
         }
         _ if ev.is_command('a') => {
@@ -2006,7 +2107,7 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
                 tx.wake_at(s.now + 1.0 / 60.0);
             }
         }
-        tx.scroll_into_view_in(pane_key(p), row_key(&id));
+        tx.scroll_into_view_in(pane_key(p), flow.reveal_key(i, row_key(&id)));
     }
     true
 }
@@ -2032,8 +2133,8 @@ fn menu_from_keys(s: &mut State, p: usize, tx: &mut Tx) {
         cursor.or_else(|| pane.entries.iter().position(|e| pane.selected.contains(&e.id)))
     };
     let (at, scroll) = lasso::menu_point(&s.views[p], row);
-    if let Some(y) = scroll {
-        tx.scroll_to_instant(ui::list_key(p), s.views[p].scroll.get().x, y);
+    if let Some([x, y]) = scroll {
+        tx.scroll_to_instant(ui::list_key(p), x, y);
     }
     s.menu = Some((p, at));
 }
@@ -2386,6 +2487,56 @@ fn view_sample() -> Vec<Entry> {
     ]
 }
 
+/// Rune's own labels in Portuguese while the interface is; English keeps Rune's. macOS writes
+/// its menu items in title case ("Selecionar Tudo", "Ocultar Outros"), Windows and Linux in
+/// sentence case ("Selecionar tudo"): each gets its system's.
+fn rune_labels(label: rune::Label<'_>) -> Option<String> {
+    rune_labels_on(label, cfg!(target_os = "macos"))
+}
+
+fn rune_labels_on(label: rune::Label<'_>, mac: bool) -> Option<String> {
+    use rune::Label as L;
+    if openexplorer_i18n::english() {
+        return None;
+    }
+    let pick = |sentence: &str, title: &str| if mac { title.to_string() } else { sentence.to_string() };
+    Some(match label {
+        L::Cut => "Recortar".into(),
+        L::Copy => "Copiar".into(),
+        L::Paste => "Colar".into(),
+        L::SelectAll => pick("Selecionar tudo", "Selecionar Tudo"),
+        L::Undo => "Desfazer".into(),
+        L::Redo => "Refazer".into(),
+        L::LearnSpelling => pick("Aprender ortografia", "Aprender Ortografia"),
+        L::NoGuesses => pick("Nenhuma sugestão", "Nenhuma Sugestão"),
+        L::Spellcheck => pick("Verificação ortográfica", "Verificação Ortográfica"),
+        L::SpellcheckLanguages => pick("Idiomas da verificação ortográfica", "Idiomas da Verificação Ortográfica"),
+        L::Minimize => "Minimizar".into(),
+        L::Maximize => "Maximizar".into(),
+        L::Restore => "Restaurar".into(),
+        L::Zoom => "Zoom".into(),
+        L::Close => "Fechar".into(),
+        L::BringAllToFront => pick("Trazer todas para a frente", "Trazer Todas para a Frente"),
+        L::StartDictation => pick("Iniciar ditado…", "Iniciar Ditado…"),
+        L::EmojiAndSymbols => pick("Emoji e símbolos", "Emoji e Símbolos"),
+        L::About(app) => format!("Sobre o {app}"),
+        L::Services => "Serviços".into(),
+        L::Hide(app) => format!("Ocultar {app}"),
+        L::HideOthers => pick("Ocultar outros", "Ocultar Outros"),
+        L::ShowAll => pick("Mostrar tudo", "Mostrar Tudo"),
+        L::Quit(app) => format!("Encerrar {app}"),
+        L::MoreNestedLines(1) => "mais 1 linha aninhada".into(),
+        L::MoreNestedLines(n) => format!("mais {n} linhas aninhadas"),
+        L::OpenLink => pick("Abrir link", "Abrir Link"),
+        L::CopyLink => pick("Copiar link", "Copiar Link"),
+        L::SaveImageAs => pick("Salvar imagem como…", "Salvar Imagem Como…"),
+        L::CopyImage => pick("Copiar imagem", "Copiar Imagem"),
+        L::CopyImageAddress => pick("Copiar endereço da imagem", "Copiar Endereço da Imagem"),
+        // A dictionary's or a menu's own name, and labels Rune adds later: as Rune has them.
+        _ => return None,
+    })
+}
+
 fn main() {
     // `openexplorer index …`: this executable as the search service (Windows starts it so), no
     // window at all.
@@ -2406,6 +2557,9 @@ fn main() {
         });
     }
     let initial = settings::Settings::load();
+    // Rune's own words (a text field's menu, the window buttons' names for screen readers) in
+    // the app's language.
+    rune::set_labels(rune_labels);
     accounts::start();
     let main_spec = AppSpec::<State> {
         min_size: Some((900.0, 420.0)),
@@ -2523,6 +2677,9 @@ fn main() {
                 found_scene(s, true);
             }),
             ("found-missing", |s| found_scene(s, false)),
+            // The Acrylic background where the system draws none (a headless run): Rune's
+            // near-opaque neutral tint shows around the panes and through the folder trees.
+            ("acrylic", |s| s.acrylic = true),
             // An upload whose names are taken in the Drive folder: all at once, or the second
             // of three asked on its own.
             ("clash", |s| clash_scene(s, true)),
@@ -2848,8 +3005,23 @@ fn main() {
     .titlebar(rune::Titlebar::new(36.0))
     .font_smoothing(initial.text_render.smoothing())
     .turn_scope(enter_turn, leave_turn)
+    // Linux has no system pop-up menu: the fields' menu is drawn in the window, as in the main
+    // one. Rune dismisses it when the window loses focus: it goes.
+    .on_popup_menu(|s, request, tx| {
+        if s.is_placeholder {
+            tx.resolve_popup_menu(None);
+        } else {
+            s.account_popup = Some(request);
+        }
+    })
+    .on_focus(|s, focused, _| {
+        if !focused && !s.is_placeholder {
+            s.account_popup = None;
+        }
+    })
     .on_close(|s, _| {
         if !s.is_placeholder {
+            s.account_popup = None;
             s.account_window_closed();
         }
     });
@@ -2865,6 +3037,10 @@ fn main() {
             if s.is_placeholder {
                 PENDING_MAIN_FOCUS.with(|c| c.set(Some(focused)));
             } else {
+                // Rune dismisses a Linux in-window menu when the window loses focus: it goes.
+                if !focused {
+                    s.popup = None;
+                }
                 accounts::window_focus(s, focused, tx);
             }
         })
@@ -2877,6 +3053,10 @@ fn main() {
             }
         })
         .on_close_request(|s, _| actions::close_requested(s))
+        // macOS: ⌘Q, Encerrar in the Dock, logging out. Elsewhere Rune never calls it.
+        .on_quit_request(actions::quit_requested)
+        // Linux has no system pop-up menu: a text field's is drawn in the window.
+        .on_popup_menu(|s, request, _| s.popup = Some(request))
         // It opens where it was closed, as Explorer's does.
         .on_window(window_place::created)
         .on_window_geometry(|_, _, _| {
@@ -2889,12 +3069,24 @@ fn main() {
     let mica = initial.mica && cfg!(windows);
     STARTED_WITH_MICA.store(mica, Ordering::Relaxed);
     MICA_ASKED.with(|a| a.set(mica.then_some(initial.material)));
-    if place.is_some() || mica {
+    // Experimental too, off Windows: the system's material behind the page and the folder
+    // trees, which also needs a transparent window.
+    let acrylic = initial.acrylic_window();
+    if place.is_some() || mica || acrylic {
         let maximized = place.is_some() && initial.window.is_some_and(|w| w.maximized);
-        main_app = main_app.window_options(rune::WindowOptions { transparent: mica, ..place.unwrap_or_default() }).maximized(maximized);
+        main_app = main_app.window_options(rune::WindowOptions { transparent: mica || acrylic, ..place.unwrap_or_default() }).maximized(maximized);
     }
     if mica {
-        main_app = main_app.window_backdrop(initial.material.backdrop()).color_scheme(initial.theme.color_scheme());
+        main_app = main_app.window_backdrop(initial.material.backdrop());
+    }
+    // The material's tint follows the app's theme, not the system's.
+    if mica || acrylic {
+        main_app = main_app.color_scheme(initial.theme.color_scheme());
+    }
+    // Experimental: content that keeps up with a drag of the left or top edge. Rune ignores it
+    // in a transparent window, so not with Mica or Acrylic.
+    if initial.resize_sync && cfg!(windows) {
+        main_app = main_app.resize_sync(rune::ResizeSync::On);
     }
 
     let (account_handle, _) = main_app.window(rune::windows::WindowSpec::from_app("add-account", account_app));
@@ -2976,6 +3168,13 @@ fn rune_args(given: impl Iterator<Item = String>) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// The tests that read or write `RESTART`, shared by the whole process, run one at a time.
+    static RESTART_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn restart_tests() -> std::sync::MutexGuard<'static, ()> {
+        RESTART_TESTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A close the app asked for, whose `on_close` comes after Adicionar conta opened a new
     /// form, keeps that form; the window's own close button drops it.
     #[test]
@@ -2994,6 +3193,7 @@ mod tests {
     /// itself once they end.
     #[test]
     fn closing_asks_only_while_transfers_run() {
+        let _one_at_a_time = restart_tests();
         let mut s = init();
         assert_eq!(actions::close_requested(&mut s), rune::CloseResponse::Close);
         let end = || transfers::End::local(std::path::Path::new(r"C:\x"));
@@ -3023,6 +3223,60 @@ mod tests {
         assert!(s.quit_asked && actions::restarting());
         drop(last);
         assert!(actions::quit_question_done(&mut s) && !actions::restarting());
+    }
+
+    #[test]
+    fn quitting_the_app_asks_like_closing() {
+        let _one_at_a_time = restart_tests();
+        let mut s = init();
+        let mut tx = Tx::default();
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Quit);
+        let end = || transfers::End::local(std::path::Path::new(r"C:\x"));
+        let batch = transfers::queue(&mut s.transfers, None, transfers::Op::Copy, [(end(), end())]);
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Defer);
+        assert!(s.quit_asked && s.quit_app);
+        actions::keep_running(&mut s);
+        assert!(!s.quit_asked && !s.quit_app);
+
+        // Asked by a quit, answered with Fechar mesmo assim: the transfers stop.
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Defer);
+        actions::quit_anyway(&mut s, &mut tx);
+        assert!(!s.quit_asked && !s.quit_app && !actions::transfers_running(&s));
+        drop(batch);
+
+        // A quit asked again while the question shows quits; a window's close asking after a
+        // quit did is a close again.
+        let other = transfers::queue(&mut s.transfers, None, transfers::Op::Copy, [(end(), end())]);
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Defer);
+        assert_eq!(actions::close_requested(&mut s), rune::CloseResponse::Close);
+        assert!(!s.quit_app);
+        drop(other);
+        let last = transfers::queue(&mut s.transfers, None, transfers::Op::Copy, [(end(), end())]);
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Defer);
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Quit);
+        assert!(!s.quit_asked && !s.quit_app && !actions::transfers_running(&s));
+        drop(last);
+
+        // ⌘Q while Reiniciar asks quits, and the app doesn't open again.
+        let again = transfers::queue(&mut s.transfers, None, transfers::Op::Copy, [(end(), end())]);
+        actions::restart(&mut s, &mut tx);
+        assert!(s.quit_asked && actions::restarting());
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Quit);
+        assert!(!s.quit_asked && !actions::restarting());
+        drop(again);
+    }
+
+    #[test]
+    fn runes_words_in_portuguese() {
+        // Tests run in Portuguese (`openexplorer_i18n`); English keeps Rune's own words.
+        assert_eq!(rune_labels(rune::Label::Cut).as_deref(), Some("Recortar"));
+        assert_eq!(rune_labels_on(rune::Label::SelectAll, false).as_deref(), Some("Selecionar tudo"));
+        // macOS writes its menu items in title case.
+        assert_eq!(rune_labels_on(rune::Label::SelectAll, true).as_deref(), Some("Selecionar Tudo"));
+        assert_eq!(rune_labels_on(rune::Label::HideOthers, true).as_deref(), Some("Ocultar Outros"));
+        assert_eq!(rune_labels(rune::Label::Quit("Open Explorer")).as_deref(), Some("Encerrar Open Explorer"));
+        assert_eq!(rune_labels(rune::Label::MoreNestedLines(3)).as_deref(), Some("mais 3 linhas aninhadas"));
+        assert_eq!(rune_labels(rune::Label::Language("pt-BR")), None);
     }
 
     /// What a running transfer queue costs the window: 40 downloads advancing, each tick
@@ -3332,7 +3586,7 @@ mod tests {
         s.panes[1].selected.clear();
         let h = lasso::HEADER_H + 10.0 * ROW_H;
         s.views[1].rect = [400.0, 100.0, 600.0, h];
-        s.views[1].scroll.set(lasso::Scroll { x: 0.0, y: 0.0, max_y: 40.0 * ROW_H + 2.0 * ROW_H, h });
+        s.views[1].scroll.set(lasso::Scroll { x: 0.0, y: 0.0, max_x: 0.0, max_y: 40.0 * ROW_H + 2.0 * ROW_H, h });
         let mut tx = Tx::default();
         let ev = |key, mods| KeyEvent { key, mods };
         let shift = Mods { shift: true, ..Mods::default() };

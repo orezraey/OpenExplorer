@@ -789,7 +789,7 @@ fn changes_arrived(s: &mut State, id: String, result: Result<Changes, String>, n
         Some(f) => changes.touches(&f),
         None => changes.all,
     };
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         let reload = matches!(&s.panes[p].loc, Location::Server { server: sv, path, find: None } if sv.id == id && stale(path));
         if reload && !s.panes[p].loading {
             crate::load(s, p);
