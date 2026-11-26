@@ -2254,44 +2254,51 @@ fn view_sample() -> Vec<Entry> {
     ]
 }
 
-/// Rune's own labels in Portuguese while the interface is; English keeps Rune's.
+/// Rune's own labels in Portuguese while the interface is; English keeps Rune's. macOS writes
+/// its menu items in title case ("Selecionar Tudo", "Ocultar Outros"), Windows and Linux in
+/// sentence case ("Selecionar tudo"): each gets its system's.
 fn rune_labels(label: rune::Label<'_>) -> Option<String> {
+    rune_labels_on(label, cfg!(target_os = "macos"))
+}
+
+fn rune_labels_on(label: rune::Label<'_>, mac: bool) -> Option<String> {
     use rune::Label as L;
     if openexplorer_i18n::english() {
         return None;
     }
+    let pick = |sentence: &str, title: &str| if mac { title.to_string() } else { sentence.to_string() };
     Some(match label {
         L::Cut => "Recortar".into(),
         L::Copy => "Copiar".into(),
         L::Paste => "Colar".into(),
-        L::SelectAll => "Selecionar tudo".into(),
+        L::SelectAll => pick("Selecionar tudo", "Selecionar Tudo"),
         L::Undo => "Desfazer".into(),
         L::Redo => "Refazer".into(),
-        L::LearnSpelling => "Aprender ortografia".into(),
-        L::NoGuesses => "Nenhuma sugestão".into(),
-        L::Spellcheck => "Verificação ortográfica".into(),
-        L::SpellcheckLanguages => "Idiomas da verificação ortográfica".into(),
+        L::LearnSpelling => pick("Aprender ortografia", "Aprender Ortografia"),
+        L::NoGuesses => pick("Nenhuma sugestão", "Nenhuma Sugestão"),
+        L::Spellcheck => pick("Verificação ortográfica", "Verificação Ortográfica"),
+        L::SpellcheckLanguages => pick("Idiomas da verificação ortográfica", "Idiomas da Verificação Ortográfica"),
         L::Minimize => "Minimizar".into(),
         L::Maximize => "Maximizar".into(),
         L::Restore => "Restaurar".into(),
         L::Zoom => "Zoom".into(),
         L::Close => "Fechar".into(),
-        L::BringAllToFront => "Trazer tudo para a frente".into(),
-        L::StartDictation => "Iniciar ditado…".into(),
-        L::EmojiAndSymbols => "Emoji e símbolos".into(),
+        L::BringAllToFront => pick("Trazer todas para a frente", "Trazer Todas para a Frente"),
+        L::StartDictation => pick("Iniciar ditado…", "Iniciar Ditado…"),
+        L::EmojiAndSymbols => pick("Emoji e símbolos", "Emoji e Símbolos"),
         L::About(app) => format!("Sobre o {app}"),
         L::Services => "Serviços".into(),
         L::Hide(app) => format!("Ocultar {app}"),
-        L::HideOthers => "Ocultar outros".into(),
-        L::ShowAll => "Mostrar tudo".into(),
+        L::HideOthers => pick("Ocultar outros", "Ocultar Outros"),
+        L::ShowAll => pick("Mostrar tudo", "Mostrar Tudo"),
         L::Quit(app) => format!("Encerrar {app}"),
         L::MoreNestedLines(1) => "mais 1 linha aninhada".into(),
         L::MoreNestedLines(n) => format!("mais {n} linhas aninhadas"),
-        L::OpenLink => "Abrir link".into(),
-        L::CopyLink => "Copiar link".into(),
-        L::SaveImageAs => "Salvar imagem como…".into(),
-        L::CopyImage => "Copiar imagem".into(),
-        L::CopyImageAddress => "Copiar endereço da imagem".into(),
+        L::OpenLink => pick("Abrir link", "Abrir Link"),
+        L::CopyLink => pick("Copiar link", "Copiar Link"),
+        L::SaveImageAs => pick("Salvar imagem como…", "Salvar Imagem Como…"),
+        L::CopyImage => pick("Copiar imagem", "Copiar Imagem"),
+        L::CopyImageAddress => pick("Copiar endereço da imagem", "Copiar Endereço da Imagem"),
         // A dictionary's or a menu's own name, and labels Rune adds later: as Rune has them.
         _ => return None,
     })
@@ -2998,7 +3005,10 @@ mod tests {
     fn runes_words_in_portuguese() {
         // Tests run in Portuguese (`openexplorer_i18n`); English keeps Rune's own words.
         assert_eq!(rune_labels(rune::Label::Cut).as_deref(), Some("Recortar"));
-        assert_eq!(rune_labels(rune::Label::SelectAll).as_deref(), Some("Selecionar tudo"));
+        assert_eq!(rune_labels_on(rune::Label::SelectAll, false).as_deref(), Some("Selecionar tudo"));
+        // macOS writes its menu items in title case.
+        assert_eq!(rune_labels_on(rune::Label::SelectAll, true).as_deref(), Some("Selecionar Tudo"));
+        assert_eq!(rune_labels_on(rune::Label::HideOthers, true).as_deref(), Some("Ocultar Outros"));
         assert_eq!(rune_labels(rune::Label::Quit("Open Explorer")).as_deref(), Some("Encerrar Open Explorer"));
         assert_eq!(rune_labels(rune::Label::MoreNestedLines(3)).as_deref(), Some("mais 3 linhas aninhadas"));
         assert_eq!(rune_labels(rune::Label::Language("pt-BR")), None);

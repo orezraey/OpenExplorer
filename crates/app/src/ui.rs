@@ -60,10 +60,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     // Linux: a menu Rune asks for (a text field's Recortar, Copiar, Colar), as the system draws
     // none there.
     if let Some(request) = &s.popup {
-        rune_kit::Menu::from_popup_menu("popup-fallback", request, |s: &mut State, picked, tx: &mut Tx| {
+        spaced(rune_kit::Menu::from_popup_menu("popup-fallback", request, |s: &mut State, picked, tx: &mut Tx| {
             s.popup = None;
             tx.resolve_popup_menu(picked);
-        })
+        }))
         .label(t("Menu de contexto", "Context menu"))
         .build(&k, &mut layer);
     }
@@ -1280,6 +1280,12 @@ fn queue_totals(s: &State, k: &Kit) -> El {
         .child(small(&sums.speed, 80.0))
 }
 
+/// A menu spaced and edged as Windows 11's: 4 points around its rows and on each side of a
+/// separator (the kit's compact menu has 2), and a hairline border around it.
+fn spaced(menu: rune_kit::Menu) -> rune_kit::Menu {
+    menu.padding(4.0).separator_spacing(4.0, 4.0).inner_border(1.0)
+}
+
 /// The queue's right-click menu: on a row, or on the list as a whole.
 fn transfer_context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     let anchor = el().key("queue-menu-anchor").size(0.0, 0.0);
@@ -1290,7 +1296,7 @@ fn transfer_context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             f(s);
         })
     };
-    let mut menu = context_menu("queue-menu", anchor, Some(at)).min_width(200.0);
+    let mut menu = spaced(context_menu("queue-menu", anchor, Some(at))).min_width(200.0);
     if let Some(row) = row {
         let (over, other) = (row.over(), row.clone());
         menu = menu
@@ -1316,7 +1322,7 @@ fn address_context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             f(s, p, tx);
         })
     };
-    let mut menu = context_menu("address-menu", anchor, Some(at)).min_width(220.0).item(item(t("Copiar endereço", "Copy address"), &icons::M_COPY, "", actions::copy_address));
+    let mut menu = spaced(context_menu("address-menu", anchor, Some(at))).min_width(220.0).item(item(t("Copiar endereço", "Copy address"), &icons::M_COPY, "", actions::copy_address));
     if crate::address::drive_link(&s.panes[p].loc).is_some() {
         menu = menu.item(item(t("Copiar link do Drive", "Copy Drive link"), &icons::M_LINK, "", actions::copy_drive_link));
     }
@@ -1411,7 +1417,7 @@ fn tree_context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         }
     });
 
-    context_menu("tree-menu", anchor, Some(at))
+    spaced(context_menu("tree-menu", anchor, Some(at)))
         .min_width(210.0)
         .item(expand_item)
         .separator()
@@ -1445,7 +1451,7 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
             f(s, p, tx);
         })
     };
-    let mut menu = context_menu("menu", anchor, Some(at)).min_width(220.0);
+    let mut menu = spaced(context_menu("menu", anchor, Some(at))).min_width(220.0);
     // Lixeira: what can come back, or go for good.
     if actions::in_trash(&s.panes[p].loc) {
         // Wide enough for "Excluir permanentemente" and its key.

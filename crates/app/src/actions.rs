@@ -160,6 +160,8 @@ pub fn quit_anyway(s: &mut State, tx: &mut Tx) {
     cancel_all_transfers(s);
     s.quit_asked = false;
     if std::mem::take(&mut s.quit_app) {
+        // A quit runs no window's `on_close`, where the window keeps its place.
+        crate::window_place::remember(s);
         tx.quit();
     } else {
         tx.close_window();
