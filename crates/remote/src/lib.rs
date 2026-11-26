@@ -931,8 +931,7 @@ mod tests {
         assert_eq!(c.0, tree(&[]));
     }
 
-    /// A list saved before servers had certificates, a connection limit or implicit FTPS
-    /// still loads, with the usual values.
+    /// Each brand is saved under its key, and one from a newer version reads as none.
     #[test]
     fn brands_are_written_and_read_by_their_key() {
         for b in Brand::ALL {
@@ -946,6 +945,8 @@ mod tests {
         assert_eq!(serde_json::from_str::<Server>(&text).unwrap().brand, None);
     }
 
+    /// A list saved before servers had certificates, a connection limit or implicit FTPS
+    /// still loads, with the usual values.
     #[test]
     fn an_older_server_list_still_loads() {
         let old = r#"[{"id":"s1","name":"NAS","protocol":"ftps","host":"nas","port":21,"user":"ana","root":"/"},{"id":"s2","name":"Futuro","protocol":"davs","brand":"synology","host":"nas","port":443,"user":"ana","root":"/"}]"#;

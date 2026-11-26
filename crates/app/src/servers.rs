@@ -1362,11 +1362,15 @@ impl Form {
         f.protocol = server.protocol;
         f.name = TextEdit::new(server.name.clone());
         f.host = TextEdit::new(server.host.clone());
-        f.host.focused = true;
+        // A service whose server isn't shown takes the focus on the user name instead.
+        let host_shown = !matches!(provider, Provider::Service(b)
+            if crate::services::of(b).is_some_and(|s| matches!(s.host, crate::services::Host::Fixed(_) | crate::services::Host::FromUser(_))));
+        f.host.focused = host_shown;
         if server.port != server.protocol.default_port() {
             f.port = TextEdit::new(server.port.to_string());
         }
         f.user = TextEdit::new(server.user.clone());
+        f.user.focused = !host_shown;
         f.folder = TextEdit::new(server.root.clone());
         f.key = TextEdit::new(server.key.clone().unwrap_or_default());
         if server.connections != remote::USUAL_CONNECTIONS {
@@ -1475,9 +1479,6 @@ impl Form {
             _ => None,
         };
         let mut user = self.user.text.trim().to_string();
-        if service.is_some_and(|s| s.lowercase_user) {
-            user = user.to_lowercase();
-        }
         let explicit_folder = !self.folder.text.trim().is_empty();
         let mut root = self.folder.text.trim().to_string();
         let mut pasted = None;
@@ -1499,8 +1500,23 @@ impl Form {
         } else {
             split_host_port(raw_host)?
         };
+        // After the address, whose user name fills an empty one.
+        if service.is_some_and(|s| s.lowercase_user) {
+            user = user.to_lowercase();
+        }
         if host.is_empty() {
-            return Err(t("Escreva o endereço do servidor.", "Type the server's address.").into());
+            use crate::services::Host;
+            // A service's server comes from the field it shows, under that field's name.
+            let field = match service.map(|s| (s, s.host)) {
+                Some((s, Host::FromUser(_))) => Some(s.user_label()),
+                Some((_, Host::Part { label, .. })) => Some(t(label.0, label.1)),
+                Some((_, Host::Pasted { .. })) => Some(t("Endereço WebDAV", "WebDAV address")),
+                Some((_, Host::Fixed(_))) | None => None,
+            };
+            return Err(match field {
+                Some(field) => tr!("Preencha \"{field}\".", "Fill in \"{field}\"."),
+                None => t("Escreva o endereço do servidor.", "Type the server's address.").into(),
+            });
         }
         if host.contains('/') || host.contains(' ') {
             return Err(t("O servidor é só o nome ou o IP, sem pastas: a pasta vai em Pasta inicial.", "The server is just the name or IP, without folders: the folder goes in Start folder.").into());
@@ -2363,6 +2379,16 @@ pub(crate) mod tests {
         stack.host = TextEdit::new("minhaconta");
         stack.user = TextEdit::new("Ana");
         assert_eq!(stack.server(&s).unwrap().0.user, "ana", "Stack takes user names in lower case");
+        stack.host = TextEdit::new("https://Ana@minhaconta.stack.storage/remote.php/webdav/");
+        stack.user = TextEdit::new("");
+        assert_eq!(stack.server(&s).unwrap().0.user, "ana", "a pasted address's user name too");
+        // Onlime shows no server field: an empty one is asked for by the field it comes from.
+        let mut onlime = Form::for_provider(Provider::Service(Brand::Onlime));
+        assert_eq!(onlime.server(&s).unwrap_err(), "Preencha \"Hospedagem (webNNN)\".");
+        onlime.user = TextEdit::new("web123");
+        let (sv, _) = onlime.server(&s).unwrap();
+        let again = Form::of(&sv);
+        assert!(again.user.focused && !again.host.focused, "editing it focuses a field that is shown");
 
         // InfiniCLOUD's address is copied whole, path included, and stays InfiniCLOUD.
         let mut infini = Form::for_provider(Provider::Service(Brand::InfiniCloud));
