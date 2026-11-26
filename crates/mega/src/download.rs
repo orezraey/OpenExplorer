@@ -37,7 +37,7 @@ impl Account {
         }
         let url = answer.get("g").and_then(Value::as_str).ok_or(t("O MEGA não deu o endereço do arquivo.", "MEGA didn't give the file's address."))?.to_string();
         let size = answer.get("s").and_then(Value::as_u64).unwrap_or(n.size);
-        let agent = crate::api::agent(Duration::from_secs(120));
+        let agent = crate::api::transfers();
         let mut check = Mac::new(&key, &nonce);
         let mut done = 0u64;
         let mut resumes = 0;
