@@ -126,6 +126,8 @@ enum Msg {
     DragEnded { from: usize, ids: Vec<String>, ended: dragout::Ended },
     /// Built-in updater check, download progress or completion.
     Update(updater::Answer),
+    /// Shared drive id -> name map learned when listing or searching a Drive account.
+    SharedDrives { email: String, names: HashMap<String, String> },
 }
 
 /// Which part of a listing a [`Msg::Listed`] is.
@@ -154,6 +156,8 @@ struct State {
     view_menu_open: bool,
     /// Which pane's view-mode dropdown menu is currently open, if any.
     view_mode_menu: Option<usize>,
+    /// Cached shared drive `id -> name` per connected Google Drive account.
+    shared_drive_names: HashMap<String, HashMap<String, String>>,
     /// Number of columns per pane in icon-grid view modes (updated from viewport width).
     grid_cols: [usize; MAX_PANES],
     /// Number of rows per column in multi-column List view mode (updated from viewport height).
@@ -372,6 +376,7 @@ impl State {
             main_tab: MainTab::Explore,
             view_menu_open: false,
             view_mode_menu: None,
+            shared_drive_names: HashMap::new(),
             grid_cols: [1; MAX_PANES],
             list_rows: [1; MAX_PANES],
             accounts_filter: None,
@@ -599,6 +604,7 @@ fn init() -> State {
         main_tab: MainTab::Explore,
         view_menu_open: false,
         view_mode_menu: None,
+        shared_drive_names: HashMap::new(),
         grid_cols: [1; MAX_PANES],
         list_rows: [1; MAX_PANES],
         accounts_filter: None,
@@ -1141,6 +1147,11 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             Msg::Link(answer) => sharing::link_answer(s, answer, tx),
             #[cfg(windows)]
             Msg::DragEnded { from, ids, ended } => drive_drag_ended(s, from, ids, ended),
+            Msg::SharedDrives { email, names } => {
+                if s.accounts.iter().any(|a| a.email == email) {
+                    s.shared_drive_names.insert(email, names);
+                }
+            }
             Msg::Found { pane, request, result, info } => {
                 if s.live[pane].load(Ordering::Relaxed) != request {
                     continue;
@@ -1333,7 +1344,32 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
 }
 
 fn entry_of(f: DriveFile) -> Entry {
-    Entry { id: f.id, name: f.name, is_dir: f.is_dir, size: f.size, modified: f.modified, target: f.target, mime: Some(f.mime), md5: f.md5, starred: f.starred }
+    Entry { id: f.id, name: f.name, is_dir: f.is_dir, size: f.size, modified: f.modified, target: f.target, mime: Some(f.mime), md5: f.md5, starred: f.starred, drive_origin: None }
+}
+
+/// Builds the column-4 origin metadata for a Google Drive search hit.
+pub(crate) fn make_drive_origin(email: &str, f: &DriveFile, sd_names: &HashMap<String, String>, include_account: bool) -> model::DriveOrigin {
+    let (shared_drive, place) = if let Some(sd_id) = &f.drive_id {
+        let raw_name = sd_names.get(sd_id).cloned().unwrap_or_else(|| t("Drive compartilhado", "Shared drive").into());
+        let shown_name = model::shown(&raw_name);
+        (Some((sd_id.clone(), raw_name)), shown_name)
+    } else if f.owned_by_me == Some(true) {
+        (None, t("Meu Drive", "My Drive").into())
+    } else {
+        (None, t("Compartilhados comigo", "Shared with me").into())
+    };
+    let label = if include_account { format!("{email} · {place}") } else { place };
+    model::DriveOrigin {
+        email: email.to_string(),
+        shared_drive,
+        owned_by_me: f.owned_by_me.unwrap_or(false),
+        label,
+    }
+}
+
+fn entry_of_search(email: &str, f: DriveFile, sd_names: &HashMap<String, String>, include_account: bool) -> Entry {
+    let origin = make_drive_origin(email, &f, sd_names, include_account);
+    Entry { drive_origin: Some(Box::new(origin)), ..entry_of(f) }
 }
 
 fn pane_key(p: usize) -> String {
@@ -1438,6 +1474,7 @@ fn disconnect(s: &mut State, email: &str) {
         return;
     }
     s.drives.remove(email);
+    s.shared_drive_names.remove(email);
     s.quotas.remove(email);
     s.cache.forget(email);
     s.tree.forget(email);
@@ -1669,6 +1706,7 @@ fn list(s: &mut State, p: usize, fresh: bool) {
         ask_quota(s, &email);
     }
     let account = AccountRef::of(s, &email);
+    let cached_sd = s.shared_drive_names.get(&email).cloned();
     let key = cache::key(&s.panes[p].loc);
     // A folder seen this session shows at once; the fresh listing then replaces it whole.
     let in_memory = key.as_ref().and_then(|k| s.cache.get(k)).cloned();
@@ -1747,13 +1785,35 @@ fn list(s: &mut State, p: usize, fresh: bool) {
             // A folder opened from Compartilhados comigo, Com estrela or Recentes lists as any
             // folder, in whichever drive it sits.
             (Space::SharedWithMe | Space::Starred | Space::Recent | Space::Search(_), Some(f)) => drive.list(f, None, &mut page),
-            (Space::Search(q), None) => drive.search(&q.text, &q.within, &mut page),
+            (Space::Search(q), None) => {
+                let sd_names = match cached_sd {
+                    Some(map) => map,
+                    None => match drive.shared_drives() {
+                        Ok(list) => {
+                            let map: HashMap<String, String> = list.into_iter().map(|d| (d.id, d.name)).collect();
+                            emit(Msg::SharedDrives { email: email.clone(), names: map.clone() });
+                            map
+                        }
+                        Err(_) => HashMap::new(),
+                    },
+                };
+                let mut first_search = true;
+                let mut search_page = |files: Vec<DriveFile>, more: bool| {
+                    let entries: Vec<Entry> = files.into_iter().map(|f| entry_of_search(&email, f, &sd_names, false)).collect();
+                    emit(Msg::Listed { pane: p, request, part: Part::Page { first: first_search, more }, result: Ok(entries), at: None });
+                    first_search = false;
+                    live.load(Ordering::Relaxed) == request
+                };
+                drive.search(&q.text, &q.within, &mut search_page)
+            }
             (Space::SharedWithMe | Space::Starred | Space::Recent | Space::Trash, None) => match space.view() {
                 Some(v) => drive.view(v, &mut page),
                 None => Ok(()),
             },
             // The shared drives show as folders.
             (Space::SharedDrives, _) => drive.shared_drives().map(|list| {
+                let map: HashMap<String, String> = list.iter().map(|d| (d.id.clone(), d.name.clone())).collect();
+                emit(Msg::SharedDrives { email: email.clone(), names: map });
                 list.into_iter()
                     .map(|d| Entry {
                         name: if d.hidden { tr!("{} (oculto)", "{} (hidden)", d.name) } else { d.name },
@@ -1765,6 +1825,7 @@ fn list(s: &mut State, p: usize, fresh: bool) {
                         mime: None,
                         md5: None,
                         starred: false,
+                        drive_origin: None,
                     })
                     .collect::<Vec<_>>()
             }).map(|entries| emit(listed(Part::WHOLE, Ok(entries)))),
@@ -2484,6 +2545,7 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
                     mime: None,
                     md5: None,
                     starred: false,
+                    drive_origin: None,
                 };
                 if s.mock.add(segs, entry) { done += 1 } else { skipped += 1 }
             }
@@ -2519,6 +2581,7 @@ fn clash_scene(s: &mut State, all: bool) {
         mime: Some(mime.into()),
         md5: None,
         starred: false,
+        drive_origin: None,
     };
     let existing = vec![e("a", "Relatório.pdf", "application/pdf"), e("b", "foto.jpg", "image/jpeg"), e("c", "Projetos", openexplorer_gdrive::api::FOLDER_MIME)];
     s.panes[1].set_entries(Ok(existing.clone()));
@@ -2576,6 +2639,7 @@ fn view_sample() -> Vec<Entry> {
         mime: mime.map(str::to_string),
         md5: None,
         starred: false,
+        drive_origin: None,
     };
     vec![
         e("f1", "Projetos antigos", true, None, 40, None),
@@ -2977,7 +3041,7 @@ fn main() {
             ("shared", |s| {
                 s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::SharedDrives));
-                let d = |id: &str, name: &str| Entry { id: id.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+                let d = |id: &str, name: &str| Entry { id: id.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
                 s.panes[1].set_entries(Ok(vec![d("0AAa", "Equipe de design"), d("0AAb", "Financeiro"), d("0AAc", "Projetos 2026")]));
             }),
             ("accounts-hub", accounts_hub_scene),
@@ -3610,7 +3674,7 @@ mod tests {
     }
 
     fn entries(from: usize, n: usize) -> Vec<Entry> {
-        (from..from + n).map(|i| Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false }).collect()
+        (from..from + n).map(|i| Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }).collect()
     }
 
     /// The median of 9 runs of `per_run` calls to `step`, in µs per call, and the best.

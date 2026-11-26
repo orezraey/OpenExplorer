@@ -294,7 +294,7 @@ mod tests {
     use super::*;
 
     fn entries(n: usize) -> Arc<Vec<Entry>> {
-        Arc::new((0..n).map(|i| Entry { id: format!("f{i}"), name: format!("f{i}.txt"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false }).collect())
+        Arc::new((0..n).map(|i| Entry { id: format!("f{i}"), name: format!("f{i}.txt"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }).collect())
     }
 
     #[test]
@@ -304,7 +304,7 @@ mod tests {
         let entries: Vec<Entry> = [Some(at(1_709_294_400_250)), Some(at(-86_400_000)), None]
             .into_iter()
             .enumerate()
-            .map(|(i, modified)| Entry { id: format!("{i}"), name: format!("f{i}"), is_dir: false, size: None, modified, target: None, mime: None, md5: None, starred: false })
+            .map(|(i, modified)| Entry { id: format!("{i}"), name: format!("f{i}"), is_dir: false, size: None, modified, target: None, mime: None, md5: None, starred: false, drive_origin: None })
             .collect();
         let text = serde_json::to_vec(&FileOut { format: FORMAT, entries: &entries }).unwrap();
         let back: FileIn = serde_json::from_slice(&text).unwrap();

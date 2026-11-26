@@ -1034,8 +1034,8 @@ pub fn drive_file(e: &Entry) -> DriveFile {
         target: e.target.clone(),
         md5: e.md5.clone(),
         starred: e.starred,
-        drive_id: None,
-        owned_by_me: None,
+        drive_id: e.drive_origin.as_deref().and_then(|o| o.shared_drive.as_ref().map(|(id, _)| id.clone())),
+        owned_by_me: e.drive_origin.as_deref().map(|o| o.owned_by_me),
     }
 }
 
@@ -1253,7 +1253,7 @@ pub fn parent_and_entry(loc: &Location) -> Option<(Location, Entry)> {
             let modified = std::fs::symlink_metadata(path).ok().and_then(|m| m.modified().ok());
             Some((
                 Location::Local(parent.to_path_buf()),
-                Entry { id: name.clone(), name, is_dir: true, size: None, modified, target: None, mime: None, md5: None, starred: false },
+                Entry { id: name.clone(), name, is_dir: true, size: None, modified, target: None, mime: None, md5: None, starred: false, drive_origin: None },
             ))
         }
         Location::Drive { email, space, path } if !path.is_empty() => {
@@ -1261,7 +1261,7 @@ pub fn parent_and_entry(loc: &Location) -> Option<(Location, Entry)> {
             let parent_path = path[..path.len() - 1].to_vec();
             Some((
                 Location::Drive { email: email.clone(), space: space.clone(), path: parent_path },
-                Entry { id, name, is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false },
+                Entry { id, name, is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None },
             ))
         }
         Location::Server { server, path, find: None } if !path.is_empty() => {
@@ -1269,7 +1269,7 @@ pub fn parent_and_entry(loc: &Location) -> Option<(Location, Entry)> {
             let parent_path = path[..path.len() - 1].to_vec();
             Some((
                 Location::Server { server: server.clone(), path: parent_path, find: None },
-                Entry { id: name.clone(), name, is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false },
+                Entry { id: name.clone(), name, is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None },
             ))
         }
         _ => None,
@@ -1921,7 +1921,7 @@ mod tests {
     /// what's typed goes back to `/` for Drive.
     #[test]
     fn a_slash_in_a_name_is_edited_as_shown() {
-        let e = Entry { id: "f1".into(), name: "a/b.txt".into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let e = Entry { id: "f1".into(), name: "a/b.txt".into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         let edit = name_field(&e);
         assert_eq!(edit.text, "a／b.txt");
         assert_eq!((edit.anchor.min(edit.focus), edit.anchor.max(edit.focus)), (0, "a／b".len()));
@@ -2087,7 +2087,7 @@ sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa 
         s.cache = crate::cache::Cache::memory_only();
         let sv = openexplorer_remote::Server::mega("ana@exemplo.com");
         let at = |path: &[&str]| crate::servers::folder(&sv, path.iter().map(|p| p.to_string()).collect());
-        let e = |id: &str| Entry { id: id.into(), name: id.into(), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false };
+        let e = |id: &str| Entry { id: id.into(), name: id.into(), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         for (path, purge) in [(&["Drive na nuvem"][..], false), (&["Drive na nuvem", "Fotos"], false), (&["Lixeira"], true), (&["Lixeira", "Velha"], true), (&["Compartilhados comigo", "Deles"], true)] {
             s.dialog = None;
             s.panes[1].go(at(path));
@@ -2122,7 +2122,7 @@ sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa 
         assert!(in_trash(&at(&["Lixeira"])) && !in_trash(&at(&["Lixeira", "Velha"])) && !in_trash(&at(&["Meus arquivos"])));
         assert!(!editable(&at(&["Lixeira"])) && editable(&at(&["Meus arquivos"])));
         s.panes[1].go(at(&["Lixeira"]));
-        let e = Entry { id: "a.txt".into(), name: "a.txt".into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let e = Entry { id: "a.txt".into(), name: "a.txt".into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         s.panes[1].set_entries(Ok(vec![e]));
         s.panes[1].selected = ["a.txt".to_string()].into();
         ask_delete(&mut s, 1);
@@ -2137,7 +2137,7 @@ sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa 
         let mut s = crate::init();
         s.cache = crate::cache::Cache::memory_only();
         s.panes[1].go(drive(Space::Trash, &[]));
-        let e = |id: &str| Entry { id: id.into(), name: id.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let e = |id: &str| Entry { id: id.into(), name: id.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         s.panes[1].set_entries(Ok(vec![e("a"), e("b")]));
         s.panes[1].selected = ["a".to_string()].into();
         // Del in Lixeira opens Excluir permanentemente, not the move to the trash.
@@ -2224,7 +2224,7 @@ sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa 
     fn the_star_item_adds_unless_all_have_one() {
         let mut s = crate::init();
         s.panes[1].go(drive(Space::MyDrive, &[]));
-        let e = |id: &str, starred| Entry { id: id.into(), name: id.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred };
+        let e = |id: &str, starred| Entry { id: id.into(), name: id.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred, drive_origin: None };
         s.panes[1].set_entries(Ok(vec![e("a", true), e("b", false)]));
         s.panes[1].selected = ["a".to_string()].into();
         assert!(!stars_to_add(&s, 1));

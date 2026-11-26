@@ -436,7 +436,7 @@ mod tests {
     }
 
     fn item() -> Entry {
-        Entry { id: "f1".into(), name: "nota.txt".into(), is_dir: false, size: Some(2), modified: None, target: None, mime: None, md5: None, starred: false }
+        Entry { id: "f1".into(), name: "nota.txt".into(), is_dir: false, size: Some(2), modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }
     }
 
     #[test]

@@ -6484,6 +6484,8 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                         2 => cell(2).child(muted(e.modified.map(format_time).unwrap_or_default())),
                         _ => cell(3).child(muted(if found {
                             crate::finder::folder_of(e)
+                        } else if let Some(origin) = &e.drive_origin {
+                            origin.label.clone()
                         } else {
                             crate::onedrive::origin_of(&pane.loc, e).unwrap_or_else(|| e.kind_label())
                         })),
@@ -6734,6 +6736,8 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                     c.1
                 } else if pane.loc.finds() {
                     t("Pasta", "Folder")
+                } else if pane.loc.is_drive_search() {
+                    t("Local", "Location")
                 } else {
                     t("Tipo", "Type")
                 },

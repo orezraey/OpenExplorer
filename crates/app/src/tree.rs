@@ -1171,7 +1171,7 @@ mod tests {
 
         // A listing of `\\nas` gives `\\NAS` its folders under Rede's spelling, so they match
         // the way down to them.
-        let dir = |name: &str| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let dir = |name: &str| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         s.tree.kids.insert(local(r"\\NAS"), Kids::Ready(Vec::new()));
         s.panes[0].go(Location::Local(PathBuf::from(r"\\nas")));
         s.panes[0].set_entries(Ok(vec![dir("Fotos")]));

@@ -495,6 +495,7 @@ mod tests {
             mime: Some(mime.into()),
             md5: None,
             starred: false,
+            drive_origin: None,
         };
         assert_eq!(Existing::of_entry(&e(FOLDER_MIME, false)).kind, Kind::Folder);
         assert_eq!(Existing::of_entry(&e("image/jpeg", false)).kind, Kind::File);
