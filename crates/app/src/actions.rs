@@ -107,7 +107,7 @@ pub fn quit_question_done(s: &mut State) -> bool {
     // A Reiniciar put off by the transfers goes with the question: else a later plain close
     // would open the app again.
     crate::RESTART.store(false, Ordering::Relaxed);
-    crate::updater::cancel_handoff();
+    update_stays(s);
     true
 }
 
@@ -115,7 +115,15 @@ pub fn quit_question_done(s: &mut State) -> bool {
 pub fn keep_running(s: &mut State) {
     s.quit_asked = false;
     crate::RESTART.store(false, Ordering::Relaxed);
-    crate::updater::cancel_handoff();
+    update_stays(s);
+}
+
+/// The app stays open after Reiniciar para atualizar asked to close: the update isn't handed
+/// off, and is ready to install again.
+fn update_stays(s: &mut State) {
+    if let Some(staged) = crate::updater::cancel_handoff() {
+        s.updater.download = crate::updater::DownloadState::Ready(staged);
+    }
 }
 
 /// Opens the built-in update modal.

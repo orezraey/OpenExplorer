@@ -438,7 +438,7 @@ impl State {
             account_synced_font: None,
             account_synced_render: None,
             is_placeholder: true,
-            updater: updater::UpdateState::new(),
+            updater: updater::UpdateState::idle(),
         }
     }
 
@@ -631,9 +631,9 @@ fn init() -> State {
                 openexplorer_gdrive::log(&format!("atualização concluída: v{ver}"));
                 state.status = tr!("Open Explorer atualizado para a versão {ver}.", "Open Explorer updated to version {ver}.");
             }
-            Err(err) => {
-                openexplorer_gdrive::log(&format!("erro atualização: {err}"));
-                fail(&mut state, err);
+            Err(code) => {
+                openexplorer_gdrive::log(&format!("erro atualização: {code}"));
+                fail(&mut state, updater::error_text(&code));
             }
         }
     }
@@ -1105,8 +1105,11 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                                 &s.updater.download,
                                 updater::DownloadState::Ready(st) if st.version == rel.version
                             );
+                            // A download or install under way stays: a second one would write
+                            // the same file.
+                            let busy = matches!(s.updater.download, updater::DownloadState::Downloading { .. } | updater::DownloadState::Installing);
                             s.updater.release = Some(rel);
-                            if !already_staged_same {
+                            if !already_staged_same && !busy {
                                 s.updater.download = updater::DownloadState::Idle;
                                 if s.updater.support.is_ok()
                                     && s.updater.offer(s.settings.auto_update) == Some(updater::Offer::Automatic)
@@ -2347,8 +2350,14 @@ fn main() {
         *STARTUP_UPDATE_NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(notice);
     }
     let initial = settings::Settings::load();
-    // Apply an update downloaded in an earlier run before opening the window.
-    if !rune::is_headless() && updater::install_kept(initial.auto_update) {
+    // Apply an update downloaded in an earlier run before opening the window. Not when this start
+    // is the helper reporting that installing it failed: trying again at once would bring the
+    // same refusal (a declined UAC prompt, a locked file) back at every start, the window never
+    // opening. That update goes; the dialog can fetch and install it again.
+    let install_failed = matches!(STARTUP_UPDATE_NOTICE.lock().unwrap_or_else(|e| e.into_inner()).as_ref(), Some(Err(_)));
+    if install_failed {
+        updater::clear_staged();
+    } else if !rune::is_headless() && updater::install_kept(initial.auto_update) {
         std::process::exit(0);
     }
     accounts::start();
@@ -2676,6 +2685,7 @@ fn main() {
                     download_url: "https://example.invalid/setup.exe".into(),
                     size: 18_400_000,
                     sha256: None,
+                    signed: None,
                 });
                 s.updater.download = updater::DownloadState::Idle;
                 s.dialog = Some(actions::Dialog::Update);
@@ -2690,6 +2700,7 @@ fn main() {
                     download_url: "https://example.invalid/setup.exe".into(),
                     size: 18_400_000,
                     sha256: None,
+                    signed: None,
                 });
                 s.updater.download = updater::DownloadState::Downloading { received: 11_200_000, total: 18_400_000 };
                 s.dialog = Some(actions::Dialog::Update);
@@ -2704,6 +2715,7 @@ fn main() {
                     download_url: "https://example.invalid/setup.exe".into(),
                     size: 18_400_000,
                     sha256: None,
+                    signed: None,
                 });
                 s.updater.download = updater::DownloadState::Ready(updater::Staged {
                     version: "0.5.0".into(),
@@ -2711,6 +2723,7 @@ fn main() {
                     sha256: "0".repeat(64),
                     install_kind: updater::InstallKind::WindowsInstalled { install_dir: PathBuf::from(r"C:\Program Files\OpenExplorer") },
                     release_url: "https://github.com/orezraey/OpenExplorer/releases/tag/v0.5.0".into(),
+                    signed: Default::default(),
                 });
                 s.dialog = Some(actions::Dialog::Update);
             }),

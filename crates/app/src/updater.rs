@@ -39,6 +39,10 @@ pub const PUBLISHER_KEY: Option<&str> = Some("ce55eeb92f07d3fe024e27f7a2b59a1de0
 /// Pending update to hand off right after `on_quit` saves caches.
 static PENDING_HANDOFF: Mutex<Option<Staged>> = Mutex::new(None);
 
+/// What [`install_kept`] found kept from an earlier run (`Some(None)`: nothing valid), for
+/// [`UpdateState::new`] to take instead of hashing the file again.
+static KEPT: Mutex<Option<Option<Staged>>> = Mutex::new(None);
+
 /// How a release should be offered to an install that can update itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Offer {
@@ -72,6 +76,16 @@ pub struct Release {
     pub download_url: String,
     pub size: u64,
     pub sha256: Option<String>,
+    /// The release's `checksums.txt` and its Ed25519 signature (hex), kept with the download so
+    /// the staged file is checked against them again before it runs.
+    pub signed: Option<Signed>,
+}
+
+/// A release's `checksums.txt` and the hex of its Ed25519 signature.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Signed {
+    pub checksums: String,
+    pub signature: String,
 }
 
 /// A downloaded and SHA-256-verified update staged on disk, ready to install.
@@ -82,6 +96,11 @@ pub struct Staged {
     pub sha256: String,
     pub install_kind: InstallKind,
     pub release_url: String,
+    /// The signed checksums it was downloaded against. `staged.json` sits in the user's own
+    /// folder, so what it names is only run once this signature and the file's line in it check
+    /// out again (see [`verify_staged`]).
+    #[serde(default)]
+    pub signed: Signed,
 }
 
 /// Download/install progress shown in the update modal and Options.
@@ -123,12 +142,32 @@ pub struct UpdateState {
 }
 
 impl UpdateState {
+    /// Nothing known and nothing read: a placeholder state's, and the tests'.
+    pub fn idle() -> Self {
+        Self {
+            checking: false,
+            checked_once: false,
+            check_error: None,
+            release: None,
+            support: Err(String::new()),
+            download: DownloadState::Idle,
+            newest_run: None,
+            last_checked: None,
+        }
+    }
+
+    /// The main window's: how this copy was installed, and the update kept from an earlier run,
+    /// as [`install_kept`] already checked it (its file is not hashed twice).
     pub fn new() -> Self {
+        if cfg!(test) {
+            return Self::idle();
+        }
         let stored = load_stored_state();
         let support = detect_install();
         let mut download = DownloadState::Idle;
         let mut release = None;
-        if let Ok(Some(staged)) = load_valid_staged()
+        let kept = KEPT.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_else(|| load_valid_staged().ok().flatten());
+        if let Some(staged) = kept
             && is_newer(VERSION, &staged.version)
         {
             release = Some(Release {
@@ -139,6 +178,7 @@ impl UpdateState {
                 download_url: String::new(),
                 size: fs::metadata(&staged.file_path).map(|m| m.len()).unwrap_or(0),
                 sha256: Some(staged.sha256.clone()),
+                signed: Some(staged.signed.clone()),
             });
             download = DownloadState::Ready(staged);
         }
@@ -232,18 +272,24 @@ pub fn install_kept(automatic: bool) -> bool {
 
     let staged = match load_valid_staged() {
         Ok(Some(s)) => s,
-        Ok(None) => return false,
+        Ok(None) => {
+            *KEPT.lock().unwrap_or_else(|e| e.into_inner()) = Some(None);
+            return false;
+        }
         Err(e) => {
             openexplorer_gdrive::log(&format!("atualização: pacote salvo inválido: {e}"));
             clear_staged();
+            *KEPT.lock().unwrap_or_else(|e| e.into_inner()) = Some(None);
             return false;
         }
     };
 
     if !is_newer(VERSION, &staged.version) {
         clear_staged();
+        *KEPT.lock().unwrap_or_else(|e| e.into_inner()) = Some(None);
         return false;
     }
+    *KEPT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Some(staged.clone()));
 
     if !installs_at_start(VERSION, &staged.version, automatic, stored.newest_run.as_deref()) {
         return false;
@@ -264,9 +310,10 @@ pub fn schedule_handoff(staged: Staged) {
     *PENDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = Some(staged);
 }
 
-/// Clears any scheduled handoff (e.g. if the user cancels closing while transfers run).
-pub fn cancel_handoff() {
-    *PENDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+/// Clears any scheduled handoff (e.g. if the user cancels closing while transfers run), and gives
+/// back the update it held, ready again.
+pub fn cancel_handoff() -> Option<Staged> {
+    PENDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 /// Runs any scheduled handoff during `on_quit`. Returns `true` if a handoff was launched
@@ -335,6 +382,8 @@ pub fn asset_name_for(version: &str, kind: &InstallKind) -> String {
 }
 
 /// Detects how the currently running executable was installed.
+// Each system's block ends the function where it is the only one compiled.
+#[allow(clippy::needless_return)]
 pub fn detect_install() -> Result<InstallKind, String> {
     let exe = std::env::current_exe().map_err(|e| tr!("Não foi possível localizar o executável: {}", "Could not locate executable: {}", e))?;
     let exe = exe.canonicalize().unwrap_or(exe);
@@ -497,14 +546,14 @@ pub fn check_latest(kind: Option<&InstallKind>) -> Result<Option<Release>, Strin
     }
 
     // Fetch and optionally verify checksums.txt.
-    let checksums = fetch_verified_checksums(&agent, &gh.assets)?;
+    let (checksums, signed) = fetch_verified_checksums(&agent, &gh.assets)?;
 
     let preferred_name = kind.map(|k| asset_name_for(&version, k)).unwrap_or_else(|| default_platform_asset(&version));
     let asset = gh
         .assets
         .iter()
         .find(|a| a.name == preferred_name)
-        .or_else(|| fallback_platform_asset(&gh.assets, &version));
+        .or_else(|| fallback_platform_asset(&gh.assets, &version, &preferred_name));
 
     let (asset_name, download_url, size) = match asset {
         Some(a) => (a.name.clone(), a.browser_download_url.clone(), a.size),
@@ -530,6 +579,7 @@ pub fn check_latest(kind: Option<&InstallKind>) -> Result<Option<Release>, Strin
         download_url,
         size,
         sha256,
+        signed,
     }))
 }
 
@@ -543,18 +593,15 @@ fn default_platform_asset(version: &str) -> String {
     }
 }
 
-fn fallback_platform_asset<'a>(assets: &'a [GhAsset], version: &str) -> Option<&'a GhAsset> {
-    let suffix = if cfg!(windows) {
-        "-windows-x64-setup.exe"
-    } else if cfg!(target_os = "macos") {
-        "-macos-universal.zip"
-    } else {
-        "-linux-x64.tar.gz"
-    };
+/// An asset of the same kind as `preferred` (its part after the version: `-windows-x64-portable.exe`,
+/// `-windows-x64-setup.exe`…) whose name carries `version` another way. Never one of another
+/// kind: a portable copy replaced by the installer would run the installer at every start.
+fn fallback_platform_asset<'a>(assets: &'a [GhAsset], version: &str, preferred: &str) -> Option<&'a GhAsset> {
+    let suffix = preferred.split_once(version).map(|(_, rest)| rest)?;
     assets.iter().find(|a| a.name.contains(version) && a.name.ends_with(suffix))
 }
 
-fn fetch_verified_checksums(agent: &ureq::Agent, assets: &[GhAsset]) -> Result<HashMap<String, String>, String> {
+fn fetch_verified_checksums(agent: &ureq::Agent, assets: &[GhAsset]) -> Result<(HashMap<String, String>, Option<Signed>), String> {
     let Some(sums_asset) = assets.iter().find(|a| a.name == "checksums.txt") else {
         if PUBLISHER_KEY.is_some() {
             return Err(t(
@@ -563,7 +610,7 @@ fn fetch_verified_checksums(agent: &ureq::Agent, assets: &[GhAsset]) -> Result<H
             )
             .into());
         }
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), None));
     };
 
     let body = agent
@@ -589,10 +636,30 @@ fn fetch_verified_checksums(agent: &ureq::Agent, assets: &[GhAsset]) -> Result<H
             .read_to_vec()
             .map_err(|e| tr!("Falha ao ler assinatura: {}", "Failed to read signature: {}", e))?;
         verify_signature(pubkey_hex, &body, &sig)?;
+        let text = String::from_utf8(body).map_err(|_| t("checksums.txt inválido.", "Invalid checksums.txt.").to_string())?;
+        let signature = if sig.len() == 64 { hex::encode(&sig) } else { String::from_utf8_lossy(&sig).trim().to_string() };
+        return Ok((parse_checksums(&text), Some(Signed { checksums: text, signature })));
     }
 
     let text = String::from_utf8_lossy(&body);
-    Ok(parse_checksums(&text))
+    Ok((parse_checksums(&text), None))
+}
+
+/// Whether `staged` may run: with a publisher key, its signed `checksums.txt` must still verify,
+/// name the file it points at as this release's asset for its install kind, and give that file's
+/// SHA-256. `staged.json` is in the user's folder, so this, not the file, is what trusts it.
+pub fn verify_staged(staged: &Staged) -> Result<(), String> {
+    let Some(key) = PUBLISHER_KEY else { return Ok(()) };
+    let refused = || t("A atualização salva não confere com a assinatura da release.", "The saved update doesn't match the release's signature.").to_string();
+    verify_signature(key, staged.signed.checksums.as_bytes(), staged.signed.signature.as_bytes()).map_err(|_| refused())?;
+    let name = staged.file_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if name != asset_name_for(&staged.version, &staged.install_kind) {
+        return Err(refused());
+    }
+    match parse_checksums(&staged.signed.checksums).get(&name) {
+        Some(sum) if sum.eq_ignore_ascii_case(&staged.sha256) => Ok(()),
+        _ => Err(refused()),
+    }
 }
 
 /// Parses standard `sha256sum` output (`<64-hex>  <filename>` or `<64-hex> *<filename>`).
@@ -726,6 +793,7 @@ pub fn download_release(release: &Release, kind: &InstallKind, mut on_progress: 
         sha256: actual_sha,
         install_kind: kind.clone(),
         release_url: release.url.clone(),
+        signed: release.signed.clone().unwrap_or_default(),
     };
     save_staged(&staged)?;
     Ok(staged)
@@ -759,6 +827,10 @@ pub fn handoff(staged: &Staged) -> Result<(), String> {
     if !actual.eq_ignore_ascii_case(&staged.sha256) {
         clear_staged();
         return Err(t("O arquivo salvo da atualização está corrompido.", "The saved update file is corrupted.").into());
+    }
+    if let Err(e) = verify_staged(staged) {
+        clear_staged();
+        return Err(e);
     }
 
     match &staged.install_kind {
@@ -795,7 +867,7 @@ fn handoff_windows_installed(staged: &Staged, install_dir: &Path) -> Result<(), 
          )\r\n\
          \"{setup}\" /SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS\r\n\
          if errorlevel 1 (\r\n\
-           start \"\" \"{exe_str}\" --update-error \"A instalação foi cancelada ou falhou.\"\r\n\
+           start \"\" \"{exe_str}\" --update-error install-failed\r\n\
          ) else (\r\n\
            start \"\" \"{exe_str}\" --update-receipt \"{ver}\"\r\n\
          )\r\n\
@@ -839,14 +911,14 @@ fn handoff_windows_portable(staged: &Staged, exe_path: &Path) -> Result<(), Stri
          del /F /Q \"{old}\" >NUL 2>&1\r\n\
          move /Y \"{dst}\" \"{old}\" >NUL\r\n\
          if errorlevel 1 (\r\n\
-           start \"\" \"{dst}\" --update-error \"Não foi possível substituir o executável.\"\r\n\
+           start \"\" \"{dst}\" --update-error replace-failed\r\n\
            del \"%~f0\" >NUL 2>&1\r\n\
            exit /b 1\r\n\
          )\r\n\
          copy /Y \"{src}\" \"{dst}\" >NUL\r\n\
          if errorlevel 1 (\r\n\
            move /Y \"{old}\" \"{dst}\" >NUL\r\n\
-           start \"\" \"{dst}\" --update-error \"Não foi possível copiar a nova versão.\"\r\n\
+           start \"\" \"{dst}\" --update-error copy-failed\r\n\
            del \"%~f0\" >NUL 2>&1\r\n\
            exit /b 1\r\n\
          )\r\n\
@@ -960,7 +1032,7 @@ if mv "$target_app" "$backup"; then
   fi
 fi
 rm -rf "$tmp_dir"
-open -a "$target_app" --args --update-error "Could not replace Open Explorer.app"
+open -a "$target_app" --args --update-error replace-failed
 "#;
     std::process::Command::new("sh")
         .arg("-c")
@@ -979,6 +1051,17 @@ open -a "$target_app" --args --update-error "Could not replace Open Explorer.app
 #[cfg(not(target_os = "macos"))]
 fn handoff_macos(_staged: &Staged, _app_dir: &Path) -> Result<(), String> {
     Err("macOS handoff is only supported on macOS.".into())
+}
+
+/// The message for an error code the update helpers pass back with `--update-error` (ASCII, as
+/// the Windows script runs in the console's code page), in the app's language.
+pub fn error_text(code: &str) -> String {
+    match code {
+        "install-failed" => t("A instalação da atualização foi cancelada ou falhou.", "The update's installation was canceled or failed.").into(),
+        "replace-failed" => t("Não foi possível substituir o Open Explorer pela nova versão.", "Open Explorer couldn't be replaced with the new version.").into(),
+        "copy-failed" => t("Não foi possível copiar a nova versão do Open Explorer.", "The new version of Open Explorer couldn't be copied.").into(),
+        other => tr!("A atualização falhou: {other}", "The update failed: {other}"),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1032,6 +1115,7 @@ fn load_valid_staged() -> Result<Option<Staged>, String> {
     if !actual.eq_ignore_ascii_case(&staged.sha256) {
         return Err("SHA-256 mismatch on staged update".into());
     }
+    verify_staged(&staged)?;
     Ok(Some(staged))
 }
 
@@ -1140,6 +1224,40 @@ mod tests {
         let err = intercept_cli(vec!["--update-error".into(), "falhou".into()]);
         assert_eq!(err.notice, Some(Err("falhou".into())));
         assert!(err.args.is_empty());
+    }
+
+    /// A staged update whose signed checksums don't verify, or name another file or kind, is
+    /// refused: `staged.json` alone can't choose what runs.
+    #[test]
+    fn a_staged_update_needs_the_release_signature() {
+        let sum = "a".repeat(64);
+        let staged = Staged {
+            version: "9.0.0".into(),
+            file_path: PathBuf::from("OpenExplorer-9.0.0-windows-x64-setup.exe"),
+            sha256: sum.clone(),
+            install_kind: InstallKind::WindowsInstalled { install_dir: PathBuf::new() },
+            release_url: String::new(),
+            signed: Signed { checksums: format!("{sum}  OpenExplorer-9.0.0-windows-x64-setup.exe
+"), signature: "00".repeat(64) },
+        };
+        assert!(verify_staged(&staged).is_err());
+        assert!(verify_staged(&Staged { signed: Signed::default(), ..staged }).is_err());
+    }
+
+    /// The fallback asset is of the same kind: never the installer for a portable copy.
+    #[test]
+    fn the_fallback_asset_keeps_the_install_kind() {
+        let asset = |name: &str| GhAsset { name: name.into(), browser_download_url: String::new(), size: 0 };
+        let assets = [asset("OpenExplorer-0.5.0-windows-x64-setup.exe"), asset("OpenExplorer-0.5.0-build1-windows-x64-portable.exe")];
+        let portable = asset_name_for("0.5.0", &InstallKind::WindowsPortable { exe_path: PathBuf::new() });
+        assert_eq!(fallback_platform_asset(&assets, "0.5.0", &portable).map(|a| a.name.as_str()), Some("OpenExplorer-0.5.0-build1-windows-x64-portable.exe"));
+        assert!(fallback_platform_asset(&assets[..1], "0.5.0", &portable).is_none());
+    }
+
+    #[test]
+    fn helper_error_codes_read_in_the_apps_language() {
+        assert_eq!(error_text("install-failed"), "A instalação da atualização foi cancelada ou falhou.");
+        assert_eq!(error_text("xyz"), "A atualização falhou: xyz");
     }
 
     #[test]
