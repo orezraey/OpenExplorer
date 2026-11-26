@@ -94,9 +94,11 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         // The mouse's side buttons anywhere else in Explorar: Voltar and Avançar in the active
         // pane (over a pane, its own handler took them first).
         .on_button(|s: &mut State, button, _: &mut Tx| crate::side_button_in_window(s, button))
-        // Hover lands and leaves with the pointer, as in the system's file lists: the default
-        // 100 ms fade on leaving left a trail of lit rows behind a fast pointer.
-        .hover_motion_within(Anim::INSTANT, Anim::INSTANT)
+        // Fluid 80 ms hover transition when hover animations are on; instant otherwise.
+        .hover_motion_within(
+            if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT },
+            if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT },
+        )
         .on_key(|s: &mut State, ev: &KeyEvent, _: &mut Tx| {
             if ev.key == rune::Key::Escape && (s.view_menu_open || s.view_mode_menu.is_some()) {
                 s.view_menu_open = false;
@@ -553,6 +555,101 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                 .child(section_head(t("Geral", "General"), t("Aparência, fonte da interface e comportamento de arquivos e transferências.", "Appearance, interface font, and how files and transfers behave.")))
                 .child(appearance)
                 .child(files_card)
+        }
+        OptionsTab::Animations => {
+            let master_badge = Some(if st.animations {
+                (t("Ativado", "On"), rune_kit::BadgeVariant::Accent)
+            } else {
+                (t("Desativado", "Off"), rune_kit::BadgeVariant::Neutral)
+            });
+            let master_card = card_box("card-anim-master").child(switch_row(
+                "opt-animations",
+                t("Ativar animações", "Enable animations"),
+                t(
+                    "Ativa ou desativa todas as animações fluidas da interface de uma só vez.",
+                    "Turns all fluid interface animations on or off at once.",
+                ),
+                master_badge,
+                st.animations,
+                |s| change_settings(s, |c| c.animations = !c.animations),
+            ));
+
+            let effects_card = card_box("card-anim-effects")
+                .opacity(if st.animations { 1.0 } else { 0.55 })
+                .child(switch_row(
+                    "opt-anim-hover",
+                    t("Realce fluido ao passar o mouse", "Fluid hover highlight"),
+                    t(
+                        "Desliza suavemente o destaque entre pastas, arquivos e controles conforme o ponteiro se move.",
+                        "Smoothly glides the highlight across folders, files, and controls as the pointer moves.",
+                    ),
+                    None,
+                    st.animate_hover,
+                    |s| change_settings(s, |c| c.animate_hover = !c.animate_hover),
+                ))
+                .child(divider())
+                .child(switch_row(
+                    "opt-anim-clipboard",
+                    t("Animação ao copiar e recortar (Ctrl+C / Ctrl+X)", "Copy & cut icon animation (Ctrl+C / Ctrl+X)"),
+                    t(
+                        "Anima os ícones das pastas e arquivos copiados ou recortados até você colar ou pressionar Esc.",
+                        "Gently wiggles icons of copied or cut folders and files until you paste or press Esc.",
+                    ),
+                    None,
+                    st.animate_clipboard,
+                    |s| change_settings(s, |c| c.animate_clipboard = !c.animate_clipboard),
+                ))
+                .child(divider())
+                .child(switch_row(
+                    "opt-anim-zoom",
+                    t("Zoom suave na lista (Ctrl + Scroll)", "Smooth list zoom (Ctrl + Scroll)"),
+                    t(
+                        "Redimensiona ícones, linhas e texto suavemente ao usar Ctrl + roda do mouse, pinça ou Ctrl + / − / 0.",
+                        "Fluidly resizes icons, rows, and text when using Ctrl + mouse wheel, pinch, or Ctrl + / − / 0.",
+                    ),
+                    None,
+                    st.animate_zoom,
+                    |s| change_settings(s, |c| c.animate_zoom = !c.animate_zoom),
+                ))
+                .child(divider())
+                .child(switch_row(
+                    "opt-anim-selection",
+                    t("Transições suaves de seleção, ordenação e árvore", "Smooth selection, sort & tree transitions"),
+                    t(
+                        "Suaviza o destaque de seleção (incluindo setas do teclado e retângulo de seleção), a reordenação ao ordenar colunas e a rotação das setas.",
+                        "Smooths selection highlights (including keyboard arrows and marquee fade), row reordering on sort, and chevron rotation.",
+                    ),
+                    None,
+                    st.animate_selection,
+                    |s| change_settings(s, |c| c.animate_selection = !c.animate_selection),
+                ));
+
+            let visual_card = card_box("card-anim-visual").child(switch_row(
+                "opt-zebra-stripes",
+                t("Listras alternadas nas linhas (zebra)", "Alternating row stripes (zebra)"),
+                t(
+                    "Aplica um fundo sutil em linhas alternadas da lista de arquivos para facilitar a leitura entre colunas.",
+                    "Applies a subtle alternating background tint across file list rows to make scanning columns easier.",
+                ),
+                None,
+                st.zebra_stripes,
+                |s| change_settings(s, |c| c.zebra_stripes = !c.zebra_stripes),
+            ));
+
+            col()
+                .key("page-animations")
+                .w_full()
+                .gap(12.0)
+                .child(section_head(
+                    t("Animações", "Animations"),
+                    t(
+                        "Efeitos visuais fluidos para navegação, cópia de arquivos, ordenação e zoom. Todos vêm ativados por padrão.",
+                        "Fluid visual effects for browsing, copying files, sorting, and zooming. All are enabled by default.",
+                    ),
+                ))
+                .child(master_card)
+                .child(effects_card)
+                .child(visual_card)
         }
         OptionsTab::Experimental => {
             let banner = row()
@@ -1857,7 +1954,10 @@ pub fn account_window_view(s: &State, cx: &mut Cx<State>) -> El {
         .fill(window_bg)
         .child(titlebar)
         .child(content)
-        .hover_motion_within(Anim::INSTANT, Anim::INSTANT);
+        .hover_motion_within(
+            if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT },
+            if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT },
+        );
 
     rune_kit::root(root, layer)
 }
@@ -5506,6 +5606,15 @@ fn tree_line(s: &State, k: &Kit, p: usize, line: &crate::tree::Line) -> El {
     };
     let arrow = if node.opens && !empty {
         let n = node.clone();
+        let chevron = if s.settings.selection_animated() {
+            icon(&icons::CHEVRON, 12.0)
+                .color(k.c.icon_faint)
+                .origin(0.5, 0.5)
+                .rotate(if open { std::f32::consts::FRAC_PI_2 } else { 0.0 })
+                .rotate_motion(crate::anim::ui_spring())
+        } else {
+            icon(if open { &icons::CHEVRON_DOWN } else { &icons::CHEVRON }, 12.0).color(k.c.icon_faint)
+        };
         row()
             .key("arrow")
             .size(16.0, 16.0)
@@ -5514,7 +5623,7 @@ fn tree_line(s: &State, k: &Kit, p: usize, line: &crate::tree::Line) -> El {
             .hover(k.alpha(k.c.text_base, 0.08))
             .cursor(Cursor::Pointer)
             .on_press(move |s: &mut State| crate::tree::toggle(s, p, &n))
-            .child(icon(if open { &icons::CHEVRON_DOWN } else { &icons::CHEVRON }, 12.0).color(k.c.icon_faint))
+            .child(chevron)
     } else {
         el().size(16.0, 16.0)
     };
@@ -5872,19 +5981,35 @@ fn searched_words(loc: &Location) -> Vec<Vec<u8>> {
 }
 
 /// The rectangle a lasso in pane `p` draws, in the list's content (so it scrolls with the
-/// rows), cut to what the viewport shows.
+/// rows), cut to what the viewport shows. Also draws the smooth fade-out on release.
 fn lasso_rect(s: &State, k: &Kit, p: usize) -> Option<El> {
-    let l = s.lasso.as_ref().filter(|l| l.pane == p && l.moved)?;
     let view = &s.views[p];
     let scroll = view.scroll.get();
-    let [x0, y0, x1, y1] = l.rect(scroll);
+    let (rect, alpha) = if let Some(l) = s.lasso.as_ref().filter(|l| l.pane == p && l.moved) {
+        (l.rect(scroll), 1.0)
+    } else {
+        let fade = s.lasso_fade.filter(|f| f.pane == p)?;
+        let a = fade.opacity(s.now);
+        if a <= 0.01 {
+            return None;
+        }
+        (fade.rect, a)
+    };
+    let [x0, y0, x1, y1] = rect;
     // Before the first layout says how big the viewport is, nothing is cut.
     let known = |size: f32, minus: f32| if size > 0.0 { (size - minus).max(0.0) } else { f32::MAX / 4.0 };
     let (left, right) = (scroll.x, scroll.x + known(view.rect[2], 0.0));
     let (top, bottom) = (scroll.y, scroll.y + known(scroll.h, HEADER_H));
     let (x0, x1) = (x0.clamp(left, right), x1.clamp(left, right));
     let (y0, y1) = (y0.clamp(top, bottom), y1.clamp(top, bottom));
-    Some(el().key("lasso").absolute(x0, HEADER_H + y0).size(x1 - x0, y1 - y0).fill(k.alpha(k.c.text_accent, 0.14)).border(1.0, k.alpha(k.c.text_accent, 0.7)))
+    Some(
+        el().key("lasso")
+            .absolute(x0, HEADER_H + y0)
+            .size(x1 - x0, y1 - y0)
+            .radius(2.0)
+            .fill(k.alpha(k.c.text_accent, 0.14 * alpha))
+            .border(1.0, k.alpha(k.c.text_accent, 0.7 * alpha)),
+    )
 }
 
 const GRID_GAP: f32 = 8.0;
@@ -5945,12 +6070,30 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let mode = pane.view_mode;
     let w = s.layout.columns[p];
     let total: f32 = w.iter().sum();
+    let order = s.layout.col_order[p];
+
+    // Details only: the list zoom (Ctrl+wheel, pinch) and the animations of Opções > Animações.
+    let row_h = s.zoom[p].row_height();
+    let icon_sz = s.zoom[p].icon_size();
+    let hover_glides = s.settings.hover_animated();
+    let sel_anim = s.settings.selection_animated();
+    let clip_anim = s.settings.clipboard_animated();
+    let zebra = s.settings.zebra_stripes;
 
     let selected = k.alpha(k.c.text_accent, if k.dark { 0.26 } else { 0.18 });
-    let hover = k.alpha(k.c.text_base, 0.045);
+    let hover = k.alpha(k.c.text_base, if k.dark { 0.065 } else { 0.05 });
+    let zebra_bg = k.alpha(k.c.text_base, if k.dark { 0.028 } else { 0.024 });
     let ring = k.c.border_focus;
+    let kbd_sel_active = sel_anim
+        && mode == ViewMode::Details
+        && s.kbd_sel[p].is_active()
+        && pane.selected.len() == 1
+        && pane.entries.get(s.kbd_sel[p].target_row()).is_some_and(|e| pane.selected.contains(&e.id));
     let (text_c, muted_c) = (k.c.text_base, k.c.text_muted);
-    let font = k.ty.text_small;
+    let mut font = k.ty.text_small;
+    if mode == ViewMode::Details {
+        font.size = s.zoom[p].font_size(font.size);
+    }
     let tile_font = k.ty.text_xsmall;
     let rename_look = RenameLook { font, ink: text_c, fill: k.c.bg_base, edge: k.c.border_focus, selection: k.selection() };
     // A search's results show what matched each name in the accent colour: a colour-only span,
@@ -5959,6 +6102,11 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let words = std::rc::Rc::new(searched_words(&pane.loc));
     let accent = k.c.text_accent;
     let marker = k.alpha(k.c.text_accent, 0.28);
+    // The items Copiar or Recortar picked up from this folder, looked up once here rather than
+    // by every row: a pick-up can hold thousands.
+    let clip_ids: std::rc::Rc<std::collections::HashSet<String>> = std::rc::Rc::new(
+        s.clip.as_ref().filter(|c| c.from == pane.loc).map(|c| c.items.iter().map(|it| it.id.clone()).collect()).unwrap_or_default(),
+    );
 
     let n = pane.entries.len();
     let show_header = mode == ViewMode::Details;
@@ -5970,31 +6118,73 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let flow = &s.views[p].flow;
     let rows = match mode {
         ViewMode::Details => {
-            flow.set(crate::lasso::Flow::default());
+            // Rows as tall as the zoom makes them.
+            flow.set(crate::lasso::Flow { step: [0.0, row_h], item: [0.0, row_h], ..Default::default() });
             let build = move |s: &State, i: usize| -> El {
                 let pane = &s.panes[p];
                 let e = &pane.entries[i];
                 let is_sel = pane.selected.contains(&e.id);
                 let found = pane.loc.finds();
-                let mut r = row().key(row_key(&e.id)).role("row").label(shown(&e.name)).focus_selected(is_sel).w(total).h(ROW_H).center_y();
-                r = if is_sel { r.fill(selected) } else { r.hover(hover) };
+                let clip_match = s.clip.as_ref().filter(|_| clip_ids.contains(&e.id));
+                let is_cut = clip_match.is_some_and(|c| c.mode == ClipMode::Cut);
+                // As wide as the columns: past them is empty space, where a drag draws a rectangle.
+                let mut r = row().key(row_key(&e.id)).role("row").label(shown(&e.name)).focus_selected(is_sel).w(total).h(row_h).center_y();
+                if sel_anim {
+                    r = r.radius(4.0).animated_changes().motion(crate::anim::ui_spring());
+                } else if clip_anim {
+                    r = r.animated_changes();
+                }
+                let stripe = if zebra && i % 2 == 1 { zebra_bg } else { Color::TRANSPARENT };
+                r = if is_sel && !kbd_sel_active {
+                    r.fill(selected)
+                } else if hover_glides {
+                    r.fill(stripe)
+                } else {
+                    r.fill(stripe).hover(hover)
+                };
+                if clip_anim {
+                    r = r.opacity(if is_cut { 0.55 } else { 1.0 }).opacity_motion(crate::anim::hover_curve());
+                } else if is_cut {
+                    r = r.opacity(0.55);
+                }
+                if s.row_reorder[p].is_active() {
+                    let dy = s.row_reorder[p].offset_px(&e.id, row_h);
+                    if dy.abs() > 0.25 {
+                        r = r.offset(0.0, dy).offset_motion(Anim::INSTANT);
+                    }
+                }
+                // The keyboard's row is outlined only when it isn't selected (Ctrl+arrows moved it
+                // alone): a selected row already shows, and an outline on the end of a Shift range
+                // reads as a second kind of selection.
                 if s.active == p && !is_sel && pane.cursor.as_deref() == Some(e.id.as_str()) {
                     r = r.outline(1.0, -1.0, ring);
                 }
                 let cell = |i: usize| row().w(w[i]).h_full().px(8.0).center_y().clip_soft(0.0);
                 let muted = |t: String| text(t).font(font).color(muted_c).truncate().shrink().min_w(0.0);
-                let r = r
-                    .child(
-                        cell(0)
+                let mut ico = entry_icon(s, &pane.loc, e, icon_sz);
+                if clip_anim
+                    && let Some(clip) = clip_match
+                {
+                    let elapsed = (s.now - clip.picked_at).max(0.0);
+                    let angle = crate::anim::wiggle_radians(icon_sz, elapsed, &e.id);
+                    ico = ico.origin(0.5, 0.5).rotate(angle).rotate_motion(Anim::INSTANT);
+                }
+                let mut cells = Vec::with_capacity(4);
+                let mut ico_opt = Some(ico);
+                for col_id in order {
+                    let c = match col_id {
+                        0 => cell(0)
                             .px(6.0)
                             .gap(6.0)
-                            .child(entry_icon(s, &pane.loc, e, 16.0))
+                            .child(ico_opt.take().unwrap_or_else(|| entry_icon(s, &pane.loc, e, icon_sz)))
                             .child(match &s.renaming {
                                 Some((rp, item)) if *rp == p && item.id == e.id => rename_field(s, rename_look),
                                 _ => {
                                     let name = shown(&e.name);
                                     let ranges = crate::finder::match_ranges(&words, &name);
                                     if s.settings.search_marker {
+                                        // Experimental: as a highlighter marks them, painted under the
+                                        // glyphs without reshaping the name.
                                         let marks = ranges.into_iter().map(|r| rune::TextHighlight::new(r, marker));
                                         text(name).font(font).color(text_c).text_highlights(marks).truncate().shrink().min_w(0.0)
                                     } else {
@@ -6003,20 +6193,26 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                                     }
                                 }
                             }),
-                    )
-                    .child(cell(1).justify_end().child(muted(e.size.map(format_size).unwrap_or_default()).align(Align::End)))
-                    .child(cell(2).child(muted(e.modified.map(format_time).unwrap_or_default())))
-                    .child(cell(3).child(muted(if found { crate::finder::folder_of(e) } else { crate::onedrive::origin_of(&pane.loc, e).unwrap_or_else(|| e.kind_label()) })));
-                wire_entry_interactions(r, p, &e.id)
+                        1 => cell(1).justify_end().child(muted(e.size.map(format_size).unwrap_or_default()).align(Align::End)),
+                        2 => cell(2).child(muted(e.modified.map(format_time).unwrap_or_default())),
+                        _ => cell(3).child(muted(if found {
+                            crate::finder::folder_of(e)
+                        } else {
+                            crate::onedrive::origin_of(&pane.loc, e).unwrap_or_else(|| e.kind_label())
+                        })),
+                    };
+                    cells.push(c);
+                }
+                wire_entry_interactions(r.children(cells), p, &e.id)
             };
             col()
                 .key("rows")
                 .w_full()
                 .pr(bar_strip)
-                .pb(2.0 * ROW_H)
+                .pb(2.0 * row_h)
                 .growth(GrowthSpec::default())
-                .virtual_rows(n, ROW_H, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
-                .virtual_rows_version((pane.version, mode, w.map(f32::to_bits), s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))))
+                .virtual_rows(n, row_h, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
+                .virtual_rows_version((pane.version, mode, w.map(f32::to_bits), order, row_h.to_bits(), s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))))
         }
         ViewMode::List => {
             let radius = k.radius.sm;
@@ -6233,25 +6429,161 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     };
 
     let table = if show_header {
-        let arrow = |c: SortCol| if pane.sort.0 == c { if pane.sort.1 { "  ▲" } else { "  ▼" } } else { "" };
-        let head = |i: usize, key: &str, label: &str, c: SortCol, end: bool| {
+        let col_meta: [(&'static str, &str, SortCol, bool); 4] = [
+            ("h-name", t("Nome", "Name"), SortCol::Name, false),
+            ("h-size", t("Tamanho", "Size"), SortCol::Size, true),
+            ("h-mod", crate::onedrive::bin_columns(&pane.loc).map_or(t("Data", "Date modified"), |c| c.0), SortCol::Modified, false),
+            (
+                "h-kind",
+                if let Some(c) = crate::onedrive::bin_columns(&pane.loc) {
+                    c.1
+                } else if pane.loc.finds() {
+                    t("Pasta", "Folder")
+                } else {
+                    t("Tipo", "Type")
+                },
+                SortCol::Kind,
+                false,
+            ),
+        ];
+
+        let active_drag = s.col_drag.filter(|d| d.pane == p);
+        let mut header_cells = Vec::with_capacity(4);
+        let mut slot_x = 0.0_f32;
+        for (slot, &col_id) in order.iter().enumerate() {
+            let (key, label, c, end) = col_meta[col_id];
+            let is_dragged = active_drag.is_some_and(|d| d.col_id == col_id && d.moved);
+            let drag_dx = active_drag.filter(|d| d.col_id == col_id && d.moved).map_or(0.0, |d| d.visual_dx);
+            let start_x = slot_x;
+            slot_x += w[col_id];
+
             let mut h = row()
                 .key(key.to_string())
-                .w(w[i])
+                .w(w[col_id])
                 .h_full()
                 .px(8.0)
+                .gap(4.0)
                 .center_y()
                 .hover(k.c.hover)
-                .cursor(Cursor::Pointer)
-                .on_press(move |s: &mut State| set_sort(s, p, c))
-                .child(text(format!("{label}{}", arrow(c))).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0))
+                .cursor(if is_dragged { Cursor::Grabbing } else { Cursor::Pointer })
+                .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                    set_sort(s, p, c);
+                    if s.row_reorder[p].is_active() {
+                        tx.wake_at(s.now + 1.0 / 60.0);
+                    }
+                })
+                .on_drag(move |s: &mut State, d: &mut Drag, _tx: &mut Tx| match d.phase {
+                    Phase::Down => {
+                        let cur_order = s.layout.col_order[p];
+                        let cur_w = s.layout.columns[p];
+                        let mut x = 0.0;
+                        for &cid in &cur_order {
+                            if cid == col_id {
+                                break;
+                            }
+                            x += cur_w[cid];
+                        }
+                        s.col_drag = Some(crate::anim::ColDrag {
+                            pane: p,
+                            col_id,
+                            original_order: cur_order,
+                            start_x: x,
+                            visual_dx: 0.0,
+                            moved: false,
+                        });
+                    }
+                    Phase::Move => {
+                        let Some(drag) = s.col_drag.as_mut().filter(|cd| cd.pane == p && cd.col_id == col_id) else {
+                            return;
+                        };
+                        if !drag.moved && d.dx.abs() < 5.0 {
+                            return;
+                        }
+                        drag.moved = true;
+                        let cur_w = s.layout.columns[p];
+                        let mut ord = s.layout.col_order[p];
+                        let cur_slot = ord.iter().position(|&id| id == col_id).unwrap_or(slot);
+                        let dragged_center = drag.start_x + d.dx + cur_w[col_id] * 0.5;
+                        let mut acc = 0.0;
+                        let mut target_slot = cur_slot;
+                        for (idx, &cid) in ord.iter().enumerate() {
+                            let cw = cur_w[cid];
+                            let mid = acc + cw * 0.5;
+                            if idx < cur_slot && dragged_center < mid {
+                                target_slot = idx;
+                                break;
+                            }
+                            if idx > cur_slot && dragged_center > mid {
+                                target_slot = idx;
+                            }
+                            acc += cw;
+                        }
+                        if target_slot != cur_slot {
+                            let mut v = ord.to_vec();
+                            v.remove(cur_slot);
+                            v.insert(target_slot, col_id);
+                            ord = [v[0], v[1], v[2], v[3]];
+                            s.layout.col_order[p] = ord;
+                        }
+                        let mut new_slot_x = 0.0;
+                        for &cid in &ord {
+                            if cid == col_id {
+                                break;
+                            }
+                            new_slot_x += cur_w[cid];
+                        }
+                        drag.visual_dx = (drag.start_x + d.dx) - new_slot_x;
+                    }
+                    Phase::Up => {
+                        if let Some(drag) = s.col_drag.take() {
+                            if d.cancelled() {
+                                s.layout.col_order[p] = drag.original_order;
+                            } else if drag.moved {
+                                s.layout.save();
+                            }
+                        }
+                    }
+                })
+                .child(text(label.to_string()).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0))
                 .border_sides([0.0, 1.0, 0.0, 0.0], k.c.border_weak);
+
+            if pane.sort.0 == c {
+                let angle = if pane.sort.1 { -std::f32::consts::FRAC_PI_2 } else { std::f32::consts::FRAC_PI_2 };
+                let chev = icon(&icons::CHEVRON, 10.0)
+                    .key(format!("sort-chev-{c:?}"))
+                    .animated_changes()
+                    .color(k.c.text_muted)
+                    .origin(0.5, 0.5)
+                    .rotate(angle)
+                    .rotate_motion(if sel_anim { crate::anim::hover_curve() } else { Anim::INSTANT });
+                h = h.child(chev);
+            }
             if end {
                 h = h.justify_end();
             }
-            h
-        };
-        let grips = (0..4).map(|i| col_grip(k, p, i, w[..=i].iter().sum()));
+            if is_dragged {
+                h = h
+                    .raise()
+                    .fill(k.c.bg_base)
+                    .border(1.0, k.alpha(k.c.text_accent, 0.55))
+                    .radius(4.0)
+                    .box_shadow(rune::Shadow { y: 2.0, blur: 6.0, color: k.dark_a(0.28), ..Default::default() })
+                    .offset(drag_dx, 0.0)
+                    .offset_motion(Anim::INSTANT);
+            } else if sel_anim {
+                h = h.animated_changes().motion(crate::anim::ui_spring());
+            }
+            let _ = start_x;
+            header_cells.push(h);
+        }
+
+        // The grips sit over the header, one at each column's right edge in visual order.
+        let mut grip_edge = 0.0_f32;
+        let mut grips = Vec::with_capacity(4);
+        for &col_id in &order {
+            grip_edge += w[col_id];
+            grips.push(col_grip(k, p, col_id, grip_edge));
+        }
         let header = row()
             .key("header")
             .w_full()
@@ -6259,12 +6591,43 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
             .fill(k.c.bg_base)
             .sticky_top(0.0)
             .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
-            .child(head(0, "h-name", t("Nome", "Name"), SortCol::Name, false))
-            .child(head(1, "h-size", t("Tamanho", "Size"), SortCol::Size, true))
-            .child(head(2, "h-mod", crate::onedrive::bin_columns(&pane.loc).map_or(t("Data", "Date modified"), |c| c.0), SortCol::Modified, false))
-            .child(head(3, "h-kind", if let Some(c) = crate::onedrive::bin_columns(&pane.loc) { c.1 } else if pane.loc.finds() { t("Pasta", "Folder") } else { t("Tipo", "Type") }, SortCol::Kind, false))
+            .children(header_cells)
             .children(grips);
-        col().key("table").w_full().min_w(total + bar_strip).child(header).child(body).children(lasso_rect(s, k, p))
+        // Gliding hover highlight pill (80 ms ease-out cubic, matching Explorer GPU mod):
+        // sits behind the rows and slides smoothly from row to row without leaving a trail.
+        let hover_pill = (hover_glides && n > 0 && pane.error.is_none()).then(|| {
+            let active = s.hovered_row[p].filter(|&idx| idx < n && s.lasso.is_none());
+            let row_idx = active.unwrap_or_else(|| s.hover_last_row[p].min(n.saturating_sub(1)));
+            let y = row_idx as f32 * row_h;
+            let curve = crate::anim::hover_curve();
+            el().key("hover-pill")
+                .animated_changes()
+                .absolute(2.0, HEADER_H)
+                .size((total - 4.0).max(0.0), row_h)
+                .radius(5.0)
+                .fill(hover)
+                .offset(0.0, y)
+                .offset_motion(curve)
+                .opacity(if active.is_some() { 1.0 } else { 0.0 })
+                .opacity_motion(curve)
+        });
+        // Gliding keyboard selection pill (Cubic Hermite glide on ↑/↓/PageUp/PageDown/Home/End).
+        let kbd_sel_pill = kbd_sel_active.then(|| {
+            let y = s.kbd_sel[p].presented_row() * row_h;
+            el().key("kbd-sel-pill").absolute(0.0, HEADER_H + y).size(total, row_h).radius(4.0).fill(selected)
+        });
+        // One viewport scrolls both ways: sideways when the columns are wider than the pane,
+        // header and rows together, and up and down with the header stuck to the top. Its
+        // vertical bar sits on the pane's right edge, wherever the columns end.
+        col()
+            .key("table")
+            .w_full()
+            .min_w(total + bar_strip)
+            .children(hover_pill)
+            .children(kbd_sel_pill)
+            .child(header)
+            .child(body)
+            .children(lasso_rect(s, k, p))
     } else {
         col().key("table").w_full().child(body).children(lasso_rect(s, k, p))
     };
@@ -6277,6 +6640,64 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .h_full()
         .scroll_xy()
         .on_scroll_offset(move |at| scrolled.set(at.into()))
+        // Track hovered row for the gliding hover highlight; returns live_only when the row
+        // doesn't change so pointer motion inside a row triggers zero view rebuilds.
+        .on_pointer_move_local(move |s: &mut State, ev: rune::PointerEvent, tx: &mut Tx| {
+            if !s.settings.hover_animated() || s.panes[p].view_mode != ViewMode::Details {
+                tx.live_only();
+                return;
+            }
+            let scroll = s.views[p].scroll.get();
+            let content_x = ev.x + scroll.x;
+            let content_y = ev.y + scroll.y - HEADER_H;
+            let total_w: f32 = s.layout.columns[p].iter().sum();
+            let rh = s.zoom[p].row_height().max(1.0);
+            let next = if ev.y >= HEADER_H && content_y >= 0.0 && content_x >= 0.0 && content_x < total_w && s.lasso.is_none() {
+                let idx = (content_y / rh).floor() as usize;
+                (idx < s.panes[p].entries.len()).then_some(idx)
+            } else {
+                None
+            };
+            if next != s.hovered_row[p] {
+                s.hovered_row[p] = next;
+                if let Some(idx) = next {
+                    s.hover_last_row[p] = idx;
+                }
+            } else {
+                tx.live_only();
+            }
+        })
+        .on_hover_change(move |s: &mut State, inside: bool, tx: &mut Tx| {
+            if !inside && s.hovered_row[p].is_some() {
+                s.hovered_row[p] = None;
+            } else {
+                tx.live_only();
+            }
+        })
+        // Ctrl + mouse wheel smoothly zooms row height, icons, and text.
+        .on_wheel(move |s: &mut State, e: rune::WheelEvent, tx: &mut Tx| {
+            // The zoom is Details': the other views keep their sizes.
+            if !(e.mods.ctrl || e.mods.cmd) || s.panes[p].view_mode != ViewMode::Details {
+                return false;
+            }
+            let delta = if e.dy > 0.0 { 1.0 } else if e.dy < 0.0 { -1.0 } else { 0.0 };
+            if delta != 0.0 && s.zoom[p].step_by(delta, s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+            true
+        })
+        // Trackpad pinch-to-zoom.
+        .on_magnify(move |s: &mut State, e: rune::MagnifyEvent, tx: &mut Tx| {
+            if s.panes[p].view_mode != ViewMode::Details {
+                return false;
+            }
+            if s.zoom[p].scale_by(1.0 + e.delta, s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+            true
+        })
+        // Where the viewport is, for the lasso, and the rows in view below the header, which
+        // Page Up and Page Down move by. Only handlers read them, so the view needn't run again.
         .on_layout_tx(move |s: &mut State, r: [f32; 4], tx: &mut Tx| {
             s.views[p].rect = r;
             let mode = s.panes[p].view_mode;
@@ -6305,7 +6726,8 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                     tx.live_only();
                 }
             } else {
-                s.page_rows[p] = ((r[3] - HEADER_H) / ROW_H).floor().max(1.0) as usize;
+                let rh = s.zoom[p].row_height().max(1.0);
+                s.page_rows[p] = ((r[3] - HEADER_H) / rh).floor().max(1.0) as usize;
                 tx.live_only();
             }
         })
@@ -6321,6 +6743,9 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let viewport = s.edges[p].list.on(viewport);
     col().key("list").w(0.0).grow(1.0).h_full().min_w(0.0).child(with_scroll_bars(k, &key, viewport, bar, true))
 }
+
+// ---------------------------------------------------------------------------------------------
+// Status bar
 
 // ---------------------------------------------------------------------------------------------
 // Status bar
@@ -6373,6 +6798,30 @@ fn statusbar(s: &State, k: &Kit, p: usize) -> El {
         .center_y()
         .border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_weak)
         .child(text(left).font(k.ty.text_xsmall).color(k.c.text_muted).truncate().shrink().min_w(0.0).grow(1.0));
+    let zoom_pct = s.zoom[p].percent();
+    if zoom_pct != 100 {
+        bar = bar.child(
+            row()
+                .key("zoom-reset")
+                .role("button")
+                .label(t("Redefinir zoom (Ctrl+0)", "Reset zoom (Ctrl+0)"))
+                .help(t("Clique ou pressione Ctrl+0 para voltar a 100%", "Click or press Ctrl+0 to reset to 100%"))
+                .h(16.0)
+                .px(5.0)
+                .mr(8.0)
+                .center()
+                .radius(4.0)
+                .fill(k.alpha(k.c.text_accent, if k.dark { 0.16 } else { 0.10 }))
+                .hover(k.alpha(k.c.text_accent, if k.dark { 0.24 } else { 0.16 }))
+                .cursor(Cursor::Pointer)
+                .on_press_tx(move |s: &mut State, tx: &mut Tx| {
+                    if s.zoom[p].reset(s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                        tx.wake_at(s.now + 1.0 / 60.0);
+                    }
+                })
+                .child(text(format!("{zoom_pct}%")).font(k.ty.caption()).color(k.c.text_accent)),
+        );
+    }
     if let Some(m) = meter {
         bar = bar.child(m);
     }

@@ -27,6 +27,9 @@ pub const QUEUE_H_MAX: f32 = 700.0;
 pub const QUEUE_COLS: [f32; 8] = [92.0, 300.0, 240.0, 190.0, 128.0, 112.0, 96.0, 88.0];
 pub const QUEUE_COL_MIN: f32 = 50.0;
 
+/// Default visual order of the 4 list columns: Nome (0), Tamanho (1), Data (2), Tipo (3).
+pub const COL_ORDER: [usize; 4] = [0, 1, 2, 3];
+
 fn deserialize_tree<'de, D: Deserializer<'de>>(d: D) -> Result<[f32; MAX_PANES], D::Error> {
     let v = Vec::<f32>::deserialize(d)?;
     Ok(std::array::from_fn(|i| v.get(i).copied().unwrap_or(TREE_W)))
@@ -35,6 +38,13 @@ fn deserialize_tree<'de, D: Deserializer<'de>>(d: D) -> Result<[f32; MAX_PANES],
 fn deserialize_columns<'de, D: Deserializer<'de>>(d: D) -> Result<[[f32; 4]; MAX_PANES], D::Error> {
     let v = Vec::<[f32; 4]>::deserialize(d)?;
     Ok(std::array::from_fn(|i| v.get(i).copied().unwrap_or(COLS)))
+}
+
+/// The column orders saved, one per pane: a file from when there were two panes gives the
+/// others the default order.
+fn deserialize_col_order<'de, D: Deserializer<'de>>(d: D) -> Result<[[usize; 4]; MAX_PANES], D::Error> {
+    let v = Vec::<[usize; 4]>::deserialize(d)?;
+    Ok(std::array::from_fn(|i| v.get(i).copied().unwrap_or(COL_ORDER)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -46,14 +56,35 @@ pub struct Layout {
     /// version that had three, is ignored.)
     #[serde(deserialize_with = "deserialize_columns")]
     pub columns: [[f32; 4]; MAX_PANES],
+    /// Per pane, the visual order of the four columns (a permutation of `0..4`).
+    #[serde(deserialize_with = "deserialize_col_order")]
+    pub col_order: [[usize; 4]; MAX_PANES],
     pub queue_h: f32,
     pub queue_cols: [f32; 8],
 }
 
 impl Default for Layout {
     fn default() -> Layout {
-        Layout { tree: [TREE_W; MAX_PANES], columns: [COLS; MAX_PANES], queue_h: QUEUE_H, queue_cols: QUEUE_COLS }
+        Layout {
+            tree: [TREE_W; MAX_PANES],
+            columns: [COLS; MAX_PANES],
+            col_order: [COL_ORDER; MAX_PANES],
+            queue_h: QUEUE_H,
+            queue_cols: QUEUE_COLS,
+        }
     }
+}
+
+/// Ensures `order` is a valid permutation of `0..4`, falling back to [`COL_ORDER`].
+pub fn valid_col_order(order: [usize; 4]) -> [usize; 4] {
+    let mut seen = [false; 4];
+    for i in order {
+        if i >= 4 || seen[i] {
+            return COL_ORDER;
+        }
+        seen[i] = true;
+    }
+    order
 }
 
 pub fn clamp_queue_h(h: f32) -> f32 {
@@ -84,6 +115,7 @@ impl Layout {
         Layout {
             tree: l.tree.map(clamp_tree),
             columns: l.columns.map(|c| [0, 1, 2, 3].map(|i| clamp_col(i, c[i]))),
+            col_order: l.col_order.map(valid_col_order),
             queue_h: clamp_queue_h(l.queue_h),
             queue_cols: std::array::from_fn(|i| clamp_queue_col(i, l.queue_cols[i])),
         }
@@ -121,5 +153,8 @@ mod tests {
         assert_eq!(l, Layout { tree: [150.0, 300.0, TREE_W, TREE_W], ..Layout::default() });
         let l: Layout = serde_json::from_str("{}").unwrap();
         assert_eq!(l, Layout::default());
+        // A column order saved with two panes: the other two take the default one.
+        let l: Layout = serde_json::from_str(r#"{"col_order":[[1,0,2,3],[3,2,1,0]]}"#).unwrap();
+        assert_eq!(l.col_order, [[1, 0, 2, 3], [3, 2, 1, 0], COL_ORDER, COL_ORDER]);
     }
 }

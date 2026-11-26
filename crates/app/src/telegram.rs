@@ -638,7 +638,7 @@ mod tests {
         let items: Vec<Entry> = s.panes[0].entries.iter().filter(|e| wanted.contains(&e.name.as_str())).cloned().collect();
         assert_eq!(items.len(), wanted.len(), "{wanted:?} in {:?}", names(s, 0));
         s.status.clear();
-        s.clip = Some(Clip { mode, from: s.panes[0].loc.clone(), items });
+        s.clip = Some(Clip { mode, from: s.panes[0].loc.clone(), items, picked_at: 0.0 });
         actions::paste(s, 1);
         settle(s);
     }

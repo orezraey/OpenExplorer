@@ -11,6 +11,7 @@
 mod accounts;
 mod actions;
 mod address;
+mod anim;
 mod autoscroll;
 mod b2;
 mod cache;
@@ -173,6 +174,20 @@ struct State {
     /// Where each pane's file list viewport is and how far it's scrolled, for the rectangle
     /// selection and the menu the keyboard opens.
     views: [lasso::Viewport; MAX_PANES],
+    /// Smooth Ctrl+wheel / pinch zoom state for each pane's file list.
+    zoom: [anim::ZoomState; MAX_PANES],
+    /// Row index currently under the pointer in each pane's file list (for the gliding hover pill).
+    hovered_row: [Option<usize>; MAX_PANES],
+    /// Last hovered row index in each pane so the hover pill fades out in place when leaving.
+    hover_last_row: [usize; MAX_PANES],
+    /// Gliding keyboard selection highlight for each pane.
+    kbd_sel: [anim::KeyboardSel; MAX_PANES],
+    /// Fading marquee/lasso rectangle after mouse release.
+    lasso_fade: Option<anim::LassoFade>,
+    /// Smooth row reorder glide when sorting a pane's file list.
+    row_reorder: [anim::RowReorder; MAX_PANES],
+    /// Active header column drag-to-reorder state.
+    col_drag: Option<anim::ColDrag>,
     dialog: Option<actions::Dialog>,
     /// The window was asked to close while transfers ran: Fechar o Open Explorer? shows over
     /// everything, the dialog under it untouched (see [`actions::close_requested`]).
@@ -365,6 +380,13 @@ impl State {
             renamed: Vec::new(),
             lasso: None,
             views: Default::default(),
+            zoom: Default::default(),
+            hovered_row: [None; MAX_PANES],
+            hover_last_row: [0; MAX_PANES],
+            kbd_sel: Default::default(),
+            lasso_fade: None,
+            row_reorder: Default::default(),
+            col_drag: None,
             dialog: None,
             quit_asked: false,
             quit_app: false,
@@ -586,6 +608,13 @@ fn init() -> State {
         renamed: Vec::new(),
         lasso: None,
         views: Default::default(),
+        zoom: Default::default(),
+        hovered_row: [None; MAX_PANES],
+        hover_last_row: [0; MAX_PANES],
+        kbd_sel: Default::default(),
+        lasso_fade: None,
+        row_reorder: Default::default(),
+        col_drag: None,
         dialog: None,
         quit_asked: false,
         quit_app: false,
@@ -854,6 +883,55 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     s.icons.set_big(big);
     let mut changed = std::mem::take(&mut s.main_dirty) | s.icons.settle();
     changed |= notice(s, now, &mut |text, how| tx.announce(text, how));
+    // Smooth Ctrl+wheel / pinch zoom, keyboard selection glide, and sort row reorder animations.
+    let mut anim_wake = false;
+    for p in 0..MAX_PANES {
+        if s.zoom[p].tick(now) {
+            changed = true;
+            if s.zoom[p].is_animating() {
+                anim_wake = true;
+            }
+        }
+        if s.kbd_sel[p].tick(now) {
+            changed = true;
+            if s.kbd_sel[p].is_active() {
+                anim_wake = true;
+            }
+        }
+        if s.row_reorder[p].tick(now) {
+            changed = true;
+            if s.row_reorder[p].is_active() {
+                anim_wake = true;
+            }
+        }
+    }
+    if let Some(fade) = s.lasso_fade {
+        changed = true;
+        if fade.done(now) {
+            s.lasso_fade = None;
+        } else {
+            anim_wake = true;
+        }
+    }
+    // Clipboard Copy/Cut icon wiggle: it runs for a moment after the pick-up, and wakes only
+    // while copied/cut items are visible in an open pane. A copy stays picked up after Colar,
+    // so a wiggle without an end would redraw the window for as long as it shows them.
+    if s.main_tab == MainTab::Explore
+        && s.settings.clipboard_animated()
+        && let Some(clip) = &s.clip
+        && !clip.items.is_empty()
+        && now - clip.picked_at < anim::WIGGLE_TOTAL
+        && {
+            let ids: std::collections::HashSet<&str> = clip.items.iter().map(|c| c.id.as_str()).collect();
+            (0..s.settings.pane_layout.count()).any(|p| !s.tabs[p].is_picker() && s.panes[p].loc == clip.from && s.panes[p].entries.iter().any(|e| ids.contains(e.id.as_str())))
+        }
+    {
+        changed = true;
+        anim_wake = true;
+    }
+    if anim_wake {
+        tx.wake_at(now + 1.0 / 60.0);
+    }
     // A rectangle selection held past the list's edge scrolls it.
     changed |= lasso::step(s, now, tx);
     // A local pane searches the computer as its field is typed in, once the keys pause.
@@ -1769,6 +1847,7 @@ fn click(s: &mut State, p: usize, id: &str, mods: Mods) {
         }
     }
     s.active = p;
+    s.kbd_sel[p].stop();
     let pane = &mut s.panes[p];
     if mods.cmd {
         if !pane.selected.remove(id) {
@@ -1920,9 +1999,32 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             }
             return true;
         }
-        // Esc lets go of the selection; the cursor stays.
+        // Ctrl+0 resets list zoom; Ctrl+= / Ctrl++ zooms in; Ctrl+- zooms out.
+        _ if ev.is_command('0') => {
+            if s.zoom[p].reset(s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+            return true;
+        }
+        _ if ev.is_command('=') || ev.is_command('+') => {
+            if s.zoom[p].step_by(1.0, s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+            return true;
+        }
+        _ if ev.is_command('-') => {
+            if s.zoom[p].step_by(-1.0, s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+            return true;
+        }
+        // Esc lets go of the selection (the cursor stays), or clears a pending copy/cut.
         Key::Escape if owns && !s.panes[p].selected.is_empty() => {
             s.panes[p].selected.clear();
+            return true;
+        }
+        Key::Escape if owns && s.clip.is_some() => {
+            s.clip = None;
             return true;
         }
         Key::Enter if ev.mods.alt => {
@@ -1986,13 +2088,24 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         _ => return false,
     };
     if let Some(i) = to {
+        let prev_single = (!ev.mods.cmd && !ev.mods.shift && s.panes[p].selected.len() == 1)
+            .then_some(at)
+            .flatten();
         let id = s.panes[p].entries[i].id.clone();
         // With Ctrl the cursor moves alone and the selection stays, as in Explorer.
         if ev.mods.cmd && !ev.mods.shift {
             s.active = p;
+            s.kbd_sel[p].stop();
             s.panes[p].cursor = Some(id.clone());
         } else {
             click(s, p, &id, Mods { shift: ev.mods.shift, ..Mods::default() });
+            if let Some(from_i) = prev_single
+                && from_i != i
+                && s.settings.selection_animated()
+            {
+                s.kbd_sel[p].start(from_i, i, s.now);
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
         }
         tx.scroll_into_view_in(pane_key(p), flow.reveal_key(i, row_key(&id)));
     }
@@ -2027,9 +2140,43 @@ fn menu_from_keys(s: &mut State, p: usize, tx: &mut Tx) {
 }
 
 fn set_sort(s: &mut State, p: usize, col: SortCol) {
+    s.kbd_sel[p].stop();
+    let animate = s.settings.selection_animated() && !s.panes[p].entries.is_empty();
+    let (old_indices, vis_start, vis_end) = if animate {
+        let scroll = s.views[p].scroll.get();
+        let row_h = s.zoom[p].row_height().max(1.0);
+        let first = (scroll.y / row_h).floor().max(0.0) as usize;
+        let vis_count = ((scroll.h / row_h).ceil().max(24.0) as usize).min(120);
+        let len = s.panes[p].entries.len();
+        let win_start = first.saturating_sub(40);
+        let win_end = (first + vis_count + 40).min(len);
+        let mut map = HashMap::with_capacity(win_end.saturating_sub(win_start));
+        for (i, e) in s.panes[p].entries[win_start..win_end].iter().enumerate() {
+            map.insert(e.id.clone(), win_start + i);
+        }
+        (map, win_start, win_end)
+    } else {
+        (HashMap::new(), 0, 0)
+    };
     let pane = &mut s.panes[p];
     pane.sort = if pane.sort.0 == col { (col, !pane.sort.1) } else { (col, true) };
     pane.sort_entries();
+    if animate && !old_indices.is_empty() {
+        let end = vis_end.min(pane.entries.len());
+        let mut deltas = HashMap::new();
+        for (offset, e) in pane.entries[vis_start..end].iter().enumerate() {
+            let new_i = vis_start + offset;
+            if let Some(&old_i) = old_indices.get(&e.id)
+                && old_i != new_i
+            {
+                let d = (old_i as f32 - new_i as f32).clamp(-24.0, 24.0);
+                deltas.insert(e.id.clone(), d);
+            }
+        }
+        s.row_reorder[p].start(deltas, s.now);
+    } else {
+        s.row_reorder[p].clear();
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

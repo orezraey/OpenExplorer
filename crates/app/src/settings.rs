@@ -270,6 +270,18 @@ pub struct Settings {
     /// Experimental: a search's matches in names marked as with a highlighter, rather than
     /// only coloured.
     pub search_marker: bool,
+    /// Master switch for native UI animations (all enabled by default).
+    pub animations: bool,
+    /// Fluid gliding hover highlight across rows, folders and controls.
+    pub animate_hover: bool,
+    /// Wiggle icons of files/folders picked up with Ctrl+C / Ctrl+X.
+    pub animate_clipboard: bool,
+    /// Smoothly animate list row/icon zoom on Ctrl+scroll and pinch gestures.
+    pub animate_zoom: bool,
+    /// Smooth selection highlights, keyboard glide, sort reorder and tree chevron rotation.
+    pub animate_selection: bool,
+    /// Subtle alternating row stripes (zebra stripes) in the file list.
+    pub zebra_stripes: bool,
     /// Experimental (Windows): the window's content keeps up with a drag of its left or top
     /// edge (Rune's `ResizeSync::On`), from the next start.
     pub resize_sync: bool,
@@ -314,6 +326,12 @@ impl Default for Settings {
             mica: false,
             material: Material::Mica,
             search_marker: false,
+            animations: true,
+            animate_hover: true,
+            animate_clipboard: true,
+            animate_zoom: true,
+            animate_selection: true,
+            zebra_stripes: true,
             resize_sync: false,
             acrylic: false,
         }
@@ -351,6 +369,26 @@ impl Settings {
         let _ = std::fs::create_dir_all(openexplorer_gdrive::config_dir());
         let _ = std::fs::write(file(), text);
     }
+
+    #[inline]
+    pub fn hover_animated(self) -> bool {
+        self.animations && self.animate_hover
+    }
+
+    #[inline]
+    pub fn clipboard_animated(self) -> bool {
+        self.animations && self.animate_clipboard
+    }
+
+    #[inline]
+    pub fn zoom_animated(self) -> bool {
+        self.animations && self.animate_zoom
+    }
+
+    #[inline]
+    pub fn selection_animated(self) -> bool {
+        self.animations && self.animate_selection
+    }
 }
 
 /// Sidebar sections in the Opções dialog.
@@ -358,6 +396,7 @@ impl Settings {
 pub enum OptionsTab {
     #[default]
     General,
+    Animations,
     Transfers,
     Cache,
     Logs,
@@ -365,11 +404,19 @@ pub enum OptionsTab {
 }
 
 impl OptionsTab {
-    pub const ALL: [OptionsTab; 5] = [OptionsTab::General, OptionsTab::Transfers, OptionsTab::Cache, OptionsTab::Logs, OptionsTab::Experimental];
+    pub const ALL: [OptionsTab; 6] = [
+        OptionsTab::General,
+        OptionsTab::Animations,
+        OptionsTab::Transfers,
+        OptionsTab::Cache,
+        OptionsTab::Logs,
+        OptionsTab::Experimental,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             OptionsTab::General => t("Geral", "General"),
+            OptionsTab::Animations => t("Animações", "Animations"),
             OptionsTab::Transfers => t("Transferências", "Transfers"),
             OptionsTab::Cache => "Cache",
             OptionsTab::Logs => "Logs",
@@ -380,6 +427,7 @@ impl OptionsTab {
     pub fn icon(self) -> &'static Icon {
         match self {
             OptionsTab::General => &crate::icons::SETTINGS,
+            OptionsTab::Animations => &crate::icons::OPT_ANIMATIONS,
             OptionsTab::Transfers => &crate::icons::OPT_TRANSFERS,
             OptionsTab::Cache => &crate::icons::OPT_CACHE,
             OptionsTab::Logs => &crate::icons::OPT_LOGS,
@@ -461,6 +509,10 @@ mod tests {
         assert!(s.segmented_downloads);
         let off: Settings = serde_json::from_str(r#"{"big_files_in_segments":false}"#).unwrap();
         assert!(!off.segmented_downloads);
+        // Animations default to enabled even when reading an older settings file.
+        assert!(s.hover_animated() && s.clipboard_animated() && s.zoom_animated() && s.selection_animated());
+        let muted = Settings { animations: false, ..Settings::default() };
+        assert!(!muted.hover_animated() && !muted.clipboard_animated() && !muted.zoom_animated() && !muted.selection_animated());
         assert_eq!(Settings::default().pane_layout, PaneLayout::Two);
         let one: Settings = serde_json::from_str(r#"{"pane_layout":"One"}"#).unwrap();
         assert_eq!((one.pane_layout, one.pane_layout.count()), (PaneLayout::One, 1));

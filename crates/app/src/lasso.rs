@@ -141,16 +141,22 @@ pub fn content(at: [f32; 2], scroll: Scroll) -> [f32; 2] {
 }
 
 /// The rows of `n` that rectangle `rect` (content points, ordered) touches: a row spans the
-/// columns' `width` and [`ROW_H`] from `i * ROW_H`. A rectangle with no height still touches
+/// columns' `width` and `row_h` from `i * row_h`. A rectangle with no height still touches
 /// the row it lies in, as a click on it would; one wholly beside the columns touches none.
-pub fn hits(rect: [f32; 4], n: usize, width: f32) -> Range<usize> {
+pub fn hits_with_row_h(rect: [f32; 4], n: usize, width: f32, row_h: f32) -> Range<usize> {
     let [x0, y0, x1, y1] = rect;
-    if n == 0 || x0 >= width || x1 < 0.0 || y1 < 0.0 || y0 >= n as f32 * ROW_H {
+    let row_h = row_h.max(1.0);
+    if n == 0 || x0 >= width || x1 < 0.0 || y1 < 0.0 || y0 >= n as f32 * row_h {
         return 0..0;
     }
-    let first = (y0.max(0.0) / ROW_H).floor() as usize;
-    let last = (y1 / ROW_H).floor() as usize;
+    let first = (y0.max(0.0) / row_h).floor() as usize;
+    let last = (y1 / row_h).floor() as usize;
     first.min(n)..(last + 1).min(n)
+}
+
+#[cfg(test)]
+pub fn hits(rect: [f32; 4], n: usize, width: f32) -> Range<usize> {
+    hits_with_row_h(rect, n, width, ROW_H)
 }
 
 /// The selection a lasso makes: the rows it touches, or with `toggle` the old selection with
@@ -185,7 +191,7 @@ fn apply(s: &mut State) {
     let scroll = s.views[p].scroll.get();
     let width: f32 = s.layout.columns[p].iter().sum();
     let pane = &s.panes[p];
-    let rows = hits(l.rect(scroll), pane.entries.len(), width);
+    let rows = hits_with_row_h(l.rect(scroll), pane.entries.len(), width, s.zoom[p].row_height());
     let selected = picked(&l.before, pane.entries[rows].iter().map(|e| e.id.clone()), l.toggle);
     s.panes[p].selected = selected;
 }
@@ -205,7 +211,12 @@ pub fn drag(s: &mut State, p: usize, d: &mut Drag, tx: &mut Tx) {
                 tx.wake_after(std::time::Duration::from_millis(16));
             }
         }
-        Phase::Up => released(s, p, d.cancelled()),
+        Phase::Up => {
+            released(s, p, d.cancelled());
+            if s.lasso_fade.is_some() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+        }
     }
 }
 
@@ -214,6 +225,8 @@ pub fn drag(s: &mut State, p: usize, d: &mut Drag, tx: &mut Tx) {
 /// (which doesn't run under this one) would make it. True when it started a lasso.
 pub fn press(s: &mut State, p: usize, at: [f32; 2], ctrl: bool) -> bool {
     s.active = p;
+    s.kbd_sel[p].stop();
+    s.lasso_fade = None;
     let mode = s.panes[p].view_mode;
     if mode != crate::model::ViewMode::Details {
         if !ctrl {
@@ -257,6 +270,10 @@ pub fn moved(s: &mut State, p: usize, at: [f32; 2]) -> bool {
 pub fn released(s: &mut State, p: usize, cancelled: bool) {
     let Some(l) = s.lasso.take_if(|l| l.pane == p) else { return };
     let scroll = s.views[p].scroll.get();
+    if l.moved && s.settings.selection_animated() {
+        s.lasso_fade = Some(crate::anim::LassoFade { pane: p, rect: l.rect(scroll), started: s.now });
+    }
+    let row_h = s.zoom[p].row_height();
     let pane = &mut s.panes[p];
     if cancelled {
         pane.selected = l.before;
@@ -264,7 +281,7 @@ pub fn released(s: &mut State, p: usize, cancelled: bool) {
         pane.cursor = l.cursor;
         return;
     }
-    let rows = hits(l.rect(scroll), pane.entries.len(), f32::MAX);
+    let rows = hits_with_row_h(l.rect(scroll), pane.entries.len(), f32::MAX, row_h);
     if !l.moved || rows.is_empty() {
         return;
     }
@@ -469,6 +486,10 @@ mod tests {
         assert_eq!(at(Some(1)), (rune::PointerPress { x: 124.0, y: top + ROW_H }, Some([0.0, ROW_H])));
         // Row 40 is below: it scrolls up to the bottom and the menu goes at the bottom edge.
         assert_eq!(at(Some(40)), (rune::PointerPress { x: 124.0, y: top + 10.0 * ROW_H }, Some([0.0, 31.0 * ROW_H])));
+        // Zoomed to rows twice as tall, row 2 ends six plain rows down: the menu follows the zoom.
+        view.flow.set(Flow { step: [0.0, 2.0 * ROW_H], item: [0.0, 2.0 * ROW_H], ..Default::default() });
+        view.scroll.set(Scroll { x: 0.0, y: 0.0, max_x: 0.0, max_y: 90.0 * ROW_H, h: HEADER_H + 10.0 * ROW_H });
+        assert_eq!(at(Some(2)), (rune::PointerPress { x: 124.0, y: top + 6.0 * ROW_H }, None));
     }
 
     /// In the icon views and in List the arrows follow the tiles and columns, and the
