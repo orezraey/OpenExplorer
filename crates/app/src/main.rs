@@ -43,6 +43,7 @@ mod telegram;
 mod transfers;
 mod tree;
 mod undo;
+mod updater;
 mod uploads;
 mod ui;
 mod watch;
@@ -123,6 +124,8 @@ enum Msg {
     /// A drag of Drive items `ids` out of pane `from` ended.
     #[cfg(windows)]
     DragEnded { from: usize, ids: Vec<String>, ended: dragout::Ended },
+    /// Built-in updater check, download progress or completion.
+    Update(updater::Answer),
 }
 
 /// Which part of a listing a [`Msg::Listed`] is.
@@ -322,7 +325,12 @@ struct State {
     account_synced_font: Option<settings::TextFont>,
     account_synced_render: Option<settings::TextRender>,
     is_placeholder: bool,
+    /// Built-in updater state (latest release, download progress, staged file).
+    updater: updater::UpdateState,
 }
+
+/// Receipt or error passed via `--update-receipt` / `--update-error` on relaunch after an update.
+static STARTUP_UPDATE_NOTICE: std::sync::Mutex<Option<Result<String, String>>> = std::sync::Mutex::new(None);
 
 /// Whether the main window was created for Mica (Opções, Experimental): only then can Windows
 /// show it, and Opções says whether it did.
@@ -480,6 +488,7 @@ impl State {
             account_synced_font: None,
             account_synced_render: None,
             is_placeholder: true,
+            updater: updater::UpdateState::idle(),
         }
     }
 
@@ -592,7 +601,7 @@ fn init() -> State {
     panes[0] = first;
     let accounts = store::accounts();
     let tree = tree::Tree::new(accounts.iter().map(|a| a.email.clone()));
-    State {
+    let mut state = State {
         main_tab: MainTab::Explore,
         view_menu_open: false,
         view_mode_menu: None,
@@ -684,7 +693,22 @@ fn init() -> State {
         account_synced_font: None,
         account_synced_render: None,
         is_placeholder: false,
+        updater: updater::UpdateState::new(),
+    };
+    if let Some(notice) = STARTUP_UPDATE_NOTICE.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        match notice {
+            Ok(ver) => {
+                updater::clear_staged();
+                openexplorer_gdrive::log(&format!("atualização concluída: v{ver}"));
+                state.status = tr!("Open Explorer atualizado para a versão {ver}.", "Open Explorer updated to version {ver}.");
+            }
+            Err(code) => {
+                openexplorer_gdrive::log(&format!("erro atualização: {code}"));
+                fail(&mut state, updater::error_text(&code));
+            }
+        }
     }
+    state
 }
 
 fn setup(s: &mut State, waker: Waker) {
@@ -700,6 +724,10 @@ fn setup(s: &mut State, waker: Waker) {
     // Each tree opens down to the folder its pane starts in.
     for p in 0..MAX_PANES {
         tree::follow(s, p);
+    }
+    // Check for updates in the background (at most once per 24 h automatically).
+    if !rune::is_headless() && s.updater.should_auto_check(updater::now_unix()) {
+        actions::check_updates(s, false);
     }
 }
 
@@ -1186,6 +1214,66 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     Err(e) => fail(s, e),
                 }
             }
+            Msg::Update(ans) => match ans {
+                updater::Answer::Checked { manual, result } => {
+                    s.updater.checking = false;
+                    s.updater.checked_once = true;
+                    let now_unix = updater::now_unix();
+                    s.updater.last_checked = Some(now_unix);
+                    updater::record_check(now_unix);
+                    match result {
+                        Ok(Some(rel)) => {
+                            openexplorer_gdrive::log(&format!("atualização disponível: v{}", rel.version));
+                            let already_staged_same = matches!(
+                                &s.updater.download,
+                                updater::DownloadState::Ready(st) if st.version == rel.version
+                            );
+                            // A download or install under way stays: a second one would write
+                            // the same file.
+                            let busy = matches!(s.updater.download, updater::DownloadState::Downloading { .. } | updater::DownloadState::Installing);
+                            s.updater.release = Some(rel);
+                            if !already_staged_same && !busy {
+                                s.updater.download = updater::DownloadState::Idle;
+                                if s.updater.support.is_ok()
+                                    && s.updater.offer(s.settings.auto_update) == Some(updater::Offer::Automatic)
+                                {
+                                    actions::download_update(s);
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            s.updater.check_error = None;
+                            if manual {
+                                s.status = tr!(
+                                    "Você já está na versão mais recente (v{}).",
+                                    "You're already on the latest version (v{}).",
+                                    updater::VERSION
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            openexplorer_gdrive::log(&format!("erro verificar atualizações: {e}"));
+                            s.updater.check_error = Some(e.clone());
+                            if manual {
+                                fail(s, e);
+                            }
+                        }
+                    }
+                }
+                updater::Answer::Progress { received, total } => {
+                    s.updater.download = updater::DownloadState::Downloading { received, total };
+                }
+                updater::Answer::Downloaded(result) => match result {
+                    Ok(staged) => {
+                        openexplorer_gdrive::log(&format!("atualização baixada e verificada: v{}", staged.version));
+                        s.updater.download = updater::DownloadState::Ready(staged);
+                    }
+                    Err(e) => {
+                        openexplorer_gdrive::log(&format!("erro baixar atualização: {e}"));
+                        s.updater.download = updater::DownloadState::Failed(e);
+                    }
+                },
+            },
         }
     }
     // Accounts on screen are asked what changed elsewhere, every few seconds; after the
@@ -2556,10 +2644,24 @@ fn main() {
             }
         });
     }
+    let cli = updater::intercept_cli(args);
+    if let Some(notice) = cli.notice {
+        *STARTUP_UPDATE_NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(notice);
+    }
     let initial = settings::Settings::load();
     // Rune's own words (a text field's menu, the window buttons' names for screen readers) in
     // the app's language.
     rune::set_labels(rune_labels);
+    // Apply an update downloaded in an earlier run before opening the window. Not when this start
+    // is the helper reporting that installing it failed: trying again at once would bring the
+    // same refusal (a declined UAC prompt, a locked file) back at every start, the window never
+    // opening. That update goes; the dialog can fetch and install it again.
+    let install_failed = matches!(STARTUP_UPDATE_NOTICE.lock().unwrap_or_else(|e| e.into_inner()).as_ref(), Some(Err(_)));
+    if install_failed {
+        updater::clear_staged();
+    } else if !rune::is_headless() && updater::install_kept(initial.auto_update) {
+        std::process::exit(0);
+    }
     accounts::start();
     let main_spec = AppSpec::<State> {
         min_size: Some((900.0, 420.0)),
@@ -2878,6 +2980,58 @@ fn main() {
                 accounts_hub_scene(s);
                 s.settings.theme = settings::Theme::Light;
             }),
+            ("update-available", |s| {
+                s.updater.support = Ok(updater::InstallKind::WindowsInstalled { install_dir: PathBuf::from(r"C:\Program Files\OpenExplorer") });
+                s.updater.release = Some(updater::Release {
+                    version: "0.5.0".into(),
+                    url: "https://github.com/orezraey/OpenExplorer/releases/tag/v0.5.0".into(),
+                    notes: "- Atualização integrada no aplicativo\n- Melhorias de desempenho na listagem".into(),
+                    asset_name: "OpenExplorer-0.5.0-windows-x64-setup.exe".into(),
+                    download_url: "https://example.invalid/setup.exe".into(),
+                    size: 18_400_000,
+                    sha256: None,
+                    signed: None,
+                });
+                s.updater.download = updater::DownloadState::Idle;
+                s.dialog = Some(actions::Dialog::Update);
+            }),
+            ("update-downloading", |s| {
+                s.updater.support = Ok(updater::InstallKind::WindowsInstalled { install_dir: PathBuf::from(r"C:\Program Files\OpenExplorer") });
+                s.updater.release = Some(updater::Release {
+                    version: "0.5.0".into(),
+                    url: "https://github.com/orezraey/OpenExplorer/releases/tag/v0.5.0".into(),
+                    notes: String::new(),
+                    asset_name: "OpenExplorer-0.5.0-windows-x64-setup.exe".into(),
+                    download_url: "https://example.invalid/setup.exe".into(),
+                    size: 18_400_000,
+                    sha256: None,
+                    signed: None,
+                });
+                s.updater.download = updater::DownloadState::Downloading { received: 11_200_000, total: 18_400_000 };
+                s.dialog = Some(actions::Dialog::Update);
+            }),
+            ("update-ready", |s| {
+                s.updater.support = Ok(updater::InstallKind::WindowsInstalled { install_dir: PathBuf::from(r"C:\Program Files\OpenExplorer") });
+                s.updater.release = Some(updater::Release {
+                    version: "0.5.0".into(),
+                    url: "https://github.com/orezraey/OpenExplorer/releases/tag/v0.5.0".into(),
+                    notes: "- Atualização integrada no aplicativo\n- Melhorias de desempenho na listagem".into(),
+                    asset_name: "OpenExplorer-0.5.0-windows-x64-setup.exe".into(),
+                    download_url: "https://example.invalid/setup.exe".into(),
+                    size: 18_400_000,
+                    sha256: None,
+                    signed: None,
+                });
+                s.updater.download = updater::DownloadState::Ready(updater::Staged {
+                    version: "0.5.0".into(),
+                    file_path: PathBuf::from("staged.exe"),
+                    sha256: "0".repeat(64),
+                    install_kind: updater::InstallKind::WindowsInstalled { install_dir: PathBuf::from(r"C:\Program Files\OpenExplorer") },
+                    release_url: "https://github.com/orezraey/OpenExplorer/releases/tag/v0.5.0".into(),
+                    signed: Default::default(),
+                });
+                s.dialog = Some(actions::Dialog::Update);
+            }),
         ],
         ..AppSpec::new("Open Explorer", (1280.0, 760.0), init, ui::view)
     };
@@ -3029,7 +3183,7 @@ fn main() {
     let mut main_app = rune::App::new(main_spec)
         .titlebar(rune::Titlebar::new(34.0))
         .font_smoothing(initial.text_render.smoothing())
-        .args(rune_args(std::env::args().skip(1)))
+        .args(rune_args(cli.args.into_iter()))
         .turn_scope(enter_turn, leave_turn)
         // B2 folders and Telegram accounts on screen look for changes only while the window is in
         // front.
@@ -3048,7 +3202,7 @@ fn main() {
         // trees and listings were last kept is kept here, so the next start has less to catch up on.
         .on_quit(|_, _| {
             accounts::save_caches();
-            if RESTART.load(Ordering::Relaxed) {
+            if !updater::run_pending_handoff() && RESTART.load(Ordering::Relaxed) {
                 relaunch();
             }
         })
