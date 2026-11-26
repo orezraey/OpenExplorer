@@ -720,6 +720,26 @@ pub fn format_time(t: SystemTime) -> String {
     chrono::DateTime::<chrono::Local>::from(t).format("%d/%m/%Y %H:%M").to_string()
 }
 
+/// A size with two decimal places ("807,33 MB"), or `"512 B"` below 1 KB.
+pub fn format_size_exact(b: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if b < 1024 {
+        return format!("{b} B");
+    }
+    let mut v = b as f64 / 1024.0;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    openexplorer_i18n::decimal(format!("{v:.2} {}", UNITS[u]))
+}
+
+/// Local date and time including seconds: `"17/08/2021 16:59:23"`.
+pub fn format_time_secs(t: SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(t).format("%d/%m/%Y %H:%M:%S").to_string()
+}
+
 /// `Option<SystemTime>` as signed milliseconds since 1970 for the disk cache: serde's own
 /// `SystemTime` format can't hold a time before 1970, and Drive has files dated far earlier.
 mod unix_ms {
