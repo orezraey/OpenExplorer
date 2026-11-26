@@ -163,6 +163,7 @@ impl Transfer {
             Stage::Done => t("Concluído", "Done"),
             Stage::Cancelled => t("Cancelado", "Canceled"),
             Stage::Failed => t("Erro", "Error"),
+            Stage::Skipped => t("Ignorado", "Skipped"),
         };
         let items = p.items.load(Ordering::Relaxed);
         if p.stage() == Stage::Running {
@@ -189,6 +190,15 @@ impl Transfer {
         let s = &self.shown;
         s.seen.set(Some((self.look(), bar_w.to_bits())));
         s.state.set(self.state_text());
+        if p.stage() == Stage::Skipped {
+            s.size.set(String::new());
+            s.percent.set("—");
+            s.fraction.set(0.0);
+            s.fill.set([1.0, 1.0, 0.0, BAR_H - 2.0]);
+            s.speed.set(String::new());
+            s.left.set(String::new());
+            return;
+        }
         s.size.set(if p.sized.load(Ordering::Relaxed) { pair(p.bytes.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed)) } else { String::new() });
         let fraction = self.fraction();
         s.percent.set(fraction.map(|f| format!("{}%", (f * 100.0).floor())).unwrap_or_else(|| "…".into()));
@@ -302,7 +312,10 @@ impl Batch {
                 p.end(Err(CANCELLED.into()));
                 continue;
             }
-            p.end(each(i, p));
+            let result = each(i, p);
+            if p.stage() != Stage::Skipped {
+                p.end(result);
+            }
         }
         self.summary()
     }
@@ -331,13 +344,21 @@ impl Batch {
     /// How the rows ended, in a line: "Copiado: 3 itens.", or what went wrong.
     pub fn summary(&self) -> Result<String, String> {
         let count = |stage| self.rows.iter().filter(|p| p.stage() == stage).count();
-        let (ok, cancelled) = (count(Stage::Done), count(Stage::Cancelled));
+        let (ok, skipped, cancelled) = (count(Stage::Done), count(Stage::Skipped), count(Stage::Cancelled));
         let failed: Vec<String> = self.rows.iter().filter(|p| p.stage() == Stage::Failed).map(|p| p.error()).collect();
+        if skipped > 0 && ok == 0 && cancelled == 0 && failed.is_empty() {
+            return Ok(tr!("Ignorados (já existiam): {}.", "Skipped (already exist): {}.", items(skipped)));
+        }
+        let skip_part = if skipped > 0 {
+            tr!(" · ignorados: {skipped}", " · skipped: {skipped}")
+        } else {
+            String::new()
+        };
         match (ok, cancelled, failed.as_slice()) {
             (0, 0, [why]) => Err(why.clone()),
-            (_, 0, []) => Ok(format!("{}: {}.", self.op.done(), items(ok))),
-            (_, _, []) => Ok(tr!("{0}: {1} · cancelados: {cancelled}.", "{0}: {1} · cancelled: {cancelled}.", self.op.done(), items(ok))),
-            (_, _, [first, ..]) => Err(tr!("{0}: {1} · com erro: {2} ({first})", "{0}: {1} · failed: {2} ({first})", self.op.done(), items(ok), failed.len())),
+            (_, 0, []) => Ok(format!("{}: {}{skip_part}.", self.op.done(), items(ok))),
+            (_, _, []) => Ok(tr!("{0}: {1} · cancelados: {cancelled}{skip_part}.", "{0}: {1} · cancelled: {cancelled}{skip_part}.", self.op.done(), items(ok))),
+            (_, _, [first, ..]) => Err(tr!("{0}: {1} · com erro: {2} ({first}){skip_part}", "{0}: {1} · failed: {2} ({first}){skip_part}", self.op.done(), items(ok), failed.len())),
         }
     }
 }
@@ -443,5 +464,31 @@ mod tests {
         let mut list = Vec::new();
         drop(queue(&mut list, None, Op::Move, [(End::local(Path::new("a")), End::local(Path::new("b")))]));
         assert_eq!(list[0].progress.stage(), Stage::Failed);
+    }
+
+    #[test]
+    fn skipped_rows_refresh_cleanly_and_summarize() {
+        let mut list = Vec::new();
+        let end = || End::local(Path::new(r"C:\x"));
+        let batch = queue(&mut list, None, Op::Copy, (0..2).map(|_| (end(), end())));
+        let summary = batch.run(|i, p| {
+            if i == 0 {
+                p.skip();
+            }
+            Ok(())
+        });
+        assert_eq!(summary, Ok("Copiado: 1 item · ignorados: 1.".into()));
+        let totals = Totals::default();
+        refresh(&list, &totals, 100.0);
+        assert_eq!(&*list[0].shown.state.get(), "Ignorado");
+        assert_eq!(&*list[0].shown.percent.get(), "—");
+
+        let mut all_skipped = Vec::new();
+        let b2 = queue(&mut all_skipped, None, Op::Download, [(end(), end())]);
+        let s2 = b2.run(|_, p| {
+            p.skip();
+            Ok(())
+        });
+        assert_eq!(s2, Ok("Ignorados (já existiam): 1 item.".into()));
     }
 }

@@ -20,16 +20,22 @@ use openexplorer_gdrive::api::{FOLDER_MIME, MANY};
 use openexplorer_gdrive::download::{export_format, local_name};
 use openexplorer_gdrive::{Drive, DriveFile};
 
+use crate::conflict::{self, Decision, FileInfo, Resolver};
+use crate::model::shown;
 use crate::ops::{self, CANCELLED, Progress, Stage};
 use crate::transfers::Batch;
 use crate::work::{Queue, Slots};
 
+/// What a row runs once all of it arrived: `(row, path made, whether it made it new, whether
+/// something in it was skipped)`.
+pub type Finish<'a> = dyn Fn(usize, &Path, bool, bool) -> Result<(), String> + Sync + 'a;
+
 /// One piece of work of a row.
 enum Work {
     /// Read Drive folder `id` into local folder `dir` (already made).
-    Folder { row: usize, id: String, dir: PathBuf },
-    /// Fetch `file` to `to`, a name claimed for it.
-    File { row: usize, file: DriveFile, to: PathBuf },
+    Folder { row: usize, id: String, dir: PathBuf, src_place: String },
+    /// Fetch `file` into `dir` as `raw_name` (conflict checked before taking a download slot).
+    File { row: usize, file: DriveFile, dir: PathBuf, raw_name: String, src_place: String, is_top: bool },
 }
 
 impl Work {
@@ -46,11 +52,17 @@ struct Row {
     left: AtomicUsize,
     /// Some work was skipped (Cancelar, or after an error).
     skipped: AtomicBool,
+    /// The top-level item itself was skipped via conflict prompt.
+    row_skipped: AtomicBool,
+    /// Some inner file inside a folder was skipped (so a move keeps the Drive folder).
+    kept: AtomicBool,
+    /// Whether this row created its top-level destination item (false when merged or replaced).
+    created: AtomicBool,
     error: Mutex<Option<String>>,
     /// Bytes of the files found so far, the row's size.
     total: AtomicU64,
-    /// The file or folder the row made in the destination.
-    made: PathBuf,
+    /// The file or folder the row made/targeted in the destination.
+    made: Mutex<PathBuf>,
 }
 
 /// Whether Drive keeps `f` in a format of Google's own, with no bytes of its own: its listed
@@ -69,8 +81,14 @@ fn known_size(f: &DriveFile) -> u64 {
 #[derive(Default)]
 pub struct Names(Mutex<HashSet<PathBuf>>);
 
+enum Claimed {
+    Write { path: PathBuf, created: bool },
+    Skip,
+    Cancel,
+}
+
 impl Names {
-    /// A free path in `dir` for Drive item `f`.
+    /// A free path in `dir` for Drive item `f` (auto-renaming without prompting).
     pub fn claim(&self, dir: &Path, f: &DriveFile) -> PathBuf {
         let name = ops::windows_name(&if f.is_dir { f.name.clone() } else { local_name(f) });
         let mut taken = self.0.lock().unwrap();
@@ -78,40 +96,193 @@ impl Names {
         taken.insert(path.clone());
         path
     }
+
+    fn claim_exact(&self, path: &Path) -> bool {
+        let mut taken = self.0.lock().unwrap();
+        if path.exists() || taken.contains(path) {
+            return false;
+        }
+        taken.insert(path.to_path_buf());
+        true
+    }
+
+    fn claim_numbered(&self, dir: &Path, raw_name: &str, is_dir: bool) -> PathBuf {
+        let mut taken = self.0.lock().unwrap();
+        let path = conflict::numbered_local(dir, raw_name, is_dir, &|p| taken.contains(p));
+        taken.insert(path.clone());
+        path
+    }
+
+    /// Resolves a destination file conflict (with `resolver`) and claims the target path
+    /// without holding any lock while waiting for user input.
+    fn resolve_file(
+        &self,
+        dir: &Path,
+        raw_name: &str,
+        file: &DriveFile,
+        src_place: &str,
+        resolver: Option<&Resolver>,
+        is_cancelled: impl Fn() -> bool,
+    ) -> Claimed {
+        let desired = dir.join(raw_name);
+        let Some(res) = resolver else {
+            let mut taken = self.0.lock().unwrap();
+            let path = ops::unique_where(dir, raw_name, &|p| taken.contains(p));
+            taken.insert(path.clone());
+            return Claimed::Write { path, created: true };
+        };
+        let (exists_on_disk, renamed_name) = {
+            let mut taken = self.0.lock().unwrap();
+            if !desired.exists() && !taken.contains(&desired) {
+                taken.insert(desired.clone());
+                return Claimed::Write { path: desired, created: true };
+            }
+            let renamed = conflict::numbered_local(dir, raw_name, false, &|p| taken.contains(p));
+            let renamed_name = renamed.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| raw_name.to_string());
+            (desired.exists(), renamed_name)
+        };
+        if !exists_on_disk {
+            // Same-name sibling in the same batch already claimed `desired`: give this one a numbered name.
+            let path = self.claim_numbered(dir, raw_name, false);
+            return Claimed::Write { path, created: true };
+        }
+        let dst_info = FileInfo::local(&desired).unwrap_or_else(|| FileInfo {
+            name: raw_name.to_string(),
+            place: dir.display().to_string(),
+            is_dir: false,
+            size: None,
+            modified: None,
+            kind: conflict::kind_of(raw_name, false, None),
+        });
+        let src_info = FileInfo::drive(file, src_place.to_string());
+        let decision = res.resolve(src_info, dst_info, renamed_name, is_cancelled);
+        match decision {
+            Decision::Cancel => Claimed::Cancel,
+            Decision::Skip => Claimed::Skip,
+            Decision::Replace if !desired.is_dir() => {
+                let mut taken = self.0.lock().unwrap();
+                if taken.contains(&desired) {
+                    let path = conflict::numbered_local(dir, raw_name, false, &|p| taken.contains(p));
+                    taken.insert(path.clone());
+                    Claimed::Write { path, created: true }
+                } else {
+                    taken.insert(desired.clone());
+                    Claimed::Write { path: desired, created: false }
+                }
+            }
+            Decision::KeepBoth | Decision::Replace => {
+                let path = self.claim_numbered(dir, raw_name, false);
+                Claimed::Write { path, created: true }
+            }
+        }
+    }
+}
+
+/// Joins a display subfolder path onto `place`.
+fn child_place(place: &str, name: &str) -> String {
+    let s = shown(name);
+    if place.is_empty() { s } else { format!("{place}\\{s}") }
 }
 
 /// Downloads each of `items` (a row of `batch` each) into the folder `dst`, with `at_once` files
 /// fetched at the same time, big ones in segments when `segmented`. A row whose files all
-/// arrived then runs `finish` with its index and the path it made (the original goes to the
-/// Drive trash after Recortar, the file opens after Abrir).
+/// arrived then runs `finish` with `(row, made_path, created_new, kept_some_skipped)`.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     d: &Drive,
     batch: &Batch,
     items: &[DriveFile],
     dst: &Path,
+    src_root: &str,
     at_once: usize,
     segmented: bool,
     slots: &Slots,
-    finish: &(dyn Fn(usize, &Path) -> Result<(), String> + Sync),
+    resolver: Option<&Resolver>,
+    finish: &Finish<'_>,
 ) -> Result<String, String> {
     let rows = batch.rows();
     let names = Names::default();
     let mut first = Vec::new();
-    let mut state = Vec::new();
+    let mut state = Vec::with_capacity(items.len());
     for (row, f) in items.iter().enumerate() {
-        let made = names.claim(dst, f);
-        rows[row].add_items(1);
         let total = known_size(f);
-        if total > 0 || !f.is_dir && !google(f) {
+        if total > 0 || (!f.is_dir && !google(f)) {
             rows[row].size(total);
         }
-        state.push(Row { left: AtomicUsize::new(1), skipped: AtomicBool::new(false), error: Mutex::new(None), total: AtomicU64::new(total), made: made.clone() });
-        first.push(if f.is_dir {
-            Work::Folder { row, id: f.target.clone().unwrap_or_else(|| f.id.clone()), dir: made }
+        let raw_name = ops::windows_name(&if f.is_dir { f.name.clone() } else { local_name(f) });
+        let desired = dst.join(&raw_name);
+        if f.is_dir {
+            let (made, created, skip_row, cancel_row) = if let Some(res) = resolver {
+                if desired.is_dir() {
+                    (desired, false, false, false)
+                } else if desired.exists() {
+                    let renamed = conflict::numbered_local(dst, &raw_name, true, &|_| false);
+                    let renamed_name = renamed.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| raw_name.clone());
+                    let dst_info = FileInfo::local(&desired).unwrap_or_else(|| FileInfo {
+                        name: raw_name.clone(),
+                        place: dst.display().to_string(),
+                        is_dir: false,
+                        size: None,
+                        modified: None,
+                        kind: conflict::kind_of(&raw_name, false, None),
+                    });
+                    match res.resolve(FileInfo::drive(f, src_root.to_string()), dst_info, renamed_name, || rows[row].cancelled()) {
+                        Decision::Skip => (desired, false, true, false),
+                        Decision::Cancel => (desired, false, false, true),
+                        Decision::KeepBoth | Decision::Replace => (names.claim_numbered(dst, &raw_name, true), true, false, false),
+                    }
+                } else if names.claim_exact(&desired) {
+                    (desired, true, false, false)
+                } else {
+                    (names.claim_numbered(dst, &raw_name, true), true, false, false)
+                }
+            } else {
+                (names.claim(dst, f), true, false, false)
+            };
+            state.push(Row {
+                left: AtomicUsize::new(1),
+                skipped: AtomicBool::new(false),
+                row_skipped: AtomicBool::new(skip_row),
+                kept: AtomicBool::new(false),
+                created: AtomicBool::new(created),
+                error: Mutex::new(None),
+                total: AtomicU64::new(total),
+                made: Mutex::new(made.clone()),
+            });
+            if skip_row {
+                rows[row].skip();
+            } else if cancel_row {
+                rows[row].end(Err(CANCELLED.into()));
+            } else {
+                rows[row].add_items(1);
+                first.push(Work::Folder {
+                    row,
+                    id: f.target.clone().unwrap_or_else(|| f.id.clone()),
+                    dir: made,
+                    src_place: child_place(src_root, &f.name),
+                });
+            }
         } else {
-            Work::File { row, file: f.clone(), to: made }
-        });
+            rows[row].add_items(1);
+            state.push(Row {
+                left: AtomicUsize::new(1),
+                skipped: AtomicBool::new(false),
+                row_skipped: AtomicBool::new(false),
+                kept: AtomicBool::new(false),
+                created: AtomicBool::new(true),
+                error: Mutex::new(None),
+                total: AtomicU64::new(total),
+                made: Mutex::new(desired),
+            });
+            first.push(Work::File {
+                row,
+                file: f.clone(),
+                dir: dst.to_path_buf(),
+                raw_name,
+                src_place: src_root.to_string(),
+                is_top: true,
+            });
+        }
     }
     let queue = Queue::new(first);
     // Folders already read in each row: a shortcut back up the tree doesn't loop.
@@ -121,6 +292,63 @@ pub fn run(
             scope.spawn(|| {
                 while let Some((work, _finished)) = queue.next() {
                     let skip = |row: usize| rows[row].cancelled() || state[row].error.lock().map(|e| e.is_some()).unwrap_or(true);
+                    // Resolve file conflicts BEFORE acquiring a download slot so waiting on user
+                    // input never starves active downloads.
+                    if let Work::File { row, file, dir, raw_name, src_place, is_top } = work {
+                        let (p, st) = (&rows[row], &state[row]);
+                        if skip(row) {
+                            st.skipped.store(true, Ordering::Relaxed);
+                        } else {
+                            match names.resolve_file(&dir, &raw_name, &file, &src_place, resolver, || skip(row)) {
+                                Claimed::Cancel => st.skipped.store(true, Ordering::Relaxed),
+                                Claimed::Skip => {
+                                    if is_top {
+                                        st.row_skipped.store(true, Ordering::Relaxed);
+                                    } else {
+                                        st.kept.store(true, Ordering::Relaxed);
+                                        p.unsize(known_size(&file));
+                                    }
+                                }
+                                Claimed::Write { path: to, created } => {
+                                    if is_top {
+                                        st.created.store(created, Ordering::Relaxed);
+                                        if let Ok(mut m) = st.made.lock() {
+                                            *m = to.clone();
+                                        }
+                                    }
+                                    let _slot = slots.acquire_unless(|| skip(row));
+                                    if skip(row) {
+                                        st.skipped.store(true, Ordering::Relaxed);
+                                    } else {
+                                        if p.stage() == Stage::Waiting {
+                                            p.begin();
+                                        }
+                                        let result = fetch(d, &file, &to, segmented, p).map(|n| {
+                                            // An export's size is known only now.
+                                            if known_size(&file) == 0 && n > 0 {
+                                                p.size(st.total.fetch_add(n, Ordering::Relaxed) + n);
+                                            }
+                                        });
+                                        match result {
+                                            Ok(()) => {}
+                                            Err(e) if e == CANCELLED => st.skipped.store(true, Ordering::Relaxed),
+                                            Err(e) => {
+                                                if let Ok(mut first) = st.error.lock() {
+                                                    first.get_or_insert(e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        p.item_done();
+                        if st.left.fetch_sub(1, Ordering::Relaxed) == 1 {
+                            finish_row(p, st, row, finish);
+                        }
+                        continue;
+                    }
+
                     let _slot = slots.acquire_unless(|| skip(work.row()));
                     // Other folders waiting are read with this one, in one listing.
                     let mut group = vec![work];
@@ -129,15 +357,15 @@ pub fn run(
                     }
                     let mut to_read = Vec::new();
                     for (k, w) in group.iter().enumerate() {
-                        if let Work::Folder { row, id, dir } = w
+                        if let Work::Folder { row, id, dir, src_place } = w
                             && !skip(*row)
                             && visited.lock().unwrap().insert((*row, id.clone()))
                         {
-                            to_read.push((k, *row, id.as_str(), dir.as_path()));
+                            to_read.push((k, *row, id.as_str(), dir.as_path(), src_place.as_str()));
                         }
                     }
                     let mut read: Vec<Option<Result<Vec<Work>, String>>> = (0..group.len()).map(|_| None).collect();
-                    for ((k, ..), r) in to_read.iter().zip(read_folders(d, &to_read, &names)) {
+                    for ((k, ..), r) in to_read.iter().zip(read_folders(d, &to_read, &names, resolver, &state, &|r| skip(r))) {
                         read[*k] = Some(r);
                     }
                     for (work, listed) in group.into_iter().zip(read) {
@@ -162,12 +390,7 @@ pub fn run(
                                         queue.add(more);
                                     })
                                 }
-                                Work::File { file, to, .. } => fetch(d, file, to, segmented, p).map(|n| {
-                                    // An export's size is known only now.
-                                    if known_size(file) == 0 && n > 0 {
-                                        p.size(st.total.fetch_add(n, Ordering::Relaxed) + n);
-                                    }
-                                }),
+                                Work::File { .. } => Ok(()),
                             };
                             match result {
                                 Ok(()) => {}
@@ -182,17 +405,7 @@ pub fn run(
                         p.item_done();
                         // The row's last piece of work ends it.
                         if st.left.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            let error = st.error.lock().ok().and_then(|e| e.clone());
-                            p.end(match error {
-                                Some(e) => Err(e),
-                                None if st.skipped.load(Ordering::Relaxed) => {
-                                    // A cancelled row takes away what it made, as a cancelled copy
-                                    // does: what's left in the destination is only whole items.
-                                    let _ = if st.made.is_dir() { std::fs::remove_dir_all(&st.made) } else { std::fs::remove_file(&st.made) };
-                                    Err(CANCELLED.into())
-                                }
-                                None => finish(row, &st.made),
-                            });
+                            finish_row(p, st, row, finish);
                         }
                     }
                 }
@@ -202,11 +415,40 @@ pub fn run(
     batch.summary()
 }
 
-/// Reads the Drive folders `list` (each `(_, row, id, local folder)`): one listing for all of
-/// them, or one each if Drive refuses that one. Gives each folder's work, in `list`'s order.
-fn read_folders(d: &Drive, list: &[(usize, usize, &str, &Path)], names: &Names) -> Vec<Result<Vec<Work>, String>> {
+fn finish_row(p: &Progress, st: &Row, row: usize, finish: &Finish<'_>) {
+    if st.row_skipped.load(Ordering::Relaxed) {
+        p.skip();
+        return;
+    }
+    let error = st.error.lock().ok().and_then(|e| e.clone());
+    let made = st.made.lock().map(|m| m.clone()).unwrap_or_default();
+    let created = st.created.load(Ordering::Relaxed);
+    let kept = st.kept.load(Ordering::Relaxed);
+    p.end(match error {
+        Some(e) => Err(e),
+        None if st.skipped.load(Ordering::Relaxed) => {
+            // A cancelled row takes away what it created, never an existing merged folder/file.
+            if created {
+                let _ = if made.is_dir() { std::fs::remove_dir_all(&made) } else { std::fs::remove_file(&made) };
+            }
+            Err(CANCELLED.into())
+        }
+        None => finish(row, &made, created, kept),
+    });
+}
+
+/// Reads the Drive folders `list` (each `(_, row, id, local folder, src_place)`): one listing for
+/// all of them, or one each if Drive refuses that one.
+fn read_folders(
+    d: &Drive,
+    list: &[(usize, usize, &str, &Path, &str)],
+    names: &Names,
+    resolver: Option<&Resolver>,
+    state: &[Row],
+    stop: &dyn Fn(usize) -> bool,
+) -> Vec<Result<Vec<Work>, String>> {
     if list.len() > 1 {
-        let ids: Vec<&str> = list.iter().map(|(_, _, id, _)| *id).collect();
+        let ids: Vec<&str> = list.iter().map(|(_, _, id, ..)| *id).collect();
         let mut children: std::collections::HashMap<String, Vec<DriveFile>> = ids.iter().map(|id| (id.to_string(), Vec::new())).collect();
         let together = d.list_many(&ids, |page| {
             for (parent, f) in page {
@@ -217,27 +459,53 @@ fn read_folders(d: &Drive, list: &[(usize, usize, &str, &Path)], names: &Names) 
         match together {
             // Cloned, not taken: one folder may be here twice (a folder and a shortcut to it,
             // both selected), and each of its rows gets its contents.
-            Ok(()) => return list.iter().map(|(_, row, id, dir)| works_in(*row, dir, children.get(*id).cloned().unwrap_or_default(), names)).collect(),
+            Ok(()) => {
+                return list
+                    .iter()
+                    .map(|(_, row, id, dir, src_place)| works_in(*row, dir, src_place, children.get(*id).cloned().unwrap_or_default(), names, resolver, &state[*row], &|| stop(*row)))
+                    .collect();
+            }
             Err(e) => openexplorer_gdrive::log(&format!("download: {} pastas numa listagem só não deu ({e}); uma a uma", list.len())),
         }
     }
-    list.iter().map(|(_, row, id, dir)| read_folder(d, *row, id, dir, names)).collect()
+    list.iter().map(|(_, row, id, dir, src_place)| read_folder(d, *row, id, dir, src_place, names, resolver, &state[*row], &|| stop(*row))).collect()
 }
 
 /// Lists Drive folder `id`, makes its subfolders in `dir`, and gives the work for what's in it.
-fn read_folder(d: &Drive, row: usize, id: &str, dir: &Path, names: &Names) -> Result<Vec<Work>, String> {
+#[allow(clippy::too_many_arguments)]
+fn read_folder(
+    d: &Drive,
+    row: usize,
+    id: &str,
+    dir: &Path,
+    src_place: &str,
+    names: &Names,
+    resolver: Option<&Resolver>,
+    st: &Row,
+    stop: &dyn Fn() -> bool,
+) -> Result<Vec<Work>, String> {
     let mut children = Vec::new();
     d.list(id, None, |page, _| {
         children.extend(page);
         true
     })?;
-    works_in(row, dir, children, names)
+    works_in(row, dir, src_place, children, names, resolver, st, stop)
 }
 
 /// Makes local folder `dir` and the subfolders of `children` (a Drive folder's contents) in it,
 /// and gives the work for what's in it. Shortcuts to files and Google's formats that can't be
 /// exported (Forms, Sites) stay out: there's nothing to fetch.
-fn works_in(row: usize, dir: &Path, children: Vec<DriveFile>, names: &Names) -> Result<Vec<Work>, String> {
+#[allow(clippy::too_many_arguments)]
+fn works_in(
+    row: usize,
+    dir: &Path,
+    src_place: &str,
+    children: Vec<DriveFile>,
+    names: &Names,
+    resolver: Option<&Resolver>,
+    st: &Row,
+    stop: &dyn Fn() -> bool,
+) -> Result<Vec<Work>, String> {
     std::fs::create_dir_all(dir).map_err(|e| openexplorer_i18n::tr!("Não consegui criar a pasta \"{}\": {e}", "Couldn't create the folder \"{}\": {e}", dir.display()))?;
     let mut work = Vec::new();
     for f in children {
@@ -245,13 +513,52 @@ fn works_in(row: usize, dir: &Path, children: Vec<DriveFile>, names: &Names) -> 
             openexplorer_gdrive::log(&format!("download: \"{}\" ({}) fica de fora: não tem o que baixar", f.name, f.mime));
             continue;
         }
-        let to = names.claim(dir, &f);
         if f.is_dir {
+            let raw_name = ops::windows_name(&f.name);
+            let desired = dir.join(&raw_name);
+            let to = if let Some(res) = resolver {
+                if desired.is_dir() {
+                    desired
+                } else if desired.exists() {
+                    let renamed = conflict::numbered_local(dir, &raw_name, true, &|_| false);
+                    let renamed_name = renamed.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| raw_name.clone());
+                    let dst_info = FileInfo::local(&desired).unwrap_or_else(|| FileInfo {
+                        name: raw_name.clone(),
+                        place: dir.display().to_string(),
+                        is_dir: false,
+                        size: None,
+                        modified: None,
+                        kind: conflict::kind_of(&raw_name, false, None),
+                    });
+                    match res.resolve(FileInfo::drive(&f, src_place.to_string()), dst_info, renamed_name, stop) {
+                        Decision::Skip => {
+                            st.kept.store(true, Ordering::Relaxed);
+                            continue;
+                        }
+                        Decision::Cancel => return Err(CANCELLED.into()),
+                        Decision::KeepBoth | Decision::Replace => names.claim_numbered(dir, &raw_name, true),
+                    }
+                } else if names.claim_exact(&desired) {
+                    desired
+                } else {
+                    names.claim_numbered(dir, &raw_name, true)
+                }
+            } else {
+                names.claim(dir, &f)
+            };
             std::fs::create_dir_all(&to).map_err(|e| openexplorer_i18n::tr!("Não consegui criar a pasta \"{}\": {e}", "Couldn't create the folder \"{}\": {e}", to.display()))?;
             let id = f.target.clone().unwrap_or_else(|| f.id.clone());
-            work.push(Work::Folder { row, id, dir: to });
+            work.push(Work::Folder { row, id, dir: to, src_place: child_place(src_place, &f.name) });
         } else if f.mime != FOLDER_MIME {
-            work.push(Work::File { row, file: f, to });
+            let raw_name = ops::windows_name(&local_name(&f));
+            work.push(Work::File {
+                row,
+                file: f,
+                dir: dir.to_path_buf(),
+                raw_name,
+                src_place: src_place.to_string(),
+                is_top: false,
+            });
         }
     }
     Ok(work)
@@ -346,7 +653,7 @@ mod tests {
         let mut rows = Vec::new();
         let end = crate::transfers::End::local(&dst);
         let batch = crate::transfers::queue(&mut rows, None, crate::transfers::Op::Download, [(end.clone(), end)]);
-        let out = run(&d, &batch, std::slice::from_ref(&folder), &dst, 4, true, &Slots::new(4), &|_, _| Ok(()));
+        let out = run(&d, &batch, std::slice::from_ref(&folder), &dst, "", 4, true, &Slots::new(4), None, &|_, _, _, _| Ok(()));
         println!("{out:?}");
         let made: Vec<PathBuf> = walk(&dst);
         let p = &rows[0].progress;
