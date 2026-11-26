@@ -102,15 +102,18 @@ once. To remove it, run as administrator:
 
 ## Google Drive
 
-Until the app passes Google's verification, you need your own OAuth client (free):
+Release builds include Open Explorer's OAuth client: go to Add account → Google Drive and click
+Connect in browser. Until Google's verification is complete, Google shows an "app isn't verified"
+warning (click Advanced → Go to Open Explorer) and caps unverified apps at 100 users.
+
+To use your own OAuth client instead (or when building from source):
 
 1. Create a project in the [Google Cloud console](https://console.cloud.google.com) and enable
    the Google Drive API.
-2. Set up the OAuth consent screen as External, in Testing, with your account as a test user.
+2. Set up the OAuth consent screen as External (in Testing, add your account as a test user;
+   Google signs out Testing apps every 7 days).
 3. Create an OAuth client ID of type Desktop app and download the JSON.
-4. In Open Explorer, go to Add account → Google Drive and paste the JSON.
-
-In Testing mode Google signs you out after 7 days.
+4. In Open Explorer, go to Add account → Google Drive → Change Client ID and paste the JSON.
 
 ## OneDrive
 

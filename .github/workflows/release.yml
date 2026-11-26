@@ -86,12 +86,17 @@ jobs:
 
       - name: Build (Windows, Linux)
         if: runner.os != 'macOS'
+        env:
+          OPENEXPLORER_GOOGLE_CLIENT_ID: ${{ secrets.OPENEXPLORER_GOOGLE_CLIENT_ID }}
+          OPENEXPLORER_GOOGLE_CLIENT_SECRET: ${{ secrets.OPENEXPLORER_GOOGLE_CLIENT_SECRET }}
         run: cargo build --release --locked -p openexplorer
 
       - name: Build (macOS, both architectures)
         if: runner.os == 'macOS'
         env:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
+          OPENEXPLORER_GOOGLE_CLIENT_ID: ${{ secrets.OPENEXPLORER_GOOGLE_CLIENT_ID }}
+          OPENEXPLORER_GOOGLE_CLIENT_SECRET: ${{ secrets.OPENEXPLORER_GOOGLE_CLIENT_SECRET }}
         run: |
           cargo build --release --locked -p openexplorer --target aarch64-apple-darwin
           cargo build --release --locked -p openexplorer --target x86_64-apple-darwin

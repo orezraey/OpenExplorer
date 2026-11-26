@@ -104,17 +104,19 @@ administrador uma vez. Para remover, rode como administrador:
 
 ## Google Drive
 
-Enquanto o app não passa pela verificação do Google, você precisa do seu próprio cliente OAuth
-(gratuito):
+Os instaladores oficiais já vêm com o cliente OAuth do Open Explorer: vá em Adicionar conta →
+Google Drive e clique em Conectar no navegador. Enquanto o app não passa pela verificação do
+Google, o Google exibe o aviso "O Google não verificou este app" (clique em Avançado → Acessar
+Open Explorer) e limita apps não verificados a 100 usuários.
+
+Para usar o seu próprio cliente OAuth (ou ao compilar do código-fonte):
 
 1. Crie um projeto no [console do Google Cloud](https://console.cloud.google.com) e ative a
    Google Drive API.
-2. Configure a tela de permissão OAuth como Externo, em Teste, com a sua conta como usuário de
-   teste.
+2. Configure a tela de permissão OAuth como Externo (no modo Teste, adicione sua conta como
+   usuário de teste; o Google pede para entrar de novo a cada 7 dias).
 3. Crie um ID do cliente OAuth do tipo App para computador e baixe o JSON.
-4. No Open Explorer, vá em Adicionar conta → Google Drive e cole o JSON.
-
-No modo Teste, o Google pede para entrar de novo a cada 7 dias.
+4. No Open Explorer, vá em Adicionar conta → Google Drive → Alterar Client ID e cole o JSON.
 
 ## OneDrive
 
