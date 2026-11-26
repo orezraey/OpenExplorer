@@ -669,14 +669,18 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
         let taken: HashSet<String> = existing.keys().cloned().collect();
         Ok((std::sync::Mutex::new((existing, taken)), small))
     };
-    let step = move |c: &mut dyn Conn, (state, _): &(std::sync::Mutex<(HashMap<String, Item>, HashSet<String>)>, Vec<bool>), rows: &[(usize, &Progress)]| {
+    // What the folder holds already, and the names taken there since.
+    type Taken = std::sync::Mutex<(HashMap<String, Item>, HashSet<String>)>;
+    let step = move |c: &mut dyn Conn, (state, _): &(Taken, Vec<bool>), rows: &[(usize, &Progress)]| {
         enum Action {
-            Send { idx: usize, target: String, is_dir: bool, merge: bool },
+            /// `replace`: the target is a file already on the server that this one overwrites, so
+            /// a cancelled or failed send never removes it (it isn't the upload's to remove).
+            Send { idx: usize, target: String, is_dir: bool, merge: bool, replace: bool },
             Skip,
             Cancel,
         }
         let mut actions = Vec::with_capacity(rows.len());
-        let mut to_batch: Vec<(usize, String, PathBuf)> = Vec::new();
+        let mut to_batch: Vec<(usize, String, PathBuf, bool)> = Vec::new();
         for (i, p) in rows {
             let src = &sources[*i];
             let is_dir = src.is_dir();
@@ -691,9 +695,9 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
                 ex
             };
             let act = match ex {
-                None => Action::Send { idx: *i, target: child(&dir, &name), is_dir, merge: false },
+                None => Action::Send { idx: *i, target: child(&dir, &name), is_dir, merge: false, replace: false },
                 Some(ex) if is_dir && ex.is_dir => {
-                    Action::Send { idx: *i, target: child(&dir, &ex.name), is_dir: true, merge: true }
+                    Action::Send { idx: *i, target: child(&dir, &ex.name), is_dir: true, merge: true, replace: false }
                 }
                 Some(ex) => {
                     let renamed = {
@@ -712,28 +716,28 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
                         Decision::Cancel => Action::Cancel,
                         Decision::Skip => Action::Skip,
                         Decision::Replace if !is_dir && !ex.is_dir => {
-                            Action::Send { idx: *i, target: child(&dir, &ex.name), is_dir: false, merge: false }
+                            Action::Send { idx: *i, target: child(&dir, &ex.name), is_dir: false, merge: false, replace: true }
                         }
                         Decision::KeepBoth | Decision::Replace => {
                             let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
                             let free = free_name(&name, is_dir, &g.1);
                             g.1.insert(free.to_lowercase());
-                            Action::Send { idx: *i, target: child(&dir, &free), is_dir, merge: false }
+                            Action::Send { idx: *i, target: child(&dir, &free), is_dir, merge: false, replace: false }
                         }
                     }
                 }
             };
-            if let Action::Send { idx, target, is_dir: false, .. } = &act
+            if let Action::Send { idx, target, is_dir: false, replace, .. } = &act
                 && rows.len() > 1
             {
-                to_batch.push((idx.to_owned(), target.clone(), sources[*idx].clone()));
+                to_batch.push((idx.to_owned(), target.clone(), sources[*idx].clone(), *replace));
             }
             actions.push(act);
         }
 
         // Fast batch path when all rows in this group are small files to upload.
         if to_batch.len() == rows.len() && rows.len() > 1 {
-            let files: Vec<(String, PathBuf)> = to_batch.iter().map(|(_, t, p)| (t.clone(), p.clone())).collect();
+            let files: Vec<(String, PathBuf)> = to_batch.iter().map(|(_, t, p, _)| (t.clone(), p.clone())).collect();
             let mut last = vec![0u64; rows.len()];
             let sent = c.upload_files(&files, &mut |k, n| {
                 let p = rows[k].1;
@@ -744,9 +748,10 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
                 .iter()
                 .zip(to_batch)
                 .zip(sent)
-                .map(|(((i, _), (_, target, _)), r)| {
+                .map(|(((i, _), (_, target, _, replace)), r)| {
                     if let Err(e) = r.map_err(cancelled) {
-                        if e == CANCELLED {
+                        // What a cancelled send left is removed, unless the file was there before.
+                        if e == CANCELLED && !replace {
                             let _ = c.remove(&target, false);
                         }
                         return Err(e);
@@ -767,12 +772,14 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
                     p.skip();
                     Ok(())
                 }
-                Action::Send { target, is_dir, merge, .. } => {
+                Action::Send { target, is_dir, merge, replace, .. } => {
                     let mut kept = false;
                     let place = if is_dir { child_place(&dst_place, &sources[*i].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()) } else { dst_place.clone() };
                     let r = send(c, &sources[*i], &target, merge, &place, &resolver, &mut kept, p);
                     if let Err(e) = r {
-                        if e == CANCELLED && !merge {
+                        // What a cancelled send left is removed, unless it was there before: a
+                        // folder merged into, or a file this one replaces.
+                        if e == CANCELLED && !merge && !replace {
                             let _ = c.remove(&target, is_dir);
                         }
                         return Err(e);

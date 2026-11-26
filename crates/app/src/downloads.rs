@@ -26,6 +26,10 @@ use crate::ops::{self, CANCELLED, Progress, Stage};
 use crate::transfers::Batch;
 use crate::work::{Queue, Slots};
 
+/// What a row runs once all of it arrived: `(row, path made, whether it made it new, whether
+/// something in it was skipped)`.
+pub type Finish<'a> = dyn Fn(usize, &Path, bool, bool) -> Result<(), String> + Sync + 'a;
+
 /// One piece of work of a row.
 enum Work {
     /// Read Drive folder `id` into local folder `dir` (already made).
@@ -194,7 +198,7 @@ pub fn run(
     segmented: bool,
     slots: &Slots,
     resolver: Option<&Resolver>,
-    finish: &(dyn Fn(usize, &Path, bool, bool) -> Result<(), String> + Sync),
+    finish: &Finish<'_>,
 ) -> Result<String, String> {
     let rows = batch.rows();
     let names = Names::default();
@@ -411,7 +415,7 @@ pub fn run(
     batch.summary()
 }
 
-fn finish_row(p: &Progress, st: &Row, row: usize, finish: &(dyn Fn(usize, &Path, bool, bool) -> Result<(), String> + Sync)) {
+fn finish_row(p: &Progress, st: &Row, row: usize, finish: &Finish<'_>) {
     if st.row_skipped.load(Ordering::Relaxed) {
         p.skip();
         return;

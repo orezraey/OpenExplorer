@@ -237,18 +237,24 @@ impl Resolver {
         if let Some(policy) = g.policy {
             return apply_choice(policy, src.modified, dst.modified);
         }
-        let (tx, rx) = mpsc::channel();
         let live = Arc::new(AtomicBool::new(true));
-        (self.ask)(Prompt {
-            op: self.op,
-            src: src.clone(),
-            dst: dst.clone(),
-            renamed,
-            may_have_more: self.may_have_more,
-            apply_all: false,
-            reply: Some(tx),
-            live: Some(live.clone()),
-        });
+        // The prompt goes out again if it's dropped unanswered (another dialog took its place):
+        // only the user's Cancel cancels the batch.
+        let ask = |live: &Arc<AtomicBool>| {
+            let (tx, rx) = mpsc::channel();
+            (self.ask)(Prompt {
+                op: self.op,
+                src: src.clone(),
+                dst: dst.clone(),
+                renamed: renamed.clone(),
+                may_have_more: self.may_have_more,
+                apply_all: false,
+                reply: Some(tx),
+                live: Some(live.clone()),
+            });
+            rx
+        };
+        let mut rx = ask(&live);
         loop {
             match rx.recv_timeout(Duration::from_millis(120)) {
                 Ok(Reply::Choose { choice, apply_all }) => {
@@ -257,7 +263,15 @@ impl Resolver {
                     }
                     return apply_choice(choice, src.modified, dst.modified);
                 }
-                Ok(Reply::Cancel) | Err(RecvTimeoutError::Disconnected) => {
+                Err(RecvTimeoutError::Disconnected) => {
+                    if is_cancelled() {
+                        live.store(false, Ordering::Relaxed);
+                        return Decision::Cancel;
+                    }
+                    std::thread::sleep(Duration::from_millis(120));
+                    rx = ask(&live);
+                }
+                Ok(Reply::Cancel) => {
                     g.cancelled = true;
                     drop(g);
                     if let Some(cancel) = &self.cancel_batch {
@@ -386,6 +400,33 @@ mod tests {
         assert_eq!(prompts.load(Ordering::Relaxed), 1);
         assert_eq!(d1, Decision::Replace);
         assert_eq!(d2, Decision::Skip);
+    }
+
+    /// A prompt dropped unanswered (another dialog took its place) is asked again; it doesn't
+    /// cancel the batch.
+    #[test]
+    fn a_dropped_prompt_is_asked_again() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let n = asked.clone();
+        let batch_cancelled = Arc::new(AtomicBool::new(false));
+        let bc = batch_cancelled.clone();
+        let resolver = Resolver::new(
+            Op::Copy,
+            false,
+            Arc::new(move |prompt| {
+                // The first one is dropped with its sender, as when MakePublic replaces it.
+                if n.fetch_add(1, Ordering::Relaxed) > 0
+                    && let Some(tx) = prompt.reply
+                {
+                    let _ = tx.send(Reply::Choose { choice: Choice::Skip, apply_all: false });
+                }
+            }),
+            Some(Arc::new(move || bc.store(true, Ordering::Relaxed))),
+        );
+        let d = resolver.resolve(info("a.txt", None), info("a.txt", None), "a (2).txt".into(), || false);
+        assert_eq!(d, Decision::Skip);
+        assert_eq!(asked.load(Ordering::Relaxed), 2);
+        assert!(!batch_cancelled.load(Ordering::Relaxed));
     }
 
     #[test]

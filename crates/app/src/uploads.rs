@@ -29,6 +29,7 @@ use crate::work::{Queue, Slots};
 
 /// What to do with a file whose name is already in the Drive folder it goes into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub enum Clash {
     /// Send it as a new version of the file there (Substituir).
     Replace,
@@ -104,6 +105,7 @@ impl Existing {
 
 /// How one item goes into a Drive folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub enum Put {
     /// As a new item with this name.
     New(String),
@@ -117,6 +119,7 @@ pub enum Put {
 
 /// One item of an upload: where it is on disk, how it goes in, and what to do with clashes
 /// inside it (a merged folder's files).
+#[cfg(test)]
 pub struct Item {
     pub path: PathBuf,
     pub put: Put,
@@ -124,6 +127,7 @@ pub struct Item {
 }
 
 /// Which of `local` (names) are taken in `existing`, by position.
+#[cfg(test)]
 pub fn clashes(local: &[String], existing: &[Existing]) -> Vec<usize> {
     let names: HashSet<&str> = existing.iter().map(|e| e.name.as_str()).collect();
     local.iter().enumerate().filter(|(_, n)| names.contains(n.as_str())).map(|(i, _)| i).collect()
@@ -134,6 +138,7 @@ pub fn clashes(local: &[String], existing: &[Existing]) -> Vec<usize> {
 /// folder is always merged into it. Neither a file and a folder nor a Google Doc can be one
 /// another's new version, so Substituir sends those under a free name, as Manter os dois does;
 /// a free name is one neither Drive nor the other items being sent have.
+#[cfg(test)]
 pub fn resolve(local: &[(String, bool)], existing: &[Existing], clash: impl Fn(usize) -> Clash) -> Vec<Put> {
     let mut there: HashMap<&str, &Existing> = HashMap::new();
     for e in existing {
@@ -171,6 +176,7 @@ pub fn numbered(name: &str, is_dir: bool, taken: &HashSet<String>) -> String {
 }
 
 /// One piece of work of a row.
+#[cfg(test)]
 enum Work {
     /// Put folder `dir` into Drive folder `parent`: make it as `name`, or with `into` use the
     /// folder already there; then queue what's in it, its clashes settled by `clash`.
@@ -180,6 +186,7 @@ enum Work {
     File { row: usize, path: PathBuf, name: String, parent: String, replace: Option<String> },
 }
 
+#[cfg(test)]
 impl Work {
     fn row(&self) -> usize {
         match self {
@@ -202,6 +209,7 @@ impl Work {
 }
 
 /// What a row still has going.
+#[cfg(test)]
 struct Row {
     /// Work queued or running.
     left: AtomicUsize,
@@ -217,6 +225,7 @@ struct Row {
 /// `at_once` folders made and files sent at the same time. With `remove`, a row whose files all
 /// arrived then goes to the Recycle Bin (Recortar and Colar). An item to skip ends its row
 /// at once.
+#[cfg(test)]
 pub fn run(d: &Drive, batch: &Batch, items: &[Item], parent: &str, remove: bool, at_once: usize, slots: &Slots) -> Result<String, String> {
     let rows = batch.rows();
     for (p, item) in rows.iter().zip(items) {
@@ -309,6 +318,7 @@ pub fn listing(d: &Drive, id: &str) -> Result<Vec<Existing>, String> {
 /// folder holds by `clash`. What's skipped comes off the row's size and keeps a move's
 /// original.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn open_folder(d: &Drive, row: usize, dir: &Path, name: &str, parent: &str, into: Option<&str>, clash: Clash, p: &Progress, st: &Row) -> Result<Vec<Work>, String> {
     let (id, existing) = match into {
         Some(id) => (id.to_string(), listing(d, id)?),
