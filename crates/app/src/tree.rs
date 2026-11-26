@@ -1271,6 +1271,8 @@ mod tests {
             target: None,
             starred: false,
             md5: None,
+            drive_id: None,
+            owned_by_me: None,
         };
         let change = |id: &str, dir: bool, parent: &str| openexplorer_gdrive::Change { file_id: id.into(), file: Some(folder(id, dir)), parents: vec![parent.into()], trashed: false, drive: false };
         drive_changed(&mut s, "a@b", &[change("x", false, "p3")], Some("R"));

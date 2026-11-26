@@ -1034,6 +1034,8 @@ pub fn drive_file(e: &Entry) -> DriveFile {
         target: e.target.clone(),
         md5: e.md5.clone(),
         starred: e.starred,
+        drive_id: None,
+        owned_by_me: None,
     }
 }
 
