@@ -41,6 +41,7 @@ mod telegram;
 mod transfers;
 mod tree;
 mod undo;
+mod updater;
 mod uploads;
 mod ui;
 mod watch;
@@ -120,6 +121,8 @@ enum Msg {
     /// A drag of Drive items `ids` out of pane `from` ended.
     #[cfg(windows)]
     DragEnded { from: usize, ids: Vec<String>, ended: dragout::Ended },
+    /// Built-in updater check, download progress or completion.
+    Update(updater::Answer),
 }
 
 /// Which part of a listing a [`Msg::Listed`] is.
@@ -287,7 +290,12 @@ struct State {
     account_synced_font: Option<settings::TextFont>,
     account_synced_render: Option<settings::TextRender>,
     is_placeholder: bool,
+    /// Built-in updater state (latest release, download progress, staged file).
+    updater: updater::UpdateState,
 }
+
+/// Receipt or error passed via `--update-receipt` / `--update-error` on relaunch after an update.
+static STARTUP_UPDATE_NOTICE: std::sync::Mutex<Option<Result<String, String>>> = std::sync::Mutex::new(None);
 
 /// Whether the main window was created for Mica (Opções, Experimental): only then can Windows
 /// show it, and Opções says whether it did.
@@ -430,6 +438,7 @@ impl State {
             account_synced_font: None,
             account_synced_render: None,
             is_placeholder: true,
+            updater: updater::UpdateState::new(),
         }
     }
 
@@ -536,7 +545,7 @@ fn init() -> State {
     }
     let accounts = store::accounts();
     let tree = tree::Tree::new(accounts.iter().map(|a| a.email.clone()));
-    State {
+    let mut state = State {
         main_tab: MainTab::Explore,
         accounts_filter: None,
         accounts_search: rune::TextEdit::new(""),
@@ -613,7 +622,22 @@ fn init() -> State {
         account_synced_font: None,
         account_synced_render: None,
         is_placeholder: false,
+        updater: updater::UpdateState::new(),
+    };
+    if let Some(notice) = STARTUP_UPDATE_NOTICE.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        match notice {
+            Ok(ver) => {
+                updater::clear_staged();
+                openexplorer_gdrive::log(&format!("atualização concluída: v{ver}"));
+                state.status = tr!("Open Explorer atualizado para a versão {ver}.", "Open Explorer updated to version {ver}.");
+            }
+            Err(err) => {
+                openexplorer_gdrive::log(&format!("erro atualização: {err}"));
+                fail(&mut state, err);
+            }
+        }
     }
+    state
 }
 
 fn setup(s: &mut State, waker: Waker) {
@@ -629,6 +653,10 @@ fn setup(s: &mut State, waker: Waker) {
     // Each tree opens down to the folder its pane starts in.
     for p in 0..2 {
         tree::follow(s, p);
+    }
+    // Check for updates in the background (at most once per 24 h automatically).
+    if !rune::is_headless() && s.updater.should_auto_check(updater::now_unix()) {
+        actions::check_updates(s, false);
     }
 }
 
@@ -1063,6 +1091,63 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     Err(e) => fail(s, e),
                 }
             }
+            Msg::Update(ans) => match ans {
+                updater::Answer::Checked { manual, result } => {
+                    s.updater.checking = false;
+                    s.updater.checked_once = true;
+                    let now_unix = updater::now_unix();
+                    s.updater.last_checked = Some(now_unix);
+                    updater::record_check(now_unix);
+                    match result {
+                        Ok(Some(rel)) => {
+                            openexplorer_gdrive::log(&format!("atualização disponível: v{}", rel.version));
+                            let already_staged_same = matches!(
+                                &s.updater.download,
+                                updater::DownloadState::Ready(st) if st.version == rel.version
+                            );
+                            s.updater.release = Some(rel);
+                            if !already_staged_same {
+                                s.updater.download = updater::DownloadState::Idle;
+                                if s.updater.support.is_ok()
+                                    && s.updater.offer(s.settings.auto_update) == Some(updater::Offer::Automatic)
+                                {
+                                    actions::download_update(s);
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            s.updater.check_error = None;
+                            if manual {
+                                s.status = tr!(
+                                    "Você já está na versão mais recente (v{}).",
+                                    "You're already on the latest version (v{}).",
+                                    updater::VERSION
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            openexplorer_gdrive::log(&format!("erro verificar atualizações: {e}"));
+                            s.updater.check_error = Some(e.clone());
+                            if manual {
+                                fail(s, e);
+                            }
+                        }
+                    }
+                }
+                updater::Answer::Progress { received, total } => {
+                    s.updater.download = updater::DownloadState::Downloading { received, total };
+                }
+                updater::Answer::Downloaded(result) => match result {
+                    Ok(staged) => {
+                        openexplorer_gdrive::log(&format!("atualização baixada e verificada: v{}", staged.version));
+                        s.updater.download = updater::DownloadState::Ready(staged);
+                    }
+                    Err(e) => {
+                        openexplorer_gdrive::log(&format!("erro baixar atualização: {e}"));
+                        s.updater.download = updater::DownloadState::Failed(e);
+                    }
+                },
+            },
         }
     }
     // Accounts on screen are asked what changed elsewhere, every few seconds; after the
@@ -2257,7 +2342,15 @@ fn main() {
             }
         });
     }
+    let cli = updater::intercept_cli(args);
+    if let Some(notice) = cli.notice {
+        *STARTUP_UPDATE_NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(notice);
+    }
     let initial = settings::Settings::load();
+    // Apply an update downloaded in an earlier run before opening the window.
+    if !rune::is_headless() && updater::install_kept(initial.auto_update) {
+        std::process::exit(0);
+    }
     accounts::start();
     let main_spec = AppSpec::<State> {
         min_size: Some((900.0, 420.0)),
@@ -2709,7 +2802,7 @@ fn main() {
     let mut main_app = rune::App::new(main_spec)
         .titlebar(rune::Titlebar::new(34.0))
         .font_smoothing(initial.text_render.smoothing())
-        .args(rune_args(std::env::args().skip(1)))
+        .args(rune_args(cli.args.into_iter()))
         .turn_scope(enter_turn, leave_turn)
         // B2 folders and Telegram accounts on screen look for changes only while the window is in
         // front.
@@ -2724,7 +2817,7 @@ fn main() {
         // trees and listings were last kept is kept here, so the next start has less to catch up on.
         .on_quit(|_, _| {
             accounts::save_caches();
-            if RESTART.load(Ordering::Relaxed) {
+            if !updater::run_pending_handoff() && RESTART.load(Ordering::Relaxed) {
                 relaunch();
             }
         })

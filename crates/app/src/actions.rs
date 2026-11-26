@@ -105,6 +105,7 @@ pub fn quit_question_done(s: &mut State) -> bool {
     // A Reiniciar put off by the transfers goes with the question: else a later plain close
     // would open the app again.
     crate::RESTART.store(false, Ordering::Relaxed);
+    crate::updater::cancel_handoff();
     true
 }
 
@@ -112,6 +113,45 @@ pub fn quit_question_done(s: &mut State) -> bool {
 pub fn keep_running(s: &mut State) {
     s.quit_asked = false;
     crate::RESTART.store(false, Ordering::Relaxed);
+    crate::updater::cancel_handoff();
+}
+
+/// Checks GitHub Releases for a newer version on a background thread.
+pub fn check_updates(s: &mut State, manual: bool) {
+    if s.updater.checking {
+        return;
+    }
+    s.updater.checking = true;
+    s.updater.check_error = None;
+    let kind = s.updater.support.as_ref().ok().cloned();
+    background(s, move |emit| {
+        let result = crate::updater::check_latest(kind.as_ref());
+        emit(Msg::Update(crate::updater::Answer::Checked { manual, result }));
+    });
+}
+
+/// Downloads the discovered update in the background, reporting progress back to the UI.
+pub fn download_update(s: &mut State) {
+    let Some(release) = s.updater.release.clone() else { return };
+    let Ok(kind) = s.updater.support.clone() else { return };
+    if matches!(s.updater.download, crate::updater::DownloadState::Downloading { .. } | crate::updater::DownloadState::Installing) {
+        return;
+    }
+    s.updater.download = crate::updater::DownloadState::Downloading { received: 0, total: release.size };
+    background(s, move |emit| {
+        let result = crate::updater::download_release(&release, &kind, |received, total| {
+            emit(Msg::Update(crate::updater::Answer::Progress { received, total }));
+        });
+        emit(Msg::Update(crate::updater::Answer::Downloaded(result)));
+    });
+}
+
+/// Hands off a downloaded update on quit and closes the window (respecting running transfers).
+pub fn install_update(s: &mut State, tx: &mut Tx) {
+    let crate::updater::DownloadState::Ready(staged) = s.updater.download.clone() else { return };
+    crate::updater::schedule_handoff(staged);
+    s.updater.download = crate::updater::DownloadState::Installing;
+    tx.close_window();
 }
 
 /// Reiniciar (Opções): the app closes as Fechar would, asking first while transfers run, and
