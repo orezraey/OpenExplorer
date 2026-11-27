@@ -133,6 +133,8 @@ impl Entry {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Location {
     Local(PathBuf),
+    /// Este Computador: the disks, each entry's id its root (`C:\`, `/media/ana/PEN`).
+    Computer,
     /// What the search index found on the computer: files from many folders, each entry's id
     /// its full path (see [`crate::finder`]).
     Found(Box<Found>),
@@ -463,7 +465,8 @@ impl Pane {
         let entries = match &self.loc {
             Location::Local(dir) => read_local(dir, show_hidden).map_err(|e| format!("{}: {e}", dir.display())),
             Location::Mock(segs) => Ok(mock.list(segs)),
-            Location::Drive { .. } | Location::DriveSearch(_) | Location::Found(_) | Location::Server { .. } => return,
+            // Listed from the disks the app keeps (see `crate::list`).
+            Location::Computer | Location::Drive { .. } | Location::DriveSearch(_) | Location::Found(_) | Location::Server { .. } => return,
         };
         self.set_entries(entries);
     }
@@ -560,7 +563,11 @@ impl Pane {
 
     pub fn sort_entries(&mut self) {
         let (col, asc) = self.sort;
-        if col == SortCol::Kind {
+        if col == SortCol::Name && self.loc == Location::Computer {
+            // The disks by letter, as Explorer has them: "AltMount (\\server) (X:)" after
+            // "Disco Local (W:)".
+            self.entries.sort_by(|a, b| order(asc, a, b, rune_kit::natural_cmp(&a.id, &b.id)));
+        } else if col == SortCol::Kind {
             // The label is built once per entry rather than twice per comparison.
             let found = self.loc.finds();
             let mut keyed: Vec<(String, Entry)> = std::mem::take(&mut self.entries).into_iter().map(|e| (kind_key(found, &e), e)).collect();
@@ -575,6 +582,7 @@ impl Pane {
     pub fn title(&self) -> String {
         match &self.loc {
             Location::Local(p) => p.display().to_string(),
+            Location::Computer => t("Este Computador", "This PC").into(),
             Location::Found(f) => tr!("“{}” em {}", "“{}” in {}", f.text, f.place),
             Location::Mock(segs) => tr!("Meu Drive/{}", "My Drive/{}", segs.join("/")),
             Location::Drive { space, path, .. } => {
@@ -842,6 +850,7 @@ pub struct Crumb {
 /// The clickable path of a location: `C:\ › Users › Ana`, `ana@gmail.com › Meu Drive › Fotos`.
 pub fn crumbs(loc: &Location) -> Vec<Crumb> {
     match loc {
+        Location::Computer => vec![Crumb { label: t("Este Computador", "This PC").into(), to: Location::Computer }],
         Location::Local(dir) if let Some((server, share)) = crate::network::unc(dir) => {
             use crate::network::{is_wsl, server_path, share_path};
             let label = if is_wsl(&server) { "Linux".to_string() } else { format!(r"\\{server}") };

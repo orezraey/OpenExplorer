@@ -91,6 +91,8 @@ enum Msg {
     Servers { found: Vec<String>, done: bool },
     /// The system says a disk was mounted or removed (see [`mounts::watch`]).
     DrivesMoved,
+    /// The disks' names, as the system shows them (see [`mounts::names`]).
+    DriveNames(Vec<(PathBuf, String)>),
     /// A file operation finished: reload the panes showing `reload`, and say how it went.
     Done { reload: Vec<Location>, result: Result<String, String> },
     /// Something Propriedades number `id` was waiting for.
@@ -257,6 +259,9 @@ struct State {
     /// The disks "Este Computador" lists, read at start and again when the system says one
     /// was mounted or removed, or the window gets the focus back.
     local_drives: Vec<(PathBuf, model::DriveKind)>,
+    /// The disks' names as the system shows them ("AltMount (\\server) (X:)"), read in the
+    /// background; a disk not in it shows by its kind (see [`mounts::names`]).
+    drive_names: HashMap<PathBuf, String>,
     /// The desktop and the user's folders, read at start.
     places: places::Places,
     /// What each pane's tree has open, and the folders read for it.
@@ -438,6 +443,7 @@ impl State {
             clip: None,
             undo: Default::default(),
             local_drives: Vec::new(),
+            drive_names: HashMap::new(),
             places: Default::default(),
             tree: tree::Tree::new(std::iter::empty()),
             layout: Default::default(),
@@ -672,6 +678,7 @@ fn init() -> State {
         clip: None,
         undo: Default::default(),
         local_drives: mounts::list(),
+        drive_names: HashMap::new(),
         places,
         tree,
         layout: layout::Layout::load(),
@@ -752,6 +759,7 @@ fn setup(s: &mut State, waker: Waker) {
     s.waker = Some(combined);
     // Disks mounted or removed while the app runs show in Este Computador at once.
     if !rune::is_headless() {
+        tree::read_drive_names(s);
         let (out, wake) = (s.outbox.clone(), s.waker.clone());
         mounts::watch(move || {
             if out.send(Msg::DrivesMoved).is_ok()
@@ -1023,7 +1031,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         } else if s.typed[p].1 > 0.0 && now >= s.typed[p].1 {
             s.typed[p].1 = 0.0;
             if s.search[p].text != s.searched[p] {
-                if s.panes[p].loc.is_local() {
+                if s.panes[p].loc.is_local() || s.panes[p].loc == Location::Computer {
                     actions::search_computer(s, p);
                     changed = true;
                 } else if let Location::Server { .. } = s.panes[p].loc {
@@ -1071,6 +1079,10 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             Msg::TreeKids { id, hidden, result } => tree::arrived(s, id, hidden, result),
             Msg::Servers { found, done } => tree::servers_found(s, found, done),
             Msg::DrivesMoved => changed |= tree::read_drives(s),
+            Msg::DriveNames(names) => {
+                tree::drive_names(s, names);
+                changed = true;
+            }
             Msg::ServerChecked { attempt, result, secret } => servers::checked(s, attempt, result, secret),
             Msg::Listed { pane, request, part, result, at } => {
                 if s.live[pane].load(Ordering::Relaxed) != request {
@@ -1719,9 +1731,34 @@ fn load(s: &mut State, p: usize) {
     list(s, p, true);
 }
 
+/// The disks or their names changed: the panes showing Este Computador list them again.
+pub(crate) fn computer_changed(s: &mut State) {
+    for p in 0..MAX_PANES {
+        if s.panes[p].loc == Location::Computer {
+            load(s, p);
+        }
+    }
+}
+
+/// Este Computador's rows: the disks the app keeps, by the names the system gave.
+fn computer_entries(s: &State) -> Vec<Entry> {
+    s.local_drives
+        .iter()
+        .map(|(root, kind)| {
+            let id = mounts::disk_id(root);
+            Entry { id, name: tree::disk_name(s, root, *kind), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }
+        })
+        .collect()
+}
+
 /// Atualizar: [`load`], with a Dropbox or OneDrive folder read whole rather than from its kept
 /// listing.
 fn refresh(s: &mut State, p: usize) {
+    // Este Computador: the disks read again, a `subst` the system didn't tell about too.
+    if s.panes[p].loc == Location::Computer {
+        tree::read_drives(s);
+        tree::read_drive_names(s);
+    }
     dropbox::forget_shown(s, p);
     onedrive::forget_shown(s, p);
     load(s, p);
@@ -1756,6 +1793,13 @@ fn list(s: &mut State, p: usize, fresh: bool) {
     // whatever the pane shows now.
     let request = s.live[p].fetch_add(1, Ordering::Relaxed) + 1;
     s.drive_search_warnings[p].clear();
+    if s.panes[p].loc == Location::Computer {
+        let entries = computer_entries(s);
+        let pane = &mut s.panes[p];
+        pane.free = None;
+        pane.set_entries(Ok(entries));
+        return;
+    }
     // Multi-account Google Drive search across every connected account.
     if let Location::DriveSearch(q) = &s.panes[p].loc {
         let text = q.text.clone();
@@ -2167,6 +2211,8 @@ pub(crate) fn folder_in(at: &Location, e: &Entry) -> Location {
     match &mut loc {
         // A folder found opens where it is.
         Location::Found(_) => loc = Location::Local(PathBuf::from(&e.id)),
+        // A disk opens at its root.
+        Location::Computer => loc = Location::Local(PathBuf::from(&e.id)),
         Location::Local(dir) => dir.push(&e.name),
         Location::Mock(segs) => segs.push(e.name.clone()),
         Location::Drive { space: space @ Space::SharedDrives, .. } => *space = Space::Shared { id: e.id.clone(), name: e.name.clone() },
@@ -2192,6 +2238,18 @@ pub(crate) fn folder_in(at: &Location, e: &Entry) -> Location {
 
 fn go_up(s: &mut State, p: usize) {
     let mut loc = s.panes[p].loc.clone();
+    // From a disk's top up to Este Computador, landing on the disk.
+    if let Location::Local(dir) = &loc
+        && mounts::is_disk_root(dir)
+    {
+        let id = mounts::disk_id(dir);
+        navigate(s, p, Location::Computer);
+        let pane = &mut s.panes[p];
+        pane.selected = [id.clone()].into();
+        pane.cursor = Some(id.clone());
+        pane.anchor = Some(id);
+        return;
+    }
     // The folder we come out of, to land on it.
     let from = match &mut loc {
         Location::Local(dir) => {
@@ -2202,7 +2260,7 @@ fn go_up(s: &mut State, p: usize) {
             name
         }
         Location::Mock(segs) => segs.pop(),
-        Location::Found(_) | Location::DriveSearch(_) => None,
+        Location::Computer | Location::Found(_) | Location::DriveSearch(_) => None,
         // From a search's results back to the folder searched.
         Location::Server { find: find @ Some(_), .. } => {
             *find = None;
@@ -2623,7 +2681,8 @@ fn paths_for(s: &State, p: usize, ids: &[String], materialize: bool) -> Vec<Path
     let pane = &s.panes[p];
     match &pane.loc {
         Location::Local(_) | Location::Found(_) => ids.iter().filter_map(|id| pane.entry(id)).filter_map(|e| pane.loc.local_path(e)).collect(),
-        Location::Drive { .. } | Location::DriveSearch(_) | Location::Server { .. } => Vec::new(),
+        // The disks themselves don't drag.
+        Location::Computer | Location::Drive { .. } | Location::DriveSearch(_) | Location::Server { .. } => Vec::new(),
         Location::Mock(segs) => {
             let dir = s.temp.join(if segs.is_empty() { "Meu Drive".to_string() } else { segs.join("_") });
             if materialize && std::fs::create_dir_all(&dir).is_err() {
@@ -2749,6 +2808,10 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
         }
         Location::Local(dir) if network::is_server(dir) => {
             s.status = t("Aqui estão as pastas compartilhadas do computador: solte os arquivos numa delas.", "These are the computer's shared folders: drop the files in one of them.").into();
+            return;
+        }
+        Location::Computer => {
+            s.status = t("Aqui estão os discos do computador: solte os arquivos numa pasta de um deles.", "These are the computer's disks: drop the files in a folder on one of them.").into();
             return;
         }
         Location::Server { .. } => {
@@ -3697,6 +3760,48 @@ mod tests {
         assert!(s.account_form.is_some() && s.account_closes == 0);
         s.account_window_closed();
         assert!(s.account_form.is_none());
+    }
+
+    /// Este Computador lists the disks by letter, by the names the system gave once they come;
+    /// a disk opens at its root, Up from it lands back on it, and a disk mounted shows there.
+    /// The disks themselves can't be deleted, renamed or pasted into.
+    #[test]
+    fn this_pc_lists_the_disks() {
+        let mut s = init();
+        let disk = |l: &str| PathBuf::from(format!("{l}:\\"));
+        s.local_drives = vec![(disk("C"), model::DriveKind::Fixed), (disk("W"), model::DriveKind::Fixed), (disk("X"), model::DriveKind::Network)];
+        let alt = r"AltMount (\\server) (X:)";
+        s.drive_names = [(disk("X"), alt.to_string())].into();
+        navigate(&mut s, 0, Location::Computer);
+        let rows = |s: &State| s.panes[0].entries.iter().map(|e| (e.id.clone(), e.name.clone())).collect::<Vec<_>>();
+        let c = model::DriveKind::Fixed.label("C:");
+        assert_eq!(rows(&s), [("C:\\".into(), c), ("W:\\".into(), model::DriveKind::Fixed.label("W:")), ("X:\\".into(), alt.into())]);
+        // The names come: the rows take them, still by letter.
+        tree::drive_names(&mut s, vec![(disk("C"), "Disco Local (C:)".into()), (disk("W"), "Zeta (W:)".into()), (disk("X"), alt.into())]);
+        assert_eq!(rows(&s).into_iter().map(|(_, n)| n).collect::<Vec<_>>(), ["Disco Local (C:)", "Zeta (W:)", alt]);
+        // Nothing to change on the disks themselves.
+        assert!(!actions::editable(&Location::Computer) && !actions::items_editable(&Location::Computer));
+        s.panes[0].selected = ["C:\\".to_string()].into();
+        actions::ask_delete(&mut s, 0);
+        assert!(s.dialog.is_none());
+        // A disk mounted joins the list.
+        tree::drives_changed(&mut s, vec![(disk("C"), model::DriveKind::Fixed), (disk("E"), model::DriveKind::Removable), (disk("W"), model::DriveKind::Fixed), (disk("X"), model::DriveKind::Network)]);
+        assert_eq!(rows(&s).into_iter().map(|(id, _)| id).collect::<Vec<_>>(), ["C:\\", "E:\\", "W:\\", "X:\\"]);
+        // Names read before E: came are left for the newer reading.
+        tree::drive_names(&mut s, vec![(disk("C"), "Antigo (C:)".into()), (disk("W"), "Zeta (W:)".into()), (disk("X"), alt.into())]);
+        assert_eq!(rows(&s)[0].1, "Disco Local (C:)");
+        // A disk opens at its root; Up comes back to it.
+        let w = s.panes[0].entries.iter().find(|e| e.id == "W:\\").cloned().unwrap();
+        assert_eq!(folder_in(&Location::Computer, &w), Location::Local(disk("W")));
+        navigate(&mut s, 0, Location::Local(disk("W")));
+        go_up(&mut s, 0);
+        assert_eq!(s.panes[0].loc, Location::Computer);
+        assert_eq!(s.panes[0].cursor.as_deref(), Some("W:\\"));
+        assert!(s.panes[0].selected.contains("W:\\"));
+        // A search from here looks through the whole computer.
+        s.search[0] = rune::TextEdit::new("notas");
+        actions::search_computer(&mut s, 0);
+        assert!(matches!(&s.panes[0].loc, Location::Found(f) if f.within.is_none() && f.text == "notas"));
     }
 
     /// A disk the system didn't tell about shows once the window gets the focus back.

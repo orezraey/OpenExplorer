@@ -6,9 +6,70 @@
 //! `EVFILT_FS` event. A mount that doesn't tell (`subst`) shows when the window gets the focus
 //! back, as the app reads the disks again then.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::model::DriveKind;
+
+/// Whether `dir` is a disk's top (`C:\`, `/`), which goes up to Este Computador; not a
+/// computer on the network (`\\servidor`).
+pub fn is_disk_root(dir: &Path) -> bool {
+    !dir.as_os_str().is_empty() && dir.parent().is_none() && crate::network::unc(dir).is_none()
+}
+
+/// The id of disk `root` in Este Computador's listing.
+pub fn disk_id(root: &Path) -> String {
+    root.display().to_string()
+}
+
+/// A disk's name until the system's comes (see [`names`]): on Windows by its kind and letter
+/// ("Disco local (C:)"); elsewhere a disk is a folder ("/media/ana/PEN") and shows by its name,
+/// `/` by its kind.
+pub fn fallback_name(root: &Path, kind: DriveKind) -> String {
+    let shown = root.display().to_string();
+    let letter = match shown.trim_end_matches(['\\', '/']) {
+        "" => shown.as_str(),
+        l => l,
+    };
+    match root.file_name() {
+        Some(name) if !cfg!(windows) => name.to_string_lossy().into_owned(),
+        _ => kind.label(letter),
+    }
+}
+
+/// The disks' names as the system shows them: Explorer's ("Disco Local (C:)", "Dados (D:)",
+/// "AltMount (\\server) (X:)"). Asking the shell can wait on a slow disk, so this runs off the
+/// window's thread. A disk the shell names nothing keeps its [`fallback_name`].
+pub fn names(drives: &[(PathBuf, DriveKind)]) -> Vec<(PathBuf, String)> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+        use windows_sys::Win32::UI::Shell::{SHFILEINFOW, SHGFI_DISPLAYNAME, SHGetFileInfoW};
+        // SAFETY: COM for this thread, undone below when this call set it up.
+        let init = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+        let out = drives
+            .iter()
+            .map(|(root, kind)| {
+                let wide: Vec<u16> = root.as_os_str().encode_wide().chain([0]).collect();
+                // SAFETY: an all-zero SHFILEINFOW is valid; a NUL-terminated path and its size.
+                let mut info: SHFILEINFOW = unsafe { std::mem::zeroed() };
+                let ok = unsafe { SHGetFileInfoW(wide.as_ptr(), 0, &mut info, std::mem::size_of::<SHFILEINFOW>() as u32, SHGFI_DISPLAYNAME) } != 0;
+                let end = info.szDisplayName.iter().position(|&c| c == 0).unwrap_or(info.szDisplayName.len());
+                let name = String::from_utf16_lossy(&info.szDisplayName[..end]);
+                (root.clone(), if ok && !name.trim().is_empty() { name } else { fallback_name(root, *kind) })
+            })
+            .collect();
+        if init >= 0 {
+            // SAFETY: pairs the successful CoInitializeEx above.
+            unsafe { CoUninitialize() };
+        }
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        drives.iter().map(|(root, kind)| (root.clone(), fallback_name(root, *kind))).collect()
+    }
+}
 
 /// The disks to show in Este Computador, with their kind.
 pub fn list() -> Vec<(PathBuf, DriveKind)> {
@@ -335,6 +396,21 @@ mod tests {
         assert_eq!(got, want.map(|(p, k)| (PathBuf::from(p), k)));
     }
 
+    /// The disks' names are Explorer's. Ignored: it reads this computer's disks (here C: and
+    /// the rclone mount on X:).
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn the_disks_are_named_as_explorer_names_them() {
+        let names = names(&list());
+        println!("{names:?}");
+        let of = |l: &str| names.iter().find(|(p, _)| p.as_os_str() == format!("{l}:\\").as_str()).map(|(_, n)| n.clone());
+        assert_eq!(of("C").as_deref(), Some("Disco Local (C:)"));
+        if let Some(x) = of("X") {
+            assert_eq!(x, r"AltMount (\\server) (X:)");
+        }
+    }
+
     /// An `rclone mount` on a free letter, as a local disk and as a network drive, reaches the
     /// watcher (WinFsp tells Windows' top-level windows) and is in the next reading; its
     /// unmount too. Ignored: it mounts drives with the rclone on PATH, which needs WinFsp.
@@ -346,9 +422,11 @@ mod tests {
         use std::sync::mpsc::channel;
         use std::time::Duration;
         let (tx, rx) = channel();
-        // Read the instant the news comes, as the app does.
+        // Read the instant the news comes, the names too, as the app does.
         watch(move || {
-            let _ = tx.send(list());
+            let drives = list();
+            let named = names(&drives);
+            let _ = tx.send((drives, named));
         });
         std::thread::sleep(Duration::from_millis(300));
         let addr = "127.0.0.1:55721";
@@ -363,21 +441,27 @@ mod tests {
             let letter = (b'G'..=b'Z').rev().map(|c| c as char).find(|c| !before.iter().any(|(d, _)| d.to_string_lossy().starts_with(*c))).expect("no free letter");
             let root = PathBuf::from(format!("{letter}:\\"));
             while rx.try_recv().is_ok() {}
-            let opt = format!("mountOpt={{\"NetworkMode\": {network}}}");
+            let opt = format!("mountOpt={{\"NetworkMode\": {network}, \"VolumeName\": \"OeTeste\"}}");
             assert!(rc(&["mount/mount", &format!("fs={}", dir.display()), &format!("mountPoint={letter}:"), &opt]), "rclone didn't mount {letter}:");
             // Some reading told has the drive: the first may come before it's there.
-            let mut kind = None;
+            let (mut kind, mut named) = (None, None);
             while kind.is_none() {
-                let Ok(drives) = rx.recv_timeout(Duration::from_secs(20)) else { break };
+                let Ok((drives, names_then)) = rx.recv_timeout(Duration::from_secs(20)) else { break };
                 kind = drives.iter().find(|(d, _)| *d == root).map(|(_, k)| *k);
+                named = names_then.into_iter().find(|(d, _)| *d == root).map(|(_, n)| n);
             }
-            std::thread::sleep(Duration::from_secs(1));
+            std::thread::sleep(Duration::from_secs(3));
+            let named_later = names(&list()).into_iter().find(|(d, _)| *d == root).map(|(_, n)| n);
+            println!("network={network} {letter}: named at the news {named:?}, 3 s later {named_later:?}");
+            if named != named_later {
+                failed.push(network);
+            }
             while rx.try_recv().is_ok() {}
             assert!(rc(&["mount/unmount", &format!("mountPoint={letter}:")]), "rclone didn't unmount {letter}:");
             let mut gone = false;
             let mut tellings = 0;
             while !gone {
-                let Ok(drives) = rx.recv_timeout(Duration::from_secs(20)) else { break };
+                let Ok((drives, _)) = rx.recv_timeout(Duration::from_secs(20)) else { break };
                 tellings += 1;
                 gone = !drives.iter().any(|(d, _)| *d == root);
             }

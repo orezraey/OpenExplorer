@@ -299,7 +299,7 @@ pub(crate) fn group_by_account(loc: &Location, items: Vec<Entry>) -> Vec<(String
 pub fn editable(loc: &Location) -> bool {
     match loc {
         Location::Local(dir) => !crate::network::is_server(dir),
-        Location::Mock(_) | Location::Found(_) | Location::DriveSearch(_) => false,
+        Location::Computer | Location::Mock(_) | Location::Found(_) | Location::DriveSearch(_) => false,
         Location::Drive { .. } => drive_folder(loc).is_some(),
         Location::Server { find, .. } => find.is_none() && accounts::why_not(loc).is_none(),
     }
@@ -350,6 +350,7 @@ fn why_not(loc: &Location) -> String {
         )
         .into(),
         Location::Found(_) | Location::DriveSearch(_) | Location::Server { find: Some(_), .. } => not_a_folder(),
+        Location::Computer => t("Aqui estão os discos do computador: abra um deles para mexer no que tem dentro.", "These are the computer's disks: open one of them to work with what's inside.").into(),
         Location::Local(dir) if crate::network::is_server(dir) => t(
             "Aqui estão as pastas compartilhadas do computador: abra uma delas para mexer no que tem dentro.",
             "These are the computer's shared folders: open one of them to work with what's inside.",
@@ -497,7 +498,7 @@ pub fn open_file(s: &mut State, p: usize, item: &Entry) {
             download(s, &loc, vec![item.clone()], dir, Then::Open, Vec::new());
         }
         Location::Server { .. } => crate::servers::open_file(s, p, item),
-        Location::Mock(_) => not_here(s, p),
+        Location::Computer | Location::Mock(_) => not_here(s, p),
     }
 }
 
@@ -609,6 +610,10 @@ pub fn go_to_address(s: &mut State, p: usize, typed: &str) -> bool {
         Target::Mock(segs) => {
             s.history.reached(p, s.panes[p].moves, true);
             crate::navigate(s, p, Location::Mock(segs));
+        }
+        Target::Computer => {
+            s.history.reached(p, s.panes[p].moves, true);
+            crate::navigate(s, p, Location::Computer);
         }
         Target::Local(path) => {
             let moves = s.panes[p].moves;
@@ -1276,7 +1281,7 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
 pub fn search(s: &mut State, p: usize) {
     let words = s.search[p].text.clone();
     s.history.add_search(&words);
-    if s.panes[p].loc.is_local() {
+    if s.panes[p].loc.is_local() || s.panes[p].loc == Location::Computer {
         return search_computer(s, p);
     }
     if let Location::Server { .. } = s.panes[p].loc {
@@ -1318,6 +1323,8 @@ pub fn search_computer(s: &mut State, p: usize) {
     let within = match &loc {
         Location::Local(dir) => Some(dir.clone()),
         Location::Found(f) => f.within.clone(),
+        // From Este Computador, the whole computer.
+        Location::Computer => None,
         _ => return,
     };
     if text.trim().is_empty() {
@@ -1703,7 +1710,7 @@ pub fn delete(s: &mut State) {
                 crate::servers::delete(s, &loc, items, vec![loc.clone()]);
             }
         }
-        Location::Mock(_) => return not_here(s, pane),
+        Location::Computer | Location::Mock(_) => return not_here(s, pane),
     }
     s.status = tr!("Excluindo {}…", "Deleting {}…", count(n));
 }
@@ -2012,7 +2019,7 @@ pub fn apply_name_in(s: &mut State, pane: usize, loc: Location, item: Option<Ent
         }
         (Location::Server { find: None, .. }, None) => crate::servers::name(s, &loc, None, name),
         (Location::Server { .. }, Some(item)) => crate::servers::name(s, &loc, Some(item), name),
-        (Location::Mock(_) | Location::Found(_) | Location::DriveSearch(_) | Location::Server { .. }, _) => not_here(s, pane),
+        (Location::Computer | Location::Mock(_) | Location::Found(_) | Location::DriveSearch(_) | Location::Server { .. }, _) => not_here(s, pane),
     }
 }
 

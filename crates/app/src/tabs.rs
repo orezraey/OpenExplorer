@@ -107,6 +107,7 @@ pub fn tab_header(s: &State, loc: &Location) -> (Option<IconKey>, &'static Icon,
             Some(node) => (node.icon, node.fallback, node.label),
             None => (Some(IconKey::Computer), &icons::COMPUTER, t("Este Computador", "This PC").into()),
         },
+        Location::Computer => (Some(IconKey::Computer), &icons::COMPUTER, t("Este Computador", "This PC").into()),
         Location::Mock(_) => (None, &icons::LAB, t("Drive simulado", "Simulated drive").into()),
         Location::Drive { email, .. } => {
             let label = s

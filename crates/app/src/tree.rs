@@ -206,7 +206,7 @@ fn desktop_node(places: &Places) -> Option<Node> {
 }
 
 fn computer_node() -> Node {
-    Node { id: NodeId::Computer, label: t("Este Computador", "This PC").into(), icon: Some(IconKey::Computer), fallback: &icons::COMPUTER, to: None, opens: true }
+    Node { id: NodeId::Computer, label: t("Este Computador", "This PC").into(), icon: Some(IconKey::Computer), fallback: &icons::COMPUTER, to: Some(Location::Computer), opens: true }
 }
 
 fn network_node() -> Node {
@@ -240,19 +240,15 @@ fn local_node(places: &Places, path: PathBuf) -> Node {
     Node { id: NodeId::Local(path.clone()), label, icon, fallback, to: Some(Location::Local(path)), opens: true }
 }
 
-/// A disk, named as Explorer names it ("Disco Local (C:)").
-fn disk_node(path: &Path, kind: DriveKind) -> Node {
-    let shown = path.display().to_string();
-    // "C:" for C:\; "/" stays itself.
-    let letter = match shown.trim_end_matches(['\\', '/']) {
-        "" => shown.as_str(),
-        l => l,
-    };
-    // Off Windows a disk is a folder ("/media/ana/PEN"): it shows by its name, "/" by its kind.
-    let label = match path.file_name() {
-        Some(name) if !cfg!(windows) => name.to_string_lossy().into_owned(),
-        _ => kind.label(letter),
-    };
+/// A disk's name as Explorer has it ("Disco Local (C:)", "AltMount (\\server) (X:)"), once
+/// the system said it, else by its kind.
+pub fn disk_name(s: &State, path: &Path, kind: DriveKind) -> String {
+    s.drive_names.get(path).cloned().unwrap_or_else(|| crate::mounts::fallback_name(path, kind))
+}
+
+/// A disk, named as Explorer names it.
+fn disk_node(s: &State, path: &Path, kind: DriveKind) -> Node {
+    let label = disk_name(s, path, kind);
     Node { id: NodeId::Local(path.to_path_buf()), label, icon: Some(IconKey::Path(path.to_path_buf())), fallback: &icons::DISK, to: Some(Location::Local(path.to_path_buf())), opens: true }
 }
 
@@ -323,7 +319,7 @@ fn sorted(mut nodes: Vec<Node>) -> Vec<Node> {
 /// the simulated drive), else as kept (borrowed, not copied, as the tree redraws often).
 fn kids_of<'a>(s: &'a State, node: &Node) -> Cow<'a, Kids> {
     Cow::Owned(match &node.id {
-        NodeId::Computer => Kids::Ready(s.local_drives.iter().map(|(d, kind)| disk_node(d, *kind)).collect()),
+        NodeId::Computer => Kids::Ready(s.local_drives.iter().map(|(d, kind)| disk_node(s, d, *kind)).collect()),
         NodeId::Linux => Kids::Ready(s.places.wsl.iter().map(|d| local_node(&s.places, share_path(WSL, d))).collect()),
         NodeId::Network if !s.tree.searched => Kids::Unknown,
         NodeId::Network => Kids::Ready(sorted(s.tree.servers.iter().map(|sv| server_node(sv)).collect())),
@@ -602,6 +598,27 @@ pub fn drives_changed(s: &mut State, drives: Vec<(PathBuf, DriveKind)>) {
     let fixed = fixed_icons(&s.places, &s.local_drives).into_iter().chain(crate::sysicons::home_key());
     s.icons.refix(fixed, moved.into_iter().map(IconKey::Path));
     s.tree.version += 1;
+    crate::computer_changed(s);
+    read_drive_names(s);
+}
+
+/// Asks the system for the disks' names in the background (see [`crate::mounts::names`]).
+pub fn read_drive_names(s: &mut State) {
+    let drives = s.local_drives.clone();
+    background(s, move |emit| emit(Msg::DriveNames(crate::mounts::names(&drives))));
+}
+
+/// The disks' names the system gave.
+pub fn drive_names(s: &mut State, names: Vec<(PathBuf, String)>) {
+    let names: HashMap<PathBuf, String> = names.into_iter().collect();
+    // Names read for disks since mounted or removed: the newer reading is on its way.
+    let current = names.len() == s.local_drives.len() && s.local_drives.iter().all(|(d, _)| names.contains_key(d));
+    if !current || names == s.drive_names {
+        return;
+    }
+    s.drive_names = names;
+    s.tree.version += 1;
+    crate::computer_changed(s);
 }
 
 /// Re-reads open local and server nodes in the tree after `show_hidden` changes.
@@ -728,6 +745,7 @@ pub fn toggle(s: &mut State, p: usize, node: &Node) {
 fn chain(s: &State, loc: &Location) -> Vec<Node> {
     match loc {
         Location::Local(path) => local_chain(s, path),
+        Location::Computer => desktop_node(&s.places).into_iter().chain([computer_node()]).collect(),
         Location::Found(f) => f.within.as_ref().map(|w| local_chain(s, w)).unwrap_or_default(),
         Location::Mock(segs) => (0..=segs.len()).map(|i| mock_node(segs[..i].to_vec())).collect(),
         Location::DriveSearch(_) => Vec::new(),
@@ -794,7 +812,7 @@ fn local_chain(s: &State, path: &Path) -> Vec<Node> {
         }
     }
     for (d, kind) in &s.local_drives {
-        let disk = disk_node(d, *kind);
+        let disk = disk_node(s, d, *kind);
         anchors.push((d.clone(), top.iter().cloned().chain([computer_node(), disk]).collect()));
     }
     // The longest anchor holding `path`, then a node for each folder below it.
@@ -1474,14 +1492,17 @@ mod tests {
         press(&mut s, 0, Move::Close, 0.0);
         assert_eq!(on_row(&s), "Drive simulado", "a closed top node has nowhere to go");
 
-        // Este Computador goes nowhere: Enter opens and closes it.
+        // Este Computador lists the disks: Enter goes there; the arrows open and close it.
         press(&mut s, 0, Move::First, 0.0);
         press(&mut s, 0, Move::Down, 0.0);
         press(&mut s, 0, Move::Down, 0.0);
         assert_eq!(on_row(&s), "Este Computador");
         press(&mut s, 0, Move::Go, 0.0);
-        assert!(!s.tree.open[0].contains(&NodeId::Computer));
-        press(&mut s, 0, Move::Go, 0.0);
+        assert_eq!(s.panes[0].loc, Location::Computer);
+        assert_eq!(on_row(&s), "Este Computador");
+        if !s.tree.open[0].contains(&NodeId::Computer) {
+            press(&mut s, 0, Move::Open, 0.0);
+        }
         assert!(s.tree.open[0].contains(&NodeId::Computer));
         press(&mut s, 0, Move::Open, 0.0);
         assert!(on_row(&s).starts_with("Disco local"));

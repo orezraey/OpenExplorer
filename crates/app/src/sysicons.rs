@@ -33,6 +33,10 @@ const OWN_ICON: &[&str] = &["exe", "lnk", "ico", "url", "msc", "cpl", "scr"];
 
 /// The key for an entry of `loc`, or `None` for Google's own formats, which have no Windows icon.
 pub fn key_for(e: &Entry, loc: &Location) -> Option<IconKey> {
+    // A disk of Este Computador, by its root (the key the tree keeps for it).
+    if *loc == Location::Computer {
+        return Some(IconKey::Path(std::path::PathBuf::from(&e.id)));
+    }
     if e.is_dir {
         return Some(IconKey::Folder);
     }
