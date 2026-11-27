@@ -24,6 +24,14 @@ pub const QUEUE_H_MAX: f32 = 700.0;
 pub const QUEUE_COLS: [f32; 8] = [92.0, 300.0, 240.0, 190.0, 128.0, 112.0, 96.0, 88.0];
 pub const QUEUE_COL_MIN: f32 = 50.0;
 
+/// The columns of Sincronizar's comparison: the path, size and date of the left side, the
+/// action, the path, size and date of the right side, and the status. A column is known by
+/// its place here whatever order the table shows them in.
+pub const SYNC_COLS: [f32; 8] = [300.0, 82.0, 124.0, 100.0, 300.0, 82.0, 124.0, 140.0];
+pub const SYNC_COL_MIN: f32 = 50.0;
+/// The order the comparison's columns start in: as [`SYNC_COLS`] lists them.
+pub const SYNC_ORDER: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Layout {
@@ -33,12 +41,39 @@ pub struct Layout {
     pub columns: [[f32; 4]; 2],
     pub queue_h: f32,
     pub queue_cols: [f32; 8],
+    /// The widths of the comparison's columns, each at its place in [`SYNC_COLS`].
+    pub sync_cols: [f32; 8],
+    /// The comparison's columns from left to right, as dragged about by their headers.
+    pub sync_order: [u8; 8],
 }
 
 impl Default for Layout {
     fn default() -> Layout {
-        Layout { tree: [TREE_W; 2], columns: [COLS; 2], queue_h: QUEUE_H, queue_cols: QUEUE_COLS }
+        Layout { tree: [TREE_W; 2], columns: [COLS; 2], queue_h: QUEUE_H, queue_cols: QUEUE_COLS, sync_cols: SYNC_COLS, sync_order: SYNC_ORDER }
     }
+}
+
+/// Comparison column `i`'s width kept between [`SYNC_COL_MIN`] and [`COL_MAX`].
+pub fn clamp_sync_col(i: usize, w: f32) -> f32 {
+    if w.is_finite() { w.clamp(SYNC_COL_MIN, COL_MAX) } else { SYNC_COLS[i] }
+}
+
+/// `order` when it names each of the comparison's columns once, the starting order otherwise.
+pub fn sync_order(order: [u8; 8]) -> [u8; 8] {
+    let mut sorted = order;
+    sorted.sort_unstable();
+    if sorted == SYNC_ORDER { order } else { SYNC_ORDER }
+}
+
+/// The comparison's columns with the one at place `from` moved to place `to`, the ones
+/// between making room.
+pub fn moved_sync_col(order: [u8; 8], from: usize, to: usize) -> [u8; 8] {
+    let mut order = order.to_vec();
+    if from < order.len() && to < order.len() {
+        let col = order.remove(from);
+        order.insert(to, col);
+    }
+    std::array::from_fn(|i| order[i])
 }
 
 pub fn clamp_queue_h(h: f32) -> f32 {
@@ -71,6 +106,8 @@ impl Layout {
             columns: l.columns.map(|c| [0, 1, 2, 3].map(|i| clamp_col(i, c[i]))),
             queue_h: clamp_queue_h(l.queue_h),
             queue_cols: std::array::from_fn(|i| clamp_queue_col(i, l.queue_cols[i])),
+            sync_cols: std::array::from_fn(|i| clamp_sync_col(i, l.sync_cols[i])),
+            sync_order: sync_order(l.sync_order),
         }
     }
 
@@ -97,6 +134,23 @@ mod tests {
         assert_eq!(clamp_queue_h(10.0), QUEUE_H_MIN);
         assert_eq!(clamp_queue_h(f32::INFINITY), QUEUE_H);
         assert_eq!(clamp_queue_col(1, 5.0), QUEUE_COL_MIN);
+        assert_eq!((clamp_sync_col(0, 5.0), clamp_sync_col(0, 400.0), clamp_sync_col(7, f32::NAN)), (SYNC_COL_MIN, 400.0, SYNC_COLS[7]));
+    }
+
+    /// The comparison's columns move about by their headers; an order that isn't each column
+    /// once (a file changed by hand, or from a version with other columns) starts over.
+    #[test]
+    fn the_comparison_columns_keep_an_order_that_names_each_once() {
+        assert_eq!(moved_sync_col(SYNC_ORDER, 2, 1), [0, 2, 1, 3, 4, 5, 6, 7]);
+        assert_eq!(moved_sync_col(SYNC_ORDER, 0, 3), [1, 2, 3, 0, 4, 5, 6, 7]);
+        assert_eq!(moved_sync_col(SYNC_ORDER, 7, 0), [7, 0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(moved_sync_col(SYNC_ORDER, 4, 4), SYNC_ORDER);
+        assert_eq!(moved_sync_col(SYNC_ORDER, 9, 0), SYNC_ORDER);
+        assert_eq!(sync_order([7, 0, 1, 2, 3, 4, 5, 6]), [7, 0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(sync_order([0, 0, 1, 2, 3, 4, 5, 6]), SYNC_ORDER);
+        assert_eq!(sync_order([0, 1, 2, 3, 4, 5, 6, 9]), SYNC_ORDER);
+        let l: Layout = serde_json::from_str(r#"{"sync_order":[1,0,2,3,4,5,6,7],"sync_cols":[400.0,82.0,124.0,100.0,300.0,82.0,124.0,140.0]}"#).unwrap();
+        assert_eq!((l.sync_order[0], l.sync_cols[0]), (1, 400.0));
     }
 
     #[test]

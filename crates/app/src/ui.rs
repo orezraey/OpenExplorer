@@ -5398,7 +5398,7 @@ fn col_grip(k: &Kit, p: usize, i: usize, edge: f32) -> El {
 }
 
 /// A column grip at `edge` over a header `height` tall, changing the width `size` picks.
-fn grip(k: &Kit, key: &str, edge: f32, height: f32, size: impl Fn(&mut State) -> &mut f32 + 'static, default: f32, clamp: impl Fn(f32) -> f32 + 'static) -> El {
+pub(crate) fn grip(k: &Kit, key: &str, edge: f32, height: f32, size: impl Fn(&mut State) -> &mut f32 + 'static, default: f32, clamp: impl Fn(f32) -> f32 + 'static) -> El {
     el().key(key.to_string())
         .role("separator")
         .label(t("Arraste para mudar a largura da coluna; clique duas vezes para voltar ao padrão", "Drag to change the column's width; double-click to restore the default"))
@@ -5418,7 +5418,7 @@ fn grip(k: &Kit, key: &str, edge: f32, height: f32, size: impl Fn(&mut State) ->
 /// The app's scroll bars: a thumb dark enough to see at rest (the kit's is a faint line on a
 /// light theme), wider and darker under the pointer. Shown always, the bar sits over the
 /// viewport's end edge: what it scrolls leaves [`ScrollBarStyle::strip`] of room there.
-fn bar_style(k: &Kit) -> ScrollBarStyle {
+pub(crate) fn bar_style(k: &Kit) -> ScrollBarStyle {
     ScrollBarStyle::from_kit(k).thumb(k.alpha(k.c.text_base, 0.3)).thumb_hover(k.alpha(k.c.text_base, 0.5)).width(8.0).hover_width(10.0)
 }
 
@@ -5556,7 +5556,7 @@ fn kept_hbar(key: &str) -> std::rc::Rc<HBar> {
 /// Attaches both the vertical `rune-kit` scrollbar and an automatic bottom horizontal scrollbar
 /// (visible only when content overflows sideways) to a `scroll_xy()` viewport keyed `key`.
 /// When `v_overlaps` is true, the horizontal track leaves room on the right for the vertical bar.
-fn with_scroll_bars(k: &Kit, key: &str, viewport: El, v_bar: ScrollBarStyle, v_overlaps: bool) -> El {
+pub(crate) fn with_scroll_bars(k: &Kit, key: &str, viewport: El, v_bar: ScrollBarStyle, v_overlaps: bool) -> El {
     let hbar = kept_hbar(key);
     hbar.rest_color.set(k.alpha(k.c.text_base, 0.34));
     hbar.hover_color.set(k.alpha(k.c.text_base, 0.56));

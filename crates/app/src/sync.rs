@@ -2,11 +2,13 @@
 //! choose a sync preset or custom rules, filter by name/date/size/subfolders, compare
 //! differences with optional MD5 hash verification, and execute the sync plan.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike, NaiveDate, TimeZone, Utc};
@@ -121,7 +123,7 @@ pub enum LeftOnlyAction {
 }
 
 impl LeftOnlyAction {
-    pub const ALL: [LeftOnlyAction; 3] = [LeftOnlyAction::CopyToRight, LeftOnlyAction::DeleteLeft, LeftOnlyAction::DoNothing];
+    pub const ALL: [LeftOnlyAction; 3] = [LeftOnlyAction::CopyToRight, LeftOnlyAction::DoNothing, LeftOnlyAction::DeleteLeft];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -153,7 +155,7 @@ pub enum RightOnlyAction {
 }
 
 impl RightOnlyAction {
-    pub const ALL: [RightOnlyAction; 3] = [RightOnlyAction::CopyToLeft, RightOnlyAction::DeleteRight, RightOnlyAction::DoNothing];
+    pub const ALL: [RightOnlyAction; 3] = [RightOnlyAction::CopyToLeft, RightOnlyAction::DoNothing, RightOnlyAction::DeleteRight];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -185,7 +187,9 @@ pub enum NewerAction {
 }
 
 impl NewerAction {
-    pub const ALL: [NewerAction; 3] = [NewerAction::CopyToRight, NewerAction::CopyToLeft, NewerAction::DoNothing];
+    pub const ALL: [NewerAction; 3] = [NewerAction::CopyToRight, NewerAction::DoNothing, NewerAction::CopyToLeft];
+    /// The same choices in the order they are offered for a file newer on the right side.
+    pub const FOR_RIGHT: [NewerAction; 3] = [NewerAction::DoNothing, NewerAction::CopyToRight, NewerAction::CopyToLeft];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -516,16 +520,26 @@ fn parse_patterns(raw: &str) -> impl Iterator<Item = &str> {
 
 /// Glob matcher (`*` matches any sequence of chars, `?` matches one char), case-insensitive.
 fn glob_match(pattern: &str, text: &str) -> bool {
+    // Plain ASCII, as most names and nearly all patterns are, is matched in place: a filter is
+    // asked about every file of both sides, and the copies below were most of what it cost.
+    if pattern.is_ascii() && text.is_ascii() {
+        return glob(pattern.as_bytes(), text.as_bytes(), b'?', b'*', u8::eq_ignore_ascii_case);
+    }
     let p: Vec<char> = pattern.to_lowercase().chars().collect();
     let t: Vec<char> = text.to_lowercase().chars().collect();
+    glob(&p, &t, '?', '*', char::eq)
+}
+
+/// [`glob_match`] over letters `same` tells alike: `one` stands for any one, `any` for any run.
+fn glob<T: Copy + PartialEq>(p: &[T], t: &[T], one: T, any: T, same: impl Fn(&T, &T) -> bool) -> bool {
     let (mut pi, mut ti) = (0usize, 0usize);
     let (mut star_p, mut star_t) = (None, 0usize);
 
     while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+        if pi < p.len() && (p[pi] == one || same(&p[pi], &t[ti])) {
             pi += 1;
             ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+        } else if pi < p.len() && p[pi] == any {
             star_p = Some(pi);
             pi += 1;
             star_t = ti;
@@ -537,14 +551,19 @@ fn glob_match(pattern: &str, text: &str) -> bool {
             return false;
         }
     }
-    while pi < p.len() && p[pi] == '*' {
+    while pi < p.len() && p[pi] == any {
         pi += 1;
     }
     pi == p.len()
 }
 
+/// A pattern with `/` between its folders, however it was typed.
+fn slashes(raw_pat: &str) -> std::borrow::Cow<'_, str> {
+    if raw_pat.contains('\\') { raw_pat.replace('\\', "/").into() } else { raw_pat.into() }
+}
+
 fn pattern_matches_dir(raw_pat: &str, rel_dir: &str) -> bool {
-    let pat = raw_pat.replace('\\', "/");
+    let pat = slashes(raw_pat);
     let anchored = pat.starts_with('/');
     let pat_clean = pat.trim_matches('/');
     if pat_clean.is_empty() {
@@ -572,7 +591,7 @@ fn pattern_matches_dir(raw_pat: &str, rel_dir: &str) -> bool {
 }
 
 fn pattern_matches_file(raw_pat: &str, rel_file: &str) -> bool {
-    let pat = raw_pat.replace('\\', "/");
+    let pat = slashes(raw_pat);
     let dir_only = pat.ends_with('/');
     let anchored = pat.starts_with('/');
     let pat_clean = pat.trim_matches('/');
@@ -796,23 +815,36 @@ impl SyncAction {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum RowStatus {
+    /// Has an action that waits its turn: before Iniciar, and through the run until it is done.
     #[default]
     Pending,
     Running,
     Done,
+    /// Its action was switched off in the table.
     Skipped,
     Failed(String),
+    /// Nothing to do: the same on both sides, or the rules say to leave it.
+    Idle,
+    /// Left out by the filter (a name, a date, a size): shown, never synchronized.
+    Filtered,
 }
 
 impl RowStatus {
     pub fn label(&self) -> String {
         match self {
-            RowStatus::Pending => t("Pendente", "Pending").into(),
+            RowStatus::Pending => t("Na fila", "Queued").into(),
             RowStatus::Running => t("Sincronizando…", "Syncing…").into(),
             RowStatus::Done => t("Concluído", "Done").into(),
             RowStatus::Skipped => t("Ignorado", "Skipped").into(),
             RowStatus::Failed(e) => tr!("Erro: {e}", "Error: {e}"),
+            RowStatus::Idle => String::new(),
+            RowStatus::Filtered => t("Filtrado", "Filtered").into(),
         }
+    }
+
+    /// What a row starts as: in the queue with something to do, idle with nothing.
+    pub fn of(action: SyncAction) -> RowStatus {
+        if action == SyncAction::None { RowStatus::Idle } else { RowStatus::Pending }
     }
 }
 
@@ -822,7 +854,8 @@ pub struct SideMeta {
     pub size: Option<u64>,
     pub modified: Option<SystemTime>,
     pub md5: Option<String>,
-    pub drive_file: Option<DriveFile>,
+    /// Boxed: most rows are of files on the computer, and it would more than double each one.
+    pub drive_file: Option<Box<DriveFile>>,
 }
 
 #[derive(Clone, Debug)]
@@ -895,24 +928,27 @@ pub enum StatusFilter {
     Done,
     Failed,
     Skipped,
+    Filtered,
 }
 
 impl StatusFilter {
-    pub const ALL: [StatusFilter; 5] = [
+    pub const ALL: [StatusFilter; 6] = [
         StatusFilter::All,
         StatusFilter::Pending,
         StatusFilter::Done,
         StatusFilter::Failed,
         StatusFilter::Skipped,
+        StatusFilter::Filtered,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             StatusFilter::All => t("Todos os estados", "All states"),
-            StatusFilter::Pending => t("Pendente", "Pending"),
+            StatusFilter::Pending => t("Na fila", "Queued"),
             StatusFilter::Done => t("Concluído", "Done"),
             StatusFilter::Failed => t("Erro", "Error"),
             StatusFilter::Skipped => t("Ignorado", "Skipped"),
+            StatusFilter::Filtered => t("Filtrado", "Filtered"),
         }
     }
 
@@ -927,6 +963,7 @@ impl StatusFilter {
             StatusFilter::Done => matches!(status, RowStatus::Done),
             StatusFilter::Failed => matches!(status, RowStatus::Failed(_)),
             StatusFilter::Skipped => matches!(status, RowStatus::Skipped),
+            StatusFilter::Filtered => matches!(status, RowStatus::Filtered),
         }
     }
 }
@@ -1126,9 +1163,281 @@ pub struct SyncState {
     pub cancel: Option<Arc<AtomicBool>>,
     pub job_seq: u64,
     pub browse_seq: u64,
+    /// Bumped whenever `rows` are replaced.
+    rows_gen: u64,
+    /// Bumped whenever a row's status changes.
+    status_gen: u64,
+    /// What the table shows of `rows`, kept until what it was made from changes.
+    shown: RefCell<Option<(ShownKey, Rc<Shown>)>>,
+    /// What `rows` add up to, kept as they change: the foot of the table shows it on every frame.
+    counts: Counts,
+    /// A column of the table being dragged by its header: the place it is at, and the place
+    /// it would land at now.
+    pub col_drag: Option<(usize, usize)>,
+    /// The rows' paths as a search reads them, made at the first search of a comparison.
+    paths: RefCell<Option<Rc<Paths>>>,
+    /// Each row's action and status as one byte (see [`tag`]), which is all a filter asks of a
+    /// row: a megabyte to go through for a million rows, where the rows themselves are 250.
+    /// Rows change only through [`SyncState::set_rows`], `toggle` and `set_status`, which keep it.
+    tags: Vec<u8>,
+}
+
+const TAG_ACTIONS: [SyncAction; 5] = [SyncAction::CopyRight, SyncAction::CopyLeft, SyncAction::DeleteRight, SyncAction::DeleteLeft, SyncAction::None];
+
+/// How many kinds of status a row has.
+const STATUSES: usize = 7;
+
+fn tag_statuses() -> [RowStatus; STATUSES] {
+    [RowStatus::Pending, RowStatus::Running, RowStatus::Done, RowStatus::Skipped, RowStatus::Failed(String::new()), RowStatus::Idle, RowStatus::Filtered]
+}
+
+/// A row's action and status as one byte: their places in [`TAG_ACTIONS`] and [`tag_statuses`].
+fn tag(action: SyncAction, status: &RowStatus) -> u8 {
+    let action = TAG_ACTIONS.iter().position(|a| *a == action).unwrap_or(0);
+    let status = match status {
+        RowStatus::Pending => 0,
+        RowStatus::Running => 1,
+        RowStatus::Done => 2,
+        RowStatus::Skipped => 3,
+        RowStatus::Failed(_) => 4,
+        RowStatus::Idle => 5,
+        RowStatus::Filtered => 6,
+    };
+    (action * STATUSES + status) as u8
+}
+
+/// Which tags the filters let through.
+fn passing(action: ActionFilter, status: StatusFilter) -> [bool; 5 * STATUSES] {
+    let statuses = tag_statuses();
+    std::array::from_fn(|tag| action.matches(TAG_ACTIONS[tag / STATUSES]) && status.matches(&statuses[tag % STATUSES]))
+}
+
+/// The rows the table shows, after its filters and search. A comparison has tens of thousands
+/// of rows, so this is worked out when they or the filters change, not on every frame.
+pub struct Shown {
+    /// Indexes into [`SyncState::rows`], in order.
+    pub rows: Rc<[u32]>,
+}
+
+/// How many rows there are of each action, leaving out the actions switched off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub copy_right: usize,
+    pub copy_left: usize,
+    pub delete: usize,
+    pub same: usize,
+}
+
+impl Counts {
+    /// The actions Iniciar would run.
+    pub fn planned(&self) -> usize {
+        self.copy_right + self.copy_left + self.delete
+    }
+
+    fn of(&mut self, action: SyncAction) -> &mut usize {
+        match action {
+            SyncAction::CopyRight => &mut self.copy_right,
+            SyncAction::CopyLeft => &mut self.copy_left,
+            SyncAction::DeleteRight | SyncAction::DeleteLeft => &mut self.delete,
+            SyncAction::None => &mut self.same,
+        }
+    }
+}
+
+/// `text` in lowercase, letter by letter: what a search is typed as and looked for in.
+fn lower(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    lower_into(&mut out, text);
+    // No NUL in what is looked for: [`Paths`] ends each path with one.
+    out.retain(|c| c != '\0');
+    out
+}
+
+fn lower_into(out: &mut String, text: &str) {
+    if text.is_ascii() {
+        let from = out.len();
+        out.push_str(text);
+        out[from..].make_ascii_lowercase();
+    } else {
+        out.extend(text.chars().flat_map(char::to_lowercase));
+    }
+}
+
+/// Every row's path in lowercase, one after the other with a NUL after each. A search reads
+/// this one run of text, in a few parts at once, where making each path lowercase again on
+/// every key typed took 40 ms of a million rows.
+struct Paths {
+    text: String,
+    /// Where each row's path ends in `text`, at its NUL.
+    ends: Vec<usize>,
+}
+
+impl Paths {
+    fn of(rows: &[CompareRow]) -> Paths {
+        let lowered = |rows: &[CompareRow]| {
+            let mut text = String::with_capacity(rows.iter().map(|r| r.rel_path.len() + 1).sum());
+            let mut ends = Vec::with_capacity(rows.len());
+            for r in rows {
+                lower_into(&mut text, &r.rel_path);
+                ends.push(text.len());
+                text.push('\0');
+            }
+            (text, ends)
+        };
+        let parts = if rows.len() < 50_000 { 1 } else { std::thread::available_parallelism().map_or(4, |c| c.get()).min(8) };
+        if parts == 1 {
+            let (text, ends) = lowered(rows);
+            return Paths { text, ends };
+        }
+        // Many rows are made lowercase in parts at once, then put end to end: the first letter
+        // of a search waits for this.
+        let made: Vec<(String, Vec<usize>)> = std::thread::scope(|sc| {
+            let work: Vec<_> = rows.chunks(rows.len().div_ceil(parts)).map(|part| sc.spawn(move || lowered(part))).collect();
+            work.into_iter().map(|w| w.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))).collect()
+        });
+        let mut text = String::with_capacity(made.iter().map(|(text, _)| text.len()).sum());
+        let mut ends = Vec::with_capacity(rows.len());
+        for (part, part_ends) in made {
+            let from = text.len();
+            text.push_str(&part);
+            ends.extend(part_ends.into_iter().map(|end| from + end));
+        }
+        Paths { text, ends }
+    }
+
+    /// The rows of `part` whose path holds `query` (in lowercase, with no NUL) and that `fits`
+    /// lets through, in order.
+    fn holding(&self, query: &str, part: std::ops::Range<usize>, fits: impl Fn(usize) -> bool) -> Vec<u32> {
+        let mut out = Vec::new();
+        if part.is_empty() {
+            return out;
+        }
+        let first = if part.start == 0 { 0 } else { self.ends[part.start - 1] + 1 };
+        // A path's NUL keeps a match from running over two rows.
+        let (mut row, mut seen) = (part.start, first);
+        for (at, _) in self.text[first..self.ends[part.end - 1]].match_indices(query) {
+            let at = first + at;
+            // Another match in a row already taken.
+            if at < seen {
+                continue;
+            }
+            while self.ends[row] < at {
+                row += 1;
+            }
+            if fits(row) {
+                out.push(row as u32);
+            }
+            seen = self.ends[row] + 1;
+        }
+        out
+    }
+}
+
+/// `pick` over `0..n` in a few parts at once when there is much to go through, its answers
+/// put together in order: which rows a filter shows, of a million, in a few milliseconds.
+fn in_parts(n: usize, pick: impl Fn(std::ops::Range<usize>) -> Vec<u32> + Sync) -> Vec<u32> {
+    let parts = if n < 50_000 { 1 } else { std::thread::available_parallelism().map_or(4, |c| c.get()).min(8) };
+    if parts == 1 {
+        return pick(0..n);
+    }
+    let each = n.div_ceil(parts);
+    std::thread::scope(|sc| {
+        let pick = &pick;
+        let work: Vec<_> = (0..parts).map(|p| sc.spawn(move || pick((p * each).min(n)..((p + 1) * each).min(n)))).collect();
+        work.into_iter().flat_map(|w| w.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))).collect()
+    })
+}
+
+#[derive(PartialEq)]
+struct ShownKey {
+    rows_gen: u64,
+    /// Only while a status filter is on: nothing else shown depends on a row's status.
+    status_gen: u64,
+    action: ActionFilter,
+    status: StatusFilter,
+    query: String,
 }
 
 impl SyncState {
+    /// Replaces the comparison's rows.
+    pub fn set_rows(&mut self, rows: Vec<CompareRow>) {
+        self.counts = Counts::default();
+        // What the filter left out is no part of the comparison: it has its own total.
+        for r in rows.iter().filter(|r| (r.enabled || r.action == SyncAction::None) && r.status != RowStatus::Filtered) {
+            *self.counts.of(r.action) += 1;
+        }
+        self.tags = rows.iter().map(|r| tag(r.action, &r.status)).collect();
+        self.rows = rows;
+        self.rows_gen += 1;
+        *self.paths.borrow_mut() = None;
+    }
+
+    /// Gives row `id` a new status; false when there's no such row.
+    pub fn set_status(&mut self, id: usize, status: RowStatus) -> bool {
+        let Some(row) = self.rows.get_mut(id).filter(|r| r.id == id) else { return false };
+        self.tags[id] = tag(row.action, &status);
+        row.status = status;
+        self.status_gen += 1;
+        true
+    }
+
+    pub fn counts(&self) -> Counts {
+        self.counts
+    }
+
+    fn paths(&self) -> Rc<Paths> {
+        self.paths.borrow_mut().get_or_insert_with(|| Rc::new(Paths::of(&self.rows))).clone()
+    }
+
+    /// Switches the action of row `id` off, or on again. Nothing for a row with none.
+    pub fn toggle(&mut self, id: usize) {
+        let Some(row) = self.rows.get_mut(id).filter(|r| r.id == id && r.action != SyncAction::None) else { return };
+        row.enabled = !row.enabled;
+        row.status = if row.enabled { RowStatus::Pending } else { RowStatus::Skipped };
+        let (on, action) = (row.enabled, row.action);
+        self.tags[id] = tag(action, &row.status);
+        let n = self.counts.of(action);
+        *n = if on { *n + 1 } else { n.saturating_sub(1) };
+        self.status_gen += 1;
+    }
+
+    pub fn clear_rows(&mut self) {
+        self.set_rows(Vec::new());
+    }
+
+
+    /// What the table shows now.
+    pub fn shown(&self) -> Rc<Shown> {
+        let key = ShownKey {
+            rows_gen: self.rows_gen,
+            status_gen: if self.status_filter == StatusFilter::All { 0 } else { self.status_gen },
+            action: self.action_filter,
+            status: self.status_filter,
+            query: lower(self.search.text.trim()),
+        };
+        let mut kept = self.shown.borrow_mut();
+        if let Some((k, shown)) = &*kept
+            && *k == key
+        {
+            return shown.clone();
+        }
+        let (tags, passes) = (&self.tags, passing(key.action, key.status));
+        let fits = |i: usize| passes[tags[i] as usize];
+        let rows: Vec<u32> = if key.query.is_empty() {
+            // The paths made for a search are as much text again as the rows hold: not kept
+            // once the search is cleared.
+            *self.paths.borrow_mut() = None;
+            in_parts(tags.len(), |part| part.filter(|&i| fits(i)).map(|i| i as u32).collect())
+        } else {
+            let paths = self.paths();
+            let paths: &Paths = &paths;
+            in_parts(tags.len(), |part| paths.holding(&key.query, part, fits))
+        };
+        let shown = Rc::new(Shown { rows: rows.into() });
+        *kept = Some((key, shown.clone()));
+        shown
+    }
+
     pub fn load() -> Self {
         let saved = load_saved_syncs();
         Self {
@@ -1152,6 +1461,13 @@ impl SyncState {
             cancel: None,
             job_seq: 0,
             browse_seq: 0,
+            rows_gen: 0,
+            status_gen: 0,
+            shown: RefCell::new(None),
+            counts: Counts::default(),
+            col_drag: None,
+            paths: RefCell::new(None),
+            tags: Vec::new(),
         }
     }
 
@@ -1164,7 +1480,7 @@ impl SyncState {
     }
 
     pub fn planned_action_count(&self) -> usize {
-        self.rows.iter().filter(|r| r.enabled && r.action != SyncAction::None).count()
+        self.counts.planned()
     }
 }
 
@@ -1239,7 +1555,7 @@ pub fn arrived(s: &mut State, ans: Answer) -> bool {
                 Ok((rows, filtered_out)) => {
                     let planned = rows.iter().filter(|r| r.enabled && r.action != SyncAction::None).count();
                     let total = rows.len();
-                    s.sync.rows = rows;
+                    s.sync.set_rows(rows);
                     s.sync.filtered_out_count = filtered_out;
                     s.sync.progress_text = tr!(
                         "Comparação concluída: {} itens ({} ações).",
@@ -1260,9 +1576,7 @@ pub fn arrived(s: &mut State, ans: Answer) -> bool {
             if s.sync.job_seq != job {
                 return false;
             }
-            if let Some(row) = s.sync.rows.iter_mut().find(|r| r.id == row_id) {
-                row.status = status;
-            }
+            s.sync.set_status(row_id, status);
             s.sync.done_count = done;
             s.sync.total_count = total;
             s.sync.progress_text = tr!(
@@ -1322,7 +1636,7 @@ pub fn new_sync(s: &mut State) {
     s.sync.pairs = vec![FolderPair { id: 1, left: None, right: None }];
     s.sync.next_pair_id = 2;
     s.sync.options = SyncOptions::default();
-    s.sync.rows.clear();
+    s.sync.clear_rows();
     s.sync.filtered_out_count = 0;
     s.sync.progress_text.clear();
     s.sync.open_menu = None;
@@ -1342,7 +1656,7 @@ pub fn open_from_panes(s: &mut State) {
         s.sync.active_name.clear();
         s.sync.pairs = vec![FolderPair { id: 1, left, right }];
         s.sync.next_pair_id = 2;
-        s.sync.rows.clear();
+        s.sync.clear_rows();
         s.sync.filtered_out_count = 0;
         s.sync.progress_text.clear();
         s.sync.open_menu = None;
@@ -1357,7 +1671,7 @@ pub fn add_pair(s: &mut State) {
     let id = s.sync.next_pair_id;
     s.sync.next_pair_id += 1;
     s.sync.pairs.push(FolderPair { id, left: None, right: None });
-    s.sync.rows.clear();
+    s.sync.clear_rows();
 }
 
 pub fn remove_pair(s: &mut State, id: u64) {
@@ -1365,7 +1679,7 @@ pub fn remove_pair(s: &mut State, id: u64) {
         return;
     }
     s.sync.pairs.retain(|p| p.id != id);
-    s.sync.rows.clear();
+    s.sync.clear_rows();
 }
 
 pub fn swap_pair(s: &mut State, id: u64) {
@@ -1374,7 +1688,7 @@ pub fn swap_pair(s: &mut State, id: u64) {
     }
     if let Some(pair) = s.sync.pairs.iter_mut().find(|p| p.id == id) {
         std::mem::swap(&mut pair.left, &mut pair.right);
-        s.sync.rows.clear();
+        s.sync.clear_rows();
     }
 }
 
@@ -1384,7 +1698,7 @@ pub fn set_pair_location(s: &mut State, pair_id: u64, side: Side, loc: SyncLocat
             Side::Left => pair.left = Some(loc),
             Side::Right => pair.right = Some(loc),
         }
-        s.sync.rows.clear();
+        s.sync.clear_rows();
     }
     s.sync.open_menu = None;
 }
@@ -1486,7 +1800,7 @@ pub fn load_saved(s: &mut State, id: &str) {
     };
     s.sync.next_pair_id = s.sync.pairs.iter().map(|p| p.id).max().unwrap_or(0) + 1;
     s.sync.options = saved.options;
-    s.sync.rows.clear();
+    s.sync.clear_rows();
     s.sync.filtered_out_count = 0;
     s.sync.progress_text.clear();
     s.sync.open_menu = None;
@@ -1512,12 +1826,7 @@ pub fn toggle_row(s: &mut State, row_id: usize) {
     if s.sync.is_busy() {
         return;
     }
-    if let Some(row) = s.sync.rows.iter_mut().find(|r| r.id == row_id)
-        && row.action != SyncAction::None
-    {
-        row.enabled = !row.enabled;
-        row.status = if row.enabled { RowStatus::Pending } else { RowStatus::Skipped };
-    }
+    s.sync.toggle(row_id);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1760,6 +2069,9 @@ struct ScannedItem {
     meta: SideMeta,
 }
 
+/// What one side of a pair holds, by path from its root.
+type Scanned = BTreeMap<String, ScannedItem>;
+
 pub fn start_compare(s: &mut State) {
     if s.sync.is_busy() {
         return;
@@ -1781,7 +2093,7 @@ pub fn start_compare(s: &mut State) {
     let cancel = Arc::new(AtomicBool::new(false));
     s.sync.cancel = Some(cancel.clone());
     s.sync.phase = SyncPhase::Comparing;
-    s.sync.rows.clear();
+    s.sync.clear_rows();
     s.sync.filtered_out_count = 0;
     s.sync.progress_text = t("Lendo pastas…", "Reading folders…").into();
     s.sync.open_menu = None;
@@ -1815,27 +2127,23 @@ pub fn start_compare(s: &mut State) {
                 if cancel.load(Ordering::Relaxed) {
                     return Err(t("Comparação cancelada.", "Comparison cancelled.").into());
                 }
-                emit(Msg::Sync(Answer::CompareProgress {
-                    job,
-                    text: tr!("Lendo esquerda: {}…", "Reading left: {}…", left_loc.short_label()),
-                }));
-                let left_map = scan_location(left_loc, &options.filter, show_hidden, &pool, &servers_list, &drives, &cancel)?;
-
+                let say = |text: String| emit(Msg::Sync(Answer::CompareProgress { job, text }));
+                say(t("Lendo pastas…", "Reading folders…").into());
+                let reading = |seen: usize| say(tr!("Lendo pastas: {seen} itens…", "Reading folders: {seen} items…"));
+                let (left_map, right_map) =
+                    scan_both(left_loc, right_loc, &options.filter, show_hidden, &pool, &servers_list, &drives, &cancel, &reading)?;
                 if cancel.load(Ordering::Relaxed) {
                     return Err(t("Comparação cancelada.", "Comparison cancelled.").into());
                 }
-                emit(Msg::Sync(Answer::CompareProgress {
-                    job,
-                    text: tr!("Lendo direita: {}…", "Reading right: {}…", right_loc.short_label()),
-                }));
-                let right_map = scan_location(right_loc, &options.filter, show_hidden, &pool, &servers_list, &drives, &cancel)?;
 
-                emit(Msg::Sync(Answer::CompareProgress {
-                    job,
-                    text: t("Comparando diferenças…", "Comparing differences…").into(),
-                }));
+                say(t("Comparando diferenças…", "Comparing differences…").into());
+                let checking = |done: usize, total: usize| say(tr!("Comparando o conteúdo: {done} de {total}…", "Comparing content: {done} of {total}…"));
                 let (mut rows, filtered_out) =
-                    compare_maps(*pair_index, left_loc, right_loc, left_map, right_map, &options, now, &cancel);
+                    compare_maps(*pair_index, left_loc, right_loc, left_map, right_map, &options, now, &cancel, &checking);
+                // A comparison stopped half way says nothing true about what is missing.
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(t("Comparação cancelada.", "Comparison cancelled.").into());
+                }
                 total_filtered_out += filtered_out;
                 all_rows.append(&mut rows);
             }
@@ -1857,14 +2165,15 @@ fn scan_location(
     servers_list: &[Server],
     drives: &HashMap<String, Arc<Drive>>,
     cancel: &AtomicBool,
-) -> Result<BTreeMap<String, ScannedItem>, String> {
+    seen: &AtomicUsize,
+) -> Result<Scanned, String> {
     let mut out = BTreeMap::new();
     match root {
         SyncLocation::Local(dir) => {
             if !dir.is_dir() {
                 return Err(tr!("Pasta não encontrada: {}", "Folder not found: {}", dir.display()));
             }
-            scan_local_dir(dir, "", 0, filter, show_hidden, cancel, &mut out)?;
+            return scan_local(dir, filter, show_hidden, cancel, seen);
         }
         SyncLocation::Drive { email, shared_drive_id, path, .. } => {
             let drive = drives
@@ -1875,7 +2184,7 @@ fn scan_location(
                 .map(|(id, _)| id.as_str())
                 .or(shared_drive_id.as_deref())
                 .unwrap_or("root");
-            scan_drive_dir(drive, folder_id, shared_drive_id.as_deref(), "", 0, filter, cancel, &mut out)?;
+            return scan_drive(drive, folder_id, shared_drive_id.as_deref(), filter, cancel, seen);
         }
         SyncLocation::Server { server_id, path, .. } => {
             let server = servers_list
@@ -1884,11 +2193,56 @@ fn scan_location(
                 .ok_or_else(|| t("Servidor não encontrado.", "Server not found.").to_string())?;
             let base = server.path(path);
             servers::with(pool, server, |conn| {
-                scan_server_dir(conn, &base, "", 0, filter, show_hidden, cancel, &mut out)
+                scan_server_dir(conn, &base, "", 0, filter, show_hidden, cancel, seen, &mut out)
             })?;
         }
     }
     Ok(out)
+}
+
+/// Reads the two sides of a pair at the same time, each on its own thread, unless both are the
+/// same server: that one is asked for one folder at a time. `tell` hears how many items were
+/// seen so far, a few times a second.
+fn scan_both(
+    left: &SyncLocation,
+    right: &SyncLocation,
+    filter: &SyncFilter,
+    show_hidden: bool,
+    pool: &Pool,
+    servers_list: &[Server],
+    drives: &HashMap<String, Arc<Drive>>,
+    cancel: &AtomicBool,
+    tell: &dyn Fn(usize),
+) -> Result<(Scanned, Scanned), String> {
+    let seen = AtomicUsize::new(0);
+    let scan = |loc: &SyncLocation| scan_location(loc, filter, show_hidden, pool, servers_list, drives, cancel, &seen);
+    let reading = || tell(seen.load(Ordering::Relaxed));
+    let failed = || Err::<Scanned, String>(t("Erro interno ao ler a pasta.", "Internal error reading the folder.").into());
+    let one_server = matches!((left, right), (SyncLocation::Server { server_id: a, .. }, SyncLocation::Server { server_id: b, .. }) if a == b);
+    let (l, r) = std::thread::scope(|sc| {
+        if one_server {
+            let both = sc.spawn(|| (scan(left), scan(right)));
+            wait_telling(|| both.is_finished(), reading);
+            both.join().unwrap_or_else(|_| (failed(), failed()))
+        } else {
+            let (l, r) = (sc.spawn(|| scan(left)), sc.spawn(|| scan(right)));
+            wait_telling(|| l.is_finished() && r.is_finished(), reading);
+            (l.join().unwrap_or_else(|_| failed()), r.join().unwrap_or_else(|_| failed()))
+        }
+    });
+    Ok((l?, r?))
+}
+
+/// Waits until `done` says so, calling `tell` a few times a second meanwhile.
+fn wait_telling(done: impl Fn() -> bool, tell: impl Fn()) {
+    let mut told = std::time::Instant::now();
+    while !done() {
+        std::thread::sleep(Duration::from_millis(5));
+        if told.elapsed() >= Duration::from_millis(150) {
+            tell();
+            told = std::time::Instant::now();
+        }
+    }
 }
 
 fn join_rel(prefix: &str, name: &str) -> String {
@@ -1899,118 +2253,145 @@ fn join_rel(prefix: &str, name: &str) -> String {
     }
 }
 
-fn scan_local_dir(
-    dir: &Path,
-    prefix: &str,
+/// A folder still to be read: where it is (a path, a Drive id), its path from the root of its
+/// side, and how deep it sits.
+struct Folder<A> {
+    at: A,
+    rel: String,
     depth: usize,
-    filter: &SyncFilter,
-    show_hidden: bool,
-    cancel: &AtomicBool,
-    out: &mut BTreeMap<String, ScannedItem>,
-) -> Result<(), String> {
-    if depth > MAX_DEPTH || cancel.load(Ordering::Relaxed) {
-        return Ok(());
-    }
-    let entries = crate::model::read_local(dir, show_hidden).map_err(|e| e.to_string())?;
-    for e in entries {
-        if cancel.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let rel = join_rel(prefix, &e.name);
-        if e.is_dir {
-            if filter.root_only {
-                continue;
-            }
-            if filter.skip_filtered_dirs && filter.is_dir_excluded(&rel) {
-                continue;
-            }
-            if !filter.is_dir_excluded(&rel) {
-                out.insert(
-                    rel.clone(),
-                    ScannedItem {
-                        is_dir: true,
-                        meta: SideMeta { id: e.id, size: None, modified: e.modified, md5: None, drive_file: None },
-                    },
-                );
-            }
-            scan_local_dir(&dir.join(&e.name), &rel, depth + 1, filter, show_hidden, cancel, out)?;
-        } else {
-            out.insert(
-                rel,
-                ScannedItem {
-                    is_dir: false,
-                    meta: SideMeta { id: e.id, size: e.size, modified: e.modified, md5: None, drive_file: None },
-                },
-            );
-        }
-    }
-    Ok(())
 }
 
-fn scan_drive_dir(
-    drive: &Drive,
-    folder_id: &str,
-    shared_drive: Option<&str>,
-    prefix: &str,
-    depth: usize,
-    filter: &SyncFilter,
+/// What [`walk`] still has to read.
+struct Walking<A> {
+    queue: Vec<Folder<A>>,
+    /// Folders being read now: with none, and an empty queue, the tree is read.
+    reading: usize,
+    error: Option<String>,
+}
+
+/// Reads a tree of folders, `readers` of them at a time: `read` lists one folder, giving the
+/// items it holds and the folders inside to read next. Listing a folder is mostly waiting (for
+/// the disk, a share on the network, Google), so several at once take a fraction of the time
+/// one by one does. The first error ends the reading and is the answer: a side that wasn't all
+/// read can't say what is missing from it.
+fn walk<A: Send>(
+    root: A,
+    readers: usize,
     cancel: &AtomicBool,
-    out: &mut BTreeMap<String, ScannedItem>,
-) -> Result<(), String> {
-    if depth > MAX_DEPTH || cancel.load(Ordering::Relaxed) {
-        return Ok(());
-    }
-    let mut items = Vec::new();
-    drive.list(folder_id, shared_drive, |page, _| {
-        items.extend(page);
-        !cancel.load(Ordering::Relaxed)
-    })?;
-    for f in items {
-        if cancel.load(Ordering::Relaxed) {
-            return Ok(());
+    read: impl Fn(&Folder<A>, &mut Vec<(String, ScannedItem)>, &mut Vec<Folder<A>>) -> Result<(), String> + Sync,
+) -> Result<Scanned, String> {
+    let state = Mutex::new(Walking { queue: vec![Folder { at: root, rel: String::new(), depth: 0 }], reading: 0, error: None });
+    let woken = Condvar::new();
+    let work = || {
+        let mut items = Vec::new();
+        loop {
+            let folder = {
+                let mut w = state.lock().unwrap();
+                loop {
+                    if let Some(next) = w.queue.pop() {
+                        w.reading += 1;
+                        break next;
+                    }
+                    if w.reading == 0 {
+                        return items;
+                    }
+                    w = woken.wait(w).unwrap();
+                }
+            };
+            let mut inside = Vec::new();
+            // A panic must still count the folder as read, or the other readers wait for ever.
+            let done = if cancel.load(Ordering::Relaxed) { Ok(()) } else { catch_panic(t("ler a pasta", "read the folder"), || read(&folder, &mut items, &mut inside)) };
+            let mut w = state.lock().unwrap();
+            w.reading -= 1;
+            match done {
+                Ok(()) if w.error.is_none() && !cancel.load(Ordering::Relaxed) => w.queue.extend(inside.into_iter().filter(|f| f.depth <= MAX_DEPTH)),
+                Ok(()) => w.queue.clear(),
+                Err(e) => {
+                    w.error.get_or_insert(e);
+                    w.queue.clear();
+                }
+            }
+            drop(w);
+            woken.notify_all();
         }
-        let rel = join_rel(prefix, &f.name);
-        if f.is_dir {
-            if filter.root_only {
-                continue;
-            }
-            if filter.skip_filtered_dirs && filter.is_dir_excluded(&rel) {
-                continue;
-            }
-            let child_id = f.target.clone().unwrap_or_else(|| f.id.clone());
-            if !filter.is_dir_excluded(&rel) {
-                out.insert(
-                    rel.clone(),
-                    ScannedItem {
-                        is_dir: true,
-                        meta: SideMeta {
-                            id: child_id.clone(),
-                            size: None,
-                            modified: f.modified,
-                            md5: None,
-                            drive_file: Some(f),
-                        },
-                    },
-                );
-            }
-            scan_drive_dir(drive, &child_id, shared_drive, &rel, depth + 1, filter, cancel, out)?;
-        } else {
-            out.insert(
-                rel,
-                ScannedItem {
-                    is_dir: false,
-                    meta: SideMeta {
-                        id: f.id.clone(),
-                        size: f.size,
-                        modified: f.modified,
-                        md5: f.md5.clone(),
-                        drive_file: Some(f),
-                    },
-                },
-            );
-        }
+    };
+    let found: Vec<_> = std::thread::scope(|sc| {
+        let readers: Vec<_> = (0..readers.max(1)).map(|_| sc.spawn(work)).collect();
+        readers.into_iter().flat_map(|r| r.join().unwrap_or_default()).collect()
+    });
+    match state.into_inner().unwrap().error {
+        Some(e) => Err(e),
+        None => Ok(found.into_iter().collect()),
     }
-    Ok(())
+}
+
+/// Whether the folder at `rel` is a row of the comparison, and whether what it holds is read.
+fn folder_part(filter: &SyncFilter, rel: &str) -> (bool, bool) {
+    if filter.root_only {
+        return (false, false);
+    }
+    let excluded = filter.is_dir_excluded(rel);
+    (!excluded, !(excluded && filter.skip_filtered_dirs))
+}
+
+/// How many folders of the computer (or of a share on the network) are read at a time.
+fn local_readers() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get()).min(8)
+}
+
+/// How many Drive folders are listed at a time, as when items are dragged out of the app.
+const DRIVE_READERS: usize = 6;
+
+fn scan_local(root: &Path, filter: &SyncFilter, show_hidden: bool, cancel: &AtomicBool, seen: &AtomicUsize) -> Result<Scanned, String> {
+    walk(root.to_path_buf(), local_readers(), cancel, |folder, items, inside| {
+        let entries = crate::model::read_local(&folder.at, show_hidden).map_err(|e| e.to_string())?;
+        seen.fetch_add(entries.len(), Ordering::Relaxed);
+        for e in entries {
+            let rel = join_rel(&folder.rel, &e.name);
+            let meta = SideMeta { id: e.id, size: e.size, modified: e.modified, md5: None, drive_file: None };
+            if e.is_dir {
+                let (listed, read) = folder_part(filter, &rel);
+                if read {
+                    inside.push(Folder { at: folder.at.join(&e.name), rel: rel.clone(), depth: folder.depth + 1 });
+                }
+                if listed {
+                    items.push((rel, ScannedItem { is_dir: true, meta }));
+                }
+            } else {
+                items.push((rel, ScannedItem { is_dir: false, meta }));
+            }
+        }
+        Ok(())
+    })
+}
+
+fn scan_drive(drive: &Drive, root_id: &str, shared_drive: Option<&str>, filter: &SyncFilter, cancel: &AtomicBool, seen: &AtomicUsize) -> Result<Scanned, String> {
+    walk(root_id.to_string(), DRIVE_READERS, cancel, |folder, items, inside| {
+        let mut files = Vec::new();
+        drive.list(&folder.at, shared_drive, |page, _| {
+            seen.fetch_add(page.len(), Ordering::Relaxed);
+            files.extend(page);
+            !cancel.load(Ordering::Relaxed)
+        })?;
+        for f in files {
+            let rel = join_rel(&folder.rel, &f.name);
+            if f.is_dir {
+                let (listed, read) = folder_part(filter, &rel);
+                let child_id = f.target.clone().unwrap_or_else(|| f.id.clone());
+                if read {
+                    inside.push(Folder { at: child_id.clone(), rel: rel.clone(), depth: folder.depth + 1 });
+                }
+                if listed {
+                    let meta = SideMeta { id: child_id, size: None, modified: f.modified, md5: None, drive_file: Some(Box::new(f)) };
+                    items.push((rel, ScannedItem { is_dir: true, meta }));
+                }
+            } else {
+                let meta = SideMeta { id: f.id.clone(), size: f.size, modified: f.modified, md5: f.md5.clone(), drive_file: Some(Box::new(f)) };
+                items.push((rel, ScannedItem { is_dir: false, meta }));
+            }
+        }
+        Ok(())
+    })
 }
 
 fn scan_server_dir(
@@ -2021,12 +2402,18 @@ fn scan_server_dir(
     filter: &SyncFilter,
     show_hidden: bool,
     cancel: &AtomicBool,
+    seen: &AtomicUsize,
     out: &mut BTreeMap<String, ScannedItem>,
 ) -> Result<(), String> {
     if depth > MAX_DEPTH || cancel.load(Ordering::Relaxed) {
         return Ok(());
     }
     let items = conn.list(remote_dir)?;
+    seen.fetch_add(items.len(), Ordering::Relaxed);
+    // A server that lists many folders in one request reads the ones in here ahead.
+    if !filter.root_only && items.iter().any(|it| it.is_dir) {
+        conn.read_ahead(remote_dir);
+    }
     for item in items {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
@@ -2052,7 +2439,7 @@ fn scan_server_dir(
                     },
                 );
             }
-            scan_server_dir(conn, &child_remote, &rel, depth + 1, filter, show_hidden, cancel, out)?;
+            scan_server_dir(conn, &child_remote, &rel, depth + 1, filter, show_hidden, cancel, seen, out)?;
         } else {
             out.insert(
                 rel,
@@ -2066,14 +2453,31 @@ fn scan_server_dir(
     Ok(())
 }
 
-fn compute_local_md5(path: &Path) -> Option<String> {
+/// How much of a file is read at a time to compare its content.
+const CONTENT_CHUNK: usize = 1 << 20;
+
+/// Reads until `buf` is full or the file ends.
+fn fill(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match file.read(&mut buf[n..])? {
+            0 => break,
+            k => n += k,
+        }
+    }
+    Ok(n)
+}
+
+fn compute_local_md5(path: &Path, buf: &mut [u8], cancel: &AtomicBool) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
     let mut hasher = Md5::new();
-    let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = file.read(&mut buf).ok()?;
+        let n = fill(&mut file, buf).ok()?;
         if n == 0 {
             break;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return None;
         }
         hasher.update(&buf[..n]);
     }
@@ -2081,14 +2485,88 @@ fn compute_local_md5(path: &Path) -> Option<String> {
     Some(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-fn resolve_md5(loc: &SyncLocation, rel_path: &str, meta: &SideMeta) -> Option<String> {
+fn resolve_md5(loc: &SyncLocation, rel_path: &str, meta: &SideMeta, buf: &mut [u8], cancel: &AtomicBool) -> Option<String> {
     if let Some(h) = &meta.md5 {
         return Some(h.to_ascii_lowercase());
     }
     if let SyncLocation::Local(root) = loc {
-        return compute_local_md5(&local_join_rel(root, rel_path));
+        return compute_local_md5(&local_join_rel(root, rel_path), buf, cancel);
     }
     None
+}
+
+/// Whether two files on the computer hold the same bytes. They are read side by side and the
+/// reading stops at the first difference, so no hash is worked out.
+fn same_bytes(a: &Path, b: &Path, bufs: &mut (Vec<u8>, Vec<u8>), cancel: &AtomicBool) -> std::io::Result<bool> {
+    let (mut a, mut b) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    loop {
+        let (n, m) = (fill(&mut a, &mut bufs.0)?, fill(&mut b, &mut bufs.1)?);
+        if n != m || bufs.0[..n] != bufs.1[..m] || cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        if n == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+/// Whether the file at `rel_path` holds the same content on both sides, as far as that can be
+/// known: a side with no MD5 and not on the computer (a server) can't say.
+fn same_content(
+    left_loc: &SyncLocation,
+    right_loc: &SyncLocation,
+    rel_path: &str,
+    l: &SideMeta,
+    r: &SideMeta,
+    bufs: &mut (Vec<u8>, Vec<u8>),
+    cancel: &AtomicBool,
+) -> bool {
+    if let (SyncLocation::Local(a), SyncLocation::Local(b)) = (left_loc, right_loc) {
+        return same_bytes(&local_join_rel(a, rel_path), &local_join_rel(b, rel_path), bufs, cancel).unwrap_or(false);
+    }
+    let left = resolve_md5(left_loc, rel_path, l, &mut bufs.0, cancel);
+    left.is_some() && left == resolve_md5(right_loc, rel_path, r, &mut bufs.0, cancel)
+}
+
+/// Which of `rows[which[i]]` hold the same content on both sides, checked on several threads
+/// at once: reading the files is nearly all of what a comparison by content costs. `progress`
+/// hears how many are done, of how many.
+fn same_content_rows(
+    rows: &[CompareRow],
+    which: &[usize],
+    left_loc: &SyncLocation,
+    right_loc: &SyncLocation,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(usize, usize),
+) -> Vec<bool> {
+    let (next, done) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let check = || {
+        let mut bufs = (vec![0u8; CONTENT_CHUNK], vec![0u8; CONTENT_CHUNK]);
+        let mut same = Vec::new();
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= which.len() || cancel.load(Ordering::Relaxed) {
+                return same;
+            }
+            let row = &rows[which[i]];
+            if let (Some(l), Some(r)) = (&row.left, &row.right)
+                && same_content(left_loc, right_loc, &row.rel_path, l, r, &mut bufs, cancel)
+            {
+                same.push(i);
+            }
+            done.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8).min(which.len());
+    let mut out = vec![false; which.len()];
+    std::thread::scope(|sc| {
+        let workers: Vec<_> = (0..threads).map(|_| sc.spawn(check)).collect();
+        wait_telling(|| workers.iter().all(|w| w.is_finished()), || progress(done.load(Ordering::Relaxed), which.len()));
+        for i in workers.into_iter().flat_map(|w| w.join().unwrap_or_default()) {
+            out[i] = true;
+        }
+    });
+    out
 }
 
 fn local_join_rel(root: &Path, rel_path: &str) -> PathBuf {
@@ -2106,34 +2584,57 @@ fn compare_maps(
     left_loc: &SyncLocation,
     right_loc: &SyncLocation,
     left: BTreeMap<String, ScannedItem>,
-    mut right: BTreeMap<String, ScannedItem>,
+    right: BTreeMap<String, ScannedItem>,
     options: &SyncOptions,
     now: SystemTime,
     cancel: &AtomicBool,
+    progress: &dyn Fn(usize, usize),
 ) -> (Vec<CompareRow>, usize) {
+    use std::cmp::Ordering::{Greater, Less};
     let rules = options.effective_rules();
-    let mut rows = Vec::new();
+    let mut rows = Vec::with_capacity(left.len().max(right.len()));
     let mut filtered_out = 0usize;
+    // The rows of files with the same size on both sides, still to be told apart by content.
+    let mut by_content = Vec::new();
 
-    // Collect union of keys in deterministic order
-    let mut merged: BTreeMap<String, (Option<ScannedItem>, Option<ScannedItem>)> = BTreeMap::new();
-    for (k, l) in left {
-        let r = right.remove(&k);
-        merged.insert(k, (Some(l), r));
-    }
-    for (k, r) in right {
-        merged.insert(k, (None, Some(r)));
-    }
-
-    for (rel_path, (l_opt, r_opt)) in merged {
+    // Both sides come sorted by path: one pass takes the next path of either, or of both.
+    let (mut left, mut right) = (left.into_iter().peekable(), right.into_iter().peekable());
+    loop {
+        let side = match (left.peek(), right.peek()) {
+            (None, None) => break,
+            (Some(_), None) => Less,
+            (None, Some(_)) => Greater,
+            (Some((l, _)), Some((r, _))) => l.cmp(r),
+        };
+        let (l_opt, r_opt) = (if side == Greater { None } else { left.next() }, if side == Less { None } else { right.next() });
+        let (rel_path, l_opt, r_opt) = match (l_opt, r_opt) {
+            (Some((path, l)), r) => (path, Some(l), r.map(|(_, r)| r)),
+            (None, Some((path, r))) => (path, None, Some(r)),
+            (None, None) => break,
+        };
         if cancel.load(Ordering::Relaxed) {
             break;
         }
         let is_dir = l_opt.as_ref().map(|x| x.is_dir).or_else(|| r_opt.as_ref().map(|x| x.is_dir)).unwrap_or(false);
 
+        // What the filter leaves out is still a row, for the table to show as filtered: with
+        // no action, so nothing ever copies or deletes it.
+        let filtered = |rel_path: String, l_opt: Option<ScannedItem>, r_opt: Option<ScannedItem>| CompareRow {
+            id: 0,
+            pair_index,
+            rel_path,
+            is_dir,
+            left: l_opt.map(|x| x.meta),
+            right: r_opt.map(|x| x.meta),
+            action: SyncAction::None,
+            enabled: false,
+            status: RowStatus::Filtered,
+        };
+
         if is_dir {
             if options.filter.is_dir_excluded(&rel_path) {
                 filtered_out += 1;
+                rows.push(filtered(rel_path, l_opt, r_opt));
                 continue;
             }
             let action = match (&l_opt, &r_opt) {
@@ -2151,7 +2652,7 @@ fn compare_maps(
                 right: r_opt.map(|x| x.meta),
                 action,
                 enabled: action != SyncAction::None,
-                status: RowStatus::Pending,
+                status: RowStatus::of(action),
             });
             continue;
         }
@@ -2168,13 +2669,19 @@ fn compare_maps(
         };
         if !allowed {
             filtered_out += 1;
+            rows.push(filtered(rel_path, l_opt, r_opt));
             continue;
         }
 
         let action = match (&l_opt, &r_opt) {
             (Some(_), None) => rules.left_only.to_sync_action(),
             (None, Some(_)) => rules.right_only.to_sync_action(),
-            (Some(l), Some(r)) => decide_both_exist(left_loc, right_loc, &rel_path, &l.meta, &r.meta, &rules, options.compare_hash),
+            (Some(l), Some(r)) => {
+                if options.compare_hash && l.meta.size == r.meta.size {
+                    by_content.push(rows.len());
+                }
+                decide_by_time(&l.meta, &r.meta, &rules)
+            }
             (None, None) => SyncAction::None,
         };
 
@@ -2187,31 +2694,26 @@ fn compare_maps(
             right: r_opt.map(|x| x.meta),
             action,
             enabled: action != SyncAction::None,
-            status: RowStatus::Pending,
+            status: RowStatus::of(action),
         });
+    }
+
+    // Optional comparison by content: two files that hold the same are equal, whatever their
+    // dates say.
+    if !by_content.is_empty() {
+        let same = same_content_rows(&rows, &by_content, left_loc, right_loc, cancel, progress);
+        for (&row, _) in by_content.iter().zip(same).filter(|(_, same)| *same) {
+            rows[row].action = SyncAction::None;
+            rows[row].enabled = false;
+            rows[row].status = RowStatus::Idle;
+        }
     }
 
     (rows, filtered_out)
 }
 
-fn decide_both_exist(
-    left_loc: &SyncLocation,
-    right_loc: &SyncLocation,
-    rel_path: &str,
-    l: &SideMeta,
-    r: &SideMeta,
-    rules: &SyncRules,
-    compare_hash: bool,
-) -> SyncAction {
-    // Optional hash comparison: if both sides provide MD5 and they match, files are identical.
-    if compare_hash
-        && l.size == r.size
-        && let (Some(hl), Some(hr)) = (resolve_md5(left_loc, rel_path, l), resolve_md5(right_loc, rel_path, r))
-        && hl == hr
-    {
-        return SyncAction::None;
-    }
-
+/// What to do with a file both sides have, from its dates and sizes.
+fn decide_by_time(l: &SideMeta, r: &SideMeta, rules: &SyncRules) -> SyncAction {
     match (l.modified, r.modified) {
         (Some(lm), Some(rm)) => {
             if lm > rm + TIME_TOLERANCE {
@@ -2278,6 +2780,7 @@ pub fn start_sync(s: &mut State) {
             }
         }
     }
+    let known = Known::from_comparison(&s.sync.rows, &pairs);
 
     background(s, move |emit| {
         let mut drives: HashMap<String, Arc<Drive>> = HashMap::new();
@@ -2352,7 +2855,7 @@ pub fn start_sync(s: &mut State) {
                 let (Some(left), Some(right)) = (&pair.left, &pair.right) else {
                     return Err(t("Par de pastas incompleto.", "Incomplete folder pair.").into());
                 };
-                execute_row(row, left, right, skip_recycle_bin, segmented, &pool, &servers_list, &drives, &cancel)
+                execute_row(row, left, right, skip_recycle_bin, segmented, &pool, &servers_list, &drives, &cancel, &known)
             });
 
             done += 1;
@@ -2383,6 +2886,7 @@ fn execute_row(
     servers_list: &[Server],
     drives: &HashMap<String, Arc<Drive>>,
     cancel: &AtomicBool,
+    known: &Known,
 ) -> Result<(), String> {
     match row.action {
         SyncAction::CopyRight => copy_item(
@@ -2397,6 +2901,7 @@ fn execute_row(
             servers_list,
             drives,
             cancel,
+            known,
         ),
         SyncAction::CopyLeft => copy_item(
             right,
@@ -2410,6 +2915,7 @@ fn execute_row(
             servers_list,
             drives,
             cancel,
+            known,
         ),
         SyncAction::DeleteRight => delete_item(right, &row.rel_path, row.is_dir, row.right.as_ref(), skip_recycle_bin, pool, servers_list, drives),
         SyncAction::DeleteLeft => delete_item(left, &row.rel_path, row.is_dir, row.left.as_ref(), skip_recycle_bin, pool, servers_list, drives),
@@ -2429,9 +2935,10 @@ fn copy_item(
     servers_list: &[Server],
     drives: &HashMap<String, Arc<Drive>>,
     cancel: &AtomicBool,
+    known: &Known,
 ) -> Result<(), String> {
     if is_dir {
-        return ensure_dir(dst_root, rel_path, pool, servers_list, drives);
+        return ensure_dir(dst_root, rel_path, pool, servers_list, drives, known);
     }
 
     // Fast path: Local -> Local
@@ -2454,7 +2961,7 @@ fn copy_item(
             .ok_or_else(|| t("Servidor não encontrado.", "Server not found.").to_string())?;
         let dst_remote = remote_join_rel(server, path, rel_path);
         return servers::with(pool, server, |conn| {
-            ensure_remote_parents(conn, &server.path(path), rel_path)?;
+            ensure_remote_parents(conn, server, &server.path(path), rel_path, known);
             conn.upload_file(&dst_remote, &from, &mut |_| !cancel.load(Ordering::Relaxed))
         });
     }
@@ -2477,7 +2984,7 @@ fn copy_item(
     }
 
     // Fast path: Local -> Drive
-    if let (SyncLocation::Local(src_base), SyncLocation::Drive { email, shared_drive_id, path, .. }) = (src_root, dst_root) {
+    if let (SyncLocation::Local(src_base), SyncLocation::Drive { email, .. }) = (src_root, dst_root) {
         let from = local_join_rel(src_base, rel_path);
         let drive = drives
             .get(email)
@@ -2485,8 +2992,8 @@ fn copy_item(
         if let Some(existing) = dst_meta {
             drive.upload_version(&existing.id, &from, &mut |_| !cancel.load(Ordering::Relaxed))?;
         } else {
-            let parent_id = ensure_drive_parents(drive, shared_drive_id.as_deref(), path, rel_path)?;
-            let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+            let (folder, name) = rel_path.rsplit_once('/').unwrap_or(("", rel_path));
+            let parent_id = known.drive_folder(drive, dst_root, folder)?;
             drive.upload(&from, &parent_id, name, &mut |_| !cancel.load(Ordering::Relaxed))?;
         }
         return Ok(());
@@ -2502,7 +3009,7 @@ fn copy_item(
             .get(email)
             .ok_or_else(|| tr!("Conta não conectada: {email}", "Account not connected: {email}"))?;
         let df = src_meta
-            .and_then(|m| m.drive_file.as_ref())
+            .and_then(|m| m.drive_file.as_deref())
             .ok_or_else(|| t("Metadados do arquivo no Drive ausentes.", "Missing Drive file metadata.").to_string())?;
         drive.download(df, &to, segmented, &mut |_| !cancel.load(Ordering::Relaxed))?;
         return Ok(());
@@ -2522,7 +3029,7 @@ fn copy_item(
                 .get(email)
                 .ok_or_else(|| tr!("Conta não conectada: {email}", "Account not connected: {email}"))?;
             let df = src_meta
-                .and_then(|m| m.drive_file.as_ref())
+                .and_then(|m| m.drive_file.as_deref())
                 .ok_or_else(|| t("Metadados do arquivo no Drive ausentes.", "Missing Drive file metadata.").to_string())?;
             drive.download(df, &tmp_file, segmented, &mut |_| !cancel.load(Ordering::Relaxed))?;
         }
@@ -2542,15 +3049,15 @@ fn copy_item(
 
     // Upload tmp_file -> destination
     match dst_root {
-        SyncLocation::Drive { email, shared_drive_id, path, .. } => {
+        SyncLocation::Drive { email, .. } => {
             let drive = drives
                 .get(email)
                 .ok_or_else(|| tr!("Conta não conectada: {email}", "Account not connected: {email}"))?;
             if let Some(existing) = dst_meta {
                 drive.upload_version(&existing.id, &tmp_file, &mut |_| !cancel.load(Ordering::Relaxed))?;
             } else {
-                let parent_id = ensure_drive_parents(drive, shared_drive_id.as_deref(), path, rel_path)?;
-                let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+                let (folder, name) = rel_path.rsplit_once('/').unwrap_or(("", rel_path));
+                let parent_id = known.drive_folder(drive, dst_root, folder)?;
                 drive.upload(&tmp_file, &parent_id, name, &mut |_| !cancel.load(Ordering::Relaxed))?;
             }
         }
@@ -2561,7 +3068,7 @@ fn copy_item(
                 .ok_or_else(|| t("Servidor não encontrado.", "Server not found.").to_string())?;
             let dst_remote = remote_join_rel(server, path, rel_path);
             servers::with(pool, server, |conn| {
-                ensure_remote_parents(conn, &server.path(path), rel_path)?;
+                ensure_remote_parents(conn, server, &server.path(path), rel_path, known);
                 conn.upload_file(&dst_remote, &tmp_file, &mut |_| !cancel.load(Ordering::Relaxed))
             })?;
         }
@@ -2615,30 +3122,116 @@ fn delete_item(
     }
 }
 
+/// The folders a run knows are there, on Drive and on servers, so a file doesn't ask for its
+/// folders again: before, each file sent to Drive listed every folder above it to find the
+/// next one's id, and each file sent to a server tried to make every folder above it.
+#[derive(Default)]
+struct Known {
+    /// A Drive folder's id, by the side it's in (see [`drive_side`]) and its path from there.
+    drive: Mutex<HashMap<(String, String), String>>,
+    /// The folders of a server, by the server's id and their path on it.
+    server: Mutex<std::collections::HashSet<(String, String)>>,
+}
+
+/// The account and folder a Drive side starts at, to tell one side's folders from another's,
+/// and that folder's id.
+fn drive_side(loc: &SyncLocation) -> Option<(String, &str)> {
+    let SyncLocation::Drive { email, shared_drive_id, path, .. } = loc else { return None };
+    let root = path.last().map(|(id, _)| id.as_str()).or(shared_drive_id.as_deref()).unwrap_or("root");
+    Some((format!("{email}\n{root}"), root))
+}
+
+impl Known {
+    /// The folders the comparison saw: each one's row holds its Drive id or its server path.
+    fn from_comparison(rows: &[CompareRow], pairs: &[FolderPair]) -> Known {
+        let known = Known::default();
+        let (mut drive, mut server) = (known.drive.lock().unwrap(), known.server.lock().unwrap());
+        for row in rows.iter().filter(|r| r.is_dir) {
+            let Some(pair) = pairs.get(row.pair_index) else { continue };
+            for (loc, meta) in [(&pair.left, &row.left), (&pair.right, &row.right)] {
+                match (loc, meta) {
+                    (Some(loc @ SyncLocation::Drive { .. }), Some(meta)) => {
+                        if let Some((side, _)) = drive_side(loc) {
+                            drive.insert((side, row.rel_path.clone()), meta.id.clone());
+                        }
+                    }
+                    (Some(SyncLocation::Server { server_id, .. }), Some(meta)) => {
+                        server.insert((server_id.clone(), meta.id.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        drop((drive, server));
+        known
+    }
+
+    /// The id of the folder at `rel_dir` (`""` for the root) of the side `side`, whose root
+    /// folder is `root`: `find` gives the id of the folder named so in the parent of that id,
+    /// making it if need be, and is asked once for each folder not known yet.
+    fn folder(&self, side: &str, root: &str, rel_dir: &str, find: &mut dyn FnMut(&str, &str) -> Result<String, String>) -> Result<String, String> {
+        if rel_dir.is_empty() {
+            return Ok(root.to_string());
+        }
+        let key = (side.to_string(), rel_dir.to_string());
+        if let Some(id) = self.drive.lock().unwrap().get(&key) {
+            return Ok(id.clone());
+        }
+        let (parent, name) = rel_dir.rsplit_once('/').unwrap_or(("", rel_dir));
+        let parent = self.folder(side, root, parent, find)?;
+        let id = find(&parent, name)?;
+        self.drive.lock().unwrap().insert(key, id.clone());
+        Ok(id)
+    }
+
+    /// [`Known::folder`] on Google Drive, for the folder at `rel_dir` of the side `root`.
+    fn drive_folder(&self, drive: &Drive, root: &SyncLocation, rel_dir: &str) -> Result<String, String> {
+        let (SyncLocation::Drive { shared_drive_id, .. }, Some((side, root_id))) = (root, drive_side(root)) else {
+            return Err(t("Par de pastas inválido.", "Invalid folder pair.").into());
+        };
+        self.folder(&side, root_id, rel_dir.trim_matches('/'), &mut |parent, name| find_or_create_drive_folder(drive, parent, shared_drive_id.as_deref(), name))
+    }
+
+    /// Has `make` make each folder of `rel_dir` under `base` on the server `server`, those not
+    /// known to be there, from the top down.
+    fn server_folders(&self, server: &str, base: &str, rel_dir: &str, make: &mut dyn FnMut(&str)) {
+        let mut cur = base.to_string();
+        for seg in rel_dir.split('/').filter(|s| !s.is_empty()) {
+            cur = servers::child(&cur, seg);
+            if self.server.lock().unwrap().insert((server.to_string(), cur.clone())) {
+                make(&cur);
+            }
+        }
+    }
+
+    /// Whether every folder of `rel_dir` under `base` is known to be there on the server.
+    fn has_server_folders(&self, server: &str, base: &str, rel_dir: &str) -> bool {
+        let known = self.server.lock().unwrap();
+        let mut cur = base.to_string();
+        rel_dir.split('/').filter(|s| !s.is_empty()).all(|seg| {
+            cur = servers::child(&cur, seg);
+            known.contains(&(server.to_string(), cur.clone()))
+        })
+    }
+}
+
 fn ensure_dir(
     root: &SyncLocation,
     rel_path: &str,
     pool: &Pool,
     servers_list: &[Server],
     drives: &HashMap<String, Arc<Drive>>,
+    known: &Known,
 ) -> Result<(), String> {
     match root {
         SyncLocation::Local(base) => {
             std::fs::create_dir_all(local_join_rel(base, rel_path)).map_err(|e| e.to_string())
         }
-        SyncLocation::Drive { email, shared_drive_id, path, .. } => {
+        SyncLocation::Drive { email, .. } => {
             let drive = drives
                 .get(email)
                 .ok_or_else(|| tr!("Conta não conectada: {email}", "Account not connected: {email}"))?;
-            let mut cur_id = path
-                .last()
-                .map(|(id, _)| id.clone())
-                .or_else(|| shared_drive_id.clone())
-                .unwrap_or_else(|| "root".into());
-            for seg in rel_path.split('/').filter(|s| !s.is_empty()) {
-                cur_id = find_or_create_drive_folder(drive, &cur_id, shared_drive_id.as_deref(), seg)?;
-            }
-            Ok(())
+            known.drive_folder(drive, root, rel_path).map(|_| ())
         }
         SyncLocation::Server { server_id, path, .. } => {
             let server = servers_list
@@ -2646,29 +3239,23 @@ fn ensure_dir(
                 .find(|sv| sv.id == *server_id)
                 .ok_or_else(|| t("Servidor não encontrado.", "Server not found.").to_string())?;
             let base = server.path(path);
+            if known.has_server_folders(&server.id, &base, rel_path) {
+                return Ok(());
+            }
             servers::with(pool, server, |conn| {
-                let mut cur = base;
-                for seg in rel_path.split('/').filter(|s| !s.is_empty()) {
-                    cur = servers::child(&cur, seg);
-                    let _ = conn.mkdir(&cur);
-                }
+                // A folder that is already there fails to be made, and that is fine.
+                known.server_folders(&server.id, &base, rel_path, &mut |path| drop(conn.mkdir(path)));
                 Ok(())
             })
         }
     }
 }
 
-fn ensure_remote_parents(conn: &mut dyn openexplorer_remote::Conn, base: &str, rel_path: &str) -> Result<(), String> {
-    let segs: Vec<&str> = rel_path.split('/').filter(|s| !s.is_empty()).collect();
-    if segs.len() <= 1 {
-        return Ok(());
+/// Makes the folders above the file at `rel_path`, those not known to be there.
+fn ensure_remote_parents(conn: &mut dyn openexplorer_remote::Conn, server: &Server, base: &str, rel_path: &str, known: &Known) {
+    if let Some((folder, _)) = rel_path.rsplit_once('/') {
+        known.server_folders(&server.id, base, folder, &mut |path| drop(conn.mkdir(path)));
     }
-    let mut cur = base.to_string();
-    for seg in &segs[..segs.len() - 1] {
-        cur = servers::child(&cur, seg);
-        let _ = conn.mkdir(&cur);
-    }
-    Ok(())
 }
 
 fn remote_join_rel(server: &Server, base_path: &[String], rel_path: &str) -> String {
@@ -2677,37 +3264,12 @@ fn remote_join_rel(server: &Server, base_path: &[String], rel_path: &str) -> Str
     server.path(&segs)
 }
 
-fn ensure_drive_parents(drive: &Drive, shared_drive: Option<&str>, base_path: &[(String, String)], rel_path: &str) -> Result<String, String> {
-    let mut cur_id = base_path
-        .last()
-        .map(|(id, _)| id.clone())
-        .or_else(|| shared_drive.map(str::to_string))
-        .unwrap_or_else(|| "root".into());
-    let segs: Vec<&str> = rel_path.split('/').filter(|s| !s.is_empty()).collect();
-    if segs.len() <= 1 {
-        return Ok(cur_id);
-    }
-    for seg in &segs[..segs.len() - 1] {
-        cur_id = find_or_create_drive_folder(drive, &cur_id, shared_drive, seg)?;
-    }
-    Ok(cur_id)
-}
-
+/// The folder named `name` in `parent_id`, made when there is none. Drive is asked for that
+/// name alone, not for everything the folder holds.
 fn find_or_create_drive_folder(drive: &Drive, parent_id: &str, shared_drive: Option<&str>, name: &str) -> Result<String, String> {
-    let mut found = None;
-    drive.list(parent_id, shared_drive, |page, _| {
-        for f in page {
-            if f.is_dir && f.name == name {
-                found = Some(f.target.unwrap_or(f.id));
-                return false;
-            }
-        }
-        true
-    })?;
-    if let Some(id) = found {
-        Ok(id)
-    } else {
-        Ok(drive.create_folder(name, parent_id)?.id)
+    match drive.child_named(parent_id, shared_drive, name)? {
+        Some(f) if f.is_dir && f.name == name => Ok(f.target.unwrap_or(f.id)),
+        _ => Ok(drive.create_folder(name, parent_id)?.id),
     }
 }
 
@@ -2740,6 +3302,27 @@ mod tests {
         assert!(!f.allows_file("app/node_modules/pkg/index.js", Some(10), Some(now), now));
         assert!(f.is_dir_excluded("app/node_modules"));
         assert!(f.allows_file("readme.md", Some(100), Some(now), now));
+    }
+
+    /// Plain ASCII is matched in place; it must say what the copy made lowercase says, and names
+    /// with accents still match whatever their case.
+    #[test]
+    fn a_pattern_matches_the_same_in_place() {
+        let lowered = |p: &str, t: &str| {
+            let (p, t): (Vec<char>, Vec<char>) = (p.to_lowercase().chars().collect(), t.to_lowercase().chars().collect());
+            glob(&p, &t, '?', '*', char::eq)
+        };
+        let patterns = ["", "*", "?", "*.INI", "a*b*c", "*a", "a*", "??.txt", "Thumbs.db", "*.*", "a?c*", "**", "*?*", "node_modules", "A*B"];
+        let names = ["", "a", "ab", "abc", "ABC", "desktop.ini", "Desktop.INI", "aXbXc", "aa.txt", "thumbs.DB", "a.b.c", "node_modules", "*", "a*b", "ab?"];
+        for p in patterns {
+            for n in names {
+                assert_eq!(glob_match(p, n), lowered(p, n), "{p:?} on {n:?}");
+            }
+        }
+        assert!(glob_match("*.ini", "Desktop.INI") && !glob_match("*.ini", "desktop.in"));
+        assert!(glob_match("relatório*", "RELATÓRIO final.docx") && glob_match("*ção.TXT", "Edição.txt"));
+        assert!(!glob_match("relatório*", "relatorio final.docx"));
+        assert!(pattern_matches_dir(r"fotos\2024", "Fotos/2024") && pattern_matches_file(r"\cache\*.log", "cache/a.log"));
     }
 
     #[test]
@@ -2800,25 +3383,42 @@ mod tests {
         let left_loc = SyncLocation::Local(left.clone());
         let right_loc = SyncLocation::Local(right.clone());
 
-        let lmap = scan_location(&left_loc, &opts.filter, true, &pool, &[], &drives, &cancel).unwrap();
-        let rmap = scan_location(&right_loc, &opts.filter, true, &pool, &[], &drives, &cancel).unwrap();
+        let (lmap, rmap) = scan_both(&left_loc, &right_loc, &opts.filter, true, &pool, &[], &drives, &cancel, &|_| {}).unwrap();
 
         // skipped dir should not be scanned at all
         assert!(!lmap.contains_key("ignored_dir/x.txt"));
 
-        let (rows, filtered_out) = compare_maps(0, &left_loc, &right_loc, lmap, rmap, &opts, SystemTime::now(), &cancel);
+        let (rows, filtered_out) = compare_maps(0, &left_loc, &right_loc, lmap, rmap, &opts, SystemTime::now(), &cancel, &|_, _| {});
         assert_eq!(filtered_out, 1); // skip.ini
 
         let by_path: HashMap<&str, SyncAction> = rows.iter().map(|r| (r.rel_path.as_str(), r.action)).collect();
         assert_eq!(by_path.get("a.txt"), Some(&SyncAction::CopyRight));
         assert_eq!(by_path.get("sub/b.txt"), Some(&SyncAction::CopyRight));
         assert_eq!(by_path.get("extra.txt"), Some(&SyncAction::DeleteRight));
-        assert!(!by_path.contains_key("skip.ini"));
+        // What the filter leaves out is a row to show, with nothing to do; the folder left
+        // unread is no row at all. What has an action is in the queue, the rest idle.
+        let state: HashMap<&str, (&RowStatus, bool)> = rows.iter().map(|r| (r.rel_path.as_str(), (&r.status, r.enabled))).collect();
+        assert_eq!((by_path.get("skip.ini"), state.get("skip.ini")), (Some(&SyncAction::None), Some(&(&RowStatus::Filtered, false))));
+        assert!(!by_path.contains_key("ignored_dir") && !by_path.contains_key("ignored_dir/x.txt"));
+        assert_eq!(state.get("a.txt"), Some(&(&RowStatus::Pending, true)));
+        assert!(rows.iter().all(|r| (r.status == RowStatus::Pending) == (r.action != SyncAction::None)));
+        // The filters: in the queue are the three with an action, filtered the one left out.
+        let mut sync = SyncState::load();
+        sync.set_rows(rows.clone());
+        let shown = |sync: &mut SyncState, status| {
+            sync.status_filter = status;
+            sync.shown().rows.iter().map(|&i| sync.rows[i as usize].rel_path.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(shown(&mut sync, StatusFilter::Pending), ["a.txt", "extra.txt", "sub", "sub/b.txt"]);
+        assert_eq!(shown(&mut sync, StatusFilter::Filtered), ["skip.ini"]);
+        assert_eq!(shown(&mut sync, StatusFilter::All).len(), rows.len());
+        let counts = sync.counts();
+        assert_eq!((counts.copy_right, counts.delete, counts.same), (3, 1, 0), "the filtered file is no part of the totals");
 
         // Execute the sync
         for row in &rows {
             if row.enabled && row.action != SyncAction::None {
-                execute_row(row, &left_loc, &right_loc, true, false, &pool, &[], &drives, &cancel).unwrap();
+                execute_row(row, &left_loc, &right_loc, true, false, &pool, &[], &drives, &cancel, &Known::default()).unwrap();
             }
         }
 
@@ -2845,7 +3445,9 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let pool = Pool::default();
         let drives = HashMap::new();
-        let lmap = scan_location(&SyncLocation::Local(left), &filter, true, &pool, &[], &drives, &cancel).unwrap();
+        let seen = AtomicUsize::new(0);
+        let lmap = scan_location(&SyncLocation::Local(left), &filter, true, &pool, &[], &drives, &cancel, &seen).unwrap();
+        assert_eq!(seen.load(Ordering::Relaxed), 2);
         assert!(lmap.contains_key("top.txt"));
         assert!(!lmap.contains_key("sub"));
         assert!(!lmap.contains_key("sub/deep.txt"));
@@ -2862,21 +3464,255 @@ mod tests {
         std::fs::create_dir_all(&left).unwrap();
         std::fs::create_dir_all(&right).unwrap();
 
+        // The same content with another date, and other content of the same size.
         std::fs::write(left.join("same.txt"), b"identical-content").unwrap();
         std::fs::write(right.join("same.txt"), b"identical-content").unwrap();
+        std::fs::write(left.join("other.txt"), b"identical-content").unwrap();
+        std::fs::write(right.join("other.txt"), b"different-content").unwrap();
 
         let left_loc = SyncLocation::Local(left);
         let right_loc = SyncLocation::Local(right);
         let t1 = SystemTime::now();
         let t2 = t1 - Duration::from_secs(60);
-        let l_meta = SideMeta { id: "same.txt".into(), size: Some(17), modified: Some(t1), md5: None, drive_file: None };
-        let r_meta = SideMeta { id: "same.txt".into(), size: Some(17), modified: Some(t2), md5: None, drive_file: None };
-        let rules = SyncMode::Mirror.preset_rules().unwrap();
+        let side = |name: &str, modified| ScannedItem {
+            is_dir: false,
+            meta: SideMeta { id: name.into(), size: Some(17), modified: Some(modified), md5: None, drive_file: None },
+        };
+        let sides = |modified| BTreeMap::from([("other.txt".to_string(), side("other.txt", modified)), ("same.txt".to_string(), side("same.txt", modified))]);
+        let cancel = AtomicBool::new(false);
+        let actions = |compare_hash: bool| {
+            let opts = SyncOptions { compare_hash, ..SyncOptions::default() };
+            let (rows, _) = compare_maps(0, &left_loc, &right_loc, sides(t1), sides(t2), &opts, t1, &cancel, &|_, _| {});
+            rows.into_iter().map(|r| (r.rel_path, r.action, r.enabled)).collect::<Vec<_>>()
+        };
 
-        assert_eq!(decide_both_exist(&left_loc, &right_loc, "same.txt", &l_meta, &r_meta, &rules, false), SyncAction::CopyRight);
-        assert_eq!(decide_both_exist(&left_loc, &right_loc, "same.txt", &l_meta, &r_meta, &rules, true), SyncAction::None);
+        assert_eq!(actions(false), [("other.txt".into(), SyncAction::CopyRight, true), ("same.txt".into(), SyncAction::CopyRight, true)]);
+        assert_eq!(actions(true), [("other.txt".into(), SyncAction::CopyRight, true), ("same.txt".into(), SyncAction::None, false)]);
+
+        // Against a side that gives an MD5 (a cloud), the file on the computer is hashed.
+        let mut bufs = (vec![0u8; 64], vec![0u8; 64]);
+        let local = SideMeta { id: "same.txt".into(), size: Some(17), modified: Some(t1), md5: None, drive_file: None };
+        let hash = compute_local_md5(&local_join_rel(match &left_loc { SyncLocation::Local(p) => p, _ => unreachable!() }, "same.txt"), &mut bufs.0, &cancel);
+        let cloud = SyncLocation::Drive { email: "a@b".into(), shared_drive_id: None, shared_drive_name: None, path: Vec::new() };
+        let there = |md5: Option<String>| SideMeta { id: "x".into(), size: Some(17), modified: Some(t2), md5, drive_file: None };
+        assert!(same_content(&left_loc, &cloud, "same.txt", &local, &there(hash.map(|h| h.to_uppercase())), &mut bufs, &cancel));
+        assert!(!same_content(&left_loc, &cloud, "same.txt", &local, &there(Some("00".into())), &mut bufs, &cancel));
+        assert!(!same_content(&left_loc, &cloud, "same.txt", &local, &there(None), &mut bufs, &cancel));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A search shows the rows whose path holds what was typed, whatever the case, for a few
+    /// rows as for many (which are gone through in parts at once), under the filters too.
+    #[test]
+    fn a_search_shows_what_looking_at_each_path_would() {
+        let names = ["Relatório Final.docx", "relatorio.txt", "FOTOS/Praia 01.JPG", "fotos/praia 02.jpg", "a/ab/aab/b", "ÁRVORE/Ação.TXT", "x"];
+        let actions = [SyncAction::None, SyncAction::CopyRight, SyncAction::DeleteRight];
+        let rows = |n: usize| -> Vec<CompareRow> {
+            (0..n)
+                .map(|i| CompareRow {
+                    id: i,
+                    pair_index: 0,
+                    rel_path: format!("pasta {}/{}", i % 97, names[i % names.len()]),
+                    is_dir: false,
+                    left: None,
+                    right: None,
+                    action: actions[i % 3],
+                    enabled: i % 3 != 0,
+                    status: if i % 5 == 0 { RowStatus::Done } else { RowStatus::Pending },
+                })
+                .collect()
+        };
+        for n in [0, 1, 6, 1_000, 120_001] {
+            let mut sync = SyncState::load();
+            sync.set_rows(rows(n));
+            for (action, status) in [(ActionFilter::All, StatusFilter::All), (ActionFilter::CopyRight, StatusFilter::All), (ActionFilter::All, StatusFilter::Done), (ActionFilter::DeleteRight, StatusFilter::Pending)] {
+                (sync.action_filter, sync.status_filter) = (action, status);
+                for typed in ["", "a", "A", "  praia 0 ", "RELAT", "relatório", "ção.txt", "árvore/a", "pasta 9", "pasta 96/x", "ab", "aab/b", "/", "zzz", "final.docx\0", ".jpg"] {
+                    sync.search = TextEdit::new(typed);
+                    let wanted = typed.trim().trim_end_matches('\0').to_lowercase();
+                    let each: Vec<u32> = sync
+                        .rows
+                        .iter()
+                        .filter(|r| action.matches(r.action) && status.matches(&r.status) && r.rel_path.to_lowercase().contains(&wanted))
+                        .map(|r| r.id as u32)
+                        .collect();
+                    assert_eq!(sync.shown().rows[..], each[..], "{typed:?} in {n} rows, {action:?} {status:?}");
+                }
+            }
+        }
+    }
+
+    /// A run asks for each folder once, and not at all for those the comparison saw.
+    #[test]
+    fn a_run_asks_for_each_folder_once() {
+        let folder = |id: &str| Some(SideMeta { id: id.into(), size: None, modified: None, md5: None, drive_file: None });
+        let row = |pair_index, rel: &str, right| CompareRow {
+            id: 0,
+            pair_index,
+            rel_path: rel.into(),
+            is_dir: true,
+            left: folder(rel),
+            right,
+            action: SyncAction::None,
+            enabled: false,
+            status: RowStatus::Pending,
+        };
+        let drive = SyncLocation::Drive { email: "a@b".into(), shared_drive_id: None, shared_drive_name: None, path: vec![("top".into(), "Top".into())] };
+        let server = SyncLocation::Server { server_id: "s1".into(), server_name: "S".into(), path: Vec::new() };
+        let here = || Some(SyncLocation::Local("x".into()));
+        let pairs = [FolderPair { id: 1, left: here(), right: Some(drive.clone()) }, FolderPair { id: 2, left: here(), right: Some(server) }];
+        let rows = [row(0, "a", folder("id-a")), row(0, "new", None), row(1, "docs", folder("/home/docs")), row(1, "docs/old", folder("/home/docs/old"))];
+        let known = Known::from_comparison(&rows, &pairs);
+
+        // Drive: a folder's id comes from the comparison, or is asked for once.
+        let (side, root) = drive_side(&drive).unwrap();
+        assert_eq!(root, "top");
+        let asked = RefCell::new(Vec::new());
+        let mut find = |parent: &str, name: &str| {
+            asked.borrow_mut().push(format!("{parent}/{name}"));
+            Ok(format!("id-{name}"))
+        };
+        for (rel, id) in [("", "top"), ("a", "id-a"), ("a/b/c", "id-c"), ("a/b/c", "id-c"), ("a/b/d", "id-d"), ("new", "id-new")] {
+            assert_eq!(known.folder(&side, root, rel, &mut find).unwrap(), id, "{rel}");
+        }
+        assert_eq!(*asked.borrow(), ["id-a/b", "id-b/c", "id-b/d", "top/new"]);
+        // Another account's folders are not these, and an error is not kept.
+        assert_eq!(known.folder("x@y\ntop", root, "a", &mut find).unwrap(), "id-a");
+        assert_eq!(asked.borrow().last().unwrap(), "top/a");
+        assert!(known.folder(&side, root, "bad", &mut |_, _| Err("no".into())).is_err());
+        assert_eq!(known.folder(&side, root, "bad", &mut find).unwrap(), "id-bad");
+
+        // A server: only the folders the comparison didn't see are made, once, from the top.
+        let made = RefCell::new(Vec::new());
+        let mut make = |path: &str| made.borrow_mut().push(path.to_string());
+        assert!(known.has_server_folders("s1", "/home", "docs/old"));
+        assert!(!known.has_server_folders("s1", "/home", "docs/2026/jan"));
+        known.server_folders("s1", "/home", "docs/old", &mut make);
+        known.server_folders("s1", "/home", "docs/2026/jan", &mut make);
+        known.server_folders("s1", "/home", "docs/2026/fev", &mut make);
+        known.server_folders("s2", "/home", "docs", &mut make);
+        assert_eq!(*made.borrow(), ["/home/docs/2026", "/home/docs/2026/jan", "/home/docs/2026/fev", "/home/docs"]);
+        assert!(known.has_server_folders("s1", "/home", "docs/2026/jan"));
+    }
+
+    /// A tree is read whole whatever the number of readers, and the first error is the answer.
+    #[test]
+    fn a_tree_is_read_by_several_readers() {
+        // Folder n holds a file and, while n < 400, folders 2n+1 and 2n+2.
+        let read = |fail: Option<usize>| {
+            move |folder: &Folder<usize>, items: &mut Vec<(String, ScannedItem)>, inside: &mut Vec<Folder<usize>>| {
+                if fail == Some(folder.at) {
+                    return Err(format!("folder {}", folder.at));
+                }
+                let meta = || SideMeta { id: String::new(), size: Some(folder.at as u64), modified: None, md5: None, drive_file: None };
+                items.push((join_rel(&folder.rel, "file"), ScannedItem { is_dir: false, meta: meta() }));
+                for n in [2 * folder.at + 1, 2 * folder.at + 2].into_iter().filter(|_| folder.at < 400) {
+                    let rel = join_rel(&folder.rel, &n.to_string());
+                    items.push((rel.clone(), ScannedItem { is_dir: true, meta: meta() }));
+                    inside.push(Folder { at: n, rel, depth: folder.depth + 1 });
+                }
+                Ok(())
+            }
+        };
+        let cancel = AtomicBool::new(false);
+        let one = walk(0usize, 1, &cancel, read(None)).unwrap();
+        // The 400 folders with folders inside make 800 more; each of the 801 holds a file.
+        assert_eq!(one.len(), 800 + 801);
+        assert_eq!(one["1/3/7/file"].meta.size, Some(7));
+        for readers in [2, 8, 32] {
+            let many = walk(0usize, readers, &cancel, read(None)).unwrap();
+            assert!(many.keys().eq(one.keys()), "{readers} readers");
+            assert_eq!(walk(0usize, readers, &cancel, read(Some(200))).err().as_deref(), Some("folder 200"));
+        }
+        // Nothing is read once cancelled.
+        cancel.store(true, Ordering::Relaxed);
+        assert!(walk(0usize, 4, &cancel, read(None)).unwrap().is_empty());
+    }
+
+    /// Two sides merge by path, whichever has each: only the left, only the right, or both.
+    #[test]
+    fn sides_merge_in_path_order() {
+        let now = SystemTime::now();
+        let file = || ScannedItem { is_dir: false, meta: SideMeta { id: String::new(), size: Some(1), modified: Some(now), md5: None, drive_file: None } };
+        let side = |names: &[&str]| names.iter().map(|n| (n.to_string(), file())).collect::<BTreeMap<_, _>>();
+        let (loc, cancel) = (SyncLocation::Local(PathBuf::from("x")), AtomicBool::new(false));
+        let (rows, _) = compare_maps(3, &loc, &loc, side(&["a", "b/1", "d"]), side(&["b/1", "c", "e"]), &SyncOptions::default(), now, &cancel, &|_, _| {});
+        let got: Vec<_> = rows.iter().map(|r| (r.rel_path.as_str(), r.left.is_some(), r.right.is_some(), r.action)).collect();
+        assert_eq!(
+            got,
+            [
+                ("a", true, false, SyncAction::CopyRight),
+                ("b/1", true, true, SyncAction::None),
+                ("c", false, true, SyncAction::DeleteRight),
+                ("d", true, false, SyncAction::CopyRight),
+                ("e", false, true, SyncAction::DeleteRight),
+            ]
+        );
+        assert!(rows.iter().all(|r| r.pair_index == 3));
+    }
+
+    /// What comparing two folders on the computer costs: 100,000 files of 1 KB a side in
+    /// 1,000 folders, read and compared with no filter, with name filters, and by content.
+    /// The tree is made once under the temp folder (`oe-sync-bench`) and kept for the next run.
+    /// Run it with `cargo test --release -p openexplorer -- --ignored --nocapture compare_cost`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn compare_cost() {
+        let root = std::env::temp_dir().join("oe-sync-bench");
+        let (left, right) = (root.join("left"), root.join("right"));
+        if !root.join("ready").exists() {
+            let started = std::time::Instant::now();
+            let body = [7u8; 1024];
+            for side in [&left, &right] {
+                for d in 0..1000 {
+                    let dir = side.join(format!("pasta {:02}", d / 50)).join(format!("sub {d:04}"));
+                    std::fs::create_dir_all(&dir).unwrap();
+                    for f in 0..100 {
+                        std::fs::write(dir.join(format!("arquivo {f:03}.bin")), body).unwrap();
+                    }
+                }
+            }
+            std::fs::write(root.join("ready"), b"").unwrap();
+            println!("tree made in {:.1} s", started.elapsed().as_secs_f64());
+        }
+        let cancel = AtomicBool::new(false);
+        let pool = Pool::default();
+        let drives = HashMap::new();
+        let (left_loc, right_loc) = (SyncLocation::Local(left), SyncLocation::Local(right));
+
+        let plain = SyncOptions::default();
+        let names = SyncFilter { exclude_patterns: "*.tmp\nthumbs.db\nnode_modules\n/cache/*.log".into(), ..SyncFilter::default() };
+        let named = SyncOptions { filter: names, ..SyncOptions::default() };
+        let hashed = SyncOptions { compare_hash: true, ..SyncOptions::default() };
+        for (label, opts) in [("no filter", &plain), ("4 name filters", &named), ("by content", &hashed)] {
+            let mut best = [f64::MAX; 3];
+            let mut rows_n = 0;
+            for _ in 0..3 {
+                let t0 = std::time::Instant::now();
+                let (lmap, rmap) = scan_both(&left_loc, &right_loc, &opts.filter, true, &pool, &[], &drives, &cancel, &|_| {}).unwrap();
+                let t1 = std::time::Instant::now();
+                let (rows, _) = compare_maps(0, &left_loc, &right_loc, lmap, rmap, opts, SystemTime::now(), &cancel, &|_, _| {});
+                let t2 = std::time::Instant::now();
+                rows_n = rows.len();
+                let (read, compared) = ((t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64());
+                if read + compared < best[2] {
+                    best = [read, compared, read + compared];
+                }
+            }
+            println!("{label}: {rows_n} rows, read {:.2} s, compare {:.2} s, total {:.2} s (best of 3)", best[0], best[1], best[2]);
+        }
+        // Reading one side after the other, as before the two were read at once.
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let (started, seen) = (std::time::Instant::now(), AtomicUsize::new(0));
+            for loc in [&left_loc, &right_loc] {
+                scan_location(loc, &plain.filter, true, &pool, &[], &drives, &cancel, &seen).unwrap();
+            }
+            best = best.min(started.elapsed().as_secs_f64());
+        }
+        println!("read, one side after the other: {best:.2} s (best of 3)");
+        println!("a row takes {} bytes before its strings", std::mem::size_of::<CompareRow>());
     }
 
     #[test]
