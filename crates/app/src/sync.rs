@@ -1507,6 +1507,14 @@ pub enum Answer {
         done: usize,
         total: usize,
     },
+    /// What a run changed since it last said: several files go at a time, and thousands of
+    /// small ones a second would each wake the window.
+    RowStatuses {
+        job: u64,
+        changes: Vec<(usize, RowStatus)>,
+        done: usize,
+        total: usize,
+    },
     SyncFinished {
         job: u64,
         ok: usize,
@@ -1583,6 +1591,18 @@ pub fn arrived(s: &mut State, ans: Answer) -> bool {
                 "Sincronizando: {done} de {total}…",
                 "Syncing: {done} of {total}…"
             );
+            true
+        }
+        Answer::RowStatuses { job, changes, done, total } => {
+            if s.sync.job_seq != job {
+                return false;
+            }
+            for (row_id, status) in changes {
+                s.sync.set_status(row_id, status);
+            }
+            s.sync.done_count = done;
+            s.sync.total_count = total;
+            s.sync.progress_text = tr!("Sincronizando: {done} de {total}…", "Syncing: {done} of {total}…");
             true
         }
         Answer::SyncFinished { job, ok, failed, cancelled } => {
@@ -2781,6 +2801,7 @@ pub fn start_sync(s: &mut State) {
         }
     }
     let known = Known::from_comparison(&s.sync.rows, &pairs);
+    let at_once = AtOnce { uploads: s.settings.uploads.into(), downloads: s.settings.downloads.into(), disk: DISK_AT_ONCE };
 
     background(s, move |emit| {
         let mut drives: HashMap<String, Arc<Drive>> = HashMap::new();
@@ -2805,75 +2826,203 @@ pub fn start_sync(s: &mut State) {
             }
         }
 
-        // Order operations safely:
-        // 1. Create directories (shallowest first)
-        // 2. Copy files
-        // 3. Delete files
-        // 4. Delete directories (deepest first)
-        let mut ordered = planned;
-        ordered.sort_by(|a, b| {
-            let phase = |r: &CompareRow| -> u8 {
-                match (r.action, r.is_dir) {
-                    (SyncAction::CopyRight | SyncAction::CopyLeft, true) => 0,
-                    (SyncAction::CopyRight | SyncAction::CopyLeft, false) => 1,
-                    (SyncAction::DeleteRight | SyncAction::DeleteLeft, false) => 2,
-                    (SyncAction::DeleteRight | SyncAction::DeleteLeft, true) => 3,
-                    _ => 4,
-                }
-            };
-            let pa = phase(a);
-            let pb = phase(b);
-            pa.cmp(&pb).then_with(|| {
-                let da = a.rel_path.matches('/').count();
-                let db = b.rel_path.matches('/').count();
-                if pa == 3 { db.cmp(&da) } else { da.cmp(&db) }
-            })
-        });
-
-        let total = ordered.len();
-        let mut ok = 0usize;
-        let mut failed = 0usize;
-        let mut done = 0usize;
-
-        for row in &ordered {
-            if cancel.load(Ordering::Relaxed) {
-                emit(Msg::Sync(Answer::SyncFinished { job, ok, failed, cancelled: true }));
-                return;
-            }
-            emit(Msg::Sync(Answer::RowStatus {
-                job,
-                row_id: row.id,
-                status: RowStatus::Running,
-                done,
-                total,
-            }));
-
-            let res = catch_panic(t("sincronizar item", "sync item"), || {
-                let pair = pairs
-                    .get(row.pair_index)
-                    .ok_or_else(|| t("Par de pastas inválido.", "Invalid folder pair.").to_string())?;
-                let (Some(left), Some(right)) = (&pair.left, &pair.right) else {
-                    return Err(t("Par de pastas incompleto.", "Incomplete folder pair.").into());
-                };
-                execute_row(row, left, right, skip_recycle_bin, segmented, &pool, &servers_list, &drives, &cancel, &known)
-            });
-
-            done += 1;
-            let status = match res {
-                Ok(()) => {
-                    ok += 1;
-                    RowStatus::Done
-                }
-                Err(e) => {
-                    failed += 1;
-                    RowStatus::Failed(e)
-                }
-            };
-            emit(Msg::Sync(Answer::RowStatus { job, row_id: row.id, status, done, total }));
-        }
-
-        emit(Msg::Sync(Answer::SyncFinished { job, ok, failed, cancelled: false }));
+        let run = Run {
+            pairs: &pairs,
+            skip_recycle_bin,
+            segmented,
+            pool: &pool,
+            servers: &servers_list,
+            drives: &drives,
+            cancel: &cancel,
+            known: &known,
+            at_once,
+        };
+        let total = planned.len();
+        let (ok, failed, cancelled) = run_plan(&run, planned, &mut |changes, done| emit(Msg::Sync(Answer::RowStatuses { job, changes, done, total })));
+        emit(Msg::Sync(Answer::SyncFinished { job, ok, failed, cancelled }));
     });
+}
+
+/// How many files a run copies at the same time, by where they go.
+#[derive(Clone, Copy, Debug)]
+pub struct AtOnce {
+    /// To a cloud or a server: Opções' uploads at once.
+    pub uploads: usize,
+    /// From a cloud or a server to the computer: Opções' downloads at once.
+    pub downloads: usize,
+    /// From a folder of the computer to another.
+    pub disk: usize,
+}
+
+/// Files copied at once between two folders of the computer: many small files go several
+/// times faster than one by one, and past this the disk is what holds them back.
+const DISK_AT_ONCE: usize = 4;
+
+/// What a run works with, besides its rows.
+struct Run<'a> {
+    pairs: &'a [FolderPair],
+    skip_recycle_bin: bool,
+    segmented: bool,
+    pool: &'a Pool,
+    servers: &'a [Server],
+    drives: &'a HashMap<String, Arc<Drive>>,
+    cancel: &'a AtomicBool,
+    known: &'a Known,
+    at_once: AtOnce,
+}
+
+impl Run<'_> {
+    /// The two sides of the pair `row` is of.
+    fn sides(&self, row: &CompareRow) -> Result<(&SyncLocation, &SyncLocation), String> {
+        let pair = self.pairs.get(row.pair_index).ok_or_else(|| t("Par de pastas inválido.", "Invalid folder pair.").to_string())?;
+        match (&pair.left, &pair.right) {
+            (Some(left), Some(right)) => Ok((left, right)),
+            _ => Err(t("Par de pastas incompleto.", "Incomplete folder pair.").into()),
+        }
+    }
+
+    fn one(&self, row: &CompareRow) -> Result<(), String> {
+        catch_panic(t("sincronizar item", "sync item"), || {
+            let (left, right) = self.sides(row)?;
+            execute_row(row, left, right, self.skip_recycle_bin, self.segmented, self.pool, self.servers, self.drives, self.cancel, self.known)
+        })
+    }
+
+    /// How many of `rows`, all copies of files going `way`, run at once: Opções' count for
+    /// that way, and for a server one connection fewer than it allows, so the panes can still
+    /// list while a run goes on.
+    fn workers(&self, way: Way, rows: &[&CompareRow]) -> usize {
+        let wanted = match way {
+            Way::Disk => self.at_once.disk,
+            Way::Up => self.at_once.uploads,
+            Way::Down => self.at_once.downloads,
+        };
+        let mut most = wanted.max(1);
+        for row in rows {
+            let Ok((left, right)) = self.sides(row) else { continue };
+            for side in [left, right] {
+                if let SyncLocation::Server { server_id, .. } = side
+                    && let Some(server) = self.servers.iter().find(|sv| sv.id == *server_id)
+                {
+                    most = most.min(server.limit().saturating_sub(1).max(1));
+                }
+            }
+        }
+        most.min(rows.len()).max(1)
+    }
+}
+
+/// Which way a file is copied, which says how many go at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Way {
+    /// Between two folders of the computer.
+    Disk,
+    /// To a cloud or a server (from the computer, or from another cloud or server).
+    Up,
+    /// From a cloud or a server to the computer.
+    Down,
+}
+
+impl Way {
+    fn of(from: &SyncLocation, to: &SyncLocation) -> Way {
+        match (from, to) {
+            (SyncLocation::Local(_), SyncLocation::Local(_)) => Way::Disk,
+            (_, SyncLocation::Local(_)) => Way::Down,
+            _ => Way::Up,
+        }
+    }
+}
+
+/// How often a run tells the window what changed: often enough to follow, seldom enough that
+/// thousands of small files a second don't each wake it.
+const TOLD_EVERY: Duration = Duration::from_millis(40);
+
+/// Runs `planned`, telling `told` which rows changed status (a few at a time) and how many are
+/// done. Returns how many went well, how many failed, and whether it was cancelled.
+///
+/// The order is what keeps it safe: folders are made first (the shallowest first), then files
+/// are copied, then files are deleted, then folders (the deepest first). Only the copies of
+/// files go several at a time, each way by its own count.
+fn run_plan(run: &Run, planned: Vec<CompareRow>, told: &mut dyn FnMut(Vec<(usize, RowStatus)>, usize)) -> (usize, usize, bool) {
+    let depth = |r: &CompareRow| r.rel_path.matches('/').count();
+    let copies = |r: &CompareRow| matches!(r.action, SyncAction::CopyRight | SyncAction::CopyLeft);
+    let mut make: Vec<&CompareRow> = planned.iter().filter(|r| copies(r) && r.is_dir).collect();
+    let copy: Vec<&CompareRow> = planned.iter().filter(|r| copies(r) && !r.is_dir).collect();
+    let delete: Vec<&CompareRow> = planned.iter().filter(|r| !copies(r) && !r.is_dir && r.action != SyncAction::None).collect();
+    let mut unmake: Vec<&CompareRow> = planned.iter().filter(|r| !copies(r) && r.is_dir && r.action != SyncAction::None).collect();
+    make.sort_by_key(|r| depth(r));
+    unmake.sort_by_key(|r| std::cmp::Reverse(depth(r)));
+
+    // Each way of copying is a group of its own, so each keeps to its count.
+    let way = |r: &CompareRow| match (run.sides(r), r.action) {
+        (Ok((left, right)), SyncAction::CopyRight) => Way::of(left, right),
+        (Ok((left, right)), _) => Way::of(right, left),
+        // No pair to go by: it fails when it runs, whichever group it is in.
+        (Err(_), _) => Way::Disk,
+    };
+    let mut groups: Vec<(usize, Vec<&CompareRow>)> = vec![(1, make)];
+    for of in [Way::Disk, Way::Up, Way::Down] {
+        let rows: Vec<&CompareRow> = copy.iter().copied().filter(|r| way(r) == of).collect();
+        groups.push((run.workers(of, &rows), rows));
+    }
+    groups.extend([(1, delete), (1, unmake)]);
+
+    let (mut ok, mut failed, mut done) = (0usize, 0usize, 0usize);
+    for (workers, rows) in groups {
+        if rows.is_empty() {
+            continue;
+        }
+        if run.cancel.load(Ordering::Relaxed) {
+            return (ok, failed, true);
+        }
+        let next = AtomicUsize::new(0);
+        let (send, changes) = std::sync::mpsc::channel::<(usize, RowStatus)>();
+        std::thread::scope(|sc| {
+            for _ in 0..workers {
+                let (send, next, rows) = (send.clone(), &next, &rows);
+                sc.spawn(move || {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= rows.len() || run.cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let row = rows[i];
+                        let _ = send.send((row.id, RowStatus::Running));
+                        let status = match run.one(row) {
+                            Ok(()) => RowStatus::Done,
+                            Err(e) => RowStatus::Failed(e),
+                        };
+                        let _ = send.send((row.id, status));
+                    }
+                });
+            }
+            drop(send);
+            // The window hears of the changes a few at a time, and at once of one that has
+            // nothing after it for a while (a big file starting).
+            let mut waiting = Vec::new();
+            let mut last = std::time::Instant::now();
+            loop {
+                let change = changes.recv_timeout(TOLD_EVERY);
+                let ended = matches!(change, Err(std::sync::mpsc::RecvTimeoutError::Disconnected));
+                if let Ok((id, status)) = change {
+                    match &status {
+                        RowStatus::Done => (ok, done) = (ok + 1, done + 1),
+                        RowStatus::Failed(_) => (failed, done) = (failed + 1, done + 1),
+                        _ => {}
+                    }
+                    waiting.push((id, status));
+                }
+                if !waiting.is_empty() && (ended || last.elapsed() >= TOLD_EVERY) {
+                    told(std::mem::take(&mut waiting), done);
+                    last = std::time::Instant::now();
+                }
+                if ended {
+                    break;
+                }
+            }
+        });
+    }
+    (ok, failed, run.cancel.load(Ordering::Relaxed))
 }
 
 fn execute_row(
@@ -3018,8 +3167,11 @@ fn copy_item(
     // General relay through a temporary file (Cloud/Server <-> Cloud/Server)
     let tmp_dir = std::env::temp_dir().join("openexplorer-sync");
     std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
+    // Several files go at a time: each takes a name of its own, which the clock alone can't
+    // promise.
+    static RELAYED: AtomicUsize = AtomicUsize::new(0);
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    let tmp_file = tmp_dir.join(format!("relay-{stamp}.tmp"));
+    let tmp_file = tmp_dir.join(format!("relay-{}-{stamp}-{}.tmp", std::process::id(), RELAYED.fetch_add(1, Ordering::Relaxed)));
     let _cleanup = TempGuard(tmp_file.clone());
 
     // Download source -> tmp_file
@@ -3131,6 +3283,8 @@ struct Known {
     drive: Mutex<HashMap<(String, String), String>>,
     /// The folders of a server, by the server's id and their path on it.
     server: Mutex<std::collections::HashSet<(String, String)>>,
+    /// Held while a folder not known yet is found or made.
+    making: Mutex<()>,
 }
 
 /// The account and folder a Drive side starts at, to tell one side's folders from another's,
@@ -3173,12 +3327,27 @@ impl Known {
         if rel_dir.is_empty() {
             return Ok(root.to_string());
         }
+        if let Some(id) = self.drive.lock().unwrap().get(&(side.to_string(), rel_dir.to_string())) {
+            return Ok(id.clone());
+        }
+        // One at a time from here: files go several at once, and two that miss the same folder
+        // would both make it (Google Drive keeps two folders of one name). The second finds
+        // what the first made.
+        let _one = self.making.lock().unwrap_or_else(|e| e.into_inner());
+        self.folder_unknown(side, root, rel_dir, find)
+    }
+
+    /// [`Known::folder`] with `making` held.
+    fn folder_unknown(&self, side: &str, root: &str, rel_dir: &str, find: &mut dyn FnMut(&str, &str) -> Result<String, String>) -> Result<String, String> {
+        if rel_dir.is_empty() {
+            return Ok(root.to_string());
+        }
         let key = (side.to_string(), rel_dir.to_string());
         if let Some(id) = self.drive.lock().unwrap().get(&key) {
             return Ok(id.clone());
         }
         let (parent, name) = rel_dir.rsplit_once('/').unwrap_or(("", rel_dir));
-        let parent = self.folder(side, root, parent, find)?;
+        let parent = self.folder_unknown(side, root, parent, find)?;
         let id = find(&parent, name)?;
         self.drive.lock().unwrap().insert(key, id.clone());
         Ok(id)
@@ -3195,11 +3364,19 @@ impl Known {
     /// Has `make` make each folder of `rel_dir` under `base` on the server `server`, those not
     /// known to be there, from the top down.
     fn server_folders(&self, server: &str, base: &str, rel_dir: &str, make: &mut dyn FnMut(&str)) {
+        if self.has_server_folders(server, base, rel_dir) {
+            return;
+        }
+        // One at a time, and a folder is known only once it is made: another file going at the
+        // same time would otherwise be sent into a folder that isn't there yet.
+        let _one = self.making.lock().unwrap_or_else(|e| e.into_inner());
         let mut cur = base.to_string();
         for seg in rel_dir.split('/').filter(|s| !s.is_empty()) {
             cur = servers::child(&cur, seg);
-            if self.server.lock().unwrap().insert((server.to_string(), cur.clone())) {
+            let key = (server.to_string(), cur.clone());
+            if !self.server.lock().unwrap().contains(&key) {
                 make(&cur);
+                self.server.lock().unwrap().insert(key);
             }
         }
     }
@@ -3594,6 +3771,211 @@ mod tests {
         known.server_folders("s2", "/home", "docs", &mut make);
         assert_eq!(*made.borrow(), ["/home/docs/2026", "/home/docs/2026/jan", "/home/docs/2026/fev", "/home/docs"]);
         assert!(known.has_server_folders("s1", "/home", "docs/2026/jan"));
+    }
+
+    /// Files going at the same time that miss the same folder make it once: on Google Drive two
+    /// makes would leave two folders of one name, and on a server a file would be sent into a
+    /// folder that isn't there yet.
+    #[test]
+    fn folders_missed_by_several_files_at_once_are_made_once() {
+        let known = Known::default();
+        let made = Mutex::new(Vec::new());
+        let sent_too_soon = AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            for worker in 0..8 {
+                let (known, made, sent_too_soon) = (&known, &made, &sent_too_soon);
+                sc.spawn(move || {
+                    for file in 0..40 {
+                        let dir = format!("a/b{}/c{}", file % 4, file % 10);
+                        // Drive: finding or making a folder takes a while, as a request does.
+                        let id = known
+                            .folder("side", "root", &dir, &mut |parent, name| {
+                                std::thread::sleep(Duration::from_millis(1));
+                                made.lock().unwrap().push(format!("drive {parent}/{name}"));
+                                Ok(format!("{parent}/{name}"))
+                            })
+                            .unwrap();
+                        assert_eq!(id, format!("root/{}", dir), "worker {worker}");
+                        // A server: the folder is there by the time the file is sent into it.
+                        known.server_folders("s1", "/home", &dir, &mut |path| {
+                            std::thread::sleep(Duration::from_millis(1));
+                            made.lock().unwrap().push(format!("server {path}"));
+                        });
+                        if !made.lock().unwrap().contains(&format!("server /home/{dir}")) {
+                            sent_too_soon.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(sent_too_soon.load(Ordering::Relaxed), 0, "a file was sent into a folder not made yet");
+        let mut made = made.into_inner().unwrap();
+        let all = made.len();
+        made.sort();
+        made.dedup();
+        // "a", its four "b" and the twenty "c" there are, on each of the two.
+        assert_eq!((made.len(), all), (2 * (1 + 4 + 20), 2 * (1 + 4 + 20)), "each folder is made once");
+    }
+
+    /// A run between two folders of the computer copies several files at a time: every file
+    /// arrives, every row ends with one status, a file that fails doesn't stop the others, and
+    /// folders are made before and deleted after.
+    #[test]
+    fn a_run_copies_several_files_at_a_time() {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("oe-sync-run-{stamp}"));
+        let (left, right) = (root.join("left"), root.join("right"));
+        for d in 0..6 {
+            std::fs::create_dir_all(left.join(format!("d{d}/deep"))).unwrap();
+            for f in 0..50 {
+                std::fs::write(left.join(format!("d{d}/deep/f{f}.txt")), format!("{d}-{f}")).unwrap();
+            }
+        }
+        // On the right only: to be deleted, the files before their folders.
+        std::fs::create_dir_all(right.join("old/older")).unwrap();
+        std::fs::write(right.join("old/older/gone.txt"), b"x").unwrap();
+        std::fs::write(right.join("old/gone too.txt"), b"x").unwrap();
+
+        let (left_loc, right_loc) = (SyncLocation::Local(left.clone()), SyncLocation::Local(right.clone()));
+        let (pool, drives, cancel) = (Pool::default(), HashMap::new(), AtomicBool::new(false));
+        let opts = SyncOptions::default();
+        let compared = || {
+            let (l, r) = scan_both(&left_loc, &right_loc, &opts.filter, true, &pool, &[], &drives, &cancel, &|_| {}).unwrap();
+            let (mut rows, _) = compare_maps(0, &left_loc, &right_loc, l, r, &opts, SystemTime::now(), &cancel, &|_, _| {});
+            rows.iter_mut().enumerate().for_each(|(i, r)| r.id = i);
+            rows
+        };
+        let mut rows = compared();
+        let planned: Vec<CompareRow> = rows.iter().filter(|r| r.enabled && r.action != SyncAction::None).cloned().collect();
+        assert_eq!(planned.len(), 12 + 300 + 4, "12 folders and 300 files to copy, 2 files and 2 folders to delete");
+        // One of the files is gone by the time it is to be copied.
+        std::fs::remove_file(left.join("d3/deep/f7.txt")).unwrap();
+
+        let pairs = [FolderPair { id: 1, left: Some(left_loc.clone()), right: Some(right_loc.clone()) }];
+        let known = Known::default();
+        let at_once = AtOnce { uploads: 1, downloads: 1, disk: 4 };
+        let run = Run { pairs: &pairs, skip_recycle_bin: true, segmented: false, pool: &pool, servers: &[], drives: &drives, cancel: &cancel, known: &known, at_once };
+        let mut told: Vec<(usize, RowStatus)> = Vec::new();
+        let mut counts = Vec::new();
+        let (ok, failed, cancelled) = run_plan(&run, planned.clone(), &mut |changes, done| {
+            told.extend(changes);
+            counts.push(done);
+        });
+        assert_eq!((ok, failed, cancelled), (315, 1, false));
+        assert!(counts.windows(2).all(|w| w[0] <= w[1]) && counts.last() == Some(&316), "the count goes up to the end: {counts:?}");
+
+        // Each row started once and ended once, started before it ended.
+        for row in &planned {
+            let its: Vec<&RowStatus> = told.iter().filter(|(id, _)| *id == row.id).map(|(_, s)| s).collect();
+            assert_eq!(its.len(), 2, "{}: {its:?}", row.rel_path);
+            assert_eq!(its[0], &RowStatus::Running, "{}", row.rel_path);
+            let failed = row.rel_path == "d3/deep/f7.txt";
+            assert_eq!(matches!(its[1], RowStatus::Failed(_)), failed, "{}: {:?}", row.rel_path, its[1]);
+            assert!(failed || its[1] == &RowStatus::Done);
+        }
+        // Folders are made before any file is copied, files are deleted before their folders,
+        // and everything is copied before anything is deleted.
+        let place = |path: &str, status: &RowStatus| {
+            let id = planned.iter().find(|r| r.rel_path == path).unwrap_or_else(|| panic!("no row {path}")).id;
+            told.iter().position(|(i, s)| *i == id && s == status).unwrap_or_else(|| panic!("{path} never {status:?}"))
+        };
+        let first_file = told.iter().position(|(id, _)| planned.iter().any(|r| r.id == *id && !r.is_dir && r.action == SyncAction::CopyRight)).unwrap();
+        let last_file = told.iter().rposition(|(id, _)| planned.iter().any(|r| r.id == *id && !r.is_dir && r.action == SyncAction::CopyRight)).unwrap();
+        assert!(place("d5/deep", &RowStatus::Done) < first_file && place("d0", &RowStatus::Done) < place("d0/deep", &RowStatus::Running));
+        assert!(last_file < place("old/gone too.txt", &RowStatus::Running));
+        assert!(place("old/older/gone.txt", &RowStatus::Done) < place("old/older", &RowStatus::Running));
+        assert!(place("old/older", &RowStatus::Done) < place("old", &RowStatus::Running));
+
+        // The right side is the left one, and comparing again finds nothing to do but the file
+        // that failed (gone from the left, so nothing at all).
+        assert_eq!(std::fs::read(right.join("d2/deep/f49.txt")).unwrap(), b"2-49");
+        assert!(!right.join("old").exists() && !right.join("d3/deep/f7.txt").exists());
+        rows = compared();
+        let left_over: Vec<&str> = rows.iter().filter(|r| r.action != SyncAction::None).map(|r| r.rel_path.as_str()).collect();
+        assert!(left_over.is_empty(), "comparing again: {left_over:?}");
+
+        // Cancelled before it starts, a run does nothing and says so.
+        cancel.store(true, Ordering::Relaxed);
+        std::fs::write(left.join("late.txt"), b"late").unwrap();
+        let late = compared().into_iter().filter(|r| r.action != SyncAction::None).collect::<Vec<_>>();
+        let mut said = 0;
+        assert_eq!(run_plan(&run, late, &mut |changes, _| said += changes.len()), (0, 0, true));
+        assert!(said == 0 && !right.join("late.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What a run between two folders of the computer costs with 1, 2, 4 and 8 files at a time:
+    /// 20,000 files of 4 KB in 200 folders, then 40 files of 16 MB. The trees are made under
+    /// the temp folder (`oe-sync-run-bench`) and removed at the end. Run it with
+    /// `cargo test --release -p openexplorer -- --ignored --nocapture run_cost`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn run_cost() {
+        let root = std::env::temp_dir().join("oe-sync-run-bench");
+        let _ = std::fs::remove_dir_all(&root);
+        let (pool, drives, cancel, opts) = (Pool::default(), HashMap::new(), AtomicBool::new(false), SyncOptions::default());
+        for (label, folders, files, size) in [("20,000 files of 4 KB", 200, 100, 4 << 10), ("40 files of 16 MB", 4, 10, 16 << 20)] {
+            let (left, right) = (root.join(label).join("left"), root.join(label).join("right"));
+            let body = vec![7u8; size];
+            for d in 0..folders {
+                std::fs::create_dir_all(left.join(format!("folder {d:03}"))).unwrap();
+                for f in 0..files {
+                    std::fs::write(left.join(format!("folder {d:03}/file {f:03}.bin")), &body).unwrap();
+                }
+            }
+            let (left_loc, right_loc) = (SyncLocation::Local(left), SyncLocation::Local(right.clone()));
+            let pairs = [FolderPair { id: 1, left: Some(left_loc.clone()), right: Some(right_loc.clone()) }];
+            let mut line = format!("{label}:");
+            for disk in [1, 2, 4, 8, 1, 4] {
+                let _ = std::fs::remove_dir_all(&right);
+                std::fs::create_dir_all(&right).unwrap();
+                let (l, r) = scan_both(&left_loc, &right_loc, &opts.filter, true, &pool, &[], &drives, &cancel, &|_| {}).unwrap();
+                let (mut rows, _) = compare_maps(0, &left_loc, &right_loc, l, r, &opts, SystemTime::now(), &cancel, &|_, _| {});
+                rows.iter_mut().enumerate().for_each(|(i, r)| r.id = i);
+                let known = Known::default();
+                let run = Run { pairs: &pairs, skip_recycle_bin: true, segmented: false, pool: &pool, servers: &[], drives: &drives, cancel: &cancel, known: &known, at_once: AtOnce { uploads: 1, downloads: 1, disk } };
+                let (started, mut told) = (std::time::Instant::now(), 0);
+                let (ok, failed, _) = run_plan(&run, rows, &mut |_, _| told += 1);
+                assert_eq!((ok, failed), (folders + folders * files, 0));
+                line += &format!("  {disk} at a time {:.2} s ({told} tellings)", started.elapsed().as_secs_f64());
+            }
+            println!("{line}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// How many files go at once follows the way they go, and a server keeps one connection
+    /// for the panes.
+    #[test]
+    fn how_many_go_at_once_follows_the_way_and_the_server() {
+        let disk = |p: &str| SyncLocation::Local(PathBuf::from(p));
+        let drive = SyncLocation::Drive { email: "a@b".into(), shared_drive_id: None, shared_drive_name: None, path: Vec::new() };
+        let on = |id: &str| SyncLocation::Server { server_id: id.into(), server_name: id.into(), path: Vec::new() };
+        assert_eq!(Way::of(&disk("a"), &disk("b")), Way::Disk);
+        assert_eq!((Way::of(&disk("a"), &drive), Way::of(&disk("a"), &on("s")), Way::of(&drive, &on("s"))), (Way::Up, Way::Up, Way::Up));
+        assert_eq!((Way::of(&drive, &disk("a")), Way::of(&on("s"), &disk("a"))), (Way::Down, Way::Down));
+
+        let server = |id: &str, connections| Server { id: id.into(), name: id.into(), protocol: openexplorer_remote::Protocol::Sftp, brand: None, host: "h".into(), port: 22, user: String::new(), root: "/".into(), key: None, host_key: None, cert: None, connections, implicit: false };
+        let servers = [server("wide", 8), server("narrow", 2), server("single", 1)];
+        let pairs = [
+            FolderPair { id: 1, left: Some(disk("a")), right: Some(drive.clone()) },
+            FolderPair { id: 2, left: Some(disk("a")), right: Some(on("wide")) },
+            FolderPair { id: 3, left: Some(disk("a")), right: Some(on("narrow")) },
+            FolderPair { id: 4, left: Some(disk("a")), right: Some(on("single")) },
+        ];
+        let (pool, drives, cancel, known) = (Pool::default(), HashMap::new(), AtomicBool::new(false), Known::default());
+        let run = Run { pairs: &pairs, skip_recycle_bin: true, segmented: false, pool: &pool, servers: &servers, drives: &drives, cancel: &cancel, known: &known, at_once: AtOnce { uploads: 5, downloads: 3, disk: 4 } };
+        let rows = |pair_index: usize, n: usize| -> Vec<CompareRow> {
+            (0..n).map(|i| CompareRow { id: i, pair_index, rel_path: format!("f{i}"), is_dir: false, left: None, right: None, action: SyncAction::CopyRight, enabled: true, status: RowStatus::Pending }).collect()
+        };
+        let workers = |way, rows: &[CompareRow]| run.workers(way, &rows.iter().collect::<Vec<_>>());
+        assert_eq!((workers(Way::Up, &rows(0, 100)), workers(Way::Down, &rows(0, 100)), workers(Way::Disk, &rows(0, 100))), (5, 3, 4));
+        assert_eq!(workers(Way::Up, &rows(0, 2)), 2, "no more than there are files");
+        assert_eq!((workers(Way::Up, &rows(1, 100)), workers(Way::Up, &rows(2, 100)), workers(Way::Up, &rows(3, 100))), (5, 1, 1));
+        // Rows of several servers together keep to the narrowest.
+        let mixed: Vec<CompareRow> = rows(1, 50).into_iter().chain(rows(2, 50)).collect();
+        assert_eq!(workers(Way::Up, &mixed), 1);
     }
 
     /// A tree is read whole whatever the number of readers, and the first error is the answer.
