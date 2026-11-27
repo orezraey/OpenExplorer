@@ -659,6 +659,8 @@ impl State {
 
     /// Shows `br` in the independent "Renomear em massa" window (movable and resizable).
     pub fn open_batch_rename(&mut self, br: batch_rename::BatchRename) {
+        // The meta tags read for the batch shown before are of other files.
+        rules_meta::forget();
         self.batch_rename = Some(Box::new(br));
         self.batch_rename_dirty = true;
         if let Some(w) = &self.batch_rename_win {
@@ -671,6 +673,7 @@ impl State {
     /// Drops the batch rename state and closes its window (plus any open rule editor window).
     pub fn close_batch_rename(&mut self) {
         self.close_rule_editor();
+        rules_meta::forget();
         self.batch_rename = None;
         self.batch_rename_dirty = true;
         if let Some(w) = &self.batch_rename_win
@@ -694,6 +697,7 @@ impl State {
             return;
         }
         self.close_rule_editor();
+        rules_meta::forget();
         self.batch_rename_shown = false;
         self.batch_rename = None;
     }
@@ -1086,7 +1090,8 @@ fn batch_rename_window_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
                 return true;
             }
             if br.media.popup.is_some() {
-                br.media.close_popup();
+                // As the popup's own Cancel does.
+                batch_rename::close_popup(s);
                 return true;
             }
             if br.rules.stack_menu.is_some() {

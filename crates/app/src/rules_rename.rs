@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, NaiveDateTime, Timelike};
 use openexplorer_i18n::{t, tr};
@@ -578,7 +579,7 @@ impl RuleConfig {
                 skip_empty: false,
             },
             RuleKind::Mapping => Self::Mapping {
-                entries: vec![(String::new(), String::new())],
+                entries: Vec::new(),
                 allow_reuse: false,
                 partial_match: false,
                 inverse: false,
@@ -1099,6 +1100,11 @@ impl RuleEditorState {
         }
         self.kind = kind;
         self.config = RuleConfig::default_for(kind);
+        // Each new rule draws its own names: with the one seed every rule started with, two
+        // batches got the same "random" names. Kept in the rule, so its preview holds still.
+        if let RuleConfig::Random { seed, .. } = &mut self.config {
+            *seed = rand::random();
+        }
         self.meta_target = None;
         self.script_status = None;
         self.show_scripts_menu = false;
@@ -1260,7 +1266,15 @@ impl RuleEditorState {
             }
             RuleConfig::PascalScript { code } => *code = self.edit_a.text.clone(),
             RuleConfig::UserInput { lines, .. } => *lines = self.edit_a.text.clone(),
-            RuleConfig::CleanUp { .. } | RuleConfig::Mapping { .. } => {}
+            RuleConfig::Mapping { entries, .. } => {
+                // A pair typed and not added with "+" would be lost when the rule is saved.
+                if !self.map_key.text.is_empty() || !self.map_val.text.is_empty() {
+                    entries.push((std::mem::take(&mut self.map_key.text), std::mem::take(&mut self.map_val.text)));
+                    self.map_key = TextEdit::new("");
+                    self.map_val = TextEdit::new("");
+                }
+            }
+            RuleConfig::CleanUp { .. } => {}
         }
     }
 
@@ -1273,10 +1287,12 @@ impl RuleEditorState {
             | MetaTagTarget::PascalScript => &mut self.edit_a,
             MetaTagTarget::ReplaceWith | MetaTagTarget::RearrangePattern => &mut self.edit_b,
         };
+        // At the caret (the end, in a field never touched), over what is selected: appended to
+        // a script, it landed after the program's `end.` and did nothing.
         if target == MetaTagTarget::PascalScript {
-            edit.text.push_str(&format!("MetaTag('{token}')"));
+            edit.insert(&format!("MetaTag('{token}')"));
         } else {
-            edit.text.push_str(&token);
+            edit.insert(&token);
         }
         self.sync_edits_to_config();
     }
@@ -1331,6 +1347,11 @@ impl Default for RulesState {
 
 impl RulesState {
     pub fn new() -> Self {
+        Self::with_presets(load_presets())
+    }
+
+    /// The state with these presets rather than those of the file on disk.
+    pub fn with_presets(presets: Vec<RulePreset>) -> Self {
         Self {
             rules: Vec::new(),
             selected: None,
@@ -1345,7 +1366,7 @@ impl RulesState {
             tag_cat_open: false,
             tag_search: TextEdit::new(""),
             tag_selected: 0,
-            presets: load_presets(),
+            presets,
             preset_name: TextEdit::new(""),
             analyze_input: TextEdit::new(""),
         }
@@ -1654,14 +1675,23 @@ fn apply_rule_batch(
             let _ = &mut list;
         }
         RuleConfig::Mapping { entries, allow_reuse, partial_match, inverse, case_sensitive, skip_ext } => {
+            // Each row as (what to find, what to put, the regex of a partial match ignoring case).
+            let rows: Vec<(&str, &str, Option<Regex>)> = entries
+                .iter()
+                .map(|(a, b)| {
+                    let (src, dst) = if *inverse { (b.as_str(), a.as_str()) } else { (a.as_str(), b.as_str()) };
+                    let any_case = *partial_match && !*case_sensitive && !src.is_empty();
+                    (src, dst, any_case.then(|| RegexBuilder::new(&regex::escape(src)).case_insensitive(true).build().ok()).flatten())
+                })
+                .collect();
             let mut used: HashSet<usize> = HashSet::new();
             for (i, item) in items.iter().enumerate() {
                 if !checked.get(i).copied().unwrap_or(true) {
                     continue;
                 }
                 let (stem, ext) = split_stem_ext(&names[i], item.is_dir, *skip_ext);
-                for (row_idx, (a, b)) in entries.iter().enumerate() {
-                    let (src, dst) = if *inverse { (b.as_str(), a.as_str()) } else { (a.as_str(), b.as_str()) };
+                for (row_idx, (src, dst, any_case)) in rows.iter().enumerate() {
+                    let (src, dst) = (*src, *dst);
                     if src.is_empty() || (!*allow_reuse && used.contains(&row_idx)) {
                         continue;
                     }
@@ -1673,13 +1703,13 @@ fn apply_rule_batch(
                                 None
                             }
                         } else {
-                            let re = RegexBuilder::new(&regex::escape(src)).case_insensitive(true).build().ok();
-                            re.filter(|r| r.is_match(&stem)).map(|r| r.replace_all(&stem, NoExpand(dst)).into_owned())
+                            any_case.as_ref().filter(|r| r.is_match(&stem)).map(|r| r.replace_all(&stem, NoExpand(dst)).into_owned())
                         }
                     } else if *case_sensitive {
                         (stem == src).then(|| dst.to_string())
                     } else {
-                        stem.eq_ignore_ascii_case(src).then(|| dst.to_string())
+                        // Every letter's case, not only the ASCII ones: `ÉCOLE` is `école`.
+                        (stem.to_lowercase() == src.to_lowercase()).then(|| dst.to_string())
                     };
                     if let Some(next_base) = matched {
                         used.insert(row_idx);
@@ -1691,11 +1721,24 @@ fn apply_rule_batch(
         }
         RuleConfig::PascalScript { code } => match rules_script::compile(code) {
             Ok(compiled) => {
+                // A script that ran to its step limit on an item would on the next ones too,
+                // each taking milliseconds: 1,000 items froze the window for seconds. The rest
+                // of the batch takes the same error without running.
+                let mut endless: Option<String> = None;
                 for (i, item) in items.iter().enumerate() {
                     if !checked.get(i).copied().unwrap_or(true) {
                         continue;
                     }
-                    match rules_script::run(&compiled, &names[i], i, item, loc) {
+                    let result = match &endless {
+                        Some(why) => Err(why.clone()),
+                        None => rules_script::run(&compiled, &names[i], i, item, loc).map_err(|failed| {
+                            if failed.endless {
+                                endless = Some(failed.why.clone());
+                            }
+                            failed.why
+                        }),
+                    };
+                    match result {
                         Ok(next) => names[i] = next,
                         Err(e) => {
                             if errors[i].is_none() {
@@ -1715,11 +1758,12 @@ fn apply_rule_batch(
         },
         // Per-item rules:
         other => {
+            let prepared = Prepared::of(other);
             for (i, item) in items.iter().enumerate() {
                 if !checked.get(i).copied().unwrap_or(true) {
                     continue;
                 }
-                match apply_single_rule(other, &names[i], item, loc) {
+                match apply_single_rule(other, &prepared, &names[i], item, loc) {
                     Ok(next) => names[i] = next,
                     Err(e) => {
                         if errors[i].is_none() {
@@ -1732,7 +1776,62 @@ fn apply_rule_batch(
     }
 }
 
-fn apply_single_rule(cfg: &RuleConfig, current: &str, item: &Entry, loc: &Location) -> Result<String, String> {
+/// What a rule works out once for the whole batch rather than again for each item: compiling a
+/// regex costs far more than running it on a name.
+enum Prepared<'a> {
+    Nothing,
+    /// Remove and Replace: the text they look for.
+    Find(Result<Regex, String>),
+    /// Remove whose text holds a meta tag (its editor has the button for one): each item
+    /// fills it in, so each has its own text to look for.
+    FindEach,
+    /// Case: each fragment kept as typed, with the regex that finds it.
+    Fragments(Vec<(Regex, &'a str)>),
+    /// Rearrange by delimiters: `None` with no delimiter to split at.
+    Delimiters(Option<Regex>),
+    /// Reformat Date: `None` with a format left empty.
+    Date(Result<Option<Box<DatePlan<'a>>>, String>),
+    /// Regular Expressions: `None` when the pattern holds a meta tag, which each item fills in.
+    Pattern(Option<Result<Regex, String>>),
+    /// Translit: the alphabet's pairs, read from its text.
+    Alphabet(Vec<(String, String)>),
+}
+
+impl<'a> Prepared<'a> {
+    fn of(cfg: &'a RuleConfig) -> Self {
+        match cfg {
+            RuleConfig::Remove { text, .. } if rules_meta::has_tags(text) => Self::FindEach,
+            RuleConfig::Remove { text: find, case_sensitive, whole_words, wildcards, .. } | RuleConfig::Replace { find, case_sensitive, whole_words, wildcards, .. }
+                if !find.is_empty() =>
+            {
+                Self::Find(find_regex(find, *case_sensitive, *whole_words, *wildcards))
+            }
+            RuleConfig::Case { force_fragments: true, fragments, .. } => Self::Fragments(
+                fragments
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|f| !f.is_empty())
+                    .filter_map(|f| Regex::new(&format!(r"(?i)\b{}\b", regex::escape(f))).ok().map(|re| (re, f)))
+                    .collect(),
+            ),
+            RuleConfig::Rearrange { split_mode: RearrangeSplit::Delimiters, delimiters, .. } => Self::Delimiters(delimiters_regex(delimiters)),
+            RuleConfig::ReformatDate { find_fmt, replace_fmt, custom_short_months, short_months, custom_long_months, long_months, .. } => {
+                let short = month_names(*custom_short_months, short_months, EN_SHORT_MONTHS);
+                let long = month_names(*custom_long_months, long_months, EN_LONG_MONTHS);
+                Self::Date(DatePlan::new(find_fmt, replace_fmt, short, long).map(|plan| plan.map(Box::new)))
+            }
+            RuleConfig::Regex { pattern, case_sensitive, .. } if !pattern.is_empty() => Self::Pattern((!rules_meta::has_tags(pattern)).then(|| pattern_regex(pattern, *case_sensitive))),
+            RuleConfig::Translit { alphabet, direction, .. } => Self::Alphabet(parse_translit_alphabet(alphabet, *direction)),
+            _ => Self::Nothing,
+        }
+    }
+}
+
+fn pattern_regex(pattern: &str, case_sensitive: bool) -> Result<Regex, String> {
+    RegexBuilder::new(pattern).case_insensitive(!case_sensitive).build().map_err(|e| tr!("Regex inválida: {e}", "Invalid regex: {e}"))
+}
+
+fn apply_single_rule(cfg: &RuleConfig, prepared: &Prepared, current: &str, item: &Entry, loc: &Location) -> Result<String, String> {
     match cfg {
         RuleConfig::Insert { text, where_mode, position, rtl, after_text, before_text, skip_ext } => {
             let expanded = rules_meta::expand_tags(text, item, loc);
@@ -1825,37 +1924,50 @@ fn apply_single_rule(cfg: &RuleConfig, current: &str, item: &Entry, loc: &Locati
             Ok(format!("{next_base}{ext}"))
         }
         RuleConfig::Remove { text, occurrences, case_sensitive, whole_words, skip_ext, wildcards } => {
-            if text.is_empty() {
-                return Ok(current.to_string());
-            }
+            let per_item;
+            let re = match prepared {
+                Prepared::Find(re) => re.as_ref().map_err(String::clone)?,
+                Prepared::FindEach => {
+                    per_item = find_regex(&rules_meta::expand_tags(text, item, loc), *case_sensitive, *whole_words, *wildcards)?;
+                    &per_item
+                }
+                // Nothing prepared: there's no text to remove.
+                _ => return Ok(current.to_string()),
+            };
             let (stem, ext) = split_stem_ext(current, item.is_dir, *skip_ext);
-            let next_base = replace_occurrences(&stem, text, "", *occurrences, *case_sensitive, *whole_words, *wildcards)?;
+            let next_base = replace_occurrences(&stem, re, "", *occurrences, *wildcards);
             Ok(format!("{next_base}{ext}"))
         }
-        RuleConfig::Replace { find, replace, occurrences, case_sensitive, whole_words, skip_ext, wildcards } => {
-            if find.is_empty() {
-                return Ok(current.to_string());
-            }
+        RuleConfig::Replace { replace, occurrences, skip_ext, wildcards, .. } => {
+            let Prepared::Find(re) = prepared else { return Ok(current.to_string()) };
             let rep = rules_meta::expand_tags(replace, item, loc);
             let (stem, ext) = split_stem_ext(current, item.is_dir, *skip_ext);
-            let next_base = replace_occurrences(&stem, find, &rep, *occurrences, *case_sensitive, *whole_words, *wildcards)?;
+            let next_base = replace_occurrences(&stem, re.as_ref().map_err(String::clone)?, &rep, *occurrences, *wildcards);
             Ok(format!("{next_base}{ext}"))
         }
         RuleConfig::Rearrange { split_mode, delimiters, new_pattern, skip_ext, rtl } => {
             let (stem, ext) = split_stem_ext(current, item.is_dir, *skip_ext);
             let pat = rules_meta::expand_tags(new_pattern, item, loc);
-            let parts = split_for_rearrange(&stem, *split_mode, delimiters, *rtl);
+            let by_delimiters = match prepared {
+                Prepared::Delimiters(re) => re.as_ref(),
+                _ => None,
+            };
+            let parts = split_for_rearrange(&stem, *split_mode, delimiters, by_delimiters, *rtl);
             let next_base = apply_rearrange_pattern(&stem, &parts, &pat);
             Ok(format!("{next_base}{ext}"))
         }
         RuleConfig::Extension { set_new, new_ext, append_original, detect_binary, remove_duplicates, dup_case_sensitive } => {
+            // A folder has no extension, as for every other rule: a dot is part of its name.
+            if item.is_dir {
+                return Ok(current.to_string());
+            }
             let mut out = current.to_string();
             if *remove_duplicates {
                 out = strip_duplicate_extensions(&out, *dup_case_sensitive);
             }
+            // Through the tags, which read each file once: the preview runs again at every change.
             if *detect_binary
-                && let Some(path) = loc.local_path(item)
-                && let Some((detected_ext, _)) = rules_meta::detect_binary_signature(&path)
+                && let Some(detected_ext) = rules_meta::resolve_tag("BinarySign_Extension", item, loc).filter(|ext| !ext.is_empty() && ext != rules_meta::PENDING)
             {
                 let stem = match out.rfind('.') {
                     Some(i) if i > 0 => &out[..i],
@@ -1948,21 +2060,20 @@ fn apply_single_rule(cfg: &RuleConfig, current: &str, item: &Entry, loc: &Locati
             };
             Ok(format!("{next_base}{ext}"))
         }
-        RuleConfig::Case { mode, preserve_case, skip_ext, force_fragments, fragments, ext_lower, ext_upper } => {
+        RuleConfig::Case { mode, preserve_case, skip_ext, ext_lower, ext_upper, .. } => {
             let (stem, mut ext) = split_stem_ext(current, item.is_dir, *skip_ext);
             let mut next_base = apply_case(&stem, *mode, *preserve_case);
-            if *force_fragments && !fragments.trim().is_empty() {
-                for frag in fragments.split(',').map(str::trim).filter(|f| !f.is_empty()) {
-                    let pat = format!(r"(?i)\b{}\b", regex::escape(frag));
-                    if let Ok(re) = Regex::new(&pat) {
-                        next_base = re.replace_all(&next_base, NoExpand(frag)).into_owned();
-                    }
+            if let Prepared::Fragments(kept) = prepared {
+                for (re, frag) in kept {
+                    next_base = re.replace_all(&next_base, NoExpand(frag)).into_owned();
                 }
             }
-            if *ext_lower {
-                ext = ext.to_lowercase();
-            } else if *ext_upper {
-                ext = ext.to_uppercase();
+            if *ext_lower || *ext_upper {
+                // The extension's own case holds whether or not the rest of the rule skips it.
+                if ext.is_empty() {
+                    (next_base, ext) = split_stem_ext(&next_base, item.is_dir, true);
+                }
+                ext = if *ext_lower { ext.to_lowercase() } else { ext.to_uppercase() };
             }
             Ok(format!("{next_base}{ext}"))
         }
@@ -1970,13 +2081,11 @@ fn apply_single_rule(cfg: &RuleConfig, current: &str, item: &Entry, loc: &Locati
             let (stem, ext) = split_stem_ext(current, item.is_dir, *skip_ext);
             let mut out = stem;
             if *strip_zeros {
-                let re = Regex::new(r"\b0+(\d+)\b").unwrap();
-                out = re.replace_all(&out, "$1").into_owned();
+                out = RE_LEADING_ZEROS.replace_all(&out, "$1").into_owned();
             }
             if *pad_numbers && *pad_numbers_len > 0 {
                 let w = *pad_numbers_len;
-                let re = Regex::new(r"\d+").unwrap();
-                out = re
+                out = RE_DIGITS
                     .replace_all(&out, |caps: &regex::Captures| {
                         let d = &caps[0];
                         if d.len() < w {
@@ -2021,24 +2130,23 @@ fn apply_single_rule(cfg: &RuleConfig, current: &str, item: &Entry, loc: &Locati
             prepare_sharepoint,
             skip_ext,
         } => {
-            let effective_skip = *skip_ext && !*prepare_sharepoint;
-            let (mut s, ext) = split_stem_ext(current, item.is_dir, effective_skip);
+            let (mut s, ext) = split_stem_ext(current, item.is_dir, *skip_ext);
             if *strip_parens {
-                s = Regex::new(r"\([^)]*\)").unwrap().replace_all(&s, " ").into_owned();
+                s = RE_IN_PARENS.replace_all(&s, " ").into_owned();
             }
             if *strip_brackets {
-                s = Regex::new(r"\[[^\]]*\]").unwrap().replace_all(&s, " ").into_owned();
+                s = RE_IN_BRACKETS.replace_all(&s, " ").into_owned();
             }
             if *strip_braces {
-                s = Regex::new(r"\{[^}]*\}").unwrap().replace_all(&s, " ").into_owned();
+                s = RE_IN_BRACES.replace_all(&s, " ").into_owned();
             }
             if *replace_pct20 {
-                s = Regex::new(r"(?i)%20").unwrap().replace_all(&s, " ").into_owned();
+                // `%20` has no letters: there's no case to ignore.
+                s = s.replace("%20", " ");
             }
             if *replace_dot {
                 if *skip_versions {
-                    // Protect digit.digit sequences temporarily
-                    let re = Regex::new(r"(\d)\.(\d)").unwrap();
+                    // A dot between two digits stays: it's a version (`1.2.3`).
                     let mut out = String::with_capacity(s.len());
                     let chars: Vec<char> = s.chars().collect();
                     for (idx, &ch) in chars.iter().enumerate() {
@@ -2050,7 +2158,6 @@ fn apply_single_rule(cfg: &RuleConfig, current: &str, item: &Entry, loc: &Locati
                             out.push(ch);
                         }
                     }
-                    let _ = re;
                     s = out;
                 } else {
                     s = s.replace('.', " ");
@@ -2104,21 +2211,24 @@ fn apply_single_rule(cfg: &RuleConfig, current: &str, item: &Entry, loc: &Locati
             if *fix_spaces {
                 s = s.split_whitespace().collect::<Vec<_>>().join(" ");
             }
-            if *prepare_sharepoint {
-                s = s
-                    .chars()
-                    .map(|c| if matches!(c, '~' | '"' | '#' | '%' | '&' | '*' | ':' | '<' | '>' | '?' | '/' | '\\' | '{' | '|' | '}') { '_' } else { c })
-                    .collect::<String>()
-                    .trim_matches(['.', ' '])
-                    .to_string();
+            let cleaned = format!("{s}{ext}");
+            if !*prepare_sharepoint {
+                return Ok(cleaned);
             }
-            Ok(format!("{s}{ext}"))
+            // The characters SharePoint refuses go from the extension too, as the box says
+            // ("always includes the extension"): only this step, the rest left it alone.
+            Ok(cleaned
+                .chars()
+                .map(|c| if matches!(c, '~' | '"' | '#' | '%' | '&' | '*' | ':' | '<' | '>' | '?' | '/' | '\\' | '{' | '|' | '}') { '_' } else { c })
+                .collect::<String>()
+                .trim_matches(['.', ' '])
+                .to_string())
         }
-        RuleConfig::Translit { alphabet, direction, auto_case, skip_ext } => {
+        RuleConfig::Translit { auto_case, skip_ext, .. } => {
+            let Prepared::Alphabet(pairs) = prepared else { return Ok(current.to_string()) };
             let (stem, ext) = split_stem_ext(current, item.is_dir, *skip_ext);
-            let pairs = parse_translit_alphabet(alphabet, *direction);
             let mut out = stem;
-            for (src, dst) in &pairs {
+            for (src, dst) in pairs {
                 if src.is_empty() {
                     continue;
                 }
@@ -2135,36 +2245,29 @@ fn apply_single_rule(cfg: &RuleConfig, current: &str, item: &Entry, loc: &Locati
             }
             Ok(format!("{out}{ext}"))
         }
-        RuleConfig::ReformatDate {
-            find_fmt,
-            replace_fmt,
-            whole_words,
-            skip_ext,
-            custom_short_months,
-            short_months,
-            custom_long_months,
-            long_months,
-            adjust_on,
-            adjust_amount,
-            adjust_unit,
-        } => {
+        RuleConfig::ReformatDate { whole_words, skip_ext, adjust_on, adjust_amount, adjust_unit, .. } => {
+            let plan = match prepared {
+                Prepared::Date(Ok(Some(plan))) => plan,
+                Prepared::Date(Err(e)) => return Err(e.clone()),
+                _ => return Ok(current.to_string()),
+            };
             let (stem, ext) = split_stem_ext(current, item.is_dir, *skip_ext);
-            let short = month_names(*custom_short_months, short_months, EN_SHORT_MONTHS);
-            let long = month_names(*custom_long_months, long_months, EN_LONG_MONTHS);
             let adjust = adjust_on.then_some((*adjust_amount, *adjust_unit));
-            let next_base = reformat_date_in_str(&stem, find_fmt, replace_fmt, *whole_words, (&short, &long), adjust)?;
+            let next_base = reformat_date_in_str(&stem, plan, *whole_words, adjust);
             Ok(format!("{next_base}{ext}"))
         }
         RuleConfig::Regex { pattern, replace, case_sensitive, skip_ext } => {
-            if pattern.is_empty() {
-                return Ok(current.to_string());
-            }
-            let expanded_pat = rules_meta::expand_tags(pattern, item, loc);
+            let per_item;
+            let re = match prepared {
+                Prepared::Pattern(Some(re)) => re.as_ref().map_err(String::clone)?,
+                Prepared::Pattern(None) => {
+                    per_item = pattern_regex(&rules_meta::expand_tags(pattern, item, loc), *case_sensitive)?;
+                    &per_item
+                }
+                // Nothing prepared: the pattern is empty.
+                _ => return Ok(current.to_string()),
+            };
             let expanded_rep = rules_meta::expand_tags(replace, item, loc);
-            let re = RegexBuilder::new(&expanded_pat)
-                .case_insensitive(!*case_sensitive)
-                .build()
-                .map_err(|e| tr!("Regex inválida: {e}", "Invalid regex: {e}"))?;
             let (stem, ext) = split_stem_ext(current, item.is_dir, *skip_ext);
             let next_base = re
                 .replace_all(&stem, |caps: &regex::Captures| expand_regex_replace(caps, &expanded_rep))
@@ -2177,6 +2280,15 @@ fn apply_single_rule(cfg: &RuleConfig, current: &str, item: &Entry, loc: &Locati
 
 // ---------------------------------------------------------------------------------------------
 // Helpers
+
+// The regexes that never change, compiled once for the program.
+static RE_LEADING_ZEROS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b0+(\d+)\b").unwrap());
+static RE_DIGITS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+").unwrap());
+static RE_IN_PARENS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\([^)]*\)").unwrap());
+static RE_IN_BRACKETS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[[^\]]*\]").unwrap());
+static RE_IN_BRACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{[^}]*\}").unwrap());
+/// `$1`, `$-1`, `$0` in a Rearrange pattern.
+static RE_PART_REF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$(-?\d+)").unwrap());
 
 /// Expands regex replacement backreferences (`$0`, `$1`, `${name}`, `$$`, `$&`) without treating
 /// a trailing underscore (as in `$1_$2`) as part of the capture group name.
@@ -2279,24 +2391,16 @@ fn insert_into(stem: &str, text: &str, mode: InsertWhere, pos: usize, rtl: bool,
     }
 }
 
-fn replace_occurrences(
-    hay: &str,
-    find: &str,
-    replace: &str,
-    occ: Occurrences,
-    case_sensitive: bool,
-    whole_words: bool,
-    wildcards: bool,
-) -> Result<String, String> {
+/// The regex that finds what Remove and Replace look for.
+fn find_regex(find: &str, case_sensitive: bool, whole_words: bool, wildcards: bool) -> Result<Regex, String> {
     let mut pat = if wildcards { wildcard_to_regex(find) } else { regex::escape(find) };
     if whole_words {
         pat = format!(r"\b(?:{pat})\b");
     }
-    let re = RegexBuilder::new(&pat)
-        .case_insensitive(!case_sensitive)
-        .build()
-        .map_err(|e| e.to_string())?;
+    RegexBuilder::new(&pat).case_insensitive(!case_sensitive).build().map_err(|e| e.to_string())
+}
 
+fn replace_occurrences(hay: &str, re: &Regex, replace: &str, occ: Occurrences, wildcards: bool) -> String {
     let expand = |caps: &regex::Captures| -> String {
         if wildcards {
             let mut out = replace.to_string();
@@ -2311,14 +2415,14 @@ fn replace_occurrences(
     };
 
     match occ {
-        Occurrences::All => Ok(re.replace_all(hay, |c: &regex::Captures| expand(c)).into_owned()),
-        Occurrences::First => Ok(re.replace(hay, |c: &regex::Captures| expand(c)).into_owned()),
+        Occurrences::All => re.replace_all(hay, |c: &regex::Captures| expand(c)).into_owned(),
+        Occurrences::First => re.replace(hay, |c: &regex::Captures| expand(c)).into_owned(),
         Occurrences::Last => {
             let all: Vec<_> = re.captures_iter(hay).collect();
-            let Some(last) = all.last() else { return Ok(hay.to_string()) };
+            let Some(last) = all.last() else { return hay.to_string() };
             let m = last.get(0).unwrap();
             let rep = expand(last);
-            Ok(format!("{}{rep}{}", &hay[..m.start()], &hay[m.end()..]))
+            format!("{}{rep}{}", &hay[..m.start()], &hay[m.end()..])
         }
     }
 }
@@ -2349,7 +2453,14 @@ fn wildcard_to_regex(pat: &str) -> String {
     out
 }
 
-fn split_for_rearrange(stem: &str, mode: RearrangeSplit, delimiters: &str, rtl: bool) -> Vec<String> {
+/// The regex that splits a name at any of `delimiters` (`a|b|c`); `None` when there are none.
+fn delimiters_regex(delimiters: &str) -> Option<Regex> {
+    let seps: Vec<String> = delimiters.split('|').filter(|s| !s.is_empty()).map(regex::escape).collect();
+    if seps.is_empty() { None } else { Regex::new(&seps.join("|")).ok() }
+}
+
+/// `by_delimiters` is [`delimiters_regex`] of `delimiters`, used when `mode` splits by them.
+fn split_for_rearrange(stem: &str, mode: RearrangeSplit, delimiters: &str, by_delimiters: Option<&Regex>, rtl: bool) -> Vec<String> {
     let mut parts: Vec<String> = match mode {
         RearrangeSplit::ExactPattern => {
             if delimiters.is_empty() {
@@ -2358,15 +2469,10 @@ fn split_for_rearrange(stem: &str, mode: RearrangeSplit, delimiters: &str, rtl: 
                 stem.split(delimiters).map(str::to_string).collect()
             }
         }
-        RearrangeSplit::Delimiters => {
-            let seps: Vec<&str> = delimiters.split('|').filter(|s| !s.is_empty()).collect();
-            if seps.is_empty() {
-                vec![stem.to_string()]
-            } else {
-                let pat = seps.iter().map(|s| regex::escape(s)).collect::<Vec<_>>().join("|");
-                Regex::new(&pat).map_or_else(|_| vec![stem.to_string()], |re| re.split(stem).map(str::to_string).collect())
-            }
-        }
+        RearrangeSplit::Delimiters => match by_delimiters {
+            Some(re) => re.split(stem).map(str::to_string).collect(),
+            None => vec![stem.to_string()],
+        },
         RearrangeSplit::Positions => {
             let mut cuts: Vec<usize> = delimiters
                 .split(|c: char| !c.is_ascii_digit())
@@ -2398,8 +2504,7 @@ fn split_for_rearrange(stem: &str, mode: RearrangeSplit, delimiters: &str, rtl: 
 }
 
 fn apply_rearrange_pattern(orig: &str, parts: &[String], pattern: &str) -> String {
-    let re = Regex::new(r"\$(-?\d+)").unwrap();
-    re.replace_all(pattern, |caps: &regex::Captures| {
+    RE_PART_REF.replace_all(pattern, |caps: &regex::Captures| {
         let idx: isize = caps[1].parse().unwrap_or(0);
         if idx == 0 {
             orig.to_string()
@@ -2691,33 +2796,42 @@ fn month_of(names: &[String; 12], text: &str) -> Option<u32> {
     names.iter().position(|n| n.to_lowercase() == text).map(|i| i as u32 + 1)
 }
 
-fn reformat_date_in_str(
-    input: &str,
-    find_fmt: &str,
-    replace_fmt: &str,
-    whole_words: bool,
-    months: (&[String; 12], &[String; 12]),
-    adjust: Option<(i64, TimeUnit)>,
-) -> Result<String, String> {
-    if find_fmt.trim().is_empty() || replace_fmt.trim().is_empty() {
-        return Ok(input.to_string());
+/// A Reformat Date rule ready to run on each name: the regex its find format makes, the fields
+/// that regex captures in order, the pieces of its replace format and the month names it uses.
+struct DatePlan<'a> {
+    re: Regex,
+    fields: Vec<DateTok<'a>>,
+    replace: Vec<DateTok<'a>>,
+    short: [String; 12],
+    long: [String; 12],
+}
+
+impl<'a> DatePlan<'a> {
+    /// `None` when a format is empty: the rule then changes nothing.
+    fn new(find_fmt: &'a str, replace_fmt: &'a str, short: [String; 12], long: [String; 12]) -> Result<Option<Self>, String> {
+        if find_fmt.trim().is_empty() || replace_fmt.trim().is_empty() {
+            return Ok(None);
+        }
+        let find = date_tokens(find_fmt);
+        let fields: Vec<DateTok> = find.iter().copied().filter(|t| !matches!(t, DateTok::Lit(_))).collect();
+        let pat: String = find
+            .iter()
+            .map(|t| match t {
+                DateTok::Lit(s) => regex::escape(s),
+                DateTok::Year4 => r"(\d{4})".into(),
+                DateTok::Year2 => r"(\d{2})".into(),
+                DateTok::MonthLong => names_group(&long),
+                DateTok::MonthShort => names_group(&short),
+                DateTok::Month | DateTok::Day | DateTok::Hour | DateTok::Minute | DateTok::Second => r"(\d{1,2})".into(),
+            })
+            .collect();
+        let re = Regex::new(&pat).map_err(|e| e.to_string())?;
+        Ok(Some(Self { re, fields, replace: date_tokens(replace_fmt), short, long }))
     }
-    let (short, long) = months;
-    let find = date_tokens(find_fmt);
-    let fields: Vec<DateTok> = find.iter().copied().filter(|t| !matches!(t, DateTok::Lit(_))).collect();
-    let pat: String = find
-        .iter()
-        .map(|t| match t {
-            DateTok::Lit(s) => regex::escape(s),
-            DateTok::Year4 => r"(\d{4})".into(),
-            DateTok::Year2 => r"(\d{2})".into(),
-            DateTok::MonthLong => names_group(long),
-            DateTok::MonthShort => names_group(short),
-            DateTok::Month | DateTok::Day | DateTok::Hour | DateTok::Minute | DateTok::Second => r"(\d{1,2})".into(),
-        })
-        .collect();
-    let re = Regex::new(&pat).map_err(|e| e.to_string())?;
-    let replace = date_tokens(replace_fmt);
+}
+
+fn reformat_date_in_str(input: &str, plan: &DatePlan, whole_words: bool, adjust: Option<(i64, TimeUnit)>) -> String {
+    let DatePlan { re, fields, replace, short, long } = plan;
 
     let mut out = String::with_capacity(input.len());
     let mut last = 0;
@@ -2730,7 +2844,7 @@ fn reformat_date_in_str(
                 continue;
             }
         }
-        let Some(mut dt) = read_date(&caps, &fields, short, long) else { continue };
+        let Some(mut dt) = read_date(&caps, fields, short, long) else { continue };
         out.push_str(&input[last..m.start()]);
         if let Some((amount, unit)) = adjust {
             dt = match unit {
@@ -2742,7 +2856,7 @@ fn reformat_date_in_str(
                 TimeUnit::Years => add_months(dt, amount * 12),
             };
         }
-        for t in &replace {
+        for t in replace {
             match t {
                 DateTok::Lit(s) => out.push_str(s),
                 DateTok::Year4 => out.push_str(&format!("{:04}", dt.year())),
@@ -2759,7 +2873,7 @@ fn reformat_date_in_str(
         last = m.end();
     }
     out.push_str(&input[last..]);
-    Ok(out)
+    out
 }
 
 /// Builds the date a match names. It needs a year, a month and a day; a time field left out is
@@ -3150,7 +3264,7 @@ mod tests {
         data.resize(64 + 42, 0);
         std::fs::write(dir.join("v.avi"), &data).unwrap();
         let entry = Entry { name: "v.avi".into(), ..file("v.avi") };
-        let got = rules_meta::resolve_tag("AVI_Width", &entry, &Location::Local(dir.clone()));
+        let got = rules_meta::resolve_tag_when_read("AVI_Width", &entry, &Location::Local(dir.clone()));
         assert_eq!(got.as_deref(), Some(""));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3190,5 +3304,179 @@ mod tests {
         rs.remove_selected();
         assert!(rs.rules.is_empty());
         assert!(!rs.all_selected);
+    }
+
+    fn folder(name: &str) -> Entry {
+        Entry { is_dir: true, ..file(name) }
+    }
+
+    /// The new name and the error one rule gives one item.
+    fn one(config: RuleConfig, item: Entry) -> (String, Option<String>) {
+        evaluate_rules(&[rule(config)], &[item], &[true], &Location::Local(PathBuf::from("C:/tmp"))).remove(0)
+    }
+
+    #[test]
+    fn sharepoint_clean_up_keeps_the_extension() {
+        let mut cfg = RuleConfig::default_for(RuleKind::CleanUp);
+        if let RuleConfig::CleanUp { replace_dot, prepare_sharepoint, .. } = &mut cfg {
+            *replace_dot = true;
+            *prepare_sharepoint = true;
+        }
+        assert_eq!(one(cfg.clone(), file("relatorio.final#v2.txt")).0, "relatorio final_v2.txt");
+        // SharePoint's own characters go from the extension too, as its box says ("always
+        // includes the extension"): the rest of the rule still leaves the extension alone.
+        assert_eq!(one(cfg, file("relatorio.final#v2.t~t")).0, "relatorio final_v2.t_t");
+    }
+
+    #[test]
+    fn remove_fills_in_the_meta_tags_its_button_inserts() {
+        let cfg = RuleConfig::Remove { text: "_:File_Extension:".into(), occurrences: Occurrences::All, case_sensitive: false, whole_words: false, skip_ext: true, wildcards: false };
+        let items = [file("relatorio_pdf.pdf"), file("foto_jpg.jpg"), file("nota_pdf.txt")];
+        let out = evaluate_rules(&[rule(cfg)], &items, &[true; 3], &Location::Local(PathBuf::from("C:/tmp")));
+        assert_eq!(out.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["relatorio.pdf", "foto.jpg", "nota_pdf.txt"]);
+    }
+
+    #[test]
+    fn a_word_between_colons_that_is_no_meta_tag_stays_as_typed() {
+        // A character class of a regex.
+        let cfg = RuleConfig::Regex { pattern: "[[:digit:]]+".into(), replace: "#".into(), case_sensitive: false, skip_ext: true };
+        assert_eq!(one(cfg, file("foto 123.jpg")), ("foto #.jpg".to_string(), None));
+        // A text to remove, where names take a colon (a server, Google Drive).
+        let cfg = RuleConfig::Remove { text: ":rascunho:".into(), occurrences: Occurrences::All, case_sensitive: false, whole_words: false, skip_ext: true, wildcards: false };
+        assert_eq!(one(cfg, file("nota :rascunho: final.txt")).0, "nota  final.txt");
+        // A real tag beside it is still filled in.
+        let mut cfg = RuleConfig::default_for(RuleKind::Insert);
+        if let RuleConfig::Insert { text, .. } = &mut cfg {
+            *text = ":nada: :File_Extension: ".into();
+        }
+        assert_eq!(one(cfg, file("a.txt")).0, ":nada: txt a.txt");
+    }
+
+    #[test]
+    fn a_meta_tag_goes_where_the_caret_is() {
+        let mut ed = RuleEditorState::from_config(RuleConfig::default_for(RuleKind::Insert));
+        ed.edit_a = TextEdit::new("ab");
+        ed.edit_a.set_caret(1);
+        ed.insert_meta_tag(MetaTagTarget::InsertText, "File_Size");
+        assert_eq!(ed.edit_a.text, "a:File_Size:b");
+        // In a script it lands inside the program, not after its `end.`.
+        let mut ed = RuleEditorState::from_config(RuleConfig::default_for(RuleKind::PascalScript));
+        ed.edit_a = TextEdit::new("begin\n  FileName := ;\nend.");
+        ed.edit_a.set_caret("begin\n  FileName := ".len());
+        ed.insert_meta_tag(MetaTagTarget::PascalScript, "File_Size");
+        assert_eq!(ed.edit_a.text, "begin\n  FileName := MetaTag(':File_Size:');\nend.");
+        // A field never touched takes it at its end, as before.
+        let mut ed = RuleEditorState::from_config(RuleConfig::default_for(RuleKind::Insert));
+        ed.edit_a = TextEdit::new("ab");
+        ed.insert_meta_tag(MetaTagTarget::InsertText, "File_Size");
+        assert_eq!(ed.edit_a.text, "ab:File_Size:");
+    }
+
+    #[test]
+    fn a_mapping_pair_typed_but_not_added_is_saved_with_the_rule() {
+        let mut rs = RulesState::new();
+        rs.open_add_at(None);
+        rs.editor.switch_kind(RuleKind::Mapping);
+        // A new mapping starts with no rows, not with an empty one.
+        assert!(matches!(&rs.editor.config, RuleConfig::Mapping { entries, .. } if entries.is_empty()));
+        rs.editor.map_key = TextEdit::new("antigo");
+        rs.editor.map_val = TextEdit::new("novo");
+        rs.commit_editor();
+        let RuleConfig::Mapping { entries, .. } = &rs.rules[0].config else { panic!() };
+        assert_eq!(entries, &[("antigo".to_string(), "novo".to_string())]);
+        assert!(rs.editor.map_key.text.is_empty() && rs.editor.map_val.text.is_empty());
+    }
+
+    #[test]
+    fn each_new_random_rule_draws_its_own_names() {
+        let seed_of = |ed: &RuleEditorState| match &ed.config {
+            RuleConfig::Random { seed, .. } => *seed,
+            _ => panic!(),
+        };
+        let mut a = RuleEditorState::from_config(RuleConfig::default_for(RuleKind::Insert));
+        a.switch_kind(RuleKind::Random);
+        let mut b = RuleEditorState::from_config(RuleConfig::default_for(RuleKind::Insert));
+        b.switch_kind(RuleKind::Random);
+        assert_ne!(seed_of(&a), seed_of(&b));
+        // The rule keeps its seed: the preview shows the same names at every drawing.
+        let rules = [rule(a.config.clone())];
+        let items = [file("a.txt"), file("b.txt")];
+        let loc = Location::Local(PathBuf::from("C:/tmp"));
+        assert_eq!(evaluate_rules(&rules, &items, &[true; 2], &loc), evaluate_rules(&rules, &items, &[true; 2], &loc));
+    }
+
+    #[test]
+    fn the_extension_case_needs_no_skip_extension() {
+        let case = |mode, ext_lower, ext_upper| RuleConfig::Case { mode, preserve_case: false, skip_ext: false, force_fragments: false, fragments: String::new(), ext_lower, ext_upper };
+        assert_eq!(one(case(CaseMode::Upper, true, false), file("Foto.Jpg")).0, "FOTO.jpg");
+        assert_eq!(one(case(CaseMode::None, false, true), file("foto.jpg")).0, "foto.JPG");
+        // A folder has no extension: its dot is part of its name.
+        assert_eq!(one(case(CaseMode::None, false, true), folder("pasta.abc")).0, "pasta.abc");
+    }
+
+    #[test]
+    fn the_extension_rule_leaves_folders_alone() {
+        let mut cfg = RuleConfig::default_for(RuleKind::Extension);
+        if let RuleConfig::Extension { new_ext, .. } = &mut cfg {
+            *new_ext = "txt".into();
+        }
+        assert_eq!(one(cfg.clone(), file("notas.md")).0, "notas.txt");
+        assert_eq!(one(cfg.clone(), folder("Fotos.2024")).0, "Fotos.2024");
+        assert_eq!(one(cfg, folder("Fotos")).0, "Fotos");
+    }
+
+    #[test]
+    fn mapping_ignores_the_case_of_accented_letters() {
+        let cfg = RuleConfig::Mapping { entries: vec![("école".into(), "school".into())], allow_reuse: true, partial_match: false, inverse: false, case_sensitive: false, skip_ext: true };
+        assert_eq!(one(cfg, file("ÉCOLE.txt")).0, "school.txt");
+    }
+
+    #[test]
+    fn a_search_that_is_no_regex_marks_every_checked_item() {
+        // `[z-a]` is a wildcard class that no regex takes.
+        let cfg = RuleConfig::Replace { find: "[z-a]".into(), replace: "x".into(), occurrences: Occurrences::All, case_sensitive: false, whole_words: false, skip_ext: true, wildcards: true };
+        let items = [file("a.txt"), file("b.txt"), file("c.txt")];
+        let out = evaluate_rules(&[rule(cfg)], &items, &[true, false, true], &Location::Local(PathBuf::from("C:/tmp")));
+        assert_eq!(out.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["a.txt", "b.txt", "c.txt"]);
+        assert_eq!(out.iter().map(|(_, error)| error.is_some()).collect::<Vec<_>>(), [true, false, true]);
+    }
+
+    #[test]
+    fn a_regex_with_a_meta_tag_reads_each_item() {
+        let cfg = RuleConfig::Regex { pattern: "_:File_Extension:$".into(), replace: String::new(), case_sensitive: false, skip_ext: true };
+        let items = [file("a_txt.txt"), file("b_pdf.pdf"), file("c_txt.pdf")];
+        let out = evaluate_rules(&[rule(cfg)], &items, &[true; 3], &Location::Local(PathBuf::from("C:/tmp")));
+        assert_eq!(out.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["a.txt", "b.pdf", "c_txt.pdf"]);
+    }
+
+    #[test]
+    fn a_script_that_never_ends_stops_the_whole_batch() {
+        let cfg = RuleConfig::PascalScript { code: "begin while true do FileName := FileName; end.".into() };
+        let items: Vec<Entry> = (0..2_000).map(|i| file(&format!("f{i}.txt"))).collect();
+        let started = std::time::Instant::now();
+        let out = evaluate_rules(&[rule(cfg)], &items, &vec![true; items.len()], &Location::Local(PathBuf::from("C:/tmp")));
+        assert!(out.iter().all(|(_, error)| error.is_some()));
+        // One item runs to the limit, not each of them (minutes, unoptimized).
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn script_arithmetic_never_panics() {
+        for code in [
+            "begin FileName := IntToStr((0 - 9223372036854775807 - 1) div (0 - 1)); end.",
+            "begin FileName := IntToStr((0 - 9223372036854775807 - 1) mod (0 - 1)); end.",
+            "begin FileName := IntToStr(9223372036854775807 + 1); end.",
+            "begin FileName := IntToStr(9223372036854775807 * 2); end.",
+            "begin FileName := IntToStr(-(0 - 9223372036854775807 - 1)); end.",
+        ] {
+            let (name, error) = one(RuleConfig::PascalScript { code: code.into() }, file("a.txt"));
+            assert!(error.is_none() && !name.is_empty(), "{code}: {name:?} {error:?}");
+        }
+    }
+
+    #[test]
+    fn a_script_error_names_the_accented_character() {
+        let (_, error) = one(RuleConfig::PascalScript { code: "begin é end.".into() }, file("a.txt"));
+        assert!(error.as_deref().is_some_and(|e| e.contains('é')), "{error:?}");
     }
 }

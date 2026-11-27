@@ -342,6 +342,7 @@ pub const MOVIE_PRESETS: &[FormatPreset] = &[
 pub struct ParsedFile {
     pub stem: String,
     pub ext: String,
+    /// Empty when the name holds none (`S01E01.mkv`).
     pub title: String,
     pub kind: MediaKind,
     pub season: Option<u32>,
@@ -351,7 +352,9 @@ pub struct ParsedFile {
 }
 
 static RE_SXXEXX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)(?:^|[\s._\-\(\[])S(\d{1,2})[\s._\-]?E(\d{1,3})(?:[\s._\-]?E?(\d{1,3}))?(?:$|[\s._\-\)\]])").unwrap());
+    // A second episode has its own `E` (`S01E01E02`, `S01E01-E02`) or a hyphen (`S01E01-02`): a
+    // bare number after a dot is something else, as the 5.1 of the sound.
+    LazyLock::new(|| Regex::new(r"(?i)(?:^|[\s._\-\(\[])S(\d{1,2})[\s._\-]?E(\d{1,3})(?:[\s._\-]?E(\d{1,3})|-(\d{1,3}))?(?:$|[\s._\-\)\]])").unwrap());
 static RE_NXNN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)(?:^|[\s._\-\(\[])(\d{1,2})x(\d{1,3})(?:[\-x](\d{1,3}))?(?:$|[\s._\-\)\]])").unwrap());
 static RE_EP_WORD: LazyLock<Regex> =
@@ -361,10 +364,35 @@ static RE_ANIME_DASH: LazyLock<Regex> =
 static RE_YEAR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:^|[\s._\-\(\[])((?:19|20)\d{2})(?:$|[\s._\-\)\]])").unwrap());
 static RE_BRACKETS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[[^\]]*\]|\([^)]*(?:1080p|720p|2160p|480p|x264|x265|hevc|web|bluray|aac|flac|dual|10bit)[^)]*\)").unwrap());
-static RE_NOISE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:^|[\s._\-])(2160p|1080p|720p|480p|4k|uhd|hdr10?|dv|web[\s._\-]?dl|webrip|bluray|bdrip|brrip|hdtv|dvdrip|remux|amzn|nf|dsnp|hmax|atvp|x264|x265|h\.?264|h\.?265|hevc|av1|xvid|aac\d*(?:\.\d)?|ddp?\d*(?:\.\d)?|ac3|dts|atmos|truehd|flac|dual|dublado|legendado|multi|repack|proper|extended|unrated|directors[\s._\-]?cut|10bit|8bit).*$")
+/// The words that only a release name has (its picture, source and codec): the title ends where
+/// the first one starts.
+static RE_RELEASE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:^|[\s._\-])(?:2160p|1080p|720p|480p|web[\s._\-]?dl|webrip|bluray|bdrip|brrip|hdtv|dvdrip|remux|x264|x265|h\.?264|h\.?265|hevc|xvid)(?:$|[\s._\-\)\]]).*$").unwrap()
+});
+/// A word a release name adds that a title can hold too ("Dual Survival", "The Extended
+/// Family"): it goes only from the end of the title, where nothing of the title follows it.
+static RE_RELEASE_TAIL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:^|[\s._\-]+)(?:4k|uhd|hdr10?|dv|amzn|nf|dsnp|hmax|atvp|av1|aac\d*(?:\.\d)?|ddp?\d*(?:\.\d)?|ac3|dts|atmos|truehd|flac|dual|dublado|legendado|multi|repack|proper|extended|unrated|directors[\s._\-]?cut|10bit|8bit)[\s._\-]*$")
         .unwrap()
 });
+
+/// `raw` without the release words after the title. A title made only of such words ("Dual")
+/// keeps them.
+fn without_release_words(raw: &str) -> String {
+    let cut = RE_RELEASE.replace(raw, "").into_owned();
+    let mut title = cut.as_str();
+    while let Some(m) = RE_RELEASE_TAIL.find(title) {
+        title = &title[..m.start()];
+    }
+    let named = |s: &str| s.chars().any(char::is_alphanumeric);
+    if named(title) { title.to_string() } else { cut }
+}
+
+/// Whether a number after a dash reads as a year ("Blade Runner - 2049") rather than as an
+/// episode: no show has that many.
+fn is_year(number: &str) -> bool {
+    number.len() == 4 && matches!(number.parse::<u32>(), Ok(1900..=2099))
+}
 
 /// Parses a media filename into its detected title, media kind (Series vs Movie), season/episode
 /// numbers, and release year.
@@ -385,7 +413,7 @@ pub fn parse_filename(name: &str, is_dir: bool) -> ParsedFile {
         season = cap.get(1).and_then(|c| c.as_str().parse().ok());
         if let Some(e1) = cap.get(2).and_then(|c| c.as_str().parse::<u32>().ok()) {
             episodes.push(e1);
-            if let Some(e2) = cap.get(3).and_then(|c| c.as_str().parse::<u32>().ok())
+            if let Some(e2) = cap.get(3).or_else(|| cap.get(4)).and_then(|c| c.as_str().parse::<u32>().ok())
                 && e2 > e1
                 && e2 - e1 <= 4
             {
@@ -409,7 +437,7 @@ pub fn parse_filename(name: &str, is_dir: bool) -> ParsedFile {
                 }
             }
         }
-    } else if let Some(cap) = RE_ANIME_DASH.captures(&stem) {
+    } else if let Some(cap) = RE_ANIME_DASH.captures(&stem).filter(|cap| !is_year(&cap[1])) {
         let m = cap.get(0).unwrap();
         cut_at = Some(m.start());
         if let Some(ep) = cap.get(1).and_then(|c| c.as_str().parse::<u32>().ok()) {
@@ -453,7 +481,7 @@ pub fn parse_filename(name: &str, is_dir: bool) -> ParsedFile {
 
     let raw_title = &title_src[..title_cut];
     let stripped = RE_BRACKETS.replace_all(raw_title, " ");
-    let stripped = RE_NOISE.replace_all(&stripped, "");
+    let stripped = without_release_words(&stripped);
     let cleaned: String = stripped
         .chars()
         .map(|c| match c {
@@ -471,7 +499,7 @@ pub fn parse_filename(name: &str, is_dir: bool) -> ParsedFile {
     ParsedFile {
         stem,
         ext,
-        title: if title.is_empty() { name.to_string() } else { title },
+        title,
         kind,
         season,
         episodes,
@@ -485,17 +513,13 @@ pub fn detect_batch_query(parsed: &[ParsedFile]) -> (String, MediaKind, Option<u
     let series_count = parsed.iter().filter(|p| p.kind == MediaKind::Series).count();
     let kind = if series_count > 0 { MediaKind::Series } else { MediaKind::Movie };
 
-    let mut counts: HashMap<String, (usize, String)> = HashMap::new();
-    for p in parsed {
-        let key = p.title.to_lowercase();
-        let entry = counts.entry(key).or_insert_with(|| (0, p.title.clone()));
-        entry.0 += 1;
+    // The title most of the files have; among those tied, the first, so the same batch always
+    // searches the same title. Files that name none don't count.
+    let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
+    for (i, p) in parsed.iter().enumerate().filter(|(_, p)| !p.title.is_empty()) {
+        counts.entry(p.title.to_lowercase()).or_insert((0, i)).0 += 1;
     }
-    let query = counts
-        .into_values()
-        .max_by_key(|(c, _)| *c)
-        .map(|(_, t)| t)
-        .unwrap_or_default();
+    let query = counts.into_values().max_by_key(|&(count, first)| (count, std::cmp::Reverse(first))).map(|(_, first)| parsed[first].title.clone()).unwrap_or_default();
 
     let year = parsed.iter().find_map(|p| p.year);
     (query, kind, year)
@@ -624,6 +648,11 @@ pub struct MediaState {
     pub query: TextEdit,
     pub format: TextEdit,
     pub parsed: Vec<ParsedFile>,
+    /// The title most of the files name, as [`norm_title`] writes it: the one the batch
+    /// searches by default.
+    pub batch_title: String,
+    /// The title last searched, written the same way: the user may have typed another.
+    pub searched_title: String,
     pub detected_year: Option<u32>,
     pub candidates: Vec<Candidate>,
     pub selected: Option<usize>,
@@ -642,17 +671,40 @@ pub struct MediaState {
     pub analyze_input: TextEdit,
     pub popup: Option<MediaPopup>,
     pub open_dropdown: Option<PrefDropdown>,
+    /// The match as it was when the title picker opened or a search began: Cancel there goes
+    /// back to it.
+    before: Option<MatchBefore>,
+}
+
+/// What a search and the title picker change, kept to put back.
+#[derive(Clone)]
+struct MatchBefore {
+    candidates: Vec<Candidate>,
+    selected: Option<usize>,
+    episodes: Vec<EpisodeInfo>,
+    episodes_for: Option<String>,
+    query: String,
+    searched_title: String,
+    // What the Match menu sets before it searches.
+    source: DataSource,
+    kind: MediaKind,
+    order: EpisodeOrder,
+    format: String,
 }
 
 impl MediaState {
     pub fn new(items: &[Entry]) -> Self {
+        Self::with_keys(items, MediaKeys::load())
+    }
+
+    /// The state with these keys rather than those of the system's credential store.
+    pub fn with_keys(items: &[Entry], keys: MediaKeys) -> Self {
         let parsed: Vec<ParsedFile> = items.iter().map(|e| parse_filename(&shown(&e.name), e.is_dir)).collect();
         let (query_text, kind, detected_year) = detect_batch_query(&parsed);
         let default_format = match kind {
             MediaKind::Series => SERIES_PRESETS[0].template,
             MediaKind::Movie => MOVIE_PRESETS[0].template,
         };
-        let keys = MediaKeys::load();
         let source = if !keys.tmdb.is_empty() || keys.tvdb.is_empty() { DataSource::Tmdb } else { DataSource::Tvdb };
         Self {
             source,
@@ -660,6 +712,8 @@ impl MediaState {
             order: EpisodeOrder::Airdate,
             lang: MediaLang::PtBr,
             match_mode: MatchMode::Opportunistic,
+            batch_title: norm_title(&query_text),
+            searched_title: String::new(),
             query: TextEdit::new(query_text),
             format: TextEdit::new(default_format),
             parsed,
@@ -679,10 +733,36 @@ impl MediaState {
             keys,
             popup: None,
             open_dropdown: None,
+            before: None,
+        }
+    }
+
+    /// Opens the title picker, keeping the match as it is for Cancel to go back to.
+    pub fn open_picker(&mut self) {
+        self.keep_before();
+        self.popup = Some(MediaPopup::SelectMatch);
+    }
+
+    /// Keeps the match as it is, unless one is kept already (a search from inside the picker).
+    fn keep_before(&mut self) {
+        if self.before.is_none() {
+            self.before = Some(MatchBefore {
+                candidates: self.candidates.clone(),
+                selected: self.selected,
+                episodes: self.episodes.clone(),
+                episodes_for: self.episodes_for.clone(),
+                query: self.query.text.clone(),
+                searched_title: self.searched_title.clone(),
+                source: self.source,
+                kind: self.kind,
+                order: self.order,
+                format: self.format.text.clone(),
+            });
         }
     }
 
     pub fn clear_match(&mut self) {
+        self.before = None;
         self.candidates.clear();
         self.selected = None;
         self.episodes.clear();
@@ -792,14 +872,39 @@ impl MediaState {
         }
     }
 
-    /// Closes the open popup. Leaving the picker without confirming goes back to the candidate
-    /// whose episodes are loaded, instead of keeping the one only highlighted there.
+    /// Closes the open popup without confirming what it shows. The title picker goes back to
+    /// the match as it was when it opened (a search made there replaces the candidates, and its
+    /// first result would stay as the match); Preferences drops a key typed and not saved.
     pub fn close_popup(&mut self) {
-        if self.popup == Some(MediaPopup::SelectMatch)
-            && let Some(id) = &self.episodes_for
-            && let Some(i) = self.candidates.iter().position(|c| c.id == *id)
-        {
-            self.selected = Some(i);
+        match self.popup {
+            Some(MediaPopup::SelectMatch) => {
+                if let Some(before) = self.before.take() {
+                    self.candidates = before.candidates;
+                    self.selected = before.selected;
+                    self.episodes = before.episodes;
+                    self.episodes_for = before.episodes_for;
+                    self.query = TextEdit::new(before.query);
+                    self.searched_title = before.searched_title;
+                    (self.source, self.kind, self.order) = (before.source, before.kind, before.order);
+                    self.format = TextEdit::new(before.format);
+                    // A search or a list of episodes still on its way is of what was left.
+                    self.search_seq += 1;
+                    self.episodes_seq += 1;
+                    self.searching = false;
+                    self.loading_episodes = false;
+                    self.error = None;
+                } else if let Some(id) = &self.episodes_for
+                    && let Some(i) = self.candidates.iter().position(|c| c.id == *id)
+                {
+                    // The candidate whose episodes are loaded, not the one only highlighted.
+                    self.selected = Some(i);
+                }
+            }
+            Some(MediaPopup::Preferences) => {
+                self.tmdb_key_edit = TextEdit::new(self.keys.tmdb.clone());
+                self.tvdb_key_edit = TextEdit::new(self.keys.tvdb.clone());
+            }
+            _ => {}
         }
         self.popup = None;
     }
@@ -828,6 +933,9 @@ impl MediaState {
     pub fn format_item(&self, idx: usize, loc: &Location) -> Option<String> {
         let cand = self.active_candidate()?;
         let parsed = self.parsed.get(idx)?;
+        if self.names_another_title(parsed) {
+            return None;
+        }
 
         match cand.kind {
             MediaKind::Movie => {
@@ -854,6 +962,30 @@ impl MediaState {
                 Some(format!("{clean}{}", parsed.ext))
             }
         }
+    }
+
+    /// Whether `parsed` names another show or movie than the rest of the batch. One match names
+    /// every file, so a file of another title would take this one's name and episodes: it is
+    /// left out, to be matched in a batch of its own. A title that only adds words to the
+    /// batch's, or drops some ("Show" and "Show US"), is the same; a file that names no title
+    /// goes with the others.
+    fn names_another_title(&self, parsed: &ParsedFile) -> bool {
+        let title = norm_title(&parsed.title);
+        !title.is_empty() && !same_title(&title, self.matched_title())
+    }
+
+    /// The title the match is for, among those the files name: the one searched when files
+    /// name it (the user picked one of the batch's shows), else the one most of them name
+    /// (the search spelled it another way: "TBBT" for The Big Bang Theory).
+    fn matched_title(&self) -> &str {
+        let searched = self.searched_title.as_str();
+        if !searched.is_empty() && self.parsed.iter().any(|p| !p.title.is_empty() && same_title(&norm_title(&p.title), searched)) { searched } else { &self.batch_title }
+    }
+
+    /// Why the match leaves item `idx` as it is, for its row to say: only when that isn't plain.
+    pub fn skipped_note(&self, idx: usize) -> Option<String> {
+        let parsed = self.parsed.get(idx)?;
+        (self.active_candidate().is_some() && self.names_another_title(parsed)).then(|| t("Outro título: renomeie à parte", "Another title: rename it apart").into())
     }
 
     fn resolve_episode(&self, idx: usize, parsed: &ParsedFile) -> Option<EpisodeInfo> {
@@ -1020,12 +1152,20 @@ fn sanitize_filename(name: &str, loc: &Location) -> String {
 
 /// Normalizes a title for confidence comparison (lowercase alphanumeric tokens only).
 fn norm_title(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Whether two titles, as [`norm_title`] writes them, are of the same show or movie: one may
+/// add words to the other ("Show" and "Show US"). An empty one is of any.
+fn same_title(a: &str, b: &str) -> bool {
+    let starts = |long: &str, short: &str| long.strip_prefix(short).is_some_and(|rest| rest.is_empty() || rest.starts_with(' '));
+    a.is_empty() || b.is_empty() || starts(a, b) || starts(b, a)
 }
 
 /// Returns `true` when the top search candidate is a clear, unambiguous match (so we can apply
@@ -1069,6 +1209,8 @@ pub fn save_keys(s: &mut State) {
 
 pub fn match_with(s: &mut State, source: DataSource, kind: MediaKind) {
     if let Some(br) = &mut s.batch_rename {
+        // Before the menu's choice changes anything: Cancel in the picker undoes it too.
+        br.media.keep_before();
         br.media.source = source;
         br.media.order = EpisodeOrder::Airdate;
         br.media.set_kind(kind);
@@ -1086,6 +1228,7 @@ pub fn match_with(s: &mut State, source: DataSource, kind: MediaKind) {
 /// Matches as Anime using Absolute episode ordering and the default Anime preset (if on a preset).
 pub fn match_anime(s: &mut State, source: DataSource) {
     if let Some(br) = &mut s.batch_rename {
+        br.media.keep_before();
         br.media.source = source;
         br.media.kind = MediaKind::Series;
         br.media.order = EpisodeOrder::Absolute;
@@ -1125,7 +1268,7 @@ pub fn start_search(s: &mut State) {
     let m = &mut br.media;
     let query = m.query.text.trim().to_string();
     if query.is_empty() {
-        m.popup = Some(MediaPopup::SelectMatch);
+        m.open_picker();
         m.error = Some(t("Digite o nome da série, anime ou filme para buscar.", "Type the series, anime or movie title to search.").into());
         return;
     }
@@ -1139,6 +1282,9 @@ pub fn start_search(s: &mut State) {
         return;
     }
 
+    // The results replace the candidates: Cancel in the picker goes back to these.
+    m.keep_before();
+    m.searched_title = norm_title(&query);
     m.search_seq += 1;
     let seq = m.search_seq;
     let source = m.source;
@@ -1178,6 +1324,8 @@ pub fn select_candidate(s: &mut State, idx: usize) {
     if idx >= br.media.candidates.len() {
         return;
     }
+    // Confirmed: there's nothing to go back to.
+    br.media.before = None;
     br.media.selected = Some(idx);
     br.media.popup = None;
     br.media.episodes.clear();
@@ -1247,6 +1395,7 @@ pub fn arrived(s: &mut State, ans: Answer) {
                             && is_confident_match(&br.media.query.text, br.media.detected_year, &br.media.candidates)
                         {
                             // High confidence: auto-apply immediately without interrupting the user.
+                            br.media.before = None;
                             br.media.selected = Some(0);
                             br.media.error = None;
                             should_fetch_eps = br.media.candidates[0].kind == MediaKind::Series;
@@ -1301,8 +1450,11 @@ pub fn arrived(s: &mut State, ans: Answer) {
 // ---------------------------------------------------------------------------------------------
 // HTTP Clients: TMDB v3 & TVDB v4
 
+/// One agent for every request: it keeps its connections open, so the requests of a search (a
+/// show's seasons, one after another) don't each open one and greet the server again.
 fn http_agent() -> ureq::Agent {
-    ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).build().into()
+    static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).build().into());
+    AGENT.clone()
 }
 
 fn fetch_poster_bytes(url: &str) -> Result<Vec<u8>, String> {
@@ -1715,5 +1867,59 @@ mod tests {
         let mstem = render_template("{n} ({y})", &movie, None, &mp);
         let msafe = sanitize_filename(&mstem, &Location::Local(PathBuf::from("C:/Movies")));
         assert_eq!(msafe, "Dune - Part Two (2024)");
+    }
+
+    #[test]
+    fn a_title_word_that_looks_like_a_release_word_stays() {
+        for (name, title) in [
+            ("Property.Brothers.S01E01.720p.mkv", "Property Brothers"),
+            ("Flack.S02E03.1080p.WEB.mkv", "Flack"),
+            ("Dual.Survival.S01E01.mkv", "Dual Survival"),
+            ("The.Extended.Family.S01E02.mkv", "The Extended Family"),
+            ("Multiverse.of.Madness.2022.1080p.mkv", "Multiverse of Madness"),
+            ("Atmosphere.2019.mkv", "Atmosphere"),
+            ("Dual.2022.1080p.WEB-DL.mkv", "Dual"),
+            // Release words still end the title, with or without a year before them.
+            ("Breaking.Bad.S01E01.Pilot.1080p.BluRay.x264.mkv", "Breaking Bad"),
+            ("Some.Movie.Extended.1080p.BluRay.x264-GRP.mkv", "Some Movie"),
+            ("Some.Movie.NF.WEB-DL.DDP5.1.Atmos.mkv", "Some Movie"),
+            ("Some.Movie.DUAL.mkv", "Some Movie"),
+        ] {
+            assert_eq!(parse_filename(name, false).title, title, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_year_after_a_dash_is_not_an_episode() {
+        for name in ["Blade Runner - 2049.mkv", "Movie Name - 2019.mkv"] {
+            let p = parse_filename(name, false);
+            assert_eq!((p.kind, p.absolute, p.episodes.as_slice()), (MediaKind::Movie, None, &[][..]), "{name}");
+        }
+        assert_eq!(parse_filename("Blade Runner - 2049.mkv", false).title, "Blade Runner");
+        assert_eq!(parse_filename("Movie Name - 2019.mkv", false).year, Some(2019));
+        // A long anime's episode past 1,000 still reads as one.
+        assert_eq!(parse_filename("[Sub] One Piece - 1071 (1080p).mkv", false).absolute, Some(1071));
+    }
+
+    #[test]
+    fn a_number_after_the_episode_is_no_second_episode() {
+        // The 5.1 of the sound.
+        assert_eq!(parse_filename("Show.S01E02.5.1.mkv", false).episodes, [2]);
+        assert_eq!(parse_filename("Show.S01E02.720p.mkv", false).episodes, [2]);
+        for name in ["Show.S01E02E03.mkv", "Show.S01E02-E03.mkv", "Show.S01E02.E03.mkv", "Show.S01E02-03.mkv"] {
+            assert_eq!(parse_filename(name, false).episodes, [2, 3], "{name}");
+        }
+    }
+
+    #[test]
+    fn the_batch_title_is_the_most_common_then_the_first() {
+        let parsed = |names: &[&str]| names.iter().map(|n| parse_filename(n, false)).collect::<Vec<_>>();
+        assert_eq!(detect_batch_query(&parsed(&["Beta.S01E01.mkv", "Alpha.S01E01.mkv", "Alpha.S01E02.mkv"])).0, "Alpha");
+        // A tie: the first title, the same at every run.
+        for _ in 0..20 {
+            assert_eq!(detect_batch_query(&parsed(&["Gamma.S01E01.mkv", "Beta.S01E01.mkv", "Alpha.S01E01.mkv"])).0, "Gamma");
+        }
+        // Files that name no title leave the search to the user.
+        assert_eq!(detect_batch_query(&parsed(&["S01E01.mkv", "S01E02.mkv"])).0, "");
     }
 }

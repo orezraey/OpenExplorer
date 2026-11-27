@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{LazyLock, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local, Utc};
 use openexplorer_i18n::t;
@@ -303,25 +303,43 @@ pub const META_TAGS: &[MetaTagDef] = &[
 static TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r":([A-Za-z0-9_]+):").unwrap());
 static TAG_CACHE: LazyLock<Mutex<HashMap<(String, String), String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Hashes read whole files, minutes for big videos or a network drive: they run on one
-/// background thread, so the window never waits on them. The jobs asked for, by cache key.
-static HASH_PENDING: LazyLock<Mutex<std::collections::HashSet<(String, String)>>> = LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
-/// A file tag to compute: the file's path as the cache keys it, the tag, the path, the item.
-type HashJob = (String, String, std::path::PathBuf, Entry);
-static HASH_QUEUE: LazyLock<Mutex<Option<Sender<HashJob>>>> = LazyLock::new(|| Mutex::new(None));
-/// Set when a background hash lands, for the batch window's poll to draw again.
+/// Tags read from the disk (a file's dates, its EXIF, its tags of music, its hash) run on one
+/// background thread, so the window never waits on them: a hash reads a whole file, minutes
+/// for big videos, and even a few bytes of each of 10,000 files, or of one on a network drive,
+/// froze the preview. The jobs asked for, by cache key.
+static TAG_PENDING: LazyLock<Mutex<std::collections::HashSet<(String, String)>>> = LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+/// A file tag to compute.
+struct TagJob {
+    /// The [`GENERATION`] it was asked in.
+    generation: u64,
+    /// The file's path as the cache keys it, and the tag.
+    key: (String, String),
+    path: std::path::PathBuf,
+    entry: Entry,
+}
+static TAG_QUEUE: LazyLock<Mutex<Option<Sender<TagJob>>>> = LazyLock::new(|| Mutex::new(None));
+/// Goes up when the batch window takes other items or closes ([`forget`]): the tags asked
+/// before are of files nobody looks at any more, and aren't read.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Set when a background tag lands, for the batch window's poll to draw again.
 static CHANGED: AtomicBool = AtomicBool::new(false);
 static WAKER: LazyLock<Mutex<Option<rune::Waker>>> = LazyLock::new(|| Mutex::new(None));
+/// The window is woken this often while tags land one after another, and when the last one
+/// does: each waking previews the whole batch again, too much to do for each of 10,000 tags.
+const WAKE_EVERY: Duration = Duration::from_millis(100);
 
 thread_local! {
     /// Whether the current preview pass met a tag still being computed.
     static WAITED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The clipboard's first line, read once for the pass: `:Clipboard:` is the same for every
+    /// item, and opening the clipboard for each one cost more than the rest of the preview.
+    static CLIPBOARD: std::cell::RefCell<Option<Option<String>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// What a tag still being computed shows meanwhile.
 pub const PENDING: &str = "…";
 
-/// The batch window's waker, called when a background hash lands.
+/// The batch window's waker, called when a background tag lands.
 pub fn set_waker(waker: rune::Waker) {
     *WAKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker);
 }
@@ -329,54 +347,103 @@ pub fn set_waker(waker: rune::Waker) {
 /// Starts a preview pass: [`waited`] then says whether it met a tag still being computed.
 pub fn begin_pass() {
     WAITED.with(|w| w.set(false));
+    CLIPBOARD.with(|c| c.borrow_mut().take());
 }
 
 pub fn waited() -> bool {
     WAITED.with(std::cell::Cell::get)
 }
 
-/// Whether a background hash landed since the last call.
+/// Whether a background tag landed since the last call.
 pub fn take_changed() -> bool {
     CHANGED.swap(false, Ordering::AcqRel)
 }
 
+fn generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
+}
+
+fn wake() {
+    if let Some(wake) = WAKER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        wake();
+    }
+}
+
 /// Queues `tag` of the file at `path` for the background thread, once.
 fn compute_later(key: (String, String), path: std::path::PathBuf, entry: &Entry) {
-    if !HASH_PENDING.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone()) {
+    if !TAG_PENDING.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone()) {
         return;
     }
-    let mut queue = HASH_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut queue = TAG_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     let tx = queue.get_or_insert_with(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<HashJob>();
+        let (tx, rx) = std::sync::mpsc::channel::<TagJob>();
         std::thread::spawn(move || {
-            for (file, tag, path, entry) in rx {
-                let val = compute_file_tag(&tag, &path, &entry).unwrap_or_default();
-                let key = (file, tag);
-                if let Ok(mut g) = TAG_CACHE.lock() {
-                    g.insert(key.clone(), val);
+            let mut woke = Instant::now();
+            while let Ok(mut job) = rx.recv() {
+                loop {
+                    compute_now(job);
+                    if woke.elapsed() >= WAKE_EVERY {
+                        wake();
+                        woke = Instant::now();
+                    }
+                    match rx.try_recv() {
+                        Ok(next) => job = next,
+                        Err(_) => break,
+                    }
                 }
-                HASH_PENDING.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
-                CHANGED.store(true, Ordering::Release);
-                if let Some(wake) = WAKER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                    wake();
-                }
+                wake();
+                woke = Instant::now();
             }
         });
         tx
     });
-    let (file, tag) = key;
-    if let Err(job) = tx.send((file, tag, path, entry.clone())) {
+    if let Err(job) = tx.send(TagJob { generation: generation(), key, path, entry: entry.clone() }) {
         // The thread is gone: forget the job, so the next pass asks again.
         *queue = None;
-        let (file, tag, ..) = job.0;
-        HASH_PENDING.lock().unwrap_or_else(|e| e.into_inner()).remove(&(file, tag));
+        TAG_PENDING.lock().unwrap_or_else(|e| e.into_inner()).remove(&job.0.key);
     }
 }
 
-pub fn clear_cache() {
+/// Computes a queued tag and keeps it, unless the batch it was asked for is gone.
+fn compute_now(job: TagJob) {
+    let stale = || job.generation != generation();
+    if stale() {
+        return;
+    }
+    // A reader that panics on a damaged file gives no tag: the thread goes on, and the preview
+    // doesn't wait for ever on a tag that would never land.
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compute_file_tag(&job.key.1, &job.path, &job.entry, &stale)));
+    let val = read.ok().flatten().unwrap_or_default();
+    if stale() {
+        return;
+    }
+    if let Ok(mut g) = TAG_CACHE.lock() {
+        g.insert(job.key.clone(), val);
+    }
+    TAG_PENDING.lock().unwrap_or_else(|e| e.into_inner()).remove(&job.key);
+    CHANGED.store(true, Ordering::Release);
+}
+
+/// Drops what was read and what is still asked for, when the batch window takes other items or
+/// closes: the next batch reads its files afresh, and a hash of a big file nobody waits for
+/// stops being read.
+pub fn forget() {
+    GENERATION.fetch_add(1, Ordering::AcqRel);
     if let Ok(mut g) = TAG_CACHE.lock() {
         g.clear();
     }
+    TAG_PENDING.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// Whether `input` holds a `:TagName:` placeholder, so it reads differently for each item.
+pub fn has_tags(input: &str) -> bool {
+    input.contains(':') && TAG_REGEX.captures_iter(input).any(|caps| is_tag(&caps[1]))
+}
+
+/// Whether `name` is a meta tag. A word between colons that isn't one is text as typed: a
+/// regex's `[[:digit:]]`, a name with colons on a server.
+fn is_tag(name: &str) -> bool {
+    META_TAGS.iter().any(|tag| tag.name == name)
 }
 
 /// Expands all `:TagName:` placeholders inside `input` for `entry` at `loc`.
@@ -387,7 +454,7 @@ pub fn expand_tags(input: &str, entry: &Entry, loc: &Location) -> String {
     TAG_REGEX
         .replace_all(input, |caps: &regex::Captures| {
             let tag_name = &caps[1];
-            resolve_tag(tag_name, entry, loc).unwrap_or_default()
+            if is_tag(tag_name) { resolve_tag(tag_name, entry, loc).unwrap_or_default() } else { caps[0].to_string() }
         })
         .into_owned()
 }
@@ -398,7 +465,8 @@ pub fn resolve_tag(tag: &str, entry: &Entry, loc: &Location) -> Option<String> {
         return Some(Local::now().format("%Y-%m-%d %H-%M-%S").to_string());
     }
     if tag == "Clipboard" {
-        return arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()).map(|s| s.lines().next().unwrap_or("").to_string());
+        let read = || arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()).map(|s| s.lines().next().unwrap_or("").to_string());
+        return CLIPBOARD.with(|c| c.borrow_mut().get_or_insert_with(read).clone());
     }
 
     let local_path = loc.local_path(entry);
@@ -454,19 +522,11 @@ pub fn resolve_tag(tag: &str, entry: &Entry, loc: &Location) -> Option<String> {
         return Some(cached.clone());
     }
 
-    if tag.starts_with("Hash_") {
-        WAITED.with(|w| w.set(true));
-        compute_later(cache_key, path, entry);
-        return Some(PENDING.into());
-    }
-    let val = compute_file_tag(tag, &path, entry).unwrap_or_default();
-    if let Ok(mut g) = TAG_CACHE.lock() {
-        if g.len() > 10_000 {
-            g.clear();
-        }
-        g.insert(cache_key, val.clone());
-    }
-    Some(val)
+    // Everything else is read from the disk, on the background thread: the cache keeps it for
+    // as long as the batch window shows these items.
+    WAITED.with(|w| w.set(true));
+    compute_later(cache_key, path, entry);
+    Some(PENDING.into())
 }
 
 fn fmt_sys_time(st: SystemTime) -> String {
@@ -474,7 +534,8 @@ fn fmt_sys_time(st: SystemTime) -> String {
     dt.format("%Y-%m-%d %H-%M-%S").to_string()
 }
 
-fn compute_file_tag(tag: &str, path: &Path, entry: &Entry) -> Option<String> {
+/// `stale` says the tag is no longer waited for: a hash stops reading its file.
+fn compute_file_tag(tag: &str, path: &Path, entry: &Entry, stale: &dyn Fn() -> bool) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
     match tag {
         "File_DateCreated" => return meta.created().ok().map(fmt_sys_time),
@@ -488,7 +549,7 @@ fn compute_file_tag(tag: &str, path: &Path, entry: &Entry) -> Option<String> {
     }
 
     if let Some(rest) = tag.strip_prefix("Hash_") {
-        return compute_hash(rest, path);
+        return compute_hash(rest, path, stale);
     }
     if tag == "BinarySign_Extension" || tag == "BinarySign_Description" {
         let (ext, desc) = detect_binary_signature(path)?;
@@ -612,62 +673,50 @@ pub fn detect_binary_signature(path: &Path) -> Option<(&'static str, &'static st
 // ---------------------------------------------------------------------------------------------
 // Hashes
 
-fn compute_hash(kind: &str, path: &Path) -> Option<String> {
+fn compute_hash(kind: &str, path: &Path, stale: &dyn Fn() -> bool) -> Option<String> {
     let mut f = File::open(path).ok()?;
-    let mut buf = [0u8; 65536];
+    // Feeds the whole file to `update`; `None` once nobody waits for the hash.
+    let mut read_all = |update: &mut dyn FnMut(&[u8])| -> Option<()> {
+        let mut buf = [0u8; 65536];
+        while let Ok(n) = f.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            if stale() {
+                return None;
+            }
+            update(&buf[..n]);
+        }
+        Some(())
+    };
     match kind {
         "CRC32" => {
             let mut h = crc32fast::Hasher::new();
-            while let Ok(n) = f.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                h.update(&buf[..n]);
-            }
+            read_all(&mut |bytes| h.update(bytes))?;
             Some(format!("{:08X}", h.finalize()))
         }
         "MD5" => {
             use md5::Digest as _;
             let mut h = md5::Md5::new();
-            while let Ok(n) = f.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                h.update(&buf[..n]);
-            }
+            read_all(&mut |bytes| h.update(bytes))?;
             Some(hex_lower(&h.finalize()))
         }
         "SHA1" => {
             use sha1::Digest as _;
             let mut h = sha1::Sha1::new();
-            while let Ok(n) = f.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                h.update(&buf[..n]);
-            }
+            read_all(&mut |bytes| h.update(bytes))?;
             Some(hex_lower(&h.finalize()))
         }
         "SHA256" => {
             use sha2::Digest as _;
             let mut h = sha2::Sha256::new();
-            while let Ok(n) = f.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                h.update(&buf[..n]);
-            }
+            read_all(&mut |bytes| h.update(bytes))?;
             Some(hex_lower(&h.finalize()))
         }
         "SHA512" => {
             use sha2::Digest as _;
             let mut h = sha2::Sha512::new();
-            while let Ok(n) = f.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                h.update(&buf[..n]);
-            }
+            read_all(&mut |bytes| h.update(bytes))?;
             Some(hex_lower(&h.finalize()))
         }
         _ => None,
@@ -1344,7 +1393,7 @@ fn torrent_tag(tag: &str, path: &Path) -> Option<String> {
     let f = File::open(path).ok()?;
     let mut data = Vec::new();
     f.take(2 * 1024 * 1024).read_to_end(&mut data).ok()?;
-    let (val, _, info_slice) = bencode_parse(&data, 0)?;
+    let (val, _, info_slice) = bencode_parse(&data, 0, 0)?;
     let BVal::Dict(root) = val else { return None };
 
     let info = root.iter().find(|(k, _)| k == b"info").map(|(_, v)| v);
@@ -1414,7 +1463,15 @@ enum BVal {
     Dict(Vec<(Vec<u8>, BVal)>),
 }
 
-fn bencode_parse<'a>(data: &'a [u8], pos: usize) -> Option<(BVal, usize, Option<&'a [u8]>)> {
+/// The lists and dictionaries a torrent may hold one inside another. A real one goes a few
+/// deep; each level is a call, and a file of a million `l` (any file can be asked for a
+/// `Torrent_` tag) overflowed the stack.
+const BENCODE_DEPTH: usize = 64;
+
+fn bencode_parse<'a>(data: &'a [u8], pos: usize, depth: usize) -> Option<(BVal, usize, Option<&'a [u8]>)> {
+    if depth > BENCODE_DEPTH {
+        return None;
+    }
     let b = *data.get(pos)?;
     match b {
         b'i' => {
@@ -1426,7 +1483,7 @@ fn bencode_parse<'a>(data: &'a [u8], pos: usize) -> Option<(BVal, usize, Option<
             let mut p = pos + 1;
             let mut list = Vec::new();
             while *data.get(p)? != b'e' {
-                let (v, np, _) = bencode_parse(data, p)?;
+                let (v, np, _) = bencode_parse(data, p, depth + 1)?;
                 list.push(v);
                 p = np;
             }
@@ -1437,9 +1494,9 @@ fn bencode_parse<'a>(data: &'a [u8], pos: usize) -> Option<(BVal, usize, Option<
             let mut dict = Vec::new();
             let mut info_slice = None;
             while *data.get(p)? != b'e' {
-                let (BVal::Bytes(k), np, _) = bencode_parse(data, p)? else { return None };
+                let (BVal::Bytes(k), np, _) = bencode_parse(data, p, depth + 1)? else { return None };
                 let val_start = np;
-                let (v, vp, sub_info) = bencode_parse(data, np)?;
+                let (v, vp, sub_info) = bencode_parse(data, np, depth + 1)?;
                 if k == b"info" {
                     info_slice = Some(&data[val_start..vp]);
                 } else if info_slice.is_none() {
@@ -1454,7 +1511,8 @@ fn bencode_parse<'a>(data: &'a [u8], pos: usize) -> Option<(BVal, usize, Option<
             let colon = data[pos..].iter().position(|&c| c == b':')? + pos;
             let len = std::str::from_utf8(&data[pos..colon]).ok()?.parse::<usize>().ok()?;
             let start = colon + 1;
-            let end = start + len;
+            // `len` comes from the file: a damaged one could overflow the addition.
+            let end = start.checked_add(len)?;
             let slice = data.get(start..end)?;
             Some((BVal::Bytes(slice.to_vec()), end, None))
         }
@@ -1495,4 +1553,50 @@ fn version_info_tag(tag: &str, path: &Path) -> Option<String> {
 #[allow(dead_code)]
 fn _epoch_unused() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// [`resolve_tag`] once the background thread has read the tag.
+#[cfg(test)]
+pub(crate) fn resolve_tag_when_read(tag: &str, entry: &Entry, loc: &Location) -> Option<String> {
+    for _ in 0..500 {
+        let got = resolve_tag(tag, entry, loc);
+        if got.as_deref() != Some(PENDING) {
+            return got;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("{tag} was never read");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forgetting_drops_what_was_read() {
+        let dir = std::env::temp_dir().join(format!("oe-rules-meta-forget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.gif"), "GIF89a").unwrap();
+        let entry = Entry { id: "a.gif".into(), name: "a.gif".into(), is_dir: false, size: Some(6), modified: None, mime: None, target: None, starred: false, md5: None, drive_origin: None };
+        let loc = Location::Local(dir.clone());
+        assert_eq!(resolve_tag_when_read("BinarySign_Extension", &entry, &loc).as_deref(), Some("gif"));
+        // The batch window closed, or took other items: the file is read again when asked.
+        forget();
+        assert_eq!(resolve_tag("BinarySign_Extension", &entry, &loc).as_deref(), Some(PENDING));
+        assert_eq!(resolve_tag_when_read("BinarySign_Extension", &entry, &loc).as_deref(), Some("gif"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_of_lists_inside_lists_is_no_torrent() {
+        assert!(bencode_parse(&vec![b'l'; 1_000_000], 0, 0).is_none());
+        // A length past the end of the numbers, where adding it to the position overflowed.
+        assert!(bencode_parse(b"18446744073709551615:x", 0, 0).is_none());
+        // A real one still reads, with the bytes of its `info` for the hash.
+        let (val, end, info) = bencode_parse(b"d8:announce3:url4:infod6:lengthi5e4:name1:xee", 0, 0).unwrap();
+        assert!(matches!(val, BVal::Dict(ref d) if d.len() == 2));
+        assert_eq!(end, 45);
+        assert_eq!(info, Some(&b"d6:lengthi5e4:name1:xe"[..]));
+    }
 }

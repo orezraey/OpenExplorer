@@ -2,13 +2,14 @@
 //! Nome / Novo Nome / Erro, Adicionar/Editar Regra modal (all 18 rules), Meta Tags picker,
 //! Presets manager, and step-by-step Analyzer.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use openexplorer_i18n::{t, tr};
-use rune::{Anim, Color, Cursor, El, ScrollSpec, Spring, TextEdit, Tx, col, el, icon, row, text};
+use rune::{Anim, Color, Cursor, El, GrowthSpec, ScrollSpec, Spring, TextEdit, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, Dialog as Modal, MenuItem, ScrollBar, TextArea, TextInput, context_menu};
 
-use crate::batch_rename::{self, BatchRename, Preview};
+use crate::batch_rename::{self, BatchRename, Preview, RowPreview};
 use crate::icons;
 use crate::model::format_bytes;
 use crate::rules_meta::{self, META_TAGS, TagCategory};
@@ -154,7 +155,7 @@ fn num_stepper(
             .on_press(move |s: &mut State| {
                 let e = ed_mut(s);
                 let cur = e.nums[slot].text.trim().parse::<i64>().unwrap_or(val);
-                let next = (cur + delta).clamp(min, max);
+                let next = cur.saturating_add(delta).clamp(min, max);
                 e.nums[slot] = TextEdit::new(next.to_string());
                 on_set(s, next);
             })
@@ -465,15 +466,15 @@ pub fn rules_workspace(
                 .cursor(Cursor::Pointer)
                 .fill(if active { k.alpha(k.c.text_accent, if k.dark { 0.16 } else { 0.09 }) } else { Color::TRANSPARENT })
                 .hover_fill(k.c.hover)
+                // A click selects; two open the rule. (A click on the rule already selected opened
+                // it, so the row just added couldn't be clicked without its editor coming up.)
                 .on_press(move |s: &mut State| {
-                    let double = s.batch_rename.as_ref().is_some_and(|b| !b.rules.all_selected && b.rules.selected == Some(i));
-                    if double {
-                        s.open_rule_editor(Some(i));
-                    } else if let Some(b) = &mut s.batch_rename {
+                    if let Some(b) = &mut s.batch_rename {
                         b.rules.selected = Some(i);
                         b.rules.all_selected = false;
                     }
                 })
+                .on_double_press(move |s: &mut State| s.open_rule_editor(Some(i)))
                 .on_secondary_press(move |s: &mut State, at: rune::PointerPress, _: &mut Tx| {
                     if let Some(b) = &mut s.batch_rename {
                         b.rules.selected = Some(i);
@@ -772,108 +773,33 @@ pub(crate) fn shared_preview_panel(
         }));
     }
 
+    // Only the rows in view are built: a batch can hold tens of thousands of files, and the
+    // table is drawn again at every change (building them all took 3 s for 10,000).
     let total = br.items.len();
     let has_regex_err = preview.regex_error.is_some();
-    let mut rows_col = col().key("rules-preview-rows").w_full();
-    for (i, rp) in preview.rows.iter().enumerate() {
-        let on = br.checked.get(i).copied().unwrap_or(false);
-        let row_err: Option<&str> = rp.error.as_deref().or_else(|| {
-            if on && has_regex_err {
-                Some(t("Regex inválida", "Invalid regex"))
-            } else {
-                None
-            }
-        });
-        let has_err = row_err.is_some();
-        let is_changed = on && rp.changed;
-        let arrow_col = if has_err {
-            k.c.danger.fg
-        } else if is_changed {
-            k.c.success.fg
-        } else {
-            k.c.text_faint
-        };
-        let next_col = if has_err {
-            k.c.danger.fg
-        } else if is_changed {
-            k.c.text_accent
-        } else if on {
-            k.c.text_base
-        } else {
-            k.c.text_faint
-        };
-        let status_label = row_err.unwrap_or("OK");
-        let status_col = if has_err { k.c.danger.fg } else { k.c.text_muted };
-
-        let mut r = row()
-            .key(format!("rules-prev-{i}"))
-            .w_full()
-            .h(28.0)
-            .center_y()
-            .hover_fill(k.c.hover)
-            .child(
-                row()
-                    .w(pcols[0])
-                    .h_full()
-                    .pl(10.0)
-                    .pr(8.0)
-                    .gap(8.0)
-                    .center_y()
-                    .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
-                    .child(instant_checkbox(k, accent_bg, format!("rules-chk-{i}"), on, "", move |s| {
-                        if let Some(c) = s.batch_rename.as_mut().and_then(|b| b.checked.get_mut(i)) {
-                            *c = !*c;
-                        }
-                    }))
-                    .child(row().grow(1.0).center().child(text("→").font(k.ty.text_small_medium).color(arrow_col))),
-            )
-            .child(
-                row()
-                    .w(pcols[1])
-                    .h_full()
-                    .px(8.0)
-                    .center_y()
-                    .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
-                    .child(
-                        text(rp.current.clone())
-                            .font(k.ty.text_small)
-                            .color(if on { k.c.text_base } else { k.c.text_faint })
-                            .w_full()
-                            .min_w(0.0)
-                            .truncate(),
-                    ),
-            )
-            .child(
-                row()
-                    .w(pcols[2])
-                    .h_full()
-                    .px(8.0)
-                    .center_y()
-                    .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
-                    .child(
-                        text(rp.next.clone())
-                            .font(if is_changed { k.ty.text_small_medium } else { k.ty.text_small })
-                            .color(next_col)
-                            .w_full()
-                            .min_w(0.0)
-                            .truncate(),
-                    ),
-            )
-            .child(
-                row()
-                    .w(pcols[3])
-                    .h_full()
-                    .px(8.0)
-                    .center_y()
-                    .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
-                    .child(text(status_label.to_string()).font(k.ty.caption()).color(status_col).w_full().min_w(0.0).truncate()),
-            )
-            .child(el().grow(1.0));
-        if i + 1 < total {
-            r = r.border_sides([0.0, 0.0, 1.0, 0.0], panel_border);
-        }
-        rows_col = rows_col.child(r);
-    }
+    let (kit, rows) = (k.clone(), preview.rows.clone());
+    let rows_col = col()
+        .key("rules-preview-rows")
+        .w_full()
+        .growth(GrowthSpec::default())
+        .virtual_rows(
+            total,
+            PREVIEW_ROW_H,
+            |s: &State, i| match s.batch_rename.as_ref().and_then(|b| b.items.get(i)) {
+                Some(item) => Cow::Owned(preview_row_key(&item.id)),
+                None => Cow::Owned(format!("rules-prev-{i}")),
+            },
+            move |s: &State, i| {
+                // Rows are built after the view returns: for the batch these rows preview, or
+                // there's nothing to draw.
+                let (Some(br), Some(rp)) = (&s.batch_rename, rows.get(i)) else { return el() };
+                let Some(item) = br.items.get(i) else { return el() };
+                let on = br.checked.get(i).copied().unwrap_or(false);
+                preview_row(&kit, rp, (i, &item.id), on, i + 1 < total, has_regex_err, pcols, panel_border, accent_bg)
+            },
+        )
+        // The items of a batch never change: their keys are read once.
+        .virtual_rows_version(br.serial);
 
     let preview_table = col()
         .key("rules-preview-table")
@@ -900,6 +826,76 @@ pub(crate) fn shared_preview_panel(
                 .child(preview_table)
                 .scroll_bar_styled(ui::bar_style(k).track_offset(prev_hdr_h, 0.0)),
         )
+}
+
+/// The key of the preview table's row for the item of this id: no other key of the window
+/// starts as it does.
+pub(crate) fn preview_row_key(id: &str) -> String {
+    format!("prev:{id}")
+}
+
+/// How tall a row of the preview table is.
+const PREVIEW_ROW_H: f32 = 28.0;
+
+/// One row of the preview table: the item's checkbox, its name, its new name and what stops
+/// it. `item` is where the item sits in the batch and its id; `divider` draws the line under it.
+#[allow(clippy::too_many_arguments)]
+fn preview_row(k: &rune_kit::Kit, rp: &RowPreview, item: (usize, &str), on: bool, divider: bool, has_regex_err: bool, pcols: [f32; 4], panel_border: Color, accent_bg: Color) -> El {
+    let row_err: Option<&str> = rp.error.as_deref().or_else(|| if on && has_regex_err { Some(t("Regex inválida", "Invalid regex")) } else { None });
+    let has_err = row_err.is_some();
+    let is_changed = on && rp.changed;
+    let arrow_col = if has_err {
+        k.c.danger.fg
+    } else if is_changed {
+        k.c.success.fg
+    } else {
+        k.c.text_faint
+    };
+    let next_col = if has_err {
+        k.c.danger.fg
+    } else if is_changed {
+        k.c.text_accent
+    } else if on {
+        k.c.text_base
+    } else {
+        k.c.text_faint
+    };
+    // A checked item left alone for a reason that isn't plain says it where an error would be.
+    let status_label = row_err.or(rp.note.as_deref().filter(|_| on)).unwrap_or("OK");
+    let status_col = if has_err { k.c.danger.fg } else { k.c.text_muted };
+    let cell = |w: f32| row().w(w).h_full().px(8.0).center_y().border_sides([0.0, 1.0, 0.0, 0.0], panel_border);
+    // The handler finds its item by id: a row can outlive the place it was built at.
+    let (at, id) = (item.0, item.1.to_string());
+    let toggle = move |s: &mut State| {
+        let Some(b) = &mut s.batch_rename else { return };
+        let here = b.items.get(at).is_some_and(|e| e.id == id);
+        let found = if here { Some(at) } else { b.items.iter().position(|e| e.id == id) };
+        if let Some(c) = found.and_then(|i| b.checked.get_mut(i)) {
+            *c = !*c;
+        }
+    };
+    let r = row()
+        .w_full()
+        .h(PREVIEW_ROW_H)
+        .center_y()
+        .hover_fill(k.c.hover)
+        .child(
+            row()
+                .w(pcols[0])
+                .h_full()
+                .pl(10.0)
+                .pr(8.0)
+                .gap(8.0)
+                .center_y()
+                .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
+                .child(instant_checkbox(k, accent_bg, format!("rules-chk-{}", item.1), on, "", toggle))
+                .child(row().grow(1.0).center().child(text("→").font(k.ty.text_small_medium).color(arrow_col))),
+        )
+        .child(cell(pcols[1]).child(text(rp.current.clone()).font(k.ty.text_small).color(if on { k.c.text_base } else { k.c.text_faint }).w_full().min_w(0.0).truncate()))
+        .child(cell(pcols[2]).child(text(rp.next.clone()).font(if is_changed { k.ty.text_small_medium } else { k.ty.text_small }).color(next_col).w_full().min_w(0.0).truncate()))
+        .child(cell(pcols[3]).child(text(status_label.to_string()).font(k.ty.caption()).color(status_col).w_full().min_w(0.0).truncate()))
+        .child(el().grow(1.0));
+    if divider { r.border_sides([0.0, 0.0, 1.0, 0.0], panel_border) } else { r }
 }
 
 pub(crate) fn shared_footer(k: &rune_kit::Kit, br: &BatchRename, preview: &Preview, can_submit: bool, extra_error: Option<&str>) -> El {
@@ -987,7 +983,7 @@ pub fn rule_editor_window_view(s: &State, cx: &mut rune::Cx<State>) -> El {
     let br = match &s.batch_rename {
         Some(br) => br.as_ref(),
         None => {
-            default_br = BatchRename::new(crate::model::Location::Local(std::path::PathBuf::new()), Vec::new(), Vec::new());
+            default_br = BatchRename::placeholder();
             &default_br
         }
     };

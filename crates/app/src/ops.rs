@@ -1,6 +1,7 @@
 //! File operations on the local disk: open, rename, new folder, delete to the Recycle Bin,
 //! copy and move. They block, so the app runs them off the UI thread.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -303,12 +304,15 @@ pub fn rename(from: &Path, name: &str) -> Result<PathBuf, String> {
 /// another pair; nothing is touched until that holds. When a rename fails, every item goes back
 /// to its first name, and the error says which (if any) couldn't, under their temporary name.
 pub fn rename_together(moves: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    // The names the batch frees, in a set: looking through `moves` for each target took a time
+    // that grew with the square of the batch (13 s for 20,000 items).
+    let freed: HashSet<String> = moves.iter().map(|(from, _)| path_key(from)).collect();
     for (from, to) in moves {
         let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         if let Some(why) = invalid_name(&name) {
             return Err(why);
         }
-        if to.exists() && !moves.iter().any(|(other, _)| same_file(other, to)) {
+        if to.exists() && !freed.contains(&path_key(to)) {
             return Err(tr!("Já existe um item chamado \"{}\" aqui.", "There's already an item named \"{}\" here.", name));
         }
         if !from.exists() {
@@ -369,9 +373,19 @@ fn with_stuck(err: String, stuck: &[PathBuf]) -> String {
     tr!("{err} Ficaram com nome temporário: {}", "{err} Left under a temporary name: {}", names.join(", "))
 }
 
-/// Same path ignoring case, as Windows compares names: renaming `a.txt` to `A.txt` is allowed.
+/// Whether the system's disks take `a.txt` and `A.txt` for the same name, as Windows' and
+/// macOS's do. Linux keeps them apart: there they are two files.
+pub const IGNORES_CASE: bool = cfg!(any(windows, target_os = "macos"));
+
+/// `path` as the system compares paths: two paths with the same key are the same file.
+pub fn path_key(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    if IGNORES_CASE { path.to_lowercase() } else { path.into_owned() }
+}
+
+/// Same path as the system compares names: on Windows, renaming `a.txt` to `A.txt` is allowed.
 fn same_file(a: &Path, b: &Path) -> bool {
-    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    path_key(a) == path_key(b)
 }
 
 pub fn new_folder(dir: &Path, name: &str) -> Result<PathBuf, String> {

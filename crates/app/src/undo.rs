@@ -476,6 +476,11 @@ fn same_path(a: &Path, b: &Path) -> bool {
     if cfg!(windows) { a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase() } else { a == b }
 }
 
+/// What two paths share when they are the [`same_path`], to keep many of them in a set.
+fn path_key(path: &Path) -> PathBuf {
+    if cfg!(windows) { PathBuf::from(path.to_string_lossy().to_lowercase()) } else { path.to_path_buf() }
+}
+
 /// The server path's name.
 fn server_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -561,12 +566,13 @@ impl Step {
                 Ok(())
             }
             Step::MoveMany { moves } => {
+                // In a set: asking each of the moves about each target grew with their square.
+                let freed: std::collections::HashSet<PathBuf> = moves.iter().map(|(from, _)| path_key(from)).collect();
                 for (from, to) in moves {
                     if !there(from) {
                         return Err(tr!("“{}” não está mais em {}.", "“{}” is no longer in {}.", name_of(from), dir_of(from)));
                     }
-                    let freed = moves.iter().any(|(other, _)| same_path(other, to));
-                    if there(to) && !freed {
+                    if there(to) && !freed.contains(&path_key(to)) {
                         return Err(tr!("já existe “{}” em {}.", "“{}” already exists in {}.", name_of(to), dir_of(to)));
                     }
                     if !to.parent().is_some_and(Path::is_dir) {
