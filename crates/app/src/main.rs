@@ -307,6 +307,7 @@ struct State {
     rule_editor_win: Option<rune::AppHandle<State>>,
     rule_editor_dirty: bool,
     rule_editor_shown: bool,
+    rule_editor_place_on_open: bool,
     rule_editor_closes: u32,
     rule_editor_synced_font: Option<settings::TextFont>,
     rule_editor_synced_render: Option<settings::TextRender>,
@@ -348,6 +349,34 @@ static RULE_EDITOR_WAKER: std::sync::LazyLock<std::sync::Mutex<Option<Waker>>> =
 thread_local! {
     static SHARED_STATE: std::cell::RefCell<Option<State>> = const { std::cell::RefCell::new(None) };
     static PENDING_MAIN_FOCUS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static RULE_EDITOR_NATIVE: std::cell::RefCell<Option<rune::WindowHandle>> = const { std::cell::RefCell::new(None) };
+    static RULE_EDITOR_LAST_SIZE: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
+}
+
+fn rule_editor_window_created(window: &rune::WindowHandle) {
+    RULE_EDITOR_NATIVE.with(|cell| *cell.borrow_mut() = Some(window.clone()));
+}
+
+fn rule_editor_geometry_changed() {
+    let Some(p) = RULE_EDITOR_NATIVE.with(|cell| cell.borrow().as_ref().and_then(rune::WindowHandle::placement)) else {
+        return;
+    };
+    let size = if p.maximized || p.minimized {
+        p.restore.map(|(_, s)| s)
+    } else if p.full_screen {
+        None
+    } else {
+        Some(p.content_size)
+    };
+    if let Some((pw, ph)) = size
+        && pw > 0
+        && ph > 0
+        && p.scale > 0.0
+    {
+        let lw = (pw as f32 / p.scale as f32).round().max(700.0) as u32;
+        let lh = (ph as f32 / p.scale as f32).round().max(440.0) as u32;
+        RULE_EDITOR_LAST_SIZE.with(|c| c.set(Some((lw, lh))));
+    }
 }
 
 impl State {
@@ -466,6 +495,7 @@ impl State {
             rule_editor_win: None,
             rule_editor_dirty: false,
             rule_editor_shown: false,
+            rule_editor_place_on_open: false,
             rule_editor_closes: 0,
             rule_editor_synced_font: None,
             rule_editor_synced_render: None,
@@ -575,24 +605,44 @@ impl State {
 
     /// Opens the independent, resizable "Adicionar Regra" / "Editar Regra" window.
     pub fn open_rule_editor(&mut self, edit_index: Option<usize>) {
+        self.open_rule_editor_at(edit_index, None);
+    }
+
+    /// Opens the independent Rule Editor window, optionally inserting a new rule at `insert_at`.
+    pub fn open_rule_editor_at(&mut self, edit_index: Option<usize>, insert_at: Option<usize>) {
         if let Some(br) = &mut self.batch_rename {
             match edit_index {
                 Some(i) => br.rules.open_edit(i),
-                None => br.rules.open_add(),
+                None => br.rules.open_add_at(insert_at),
             }
         } else {
             return;
         }
         self.rule_editor_dirty = true;
         if let Some(w) = &self.rule_editor_win {
+            let was_shown = self.rule_editor_shown;
             self.rule_editor_shown = true;
+            if !was_shown {
+                self.rule_editor_place_on_open = true;
+            }
             w.open();
             w.wake();
         }
     }
 
+    fn save_rule_editor_size(&mut self) {
+        rule_editor_geometry_changed();
+        if let Some(sz) = RULE_EDITOR_LAST_SIZE.with(std::cell::Cell::get)
+            && self.settings.rule_editor_size != Some(sz)
+        {
+            self.settings.rule_editor_size = Some(sz);
+            self.settings.save();
+        }
+    }
+
     /// Closes the independent Rule Editor window without discarding `batch_rename`.
     pub fn close_rule_editor(&mut self) {
+        self.save_rule_editor_size();
         if let Some(br) = &mut self.batch_rename {
             br.rules.editor.meta_target = None;
             br.rules.tag_cat_open = false;
@@ -607,6 +657,7 @@ impl State {
     }
 
     fn rule_editor_window_closed(&mut self) {
+        self.save_rule_editor_size();
         if self.rule_editor_closes > 0 {
             self.rule_editor_closes -= 1;
             return;
@@ -749,6 +800,7 @@ fn init() -> State {
         rule_editor_win: None,
         rule_editor_dirty: false,
         rule_editor_shown: false,
+        rule_editor_place_on_open: false,
         rule_editor_closes: 0,
         rule_editor_synced_font: None,
         rule_editor_synced_render: None,
@@ -875,6 +927,10 @@ fn batch_rename_window_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
                 br.media.popup = None;
                 return true;
             }
+            if br.rules.stack_menu.is_some() {
+                br.rules.stack_menu = None;
+                return true;
+            }
             if br.rules.popup.is_some() {
                 br.rules.popup = None;
                 return true;
@@ -882,6 +938,67 @@ fn batch_rename_window_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
         }
         s.close_batch_rename();
         return true;
+    }
+    if let Some(br) = &mut s.batch_rename
+        && br.mode == batch_rename::Mode::Rules
+        && br.rules.popup.is_none()
+        && br.rules.stack_menu.is_none()
+    {
+        let plain = ev.mods == Mods::default();
+        let shift_only = ev.mods.shift && !ev.mods.ctrl && !ev.mods.cmd && !ev.mods.alt;
+        let cmd_only = (ev.mods.ctrl || ev.mods.cmd) && !ev.mods.shift && !ev.mods.alt;
+        let sel = br.rules.selected.filter(|&i| i < br.rules.rules.len());
+        match &ev.key {
+            Key::Insert if plain => {
+                s.open_rule_editor(None);
+                return true;
+            }
+            Key::Insert if shift_only => {
+                br.rules.duplicate_selected();
+                return true;
+            }
+            Key::Enter if plain => {
+                if let Some(i) = sel {
+                    s.open_rule_editor(Some(i));
+                    return true;
+                }
+            }
+            Key::Enter if shift_only => {
+                if let Some(i) = sel {
+                    br.rules.open_comment(i);
+                    return true;
+                }
+            }
+            Key::Delete if plain => {
+                br.rules.remove_selected();
+                return true;
+            }
+            Key::Delete if shift_only => {
+                br.rules.clear_all();
+                return true;
+            }
+            Key::Up if cmd_only => {
+                br.rules.move_selected(-1);
+                return true;
+            }
+            Key::Down if cmd_only => {
+                br.rules.move_selected(1);
+                return true;
+            }
+            _ if ev.is_command('a') => {
+                br.rules.select_all();
+                return true;
+            }
+            Key::Text(ch) if shift_only && ch.eq_ignore_ascii_case("m") => {
+                br.rules.set_all_enabled(true);
+                return true;
+            }
+            Key::Text(ch) if shift_only && ch.eq_ignore_ascii_case("u") => {
+                br.rules.set_all_enabled(false);
+                return true;
+            }
+            _ => {}
+        }
     }
     false
 }
@@ -897,6 +1014,12 @@ fn setup_rule_editor_window(_: &mut State, waker: Waker) {
 fn poll_rule_editor_window(s: &mut State, _now: f64, tx: &mut Tx) -> bool {
     if s.is_placeholder {
         return false;
+    }
+    if std::mem::take(&mut s.rule_editor_place_on_open) {
+        if let Some((rw, rh)) = s.settings.rule_editor_size {
+            tx.resize_window_instant(((rw as f32).max(700.0), (rh as f32).max(440.0)));
+        }
+        tx.center_window();
     }
     if s.rule_editor_synced_font != Some(s.settings.font) {
         s.rule_editor_synced_font = Some(s.settings.font);
@@ -3022,18 +3145,27 @@ fn main() {
 
     let (account_handle, _) = main_app.window(rune::windows::WindowSpec::from_app("add-account", account_app));
     let (batch_rename_handle, _) = main_app.window(rune::windows::WindowSpec::from_app("batch-rename", batch_rename_app));
+    let ed_init_size = initial
+        .rule_editor_size
+        .map(|(w, h)| ((w as f32).max(700.0), (h as f32).max(440.0)))
+        .unwrap_or((840.0, 520.0));
     let rule_editor_app = rune::App::new(AppSpec::<State> {
         min_size: Some((700.0, 440.0)),
         families: initial.font.families(),
         setup: Some(setup_rule_editor_window),
         poll: Some(poll_rule_editor_window),
         on_key: Some(rule_editor_window_key),
-        ..AppSpec::new(rules_ui::editor_window_title(None), (840.0, 520.0), init_rule_editor_window, rules_ui::rule_editor_window_view)
+        ..AppSpec::new(rules_ui::editor_window_title(None), ed_init_size, init_rule_editor_window, rules_ui::rule_editor_window_view)
     })
     .windowless()
     .titlebar(rune::Titlebar::new(36.0))
     .font_smoothing(initial.text_render.smoothing())
     .turn_scope(enter_turn, leave_turn)
+    .on_window(rule_editor_window_created)
+    .on_window_geometry(|_, _, _| {
+        rule_editor_geometry_changed();
+        false
+    })
     .on_close(|s, _| {
         if !s.is_placeholder {
             s.rule_editor_window_closed();

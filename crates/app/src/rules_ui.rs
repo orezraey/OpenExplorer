@@ -5,8 +5,8 @@
 use std::sync::Arc;
 
 use openexplorer_i18n::{t, tr};
-use rune::{Anim, Color, Cursor, El, ScrollSpec, Spring, TextEdit, col, el, icon, row, text};
-use rune_kit::{Button, ButtonVariant, Dialog as Modal, ScrollBar, TextArea, TextInput};
+use rune::{Anim, Color, Cursor, El, ScrollSpec, Spring, TextEdit, Tx, col, el, icon, row, text};
+use rune_kit::{Button, ButtonVariant, Dialog as Modal, MenuItem, ScrollBar, TextArea, TextInput, context_menu};
 
 use crate::batch_rename::{self, BatchRename, Preview};
 use crate::icons;
@@ -170,12 +170,11 @@ fn num_stepper(
         .child(
             row()
                 .w(54.0)
-                .pl(4.0)
                 .center_y()
                 .child(
                     TextInput::new(edit)
                         .plain()
-                        .width(Some(50.0))
+                        .width(Some(54.0))
                         .height(26.0)
                         .invalid(invalid)
                         .label(key)
@@ -244,6 +243,27 @@ fn meta_tag_btn(k: &rune_kit::Kit, target: MetaTagTarget) -> El {
         })
         .child(icon(&icons::PLUS, 12.0).color(k.c.text_accent))
         .child(text(t("Inserir Meta Tag", "Insert Meta Tag")).font(k.ty.text_xsmall_medium).color(k.c.text_base))
+}
+
+fn table_col_grip(
+    k: &rune_kit::Kit,
+    key: String,
+    edge: f32,
+    height: f32,
+    on_drag: impl Fn(&mut State, &mut rune::Drag) + 'static,
+) -> El {
+    el().key(key)
+        .role("separator")
+        .label(t(
+            "Arraste para mudar a largura da coluna; clique duas vezes para voltar ao padrão",
+            "Drag to change column width; double-click to reset default",
+        ))
+        .absolute(edge - 4.0, 0.0)
+        .w(8.0)
+        .h(height)
+        .cursor(Cursor::ResizeColumn)
+        .hover(k.alpha(k.c.border_focus, 0.35))
+        .on_drag(move |s: &mut State, d: &mut rune::Drag, _: &mut Tx| on_drag(s, d))
 }
 
 fn close_popup(s: &mut State) {
@@ -325,111 +345,255 @@ pub fn rules_workspace(
             }
         }));
 
+    let all_rules_enabled = !rs.rules.is_empty() && rs.rules.iter().all(|r| r.enabled);
+    let cols = rs.col_widths;
+    let header_h = 28.0;
+    let mut header_row = row()
+        .key("rules-stack-header")
+        .w_full()
+        .h(header_h)
+        .sticky_top(0.0)
+        .fill(k.c.surface_raised)
+        .border_sides([0.0, 0.0, 1.0, 0.0], panel_border)
+        .child(
+            row()
+                .w(cols[0])
+                .h_full()
+                .pl(10.0)
+                .pr(8.0)
+                .gap(8.0)
+                .center_y()
+                .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
+                .child(instant_checkbox(k, accent_bg, "rules-stack-toggle-all".into(), all_rules_enabled, "", move |s| {
+                    if let Some(b) = &mut s.batch_rename {
+                        b.rules.set_all_enabled(!all_rules_enabled);
+                    }
+                }))
+                .child(text("#").font(k.ty.caption()).color(k.c.text_muted)),
+        )
+        .child(
+            row()
+                .w(cols[1])
+                .h_full()
+                .px(8.0)
+                .center_y()
+                .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
+                .child(text(t("Regra", "Rule")).font(k.ty.text_xsmall_medium).color(k.c.text_muted).truncate()),
+        )
+        .child(
+            row()
+                .w(cols[2])
+                .h_full()
+                .px(8.0)
+                .center_y()
+                .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
+                .child(text(t("Instrução", "Instruction")).font(k.ty.text_xsmall_medium).color(k.c.text_muted).truncate()),
+        )
+        .child(el().grow(1.0).min_w(78.0));
+
+    for i in 0..3 {
+        let edge: f32 = cols[..=i].iter().sum();
+        header_row = header_row.child(table_col_grip(k, format!("rule-col-grip-{i}"), edge, header_h, move |s, d| {
+            if let Some(b) = &mut s.batch_rename {
+                let _ = ui::resize(
+                    d,
+                    d.dx,
+                    &mut b.rules.col_widths[i],
+                    rules_rename::DEFAULT_RULE_COLS[i],
+                    |v| rules_rename::clamp_rule_col(i, v),
+                );
+            }
+        }));
+    }
+
     // Rule Stack area ("Clique aqui para adicionar regra" when empty)
-    let stack_body: El = if rs.rules.is_empty() {
+    let stack_rows: El = if rs.rules.is_empty() {
         row()
             .key("rules-empty-click")
             .role("button")
             .w_full()
-            .h(120.0)
+            .h(112.0)
             .center()
             .cursor(Cursor::Pointer)
             .hover_fill(k.c.hover)
             .on_press(|s: &mut State| {
                 s.open_rule_editor(None);
             })
+            .on_secondary_press(|s: &mut State, at: rune::PointerPress, _: &mut Tx| {
+                if let Some(b) = &mut s.batch_rename {
+                    b.rules.stack_menu = Some((None, at));
+                }
+            })
             .child(text(t("Clique aqui para adicionar regra", "Click here to add a rule")).font(k.ty.body_medium).color(k.c.text_muted))
     } else {
-        let mut list = col().key("rules-stack-list").w_full().pr(12.0);
+        let mut list = col().key("rules-stack-list").w_full();
         for (i, rule) in rs.rules.iter().enumerate() {
-            let active = rs.selected == Some(i);
+            let active = rs.all_selected || rs.selected == Some(i);
+            let instr_el: El = if rule.comment.trim().is_empty() {
+                text(rule.summary())
+                    .font(k.ty.text_xsmall)
+                    .color(if rule.enabled { k.c.text_muted } else { k.c.text_faint })
+                    .w_full()
+                    .min_w(0.0)
+                    .truncate()
+            } else {
+                row()
+                    .w_full()
+                    .min_w(0.0)
+                    .gap(8.0)
+                    .center_y()
+                    .child(
+                        text(rule.summary())
+                            .font(k.ty.text_xsmall)
+                            .color(if rule.enabled { k.c.text_muted } else { k.c.text_faint })
+                            .shrink()
+                            .min_w(0.0)
+                            .truncate(),
+                    )
+                    .child(
+                        text(format!("// {}", rule.comment.trim()))
+                            .font(k.ty.caption())
+                            .color(k.c.text_accent)
+                            .truncate(),
+                    )
+            };
             let mut r = row()
                 .key(format!("rule-row-{i}"))
                 .w_full()
-                .min_h(30.0)
-                .px(10.0)
-                .py(4.0)
-                .gap(8.0)
+                .h(30.0)
                 .center_y()
                 .cursor(Cursor::Pointer)
                 .fill(if active { k.alpha(k.c.text_accent, if k.dark { 0.16 } else { 0.09 }) } else { Color::TRANSPARENT })
                 .hover_fill(k.c.hover)
                 .on_press(move |s: &mut State| {
-                    let double = s.batch_rename.as_ref().is_some_and(|b| b.rules.selected == Some(i));
+                    let double = s.batch_rename.as_ref().is_some_and(|b| !b.rules.all_selected && b.rules.selected == Some(i));
                     if double {
                         s.open_rule_editor(Some(i));
                     } else if let Some(b) = &mut s.batch_rename {
                         b.rules.selected = Some(i);
+                        b.rules.all_selected = false;
                     }
                 })
-                .child(instant_checkbox(k, accent_bg, format!("rule-en-{i}"), rule.enabled, "", move |s| {
-                    if let Some(r) = s.batch_rename.as_mut().and_then(|b| b.rules.rules.get_mut(i)) {
-                        r.enabled = !r.enabled;
+                .on_secondary_press(move |s: &mut State, at: rune::PointerPress, _: &mut Tx| {
+                    if let Some(b) = &mut s.batch_rename {
+                        b.rules.selected = Some(i);
+                        b.rules.all_selected = false;
+                        b.rules.stack_menu = Some((Some(i), at));
                     }
-                }))
-                .child(text(format!("{}", i + 1)).font(k.ty.caption()).color(k.c.text_faint).w(18.0))
-                .child(
-                    text(rule.config.kind().label())
-                        .font(k.ty.text_xsmall_medium)
-                        .color(if rule.enabled { k.c.text_base } else { k.c.text_faint })
-                        .w(140.0)
-                        .truncate(),
-                )
-                .child(
-                    text(rule.summary())
-                        .font(k.ty.text_xsmall)
-                        .color(if rule.enabled { k.c.text_muted } else { k.c.text_faint })
-                        .grow(1.0)
-                        .w(0.0)
-                        .min_w(0.0)
-                        .truncate(),
-                )
+                })
                 .child(
                     row()
-                        .key(format!("rule-edit-{i}"))
-                        .role("button")
-                        .px(7.0)
-                        .py(2.0)
-                        .radius(4.0)
-                        .hover_fill(k.alpha(k.c.text_base, 0.08))
-                        .cursor(Cursor::Pointer)
-                        .on_press(move |s: &mut State| {
-                            s.open_rule_editor(Some(i));
-                        })
-                        .child(text(t("Editar", "Edit")).font(k.ty.caption()).color(k.c.text_accent)),
-                )
-                .child(
-                    row()
-                        .key(format!("rule-del-{i}"))
-                        .role("button")
-                        .px(6.0)
-                        .py(2.0)
-                        .radius(4.0)
-                        .hover_fill(k.c.danger.bg)
-                        .cursor(Cursor::Pointer)
-                        .on_press(move |s: &mut State| {
-                            if let Some(b) = &mut s.batch_rename
-                                && i < b.rules.rules.len()
-                            {
-                                b.rules.rules.remove(i);
-                                b.rules.selected = None;
+                        .w(cols[0])
+                        .h_full()
+                        .pl(10.0)
+                        .pr(8.0)
+                        .gap(8.0)
+                        .center_y()
+                        .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
+                        .child(instant_checkbox(k, accent_bg, format!("rule-en-{i}"), rule.enabled, "", move |s| {
+                            if let Some(r) = s.batch_rename.as_mut().and_then(|b| b.rules.rules.get_mut(i)) {
+                                r.enabled = !r.enabled;
                             }
-                        })
-                        .child(text("×").font(k.ty.text_small).color(k.c.text_muted)),
+                        }))
+                        .child(text(format!("{}", i + 1)).font(k.ty.caption()).color(k.c.text_faint).truncate()),
+                )
+                .child(
+                    row()
+                        .w(cols[1])
+                        .h_full()
+                        .px(8.0)
+                        .center_y()
+                        .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
+                        .child(
+                            text(rule.config.kind().label())
+                                .font(k.ty.text_xsmall_medium)
+                                .color(if rule.enabled { k.c.text_base } else { k.c.text_faint })
+                                .w_full()
+                                .min_w(0.0)
+                                .truncate(),
+                        ),
+                )
+                .child(
+                    row()
+                        .w(cols[2])
+                        .h_full()
+                        .px(8.0)
+                        .center_y()
+                        .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
+                        .child(instr_el),
+                )
+                .child(
+                    row()
+                        .grow(1.0)
+                        .min_w(78.0)
+                        .pr(16.0)
+                        .gap(4.0)
+                        .justify_end()
+                        .center_y()
+                        .child(
+                            row()
+                                .key(format!("rule-edit-{i}"))
+                                .role("button")
+                                .px(7.0)
+                                .py(2.0)
+                                .radius(4.0)
+                                .hover_fill(k.alpha(k.c.text_base, 0.08))
+                                .cursor(Cursor::Pointer)
+                                .on_press(move |s: &mut State| {
+                                    s.open_rule_editor(Some(i));
+                                })
+                                .child(text(t("Editar", "Edit")).font(k.ty.caption()).color(k.c.text_accent)),
+                        )
+                        .child(
+                            row()
+                                .key(format!("rule-del-{i}"))
+                                .role("button")
+                                .px(6.0)
+                                .py(2.0)
+                                .radius(4.0)
+                                .hover_fill(k.c.danger.bg)
+                                .cursor(Cursor::Pointer)
+                                .on_press(move |s: &mut State| {
+                                    if let Some(b) = &mut s.batch_rename
+                                        && i < b.rules.rules.len()
+                                    {
+                                        b.rules.rules.remove(i);
+                                        b.rules.selected = if b.rules.rules.is_empty() { None } else { Some(i.min(b.rules.rules.len() - 1)) };
+                                        b.rules.all_selected = false;
+                                    }
+                                })
+                                .child(text("×").font(k.ty.text_small).color(k.c.text_muted)),
+                        ),
                 );
             if i + 1 < rs.rules.len() {
                 r = r.border_sides([0.0, 0.0, 1.0, 0.0], panel_border);
             }
             list = list.child(r);
         }
-        col()
-            .key("rules-stack-scroll")
-            .w_full()
-            .h(120.0)
-            .scroll(ScrollSpec { stick_bottom: false })
-            .child(list)
-            .scroll_bar_styled(ui::bar_style(k))
+        list
     };
+
+    let stack_menu_el = render_stack_context_menu(k, br, layer);
+
+    let stack_table = col()
+        .key("rules-stack-table")
+        .w_full()
+        .child(header_row)
+        .child(stack_rows);
+
+    let stack_viewport = col()
+        .key("rules-stack-scroll")
+        .w_full()
+        .h(140.0)
+        .min_h(0.0)
+        .on_secondary_press(|s: &mut State, at: rune::PointerPress, _: &mut Tx| {
+            if let Some(b) = &mut s.batch_rename {
+                b.rules.stack_menu = Some((None, at));
+            }
+        })
+        .scroll_xy()
+        .child(stack_table)
+        .scroll_bar_styled(ui::bar_style(k).track_offset(header_h, 0.0));
 
     let stack_panel = col()
         .key("rules-stack-panel")
@@ -437,7 +601,9 @@ pub fn rules_workspace(
         .radius(k.radius.md)
         .fill(panel_bg)
         .border(1.0, panel_border)
-        .child(stack_body);
+        .clip_soft(0.0)
+        .child(stack_viewport)
+        .child(stack_menu_el);
 
     // Middle utility bar: Arquivos | Analisar | Exportar | Limpar
     let util_bar = row()
@@ -470,30 +636,79 @@ pub fn rules_workspace(
             }
         }));
 
-    // ReNamer-style preview table: Estado | Nome | Novo Nome | Erro
-    let table_header = row()
+    // ReNamer-style preview table: Estado | Nome | Novo Nome | Erro (resizable columns + grid dividers)
+    let pcols = rs.preview_cols;
+    let prev_hdr_h = 30.0;
+    let mut table_header = row()
         .key("rules-preview-header")
         .w_full()
-        .h(30.0)
-        .pl(10.0)
-        .pr(22.0)
-        .gap(8.0)
-        .center_y()
+        .h(prev_hdr_h)
+        .sticky_top(0.0)
         .fill(k.c.surface_raised)
         .border_sides([0.0, 0.0, 1.0, 0.0], panel_border)
-        .child(instant_checkbox(k, accent_bg, "rules-toggle-all".into(), all_checked, "", move |s| {
+        .child(
+            row()
+                .w(pcols[0])
+                .h_full()
+                .pl(10.0)
+                .pr(8.0)
+                .gap(8.0)
+                .center_y()
+                .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
+                .child(instant_checkbox(k, accent_bg, "rules-toggle-all".into(), all_checked, "", move |s| {
+                    if let Some(b) = &mut s.batch_rename {
+                        let next = !all_checked;
+                        b.checked.iter_mut().for_each(|c| *c = next);
+                    }
+                }))
+                .child(text(t("Estado", "State")).font(k.ty.caption()).color(k.c.text_muted).truncate()),
+        )
+        .child(
+            row()
+                .w(pcols[1])
+                .h_full()
+                .px(8.0)
+                .center_y()
+                .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
+                .child(text(t("Nome", "Name")).font(k.ty.text_xsmall_medium).color(k.c.text_muted).truncate()),
+        )
+        .child(
+            row()
+                .w(pcols[2])
+                .h_full()
+                .px(8.0)
+                .center_y()
+                .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
+                .child(text(t("Novo Nome", "New Name")).font(k.ty.text_xsmall_medium).color(k.c.text_muted).truncate()),
+        )
+        .child(
+            row()
+                .w(pcols[3])
+                .h_full()
+                .px(8.0)
+                .center_y()
+                .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
+                .child(text(t("Erro", "Status")).font(k.ty.caption()).color(k.c.text_muted).truncate()),
+        )
+        .child(el().grow(1.0));
+
+    for i in 0..4 {
+        let edge: f32 = pcols[..=i].iter().sum();
+        table_header = table_header.child(table_col_grip(k, format!("rule-prev-grip-{i}"), edge, prev_hdr_h, move |s, d| {
             if let Some(b) = &mut s.batch_rename {
-                let next = !all_checked;
-                b.checked.iter_mut().for_each(|c| *c = next);
+                let _ = ui::resize(
+                    d,
+                    d.dx,
+                    &mut b.rules.preview_cols[i],
+                    rules_rename::DEFAULT_PREVIEW_COLS[i],
+                    |v| rules_rename::clamp_preview_col(i, v),
+                );
             }
-        }))
-        .child(text(t("Estado", "State")).font(k.ty.caption()).color(k.c.text_muted).w(38.0))
-        .child(text(t("Nome", "Name")).font(k.ty.text_xsmall_medium).color(k.c.text_muted).grow(1.0).w(0.0).min_w(0.0))
-        .child(text(t("Novo Nome", "New Name")).font(k.ty.text_xsmall_medium).color(k.c.text_muted).grow(1.0).w(0.0).min_w(0.0))
-        .child(text(t("Erro", "Status")).font(k.ty.caption()).color(k.c.text_muted).w(108.0));
+        }));
+    }
 
     let total = br.items.len();
-    let mut rows_col = col().key("rules-preview-rows").w_full().pr(12.0);
+    let mut rows_col = col().key("rules-preview-rows").w_full();
     for (i, rp) in preview.rows.iter().enumerate() {
         let on = br.checked.get(i).copied().unwrap_or(false);
         let has_err = rp.error.is_some();
@@ -520,26 +735,78 @@ pub fn rules_workspace(
         let mut r = row()
             .key(format!("rules-prev-{i}"))
             .w_full()
-            .min_h(28.0)
-            .px(10.0)
-            .py(3.0)
-            .gap(8.0)
+            .h(28.0)
             .center_y()
             .hover_fill(k.c.hover)
-            .child(instant_checkbox(k, accent_bg, format!("rules-chk-{i}"), on, "", move |s| {
-                if let Some(c) = s.batch_rename.as_mut().and_then(|b| b.checked.get_mut(i)) {
-                    *c = !*c;
-                }
-            }))
-            .child(row().w(38.0).center().child(text("→").font(k.ty.text_small_medium).color(arrow_col)))
-            .child(text(rp.current.clone()).font(k.ty.text_small).color(if on { k.c.text_base } else { k.c.text_faint }).truncate().grow(1.0).w(0.0).min_w(0.0))
-            .child(text(rp.next.clone()).font(if is_changed { k.ty.text_small_medium } else { k.ty.text_small }).color(next_col).truncate().grow(1.0).w(0.0).min_w(0.0))
-            .child(text(status_label.to_string()).font(k.ty.caption()).color(status_col).w(108.0).truncate());
+            .child(
+                row()
+                    .w(pcols[0])
+                    .h_full()
+                    .pl(10.0)
+                    .pr(8.0)
+                    .gap(8.0)
+                    .center_y()
+                    .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
+                    .child(instant_checkbox(k, accent_bg, format!("rules-chk-{i}"), on, "", move |s| {
+                        if let Some(c) = s.batch_rename.as_mut().and_then(|b| b.checked.get_mut(i)) {
+                            *c = !*c;
+                        }
+                    }))
+                    .child(row().grow(1.0).center().child(text("→").font(k.ty.text_small_medium).color(arrow_col))),
+            )
+            .child(
+                row()
+                    .w(pcols[1])
+                    .h_full()
+                    .px(8.0)
+                    .center_y()
+                    .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
+                    .child(
+                        text(rp.current.clone())
+                            .font(k.ty.text_small)
+                            .color(if on { k.c.text_base } else { k.c.text_faint })
+                            .w_full()
+                            .min_w(0.0)
+                            .truncate(),
+                    ),
+            )
+            .child(
+                row()
+                    .w(pcols[2])
+                    .h_full()
+                    .px(8.0)
+                    .center_y()
+                    .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
+                    .child(
+                        text(rp.next.clone())
+                            .font(if is_changed { k.ty.text_small_medium } else { k.ty.text_small })
+                            .color(next_col)
+                            .w_full()
+                            .min_w(0.0)
+                            .truncate(),
+                    ),
+            )
+            .child(
+                row()
+                    .w(pcols[3])
+                    .h_full()
+                    .px(8.0)
+                    .center_y()
+                    .border_sides([0.0, 1.0, 0.0, 0.0], panel_border)
+                    .child(text(status_label.to_string()).font(k.ty.caption()).color(status_col).w_full().min_w(0.0).truncate()),
+            )
+            .child(el().grow(1.0));
         if i + 1 < total {
             r = r.border_sides([0.0, 0.0, 1.0, 0.0], panel_border);
         }
         rows_col = rows_col.child(r);
     }
+
+    let preview_table = col()
+        .key("rules-preview-table")
+        .w_full()
+        .child(table_header)
+        .child(rows_col);
 
     let preview_panel = col()
         .key("rules-preview-panel")
@@ -549,16 +816,16 @@ pub fn rules_workspace(
         .radius(k.radius.md)
         .fill(panel_bg)
         .border(1.0, panel_border)
-        .child(table_header)
+        .clip_soft(0.0)
         .child(
             col()
                 .key("rules-preview-scroll")
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)
-                .scroll(ScrollSpec { stick_bottom: false })
-                .child(rows_col)
-                .scroll_bar_styled(ui::bar_style(k)),
+                .scroll_xy()
+                .child(preview_table)
+                .scroll_bar_styled(ui::bar_style(k).track_offset(prev_hdr_h, 0.0)),
         );
 
     // Bottom status bar ("13 arquivos (10,92 GB)") + Renomear button
@@ -597,6 +864,7 @@ pub fn rules_workspace(
         match popup {
             RulesPopup::Presets => render_presets_modal(k, br, panel_border, layer),
             RulesPopup::Analyze => render_analyze_modal(k, br, panel_border, layer),
+            RulesPopup::Comment(idx) => render_comment_modal(k, br, idx, layer),
         }
     }
 
@@ -827,7 +1095,6 @@ fn text_box(
     row()
         .w_full()
         .h(28.0)
-        .px(6.0)
         .center_y()
         .radius(k.radius.sm)
         .fill(fill)
@@ -2683,6 +2950,179 @@ fn render_analyze_modal(k: &rune_kit::Kit, br: &BatchRename, panel_border: Color
         .open(true)
         .child(body)
         .width(560.0)
+        .fit()
+        .on_close(close_popup)
+        .build(k, layer);
+}
+
+fn render_stack_context_menu(k: &rune_kit::Kit, br: &BatchRename, layer: &mut Vec<El>) -> El {
+    let anchor = el().key("rules-stack-menu-anchor").size(0.0, 0.0);
+    let Some((clicked_idx, at)) = br.rules.stack_menu else { return anchor };
+    let rs = &br.rules;
+    let target = clicked_idx.or(rs.selected).filter(|&i| i < rs.rules.len());
+    let has_rules = !rs.rules.is_empty();
+    let can_up = target.is_some_and(|i| i > 0);
+    let can_dn = target.is_some_and(|i| i + 1 < rs.rules.len());
+
+    let act = |label: &str, ic: Option<&'static rune::Icon>, sc: &'static str, enabled: bool, f: Box<dyn Fn(&mut State)>| {
+        let mut it = MenuItem::new(label).shortcut(sc).disabled(!enabled).on_select_tx(move |s: &mut State, _: &mut Tx| {
+            if let Some(b) = &mut s.batch_rename {
+                b.rules.stack_menu = None;
+            }
+            f(s);
+        });
+        if let Some(i) = ic {
+            it = it.icon(i);
+        }
+        it
+    };
+
+    context_menu("rules-stack-menu", anchor, Some(at))
+        .min_width(245.0)
+        .item(act(t("Adicionar Regra", "Add Rule"), Some(&icons::PLUS), "Ins", true, Box::new(|s| {
+            s.open_rule_editor(None);
+        })))
+        .item(act(t("Adicionar regra (acima)", "Add rule (above)"), Some(&icons::PLUS), "", target.is_some(), Box::new(move |s| {
+            if let Some(i) = target {
+                s.open_rule_editor_at(None, Some(i));
+            }
+        })))
+        .item(act(t("Adicionar regra (abaixo)", "Add rule (below)"), Some(&icons::PLUS), "", target.is_some(), Box::new(move |s| {
+            if let Some(i) = target {
+                s.open_rule_editor_at(None, Some(i + 1));
+            }
+        })))
+        .item(act(t("Editar Regra", "Edit Rule"), Some(&icons::M_RENAME), "Enter", target.is_some(), Box::new(move |s| {
+            if let Some(i) = target {
+                s.open_rule_editor(Some(i));
+            }
+        })))
+        .item(act(t("Duplicar Regra", "Duplicate Rule"), Some(&icons::M_COPY), "Shift+Ins", target.is_some(), Box::new(move |s| {
+            if let Some(b) = &mut s.batch_rename {
+                b.rules.selected = target;
+                b.rules.duplicate_selected();
+            }
+        })))
+        .item(act(t("Remover Regra", "Remove Rule"), Some(&icons::M_DELETE), "Del", target.is_some(), Box::new(move |s| {
+            if let Some(b) = &mut s.batch_rename {
+                if !b.rules.all_selected {
+                    b.rules.selected = target;
+                }
+                b.rules.remove_selected();
+            }
+        })))
+        .item(act(t("Remover Todas as Regras", "Remove All Rules"), Some(&icons::M_EMPTY_TRASH), "Shift+Del", has_rules, Box::new(|s| {
+            if let Some(b) = &mut s.batch_rename {
+                b.rules.clear_all();
+            }
+        })))
+        .separator()
+        .item(act(t("Mover Para Cima", "Move Up"), Some(&icons::UP), "Ctrl+Acima", can_up, Box::new(move |s| {
+            if let Some(b) = &mut s.batch_rename {
+                b.rules.selected = target;
+                b.rules.move_selected(-1);
+            }
+        })))
+        .item(act(t("Mover Para Baixo", "Move Down"), Some(&icons::CHEVRON_DOWN), "Ctrl+Abaixo", can_dn, Box::new(move |s| {
+            if let Some(b) = &mut s.batch_rename {
+                b.rules.selected = target;
+                b.rules.move_selected(1);
+            }
+        })))
+        .separator()
+        .item(act(t("Selecionar Tudo", "Select All"), None, "Ctrl+A", has_rules, Box::new(|s| {
+            if let Some(b) = &mut s.batch_rename {
+                b.rules.select_all();
+            }
+        })))
+        .item(
+            MenuItem::new(t("Marcar Todos", "Mark All"))
+                .checked(true)
+                .shortcut("Shift+M")
+                .disabled(!has_rules)
+                .on_select_tx(|s: &mut State, _: &mut Tx| {
+                    if let Some(b) = &mut s.batch_rename {
+                        b.rules.stack_menu = None;
+                        b.rules.set_all_enabled(true);
+                    }
+                }),
+        )
+        .item(
+            MenuItem::new(t("Desmarcar Todos", "Unmark All"))
+                .checked(false)
+                .shortcut("Shift+U")
+                .disabled(!has_rules)
+                .on_select_tx(|s: &mut State, _: &mut Tx| {
+                    if let Some(b) = &mut s.batch_rename {
+                        b.rules.stack_menu = None;
+                        b.rules.set_all_enabled(false);
+                    }
+                }),
+        )
+        .separator()
+        .item(act(t("Exportar para Área de Transferência", "Export to Clipboard"), Some(&icons::M_COPY), "", has_rules, Box::new(|s| {
+            if let Some(b) = &s.batch_rename {
+                let txt = b.rules.export_rules_text();
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    let _ = cb.set_text(txt);
+                }
+            }
+        })))
+        .item(act(t("Comentário...", "Comment..."), Some(&icons::M_PROPERTIES), "Shift+Enter", target.is_some(), Box::new(move |s| {
+            if let Some(b) = &mut s.batch_rename
+                && let Some(i) = target
+            {
+                b.rules.open_comment(i);
+            }
+        })))
+        .on_close(|s: &mut State| {
+            if let Some(b) = &mut s.batch_rename {
+                b.rules.stack_menu = None;
+            }
+        })
+        .build(k, layer)
+}
+
+fn render_comment_modal(k: &rune_kit::Kit, br: &BatchRename, idx: usize, layer: &mut Vec<El>) {
+    let rs = &br.rules;
+    let body = col()
+        .w_full()
+        .px(16.0)
+        .pb(16.0)
+        .gap(12.0)
+        .child(text_box(k, t("Comentário", "Comment"), t("Nota opcional sobre esta regra…", "Optional note about this rule…"), &rs.comment_edit, |s| {
+            match &mut s.batch_rename {
+                Some(b) => &mut b.rules.comment_edit,
+                None => &mut s.name_edit,
+            }
+        }))
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .justify_end()
+                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close_popup).build(k).cursor(Cursor::Pointer))
+                .child(
+                    Button::new(t("Salvar", "Save"))
+                        .variant(ButtonVariant::Submit)
+                        .on_press(move |s: &mut State| {
+                            if let Some(b) = &mut s.batch_rename {
+                                if let Some(rule) = b.rules.rules.get_mut(idx) {
+                                    rule.comment = b.rules.comment_edit.text.trim().to_string();
+                                }
+                                b.rules.popup = None;
+                            }
+                        })
+                        .build(k)
+                        .default_button()
+                        .cursor(Cursor::Pointer),
+                ),
+        );
+
+    Modal::new("rules-comment-modal", t("Comentário da Regra", "Rule Comment"))
+        .open(true)
+        .child(body)
+        .width(420.0)
         .fit()
         .on_close(close_popup)
         .build(k, layer);

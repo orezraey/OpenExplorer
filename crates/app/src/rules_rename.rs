@@ -618,81 +618,290 @@ pub const CYRILLIC_TRANSLIT: &str = "а=a, б=b, в=v, г=g, д=d, е=e, ё=yo, 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rule {
     pub enabled: bool,
+    #[serde(default)]
+    pub comment: String,
     pub config: RuleConfig,
 }
 
 impl Rule {
+    pub fn new(config: RuleConfig) -> Self {
+        Self { enabled: true, comment: String::new(), config }
+    }
+
     pub fn summary(&self) -> String {
-        match &self.config {
-            RuleConfig::Insert { text, where_mode, .. } => {
-                let w = match where_mode {
-                    InsertWhere::Prefix => t("prefixo", "prefix"),
-                    InsertWhere::Suffix => t("sufixo", "suffix"),
-                    InsertWhere::Position => t("posição", "position"),
-                    InsertWhere::AfterText => t("após texto", "after text"),
-                    InsertWhere::BeforeText => t("antes do texto", "before text"),
-                    InsertWhere::ReplaceCurrent => t("substituir", "replace"),
-                };
-                tr!("“{text}” como {w}", "“{text}” as {w}")
+        let flags_suffix = |flags: &[(&'static str, &'static str, bool)]| -> String {
+            let active: Vec<&str> = flags.iter().filter(|(_, _, on)| *on).map(|(pt, en, _)| t(*pt, *en)).collect();
+            if active.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", active.join(", "))
             }
-            RuleConfig::Delete { from_mode, from_pos, from_delim, until_mode, until_count, until_delim, delete_current, .. } => {
+        };
+        let occ_label = |occ: Occurrences| match occ {
+            Occurrences::All => t("todos", "all"),
+            Occurrences::First => t("primeiro", "first"),
+            Occurrences::Last => t("último", "last"),
+        };
+        let where_desc = |wm: InsertWhere, pos: usize, rtl: bool, after: &str, before: &str| -> String {
+            match wm {
+                InsertWhere::Prefix => t("como Prefixo", "as Prefix").into(),
+                InsertWhere::Suffix => t("como Sufixo", "as Suffix").into(),
+                InsertWhere::Position => {
+                    if rtl {
+                        tr!("na posição {pos} (dir→esq)", "at position {pos} (RTL)")
+                    } else {
+                        tr!("na posição {pos}", "at position {pos}")
+                    }
+                }
+                InsertWhere::AfterText => tr!("após texto \"{after}\"", "after text \"{after}\""),
+                InsertWhere::BeforeText => tr!("antes do texto \"{before}\"", "before text \"{before}\""),
+                InsertWhere::ReplaceCurrent => t("substituindo nome atual", "replacing current name").into(),
+            }
+        };
+
+        match &self.config {
+            RuleConfig::Insert { text, where_mode, position, rtl, after_text, before_text, skip_ext } => {
+                let pos_str = where_desc(*where_mode, *position, *rtl, after_text, before_text);
+                let tail = flags_suffix(&[("ignorar extensão", "skip extension", *skip_ext)]);
+                tr!("Inserir \"{text}\" {pos_str}{tail}", "Insert \"{text}\" {pos_str}{tail}")
+            }
+            RuleConfig::Delete { from_mode, from_pos, from_delim, until_mode, until_count, until_delim, delete_current, skip_ext, rtl, keep_delimiters } => {
+                let tail = flags_suffix(&[
+                    ("não remover delimitadores", "do not remove delimiters", *keep_delimiters),
+                    ("direita-para-esquerda", "right-to-left", *rtl),
+                    ("ignorar extensão", "skip extension", *skip_ext),
+                ]);
                 if *delete_current {
-                    t("Excluir nome atual", "Delete current name").into()
+                    format!("{}{tail}", t("Excluir nome atual", "Delete current name"))
                 } else {
                     let f = match from_mode {
-                        DeleteFrom::Position => tr!("pos {from_pos}", "pos {from_pos}"),
-                        DeleteFrom::Delimiter => tr!("“{from_delim}”", "“{from_delim}”"),
+                        DeleteFrom::Position => tr!("posição {from_pos}", "position {from_pos}"),
+                        DeleteFrom::Delimiter => tr!("delimitador \"{from_delim}\"", "delimiter \"{from_delim}\""),
                     };
                     let u = match until_mode {
-                        DeleteUntil::Count => tr!("{until_count} car.", "{until_count} chars"),
-                        DeleteUntil::Delimiter => tr!("“{until_delim}”", "“{until_delim}”"),
-                        DeleteUntil::UntilEnd => t("fim", "end").into(),
+                        DeleteUntil::Count => tr!("contagem {until_count}", "count {until_count}"),
+                        DeleteUntil::Delimiter => tr!("delimitador \"{until_delim}\"", "delimiter \"{until_delim}\""),
+                        DeleteUntil::UntilEnd => t("o final", "the end").into(),
                     };
-                    tr!("De {f} até {u}", "From {f} until {u}")
+                    tr!("Excluir de {f} até {u}{tail}", "Delete from {f} until {u}{tail}")
                 }
             }
-            RuleConfig::Remove { text, .. } => tr!("Remover “{text}”", "Remove “{text}”"),
-            RuleConfig::Replace { find, replace, .. } => tr!("“{find}” → “{replace}”", "“{find}” → “{replace}”"),
-            RuleConfig::Rearrange { delimiters, new_pattern, .. } => tr!("Dividir por “{delimiters}” → “{new_pattern}”", "Split “{delimiters}” → “{new_pattern}”"),
-            RuleConfig::Extension { new_ext, detect_binary, remove_duplicates, .. } => {
+            RuleConfig::Remove { text, occurrences, case_sensitive, whole_words, skip_ext, wildcards } => {
+                let occ = occ_label(*occurrences);
+                let tail = flags_suffix(&[
+                    ("diferenciar maiúsculas", "case sensitive", *case_sensitive),
+                    ("palavras inteiras", "whole words", *whole_words),
+                    ("curingas", "wildcards", *wildcards),
+                    ("ignorar extensão", "skip extension", *skip_ext),
+                ]);
+                tr!("Remover {occ} \"{text}\"{tail}", "Remove {occ} \"{text}\"{tail}")
+            }
+            RuleConfig::Replace { find, replace, occurrences, case_sensitive, whole_words, skip_ext, wildcards } => {
+                let occ = occ_label(*occurrences);
+                let tail = flags_suffix(&[
+                    ("diferenciar maiúsculas", "case sensitive", *case_sensitive),
+                    ("palavras inteiras", "whole words", *whole_words),
+                    ("curingas", "wildcards", *wildcards),
+                    ("ignorar extensão", "skip extension", *skip_ext),
+                ]);
+                tr!("Substituir {occ} \"{find}\" com \"{replace}\"{tail}", "Replace {occ} \"{find}\" with \"{replace}\"{tail}")
+            }
+            RuleConfig::Rearrange { split_mode, delimiters, new_pattern, skip_ext, rtl } => {
+                let how = match split_mode {
+                    RearrangeSplit::Delimiters => tr!("Dividir por delimitadores \"{delimiters}\"", "Split by delimiters \"{delimiters}\""),
+                    RearrangeSplit::Positions => tr!("Dividir nas posições \"{delimiters}\"", "Split at positions \"{delimiters}\""),
+                    RearrangeSplit::ExactPattern => tr!("Dividir por padrão exato \"{delimiters}\"", "Split by exact pattern \"{delimiters}\""),
+                };
+                let tail = flags_suffix(&[
+                    ("direita-para-esquerda", "right-to-left", *rtl),
+                    ("ignorar extensão", "skip extension", *skip_ext),
+                ]);
+                tr!("{how}, Novo padrão \"{new_pattern}\"{tail}", "{how}, New pattern \"{new_pattern}\"{tail}")
+            }
+            RuleConfig::Extension { set_new, new_ext, append_original, detect_binary, remove_duplicates, dup_case_sensitive } => {
+                let mut parts: Vec<String> = Vec::new();
                 if *detect_binary {
-                    t("Detectar assinatura binária", "Detect binary signature").into()
-                } else if *remove_duplicates {
-                    t("Remover extensões duplicadas", "Remove duplicate extensions").into()
+                    parts.push(t("Detectar assinatura binária", "Detect binary signature").into());
+                } else if *set_new {
+                    parts.push(tr!("Alterar extensão para \".{new_ext}\"", "Set extension to \".{new_ext}\""));
+                }
+                if *append_original {
+                    parts.push(t("anexar ao nome original", "append to original").into());
+                }
+                if *remove_duplicates {
+                    parts.push(t("remover extensões duplicadas", "remove duplicate extensions").into());
+                }
+                if parts.is_empty() {
+                    parts.push(t("Sem alteração de extensão", "No extension changes").into());
+                }
+                let tail = flags_suffix(&[("diferenciar maiúsculas", "case sensitive", *dup_case_sensitive)]);
+                format!("{}{tail}", parts.join(", "))
+            }
+            RuleConfig::Strip { english, digits, symbols, brackets, custom, custom_chars, unicode_range, where_mode, invert, case_sensitive, skip_ext, .. } => {
+                let mut sets: Vec<String> = Vec::new();
+                if *english { sets.push(t("inglês", "English").into()); }
+                if *digits { sets.push(t("dígitos", "digits").into()); }
+                if *symbols { sets.push(t("símbolos", "symbols").into()); }
+                if *brackets { sets.push(t("colchetes", "brackets").into()); }
+                if *custom { sets.push(tr!("\"{custom_chars}\"", "\"{custom_chars}\"")); }
+                if *unicode_range { sets.push(t("unicode", "unicode").into()); }
+                let what = if sets.is_empty() { t("nenhum conjunto", "none").into() } else { sets.join(", ") };
+                let loc = match where_mode {
+                    StripWhere::Everywhere => t("em todo lugar", "everywhere"),
+                    StripWhere::Main => t("no início", "leading"),
+                    StripWhere::Right => t("à direita", "trailing"),
+                };
+                let tail = flags_suffix(&[
+                    ("inverter seleção", "invert selection", *invert),
+                    ("diferenciar maiúsculas", "case sensitive", *case_sensitive),
+                    ("ignorar extensão", "skip extension", *skip_ext),
+                ]);
+                tr!("Retirar ({what}) {loc}{tail}", "Strip ({what}) {loc}{tail}")
+            }
+            RuleConfig::Case { mode, preserve_case, skip_ext, force_fragments, fragments, ext_lower, ext_upper } => {
+                let base = match mode {
+                    CaseMode::TitleCase => t("Primeira Letra Da Palavra Em Maiúscula", "Capitalize Every Word"),
+                    CaseMode::Lower => t("tudo em minúsculo", "all lower case"),
+                    CaseMode::Upper => t("TUDO EM MAIÚSCULO", "ALL UPPER CASE"),
+                    CaseMode::Invert => t("iNVERTER mAIÚSCULAS/mINÚSCULAS", "iNVERT cASE"),
+                    CaseMode::FirstLetter => t("Primeira letra maiúscula", "First letter capital"),
+                    CaseMode::Sentence => t("Iniciar sentença em maiúsculas", "Sentence case"),
+                    CaseMode::None => t("(nenhum)", "(none)"),
+                };
+                let mut extra: Vec<String> = Vec::new();
+                if *preserve_case { extra.push(t("preservar existentes", "preserve existing").into()); }
+                if *force_fragments && !fragments.trim().is_empty() {
+                    extra.push(tr!("fragmentos \"{fragments}\"", "fragments \"{fragments}\""));
+                }
+                if *ext_lower { extra.push(t("ext. minúscula", "ext. lower").into()); }
+                if *ext_upper { extra.push(t("ext. maiúscula", "ext. UPPER").into()); }
+                if *skip_ext { extra.push(t("ignorar extensão", "skip extension").into()); }
+                if extra.is_empty() {
+                    base.into()
                 } else {
-                    tr!("Nova extensão: .{new_ext}", "New extension: .{new_ext}")
+                    format!("{base} ({})", extra.join(", "))
                 }
             }
-            RuleConfig::Strip { .. } => t("Retirar conjuntos de caracteres", "Strip character sets").into(),
-            RuleConfig::Case { mode, .. } => match mode {
-                CaseMode::TitleCase => t("Primeira Letra Da Palavra Em Maiúscula", "Title Case"),
-                CaseMode::Lower => t("tudo em minúsculo", "all lower case"),
-                CaseMode::Upper => t("TUDO EM MAIÚSCULO", "ALL UPPER CASE"),
-                CaseMode::Invert => t("iNVERTER cAIXA", "iNVERT cASE"),
-                CaseMode::FirstLetter => t("Primeira letra maiúscula", "Capitalize first letter"),
-                CaseMode::Sentence => t("Iniciar sentença em maiúsculas", "Sentence case"),
-                CaseMode::None => t("(Apenas extensão)", "(Extension only)"),
-            }
-            .into(),
-            RuleConfig::Serialize { start, step, pad_zeros, pad_length, .. } => {
-                if *pad_zeros {
-                    tr!("Início {start}, passo {step}, zeros={pad_length}", "Start {start}, step {step}, pad={pad_length}")
+            RuleConfig::Serialize { start, step, pad_zeros, pad_length, where_mode, position, skip_ext, .. } => {
+                let pos_str = where_desc(*where_mode, *position, false, "", "");
+                let tail = flags_suffix(&[
+                    ("ignorar extensão", "skip extension", *skip_ext),
+                ]);
+                let pad_note = if *pad_zeros {
+                    tr!(", preencher zeros={pad_length}", ", pad zeros={pad_length}")
                 } else {
-                    tr!("Início {start}, passo {step}", "Start {start}, step {step}")
+                    String::new()
+                };
+                tr!(
+                    "Serializar incremental de {start} (passo {step}{pad_note}) {pos_str}{tail}",
+                    "Serialize incremental from {start} (step {step}{pad_note}) {pos_str}{tail}"
+                )
+            }
+            RuleConfig::Random { length, digits, letters, custom, where_mode, position, skip_ext, .. } => {
+                let pos_str = where_desc(*where_mode, *position, false, "", "");
+                let mut pool = Vec::new();
+                if *digits { pool.push(t("dígitos", "digits")); }
+                if *letters { pool.push(t("letras", "letters")); }
+                if *custom { pool.push(t("usuário", "custom")); }
+                let pool_s = if pool.is_empty() { t("padrão", "default").into() } else { pool.join("+") };
+                let tail = flags_suffix(&[("ignorar extensão", "skip extension", *skip_ext)]);
+                tr!(
+                    "Aleatório de {length} car. ({pool_s}) {pos_str}{tail}",
+                    "Random {length} chars ({pool_s}) {pos_str}{tail}"
+                )
+            }
+            RuleConfig::Padding { pad_numbers, pad_numbers_len, strip_zeros, pad_text, pad_text_len, pad_text_chars, skip_ext, .. } => {
+                let mut ops: Vec<String> = Vec::new();
+                if *pad_numbers { ops.push(tr!("zeros até compr. {pad_numbers_len}", "zeros to len {pad_numbers_len}")); }
+                if *strip_zeros { ops.push(t("remover zeros à esquerda", "strip leading zeros").into()); }
+                if *pad_text { ops.push(tr!("texto com \"{pad_text_chars}\" até {pad_text_len}", "text \"{pad_text_chars}\" to {pad_text_len}")); }
+                let what = if ops.is_empty() { t("sem preenchimento", "no padding").into() } else { ops.join(", ") };
+                let tail = flags_suffix(&[("ignorar extensão", "skip extension", *skip_ext)]);
+                tr!("Preencher ({what}){tail}", "Padding ({what}){tail}")
+            }
+            RuleConfig::CleanUp { strip_parens, strip_brackets, strip_braces, fix_spaces, strip_accents, skip_ext, .. } => {
+                let mut acts: Vec<&str> = Vec::new();
+                if *strip_parens || *strip_brackets || *strip_braces {
+                    acts.push(t("retirar colchetes", "strip brackets"));
+                }
+                if *fix_spaces {
+                    acts.push(t("corrigir espaços", "fix spaces"));
+                }
+                if *strip_accents {
+                    acts.push(t("remover acentos", "strip accents"));
+                }
+                let head = if acts.is_empty() {
+                    t("Limpar caracteres e espaços", "Clean up characters and spaces").into()
+                } else {
+                    acts.join(", ")
+                };
+                let tail = flags_suffix(&[("ignorar extensão", "skip extension", *skip_ext)]);
+                format!("{head}{tail}")
+            }
+            RuleConfig::Translit { direction, auto_case, skip_ext, .. } => {
+                let d = match direction {
+                    TranslitDir::Forward => t("Avançar", "Forward"),
+                    TranslitDir::Backward => t("Retroceder", "Backward"),
+                };
+                let tail = flags_suffix(&[
+                    ("ajuste automático", "auto case", *auto_case),
+                    ("ignorar extensão", "skip extension", *skip_ext),
+                ]);
+                tr!("Transliterar ({d}){tail}", "Transliterate ({d}){tail}")
+            }
+            RuleConfig::ReformatDate { find_fmt, replace_fmt, whole_words, skip_ext, adjust_on, adjust_amount, adjust_unit, .. } => {
+                let adj = if *adjust_on && *adjust_amount != 0 {
+                    let u = adjust_unit.label().to_lowercase();
+                    format!(" ({:+} {u})", adjust_amount)
+                } else {
+                    String::new()
+                };
+                let tail = flags_suffix(&[
+                    ("palavras inteiras", "whole words", *whole_words),
+                    ("ignorar extensão", "skip extension", *skip_ext),
+                ]);
+                tr!(
+                    "Converter formato \"{find_fmt}\" para \"{replace_fmt}\"{adj}{tail}",
+                    "Reformat \"{find_fmt}\" to \"{replace_fmt}\"{adj}{tail}"
+                )
+            }
+            RuleConfig::Regex { pattern, replace, case_sensitive, skip_ext } => {
+                let tail = flags_suffix(&[
+                    ("diferenciar maiúsculas", "case sensitive", *case_sensitive),
+                    ("ignorar extensão", "skip extension", *skip_ext),
+                ]);
+                tr!(
+                    "Substituir expressão \"{pattern}\" com \"{replace}\"{tail}",
+                    "Replace regex \"{pattern}\" with \"{replace}\"{tail}"
+                )
+            }
+            RuleConfig::PascalScript { code } => {
+                let flat: Vec<&str> = code.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+                if flat.is_empty() {
+                    t("(Script Pascal vazio)", "(Empty Pascal Script)").into()
+                } else {
+                    flat.join(" ")
                 }
             }
-            RuleConfig::Random { length, .. } => tr!("Sequência de {length} caracteres", "{length}-character random string"),
-            RuleConfig::Padding { .. } => t("Preenchimento de números/texto", "Number/text padding").into(),
-            RuleConfig::CleanUp { .. } => t("Limpar espaços e símbolos", "Clean up spaces & symbols").into(),
-            RuleConfig::Translit { direction, .. } => match direction {
-                TranslitDir::Forward => t("Transliterar (Avançar)", "Transliterate (Forward)").into(),
-                TranslitDir::Backward => t("Transliterar (Retroceder)", "Transliterate (Backward)").into(),
-            },
-            RuleConfig::ReformatDate { find_fmt, replace_fmt, .. } => tr!("{find_fmt} → {replace_fmt}", "{find_fmt} → {replace_fmt}"),
-            RuleConfig::Regex { pattern, replace, .. } => tr!("/{pattern}/ → “{replace}”", "/{pattern}/ → “{replace}”"),
-            RuleConfig::PascalScript { .. } => t("Script Pascal personalizado", "Custom Pascal Script").into(),
-            RuleConfig::UserInput { .. } => t("Lista de nomes do usuário", "User input name list").into(),
-            RuleConfig::Mapping { entries, .. } => tr!("{} mapeamento(s)", "{} mapping(s)", entries.len()),
+            RuleConfig::UserInput { lines, mode, skip_ext, .. } => {
+                let n = lines.lines().count();
+                let m = match mode {
+                    UserInputMode::Before => t("na frente", "before"),
+                    UserInputMode::After => t("após", "after"),
+                    UserInputMode::Replace => t("substituir", "replace"),
+                };
+                let tail = flags_suffix(&[("ignorar extensão", "skip extension", *skip_ext)]);
+                tr!("Entrada ({m}, {n} linha(s)){tail}", "User input ({m}, {n} line(s)){tail}")
+            }
+            RuleConfig::Mapping { entries, partial_match, inverse, case_sensitive, skip_ext, .. } => {
+                let tail = flags_suffix(&[
+                    ("corresp. parcial", "partial match", *partial_match),
+                    ("inverso", "inverse", *inverse),
+                    ("diferenciar maiúsculas", "case sensitive", *case_sensitive),
+                    ("ignorar extensão", "skip extension", *skip_ext),
+                ]);
+                tr!("Mapear {} entrada(s){tail}", "Map {} entry(ies){tail}", entries.len())
+            }
         }
     }
 }
@@ -725,72 +934,11 @@ pub fn builtin_presets() -> Vec<RulePreset> {
         RulePreset {
             name: t("Limpar nome para web / mídia", "Clean up name for web / media").into(),
             rules: vec![
-                Rule {
-                    enabled: true,
-                    config: RuleConfig::CleanUp {
-                        strip_parens: false,
-                        strip_brackets: true,
-                        strip_braces: true,
-                        replace_dot: true,
-                        replace_comma: false,
-                        replace_underscore: true,
-                        replace_plus: false,
-                        replace_dash: false,
-                        replace_pct20: true,
-                        skip_versions: true,
-                        fix_spaces: true,
-                        normalize_unicode_spaces: true,
-                        strip_emoji: false,
-                        strip_accents: false,
-                        space_before_camel: false,
-                        prepare_sharepoint: false,
-                        skip_ext: true,
-                    },
-                },
-                Rule {
-                    enabled: true,
-                    config: RuleConfig::Case {
-                        mode: CaseMode::TitleCase,
-                        preserve_case: false,
-                        skip_ext: true,
-                        force_fragments: false,
-                        fragments: "CD, DVD, DJ".into(),
-                        ext_lower: true,
-                        ext_upper: false,
-                    },
-                },
-            ],
-        },
-        RulePreset {
-            name: t("Numerar com zeros (01, 02...)", "Zero-padded numbering (01, 02...)").into(),
-            rules: vec![Rule {
-                enabled: true,
-                config: RuleConfig::Serialize {
-                    start: 1,
-                    repeat: 1,
-                    step: 1,
-                    reset_every_on: false,
-                    reset_every: 1,
-                    reset_folder_change: false,
-                    reset_name_change: false,
-                    pad_zeros: true,
-                    pad_length: 2,
-                    num_system: NumSystem::Decimal,
-                    where_mode: InsertWhere::Prefix,
-                    position: 1,
-                    skip_ext: true,
-                },
-            }],
-        },
-        RulePreset {
-            name: t("Remover acentos e normalizar espaços", "Strip accents and normalize spaces").into(),
-            rules: vec![Rule {
-                enabled: true,
-                config: RuleConfig::CleanUp {
+                Rule::new(RuleConfig::CleanUp {
                     strip_parens: false,
-                    strip_brackets: false,
-                    strip_braces: false,
-                    replace_dot: false,
+                    strip_brackets: true,
+                    strip_braces: true,
+                    replace_dot: true,
                     replace_comma: false,
                     replace_underscore: true,
                     replace_plus: false,
@@ -799,13 +947,62 @@ pub fn builtin_presets() -> Vec<RulePreset> {
                     skip_versions: true,
                     fix_spaces: true,
                     normalize_unicode_spaces: true,
-                    strip_emoji: true,
-                    strip_accents: true,
+                    strip_emoji: false,
+                    strip_accents: false,
                     space_before_camel: false,
                     prepare_sharepoint: false,
                     skip_ext: true,
-                },
-            }],
+                }),
+                Rule::new(RuleConfig::Case {
+                    mode: CaseMode::TitleCase,
+                    preserve_case: false,
+                    skip_ext: true,
+                    force_fragments: false,
+                    fragments: "CD, DVD, DJ".into(),
+                    ext_lower: true,
+                    ext_upper: false,
+                }),
+            ],
+        },
+        RulePreset {
+            name: t("Numerar com zeros (01, 02...)", "Zero-padded numbering (01, 02...)").into(),
+            rules: vec![Rule::new(RuleConfig::Serialize {
+                start: 1,
+                repeat: 1,
+                step: 1,
+                reset_every_on: false,
+                reset_every: 1,
+                reset_folder_change: false,
+                reset_name_change: false,
+                pad_zeros: true,
+                pad_length: 2,
+                num_system: NumSystem::Decimal,
+                where_mode: InsertWhere::Prefix,
+                position: 1,
+                skip_ext: true,
+            })],
+        },
+        RulePreset {
+            name: t("Remover acentos e normalizar espaços", "Strip accents and normalize spaces").into(),
+            rules: vec![Rule::new(RuleConfig::CleanUp {
+                strip_parens: false,
+                strip_brackets: false,
+                strip_braces: false,
+                replace_dot: false,
+                replace_comma: false,
+                replace_underscore: true,
+                replace_plus: false,
+                replace_dash: false,
+                replace_pct20: true,
+                skip_versions: true,
+                fix_spaces: true,
+                normalize_unicode_spaces: true,
+                strip_emoji: true,
+                strip_accents: true,
+                space_before_camel: false,
+                prepare_sharepoint: false,
+                skip_ext: true,
+            })],
         },
     ]
 }
@@ -819,6 +1016,8 @@ pub enum RulesPopup {
     Presets,
     /// Step-by-step rule analyzer modal.
     Analyze,
+    /// Edit comment for rule at index.
+    Comment(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -836,6 +1035,8 @@ pub struct RuleEditorState {
     pub config: RuleConfig,
     /// Index in `RulesState::rules` when editing an existing rule, or `None` when adding.
     pub edit_index: Option<usize>,
+    /// Optional insertion slot (`Adicionar regra (acima)` / `(abaixo)`) when adding a new rule.
+    pub insert_at: Option<usize>,
     /// Active Meta Tags sub-picker target inside the independent Rule Editor window.
     pub meta_target: Option<MetaTagTarget>,
     // Shared text edits synced with `config` for smooth Rune TextInput editing:
@@ -865,6 +1066,7 @@ impl RuleEditorState {
             kind,
             config,
             edit_index: None,
+            insert_at: None,
             meta_target: None,
             edit_a: TextEdit::new(""),
             edit_b: TextEdit::new(""),
@@ -1076,9 +1278,33 @@ impl RuleEditorState {
     }
 }
 
+pub const DEFAULT_RULE_COLS: [f32; 3] = [56.0, 150.0, 480.0];
+pub const DEFAULT_PREVIEW_COLS: [f32; 4] = [78.0, 290.0, 290.0, 120.0];
+
+pub fn clamp_rule_col(i: usize, w: f32) -> f32 {
+    match i {
+        0 => w.clamp(42.0, 140.0),
+        1 => w.clamp(80.0, 380.0),
+        _ => w.clamp(140.0, 1400.0),
+    }
+}
+
+pub fn clamp_preview_col(i: usize, w: f32) -> f32 {
+    match i {
+        0 => w.clamp(56.0, 160.0),
+        1 | 2 => w.clamp(100.0, 900.0),
+        _ => w.clamp(64.0, 360.0),
+    }
+}
+
 pub struct RulesState {
     pub rules: Vec<Rule>,
     pub selected: Option<usize>,
+    pub all_selected: bool,
+    pub col_widths: [f32; 3],
+    pub preview_cols: [f32; 4],
+    pub stack_menu: Option<(Option<usize>, rune::PointerPress)>,
+    pub comment_edit: TextEdit,
     pub popup: Option<RulesPopup>,
     pub editor: RuleEditorState,
     // Meta Tags picker state
@@ -1104,6 +1330,11 @@ impl RulesState {
         Self {
             rules: Vec::new(),
             selected: None,
+            all_selected: false,
+            col_widths: DEFAULT_RULE_COLS,
+            preview_cols: DEFAULT_PREVIEW_COLS,
+            stack_menu: None,
+            comment_edit: TextEdit::new(""),
             popup: None,
             editor: RuleEditorState::from_config(RuleConfig::default_for(RuleKind::Insert)),
             tag_cat: rules_meta::TagCategory::All,
@@ -1116,41 +1347,111 @@ impl RulesState {
         }
     }
 
-    pub fn open_add(&mut self) {
+    pub fn open_add_at(&mut self, insert_at: Option<usize>) {
         self.editor = RuleEditorState::from_config(RuleConfig::default_for(RuleKind::Insert));
+        self.editor.insert_at = insert_at;
         self.popup = None;
+        self.stack_menu = None;
     }
 
     pub fn open_edit(&mut self, idx: usize) {
         let Some(rule) = self.rules.get(idx) else { return };
         self.selected = Some(idx);
+        self.all_selected = false;
         self.editor = RuleEditorState::from_config(rule.config.clone());
         self.editor.edit_index = Some(idx);
         self.popup = None;
+        self.stack_menu = None;
     }
 
     pub fn commit_editor(&mut self) {
         self.editor.sync_edits_to_config();
         let config = self.editor.config.clone();
-        match self.editor.edit_index {
-            Some(idx) if idx < self.rules.len() => {
+        match (self.editor.edit_index, self.editor.insert_at) {
+            (Some(idx), _) if idx < self.rules.len() => {
                 self.rules[idx].config = config;
                 self.selected = Some(idx);
             }
+            (None, Some(pos)) if pos <= self.rules.len() => {
+                self.rules.insert(pos, Rule::new(config));
+                self.selected = Some(pos);
+            }
             _ => {
-                self.rules.push(Rule { enabled: true, config });
+                self.rules.push(Rule::new(config));
                 self.selected = Some(self.rules.len() - 1);
             }
         }
+        self.all_selected = false;
+        self.editor.insert_at = None;
         self.editor.meta_target = None;
     }
 
     pub fn remove_selected(&mut self) {
+        if self.all_selected {
+            self.clear_all();
+            return;
+        }
         let Some(i) = self.selected else { return };
         if i < self.rules.len() {
             self.rules.remove(i);
             self.selected = if self.rules.is_empty() { None } else { Some(i.min(self.rules.len() - 1)) };
         }
+    }
+
+    pub fn clear_all(&mut self) {
+        self.rules.clear();
+        self.selected = None;
+        self.all_selected = false;
+    }
+
+    pub fn duplicate_selected(&mut self) {
+        let Some(i) = self.selected else { return };
+        if let Some(cloned) = self.rules.get(i).cloned() {
+            let at = i + 1;
+            self.rules.insert(at, cloned);
+            self.selected = Some(at);
+            self.all_selected = false;
+        }
+    }
+
+    pub fn select_all(&mut self) {
+        if !self.rules.is_empty() {
+            self.all_selected = true;
+            if self.selected.is_none() {
+                self.selected = Some(0);
+            }
+        }
+    }
+
+    pub fn set_all_enabled(&mut self, enabled: bool) {
+        for r in &mut self.rules {
+            r.enabled = enabled;
+        }
+    }
+
+    pub fn open_comment(&mut self, idx: usize) {
+        if let Some(r) = self.rules.get(idx) {
+            self.selected = Some(idx);
+            self.all_selected = false;
+            self.comment_edit = TextEdit::new(r.comment.clone());
+            self.popup = Some(RulesPopup::Comment(idx));
+            self.stack_menu = None;
+        }
+    }
+
+    pub fn export_rules_text(&self) -> String {
+        let mut lines = Vec::with_capacity(self.rules.len() + 1);
+        lines.push(format!("#\t{}\t{}\t{}", t("Ativo", "Active"), t("Regra", "Rule"), t("Instrução", "Instruction")));
+        for (i, r) in self.rules.iter().enumerate() {
+            let mark = if r.enabled { "[x]" } else { "[ ]" };
+            let cmt = if r.comment.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" // {}", r.comment.trim())
+            };
+            lines.push(format!("{}\t{mark}\t{}\t{}{cmt}", i + 1, r.config.kind().label(), r.summary()));
+        }
+        lines.join("\n")
     }
 
     pub fn move_selected(&mut self, delta: isize) {
@@ -1159,6 +1460,7 @@ impl RulesState {
         if i != j && j < self.rules.len() {
             self.rules.swap(i, j);
             self.selected = Some(j);
+            self.all_selected = false;
         }
     }
 }
@@ -2430,50 +2732,46 @@ mod tests {
         }
     }
 
+    #[cfg(test)]
+    fn rule(config: RuleConfig) -> Rule {
+        Rule::new(config)
+    }
+
     #[test]
     fn insert_delete_remove_and_replace_rules() {
         let items = vec![file("Relatorio_Final_2025.pdf")];
         let loc = Location::Local(PathBuf::from("C:/docs"));
         let rules = vec![
-            Rule {
-                enabled: true,
-                config: RuleConfig::Replace {
-                    find: "_".into(),
-                    replace: " ".into(),
-                    occurrences: Occurrences::All,
-                    case_sensitive: false,
-                    whole_words: false,
-                    skip_ext: true,
-                    wildcards: false,
-                },
-            },
-            Rule {
-                enabled: true,
-                config: RuleConfig::Insert {
-                    text: "[OK] ".into(),
-                    where_mode: InsertWhere::Prefix,
-                    position: 1,
-                    rtl: false,
-                    after_text: String::new(),
-                    before_text: String::new(),
-                    skip_ext: true,
-                },
-            },
-            Rule {
-                enabled: true,
-                config: RuleConfig::Delete {
-                    from_mode: DeleteFrom::Delimiter,
-                    from_pos: 1,
-                    from_delim: " 2025".into(),
-                    until_mode: DeleteUntil::UntilEnd,
-                    until_count: 1,
-                    until_delim: String::new(),
-                    delete_current: false,
-                    skip_ext: true,
-                    rtl: false,
-                    keep_delimiters: false,
-                },
-            },
+            rule(RuleConfig::Replace {
+                find: "_".into(),
+                replace: " ".into(),
+                occurrences: Occurrences::All,
+                case_sensitive: false,
+                whole_words: false,
+                skip_ext: true,
+                wildcards: false,
+            }),
+            rule(RuleConfig::Insert {
+                text: "[OK] ".into(),
+                where_mode: InsertWhere::Prefix,
+                position: 1,
+                rtl: false,
+                after_text: String::new(),
+                before_text: String::new(),
+                skip_ext: true,
+            }),
+            rule(RuleConfig::Delete {
+                from_mode: DeleteFrom::Delimiter,
+                from_pos: 1,
+                from_delim: " 2025".into(),
+                until_mode: DeleteUntil::UntilEnd,
+                until_count: 1,
+                until_delim: String::new(),
+                delete_current: false,
+                skip_ext: true,
+                rtl: false,
+                keep_delimiters: false,
+            }),
         ];
         let res = evaluate_rules(&rules, &items, &[true], &loc);
         assert_eq!(res[0].0, "[OK] Relatorio Final.pdf");
@@ -2484,68 +2782,56 @@ mod tests {
         let items = vec![file("artist - track_one [1080p].MP3"), file("artist - track_two (demo).MP3")];
         let loc = Location::Local(PathBuf::from("C:/music"));
         let rules = vec![
-            Rule {
-                enabled: true,
-                config: RuleConfig::CleanUp {
-                    strip_parens: true,
-                    strip_brackets: true,
-                    strip_braces: false,
-                    replace_dot: false,
-                    replace_comma: false,
-                    replace_underscore: true,
-                    replace_plus: false,
-                    replace_dash: false,
-                    replace_pct20: false,
-                    skip_versions: true,
-                    fix_spaces: true,
-                    normalize_unicode_spaces: true,
-                    strip_emoji: false,
-                    strip_accents: false,
-                    space_before_camel: false,
-                    prepare_sharepoint: false,
-                    skip_ext: true,
-                },
-            },
-            Rule {
-                enabled: true,
-                config: RuleConfig::Rearrange {
-                    split_mode: RearrangeSplit::Delimiters,
-                    delimiters: " - ".into(),
-                    new_pattern: "$2 - $1".into(),
-                    skip_ext: true,
-                    rtl: false,
-                },
-            },
-            Rule {
-                enabled: true,
-                config: RuleConfig::Case {
-                    mode: CaseMode::TitleCase,
-                    preserve_case: false,
-                    skip_ext: true,
-                    force_fragments: false,
-                    fragments: String::new(),
-                    ext_lower: true,
-                    ext_upper: false,
-                },
-            },
-            Rule {
-                enabled: true,
-                config: RuleConfig::Serialize {
-                    start: 1,
-                    repeat: 1,
-                    step: 1,
-                    reset_every_on: false,
-                    reset_every: 1,
-                    reset_folder_change: false,
-                    reset_name_change: false,
-                    pad_zeros: true,
-                    pad_length: 2,
-                    num_system: NumSystem::Decimal,
-                    where_mode: InsertWhere::Prefix,
-                    position: 1,
-                    skip_ext: true,
-                },
-            },
+            rule(RuleConfig::CleanUp {
+                strip_parens: true,
+                strip_brackets: true,
+                strip_braces: false,
+                replace_dot: false,
+                replace_comma: false,
+                replace_underscore: true,
+                replace_plus: false,
+                replace_dash: false,
+                replace_pct20: false,
+                skip_versions: true,
+                fix_spaces: true,
+                normalize_unicode_spaces: true,
+                strip_emoji: false,
+                strip_accents: false,
+                space_before_camel: false,
+                prepare_sharepoint: false,
+                skip_ext: true,
+            }),
+            rule(RuleConfig::Rearrange {
+                split_mode: RearrangeSplit::Delimiters,
+                delimiters: " - ".into(),
+                new_pattern: "$2 - $1".into(),
+                skip_ext: true,
+                rtl: false,
+            }),
+            rule(RuleConfig::Case {
+                mode: CaseMode::TitleCase,
+                preserve_case: false,
+                skip_ext: true,
+                force_fragments: false,
+                fragments: String::new(),
+                ext_lower: true,
+                ext_upper: false,
+            }),
+            rule(RuleConfig::Serialize {
+                start: 1,
+                repeat: 1,
+                step: 1,
+                reset_every_on: false,
+                reset_every: 1,
+                reset_folder_change: false,
+                reset_name_change: false,
+                pad_zeros: true,
+                pad_length: 2,
+                num_system: NumSystem::Decimal,
+                where_mode: InsertWhere::Prefix,
+                position: 1,
+                skip_ext: true,
+            }),
         ];
         // Insert " - " separator after serialize using a quick rule:
         let res = evaluate_rules(&rules, &items, &[true, true], &loc);
@@ -2558,37 +2844,28 @@ mod tests {
         let items = vec![file("Ação_2026-11-26.txt")];
         let loc = Location::Local(PathBuf::from("C:/tmp"));
         let rules = vec![
-            Rule {
-                enabled: true,
-                config: RuleConfig::Translit {
-                    alphabet: DEFAULT_LATIN_TRANSLIT.into(),
-                    direction: TranslitDir::Forward,
-                    auto_case: true,
-                    skip_ext: true,
-                },
-            },
-            Rule {
-                enabled: true,
-                config: RuleConfig::ReformatDate {
-                    find_fmt: "yyyy-mm-dd".into(),
-                    replace_fmt: "dd-mm-yyyy".into(),
-                    whole_words: true,
-                    skip_ext: true,
-                    custom_short_months: false,
-                    short_months: String::new(),
-                    custom_long_months: false,
-                    long_months: String::new(),
-                    adjust_on: true,
-                    adjust_amount: 1,
-                    adjust_unit: TimeUnit::Days,
-                },
-            },
-            Rule {
-                enabled: true,
-                config: RuleConfig::PascalScript {
-                    code: "begin\n  FileName := WideUpperCase(WideExtractBaseName(FileName)) + WideExtractFileExt(FileName);\nend.".into(),
-                },
-            },
+            rule(RuleConfig::Translit {
+                alphabet: DEFAULT_LATIN_TRANSLIT.into(),
+                direction: TranslitDir::Forward,
+                auto_case: true,
+                skip_ext: true,
+            }),
+            rule(RuleConfig::ReformatDate {
+                find_fmt: "yyyy-mm-dd".into(),
+                replace_fmt: "dd-mm-yyyy".into(),
+                whole_words: true,
+                skip_ext: true,
+                custom_short_months: false,
+                short_months: String::new(),
+                custom_long_months: false,
+                long_months: String::new(),
+                adjust_on: true,
+                adjust_amount: 1,
+                adjust_unit: TimeUnit::Days,
+            }),
+            rule(RuleConfig::PascalScript {
+                code: "begin\n  FileName := WideUpperCase(WideExtractBaseName(FileName)) + WideExtractFileExt(FileName);\nend.".into(),
+            }),
         ];
         let res = evaluate_rules(&rules, &items, &[true], &loc);
         assert_eq!(res[0].0, "ACAO_27-11-2026.txt");
@@ -2600,87 +2877,106 @@ mod tests {
         let items = vec![file("  7 - Demo File.TMP  ")];
         let loc = Location::Local(PathBuf::from("C:/tmp"));
         let rules = vec![
-            Rule {
-                enabled: true,
-                config: RuleConfig::Strip {
-                    english: false,
-                    english_chars: String::new(),
-                    digits: false,
-                    digits_chars: String::new(),
-                    symbols: false,
-                    symbols_chars: String::new(),
-                    brackets: false,
-                    brackets_chars: String::new(),
-                    custom: true,
-                    custom_chars: " ".into(),
-                    unicode_range: false,
-                    unicode_range_str: String::new(),
-                    where_mode: StripWhere::Right,
-                    invert: false,
-                    case_sensitive: false,
-                    skip_ext: false,
-                },
-            },
-            Rule {
-                enabled: true,
-                config: RuleConfig::Extension {
-                    set_new: true,
-                    new_ext: "log".into(),
-                    append_original: false,
-                    detect_binary: false,
-                    remove_duplicates: false,
-                    dup_case_sensitive: false,
-                },
-            },
-            Rule {
-                enabled: true,
-                config: RuleConfig::Regex {
-                    pattern: r"^\s*(\d+)\s*-\s*(.+)$".into(),
-                    replace: "$1_$2".into(),
-                    case_sensitive: false,
-                    skip_ext: true,
-                },
-            },
-            Rule {
-                enabled: true,
-                config: RuleConfig::Padding {
-                    pad_numbers: true,
-                    pad_numbers_len: 3,
-                    strip_zeros: false,
-                    pad_text: false,
-                    pad_text_len: 0,
-                    pad_text_chars: String::new(),
-                    pad_text_side: Side::Left,
-                    skip_ext: true,
-                },
-            },
-            Rule {
-                enabled: true,
-                config: RuleConfig::Mapping {
-                    entries: vec![("Demo File".into(), "Sample".into())],
-                    allow_reuse: false,
-                    partial_match: true,
-                    inverse: false,
-                    case_sensitive: true,
-                    skip_ext: true,
-                },
-            },
+            rule(RuleConfig::Strip {
+                english: false,
+                english_chars: String::new(),
+                digits: false,
+                digits_chars: String::new(),
+                symbols: false,
+                symbols_chars: String::new(),
+                brackets: false,
+                brackets_chars: String::new(),
+                custom: true,
+                custom_chars: " ".into(),
+                unicode_range: false,
+                unicode_range_str: String::new(),
+                where_mode: StripWhere::Right,
+                invert: false,
+                case_sensitive: false,
+                skip_ext: false,
+            }),
+            rule(RuleConfig::Extension {
+                set_new: true,
+                new_ext: "log".into(),
+                append_original: false,
+                detect_binary: false,
+                remove_duplicates: false,
+                dup_case_sensitive: false,
+            }),
+            rule(RuleConfig::Regex {
+                pattern: r"^\s*(\d+)\s*-\s*(.+)$".into(),
+                replace: "$1_$2".into(),
+                case_sensitive: false,
+                skip_ext: true,
+            }),
+            rule(RuleConfig::Padding {
+                pad_numbers: true,
+                pad_numbers_len: 3,
+                strip_zeros: false,
+                pad_text: false,
+                pad_text_len: 0,
+                pad_text_chars: String::new(),
+                pad_text_side: Side::Left,
+                skip_ext: true,
+            }),
+            rule(RuleConfig::Mapping {
+                entries: vec![("Demo File".into(), "Sample".into())],
+                allow_reuse: false,
+                partial_match: true,
+                inverse: false,
+                case_sensitive: true,
+                skip_ext: true,
+            }),
         ];
         let res = evaluate_rules(&rules, &items, &[true], &loc);
         assert_eq!(res[0].0, "007_Sample.log");
         assert!(res[0].1.is_none());
 
-        let ui_rules = vec![Rule {
-            enabled: true,
-            config: RuleConfig::UserInput {
-                lines: "custom_name".into(),
-                mode: UserInputMode::Replace,
-                skip_ext: true,
-                trim_lines: true,
-                skip_empty: true,
-            },
-        }];
+        let ui_rules = vec![rule(RuleConfig::UserInput {
+            lines: "custom_name".into(),
+            mode: UserInputMode::Replace,
+            skip_ext: true,
+            trim_lines: true,
+            skip_empty: true,
+        })];
         let ui_res = evaluate_rules(&ui_rules, &[file("orig.txt")], &[true], &loc);
         assert_eq!(ui_res[0].0, "custom_name.txt");
+    }
+
+    #[test]
+    fn rule_stack_context_actions_and_export() {
+        let mut rs = RulesState::new();
+        rs.rules.push(rule(RuleConfig::Extension {
+            set_new: true,
+            new_ext: "mp4".into(),
+            append_original: false,
+            detect_binary: false,
+            remove_duplicates: false,
+            dup_case_sensitive: false,
+        }));
+        rs.selected = Some(0);
+        rs.duplicate_selected();
+        assert_eq!(rs.rules.len(), 2);
+
+        rs.open_add_at(Some(1));
+        rs.editor.edit_a = TextEdit::new("pre_");
+        rs.commit_editor();
+        assert_eq!(rs.rules.len(), 3);
+        assert_eq!(rs.rules[1].config.kind(), RuleKind::Insert);
+
+        rs.rules[1].comment = "prefix step".into();
+        rs.set_all_enabled(false);
+        assert!(rs.rules.iter().all(|r| !r.enabled));
+        rs.set_all_enabled(true);
+        assert!(rs.rules.iter().all(|r| r.enabled));
+
+        let exported = rs.export_rules_text();
+        assert!(exported.contains("// prefix step"));
+
+        rs.select_all();
+        assert!(rs.all_selected);
+        rs.remove_selected();
+        assert!(rs.rules.is_empty());
+        assert!(!rs.all_selected);
     }
 }

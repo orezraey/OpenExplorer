@@ -4134,7 +4134,7 @@ fn accounts_hub(s: &State, k: &Kit) -> El {
 /// click, and on release when the size ended up different.
 /// `step` is how far the pointer moved along the size: `d.dx` for a width, `-d.dy` for a
 /// height grown upwards.
-fn resize(d: &mut Drag, step: f32, size: &mut f32, default: f32, clamp: impl Fn(f32) -> f32) -> bool {
+pub(crate) fn resize(d: &mut Drag, step: f32, size: &mut f32, default: f32, clamp: impl Fn(f32) -> f32) -> bool {
     match d.phase {
         Phase::Down if d.clicks >= 2 => {
             // The release of this click resizes from the default, so it doesn't undo it.
