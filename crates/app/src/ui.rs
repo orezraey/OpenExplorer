@@ -6451,8 +6451,10 @@ fn tree(s: &State, k: &Kit, p: usize) -> El {
         .role("tree")
         .label(t("Pastas", "Folders"))
         .focusable(true)
-        // The row the keyboard is on shows focus with its own ring.
+        // The row the keyboard is on shows focus with its own ring, while the tree has focus
+        // however it got it (Tab from the search field, a click). Switching windows keeps it.
         .no_focus_ring()
+        .on_focus_change(move |s: &mut State, on, _: &mut Tx| crate::tree::focus(s, p, on))
         .active_descendant(at)
         .on_key(move |s: &mut State, ev: &KeyEvent, tx: &mut Tx| crate::tree::key(s, p, ev, tx))
         .instant_changes()

@@ -1394,15 +1394,6 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
         }
     }
-    // A tree shows its keyboard row's ring while it has focus, however it got it (Tab from the
-    // search field, a click), and stops once focus left it.
-    for p in 0..MAX_PANES {
-        let on = tx.focused() == Some(ui::tree_key(p).as_str());
-        if s.tree.focused[p] != on {
-            tree::focus(s, p, on);
-            changed = true;
-        }
-    }
     // Each tree brings the folder its pane shows into view, once that's in the tree.
     for p in 0..MAX_PANES {
         if tree::following(s, p) {
@@ -2527,9 +2518,9 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             go_up(s, p);
             return true;
         }
-        // Back to the tree beside the files, as in Explorer.
+        // Back to the tree beside the files, as in Explorer. Its ring comes on once focus lands
+        // there (`on_focus_change`), so a hidden tree shows none.
         Key::Tab if ev.mods.shift => {
-            tree::focus(s, p, true);
             tx.focus(ui::tree_key(p), true);
             return true;
         }
@@ -4169,6 +4160,46 @@ mod tests {
         });
         println!("List view tick: {best:.0} µs best, {median:.0} µs median of 9 runs of 100");
         drop(batch);
+    }
+
+    /// A tree's keyboard ring comes on when the tree takes focus, stays while another window is in
+    /// front, and goes when focus moves on inside the window.
+    #[test]
+    fn the_tree_ring_follows_focus_not_the_window() {
+        let mut rt = rune::Runtime::new(init(), ui::view, (1600.0, 1000.0), rune::Env::new(false, 1.0));
+        let frames = |rt: &mut rune::Runtime<State>| {
+            for _ in 0..3 {
+                rt.frame(1.0 / 60.0);
+            }
+        };
+        frames(&mut rt);
+        let ring = |rt: &mut rune::Runtime<State>| {
+            let mut on = false;
+            rt.update(|s, _| on = s.tree.focused[0]);
+            on
+        };
+        assert!(!ring(&mut rt));
+        rt.update(|_, tx| tx.focus(ui::tree_key(0), true));
+        frames(&mut rt);
+        assert!(ring(&mut rt), "focus came to the tree");
+        rt.window_focus(false);
+        frames(&mut rt);
+        assert!(ring(&mut rt), "another window in front keeps it");
+        rt.window_focus(true);
+        frames(&mut rt);
+        assert!(ring(&mut rt), "back to the front, still on");
+        rt.update(|_, tx| tx.focus(pane_key(0), true));
+        frames(&mut rt);
+        assert!(!ring(&mut rt), "focus moved on to the list");
+        // Shift+Tab from the list with the tree hidden: focus can't go there, so no ring.
+        rt.update(|s, _| s.show_tree[0] = false);
+        frames(&mut rt);
+        let shift_tab = KeyEvent { key: Key::Tab, mods: Mods { shift: true, ..Mods::default() } };
+        rt.update(|s, tx| {
+            key(s, 0, &shift_tab, tx);
+        });
+        frames(&mut rt);
+        assert!(!ring(&mut rt), "the hidden tree never took focus");
     }
 
     /// The hover highlight follows the pointer to the row under it and fades when it leaves the
