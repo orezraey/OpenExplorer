@@ -20,6 +20,9 @@ pub struct Dav {
     origin: String,
     host: String,
     auth: Option<String>,
+    /// Whether the server keeps the date sent with a file (`X-OC-Mtime`), once that is known:
+    /// from the first file sent with one, read back.
+    keeps_dates: Option<bool>,
 }
 
 /// What a path segment may not hold unescaped.
@@ -54,7 +57,7 @@ impl Dav {
             let pair = format!("{}:{secret}", server.user);
             format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(pair))
         });
-        let mut dav = Dav { agent, origin: format!("{scheme}://{host}{port}"), host: server.host.clone(), auth };
+        let mut dav = Dav { agent, origin: format!("{scheme}://{host}{port}"), host: server.host.clone(), auth, keeps_dates: None };
         // Checks the address and the login now, with a clear message.
         dav.stat(if server.root.is_empty() { "/" } else { &server.root })?;
         Ok(dav)
@@ -302,6 +305,46 @@ impl Conn for Dav {
     }
 
     fn upload(&mut self, path: &str, src: &mut dyn Read, len: u64, progress: Progress) -> Result<()> {
+        self.put(path, src, len, None, progress)
+    }
+
+    /// The date goes with the file, in the `X-OC-Mtime` header that ownCloud, Nextcloud,
+    /// Fastmail and rclone take (plain WebDAV has no way to set one, and some servers answer a
+    /// PROPPATCH of the date with a success and leave it as it was). Nothing in the answer says
+    /// whether it was kept, so the first file sent is read back, and the rest go by that.
+    fn upload_file_dated(&mut self, path: &str, local: &std::path::Path, modified: SystemTime, progress: Progress) -> Result<Option<bool>> {
+        let mut file = std::fs::File::open(local).map_err(|e| tr!("Não consegui abrir {}: {e}", "Couldn't open {}: {e}", local.display()))?;
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        self.put(path, &mut file, len, Some(modified), progress)?;
+        // An answer that doesn't come says nothing of the server: asked again of the next file.
+        if self.keeps_dates.is_none()
+            && let Ok(there) = self.stat(path)
+        {
+            self.keeps_dates = Some(there.and_then(|i| i.modified).is_some_and(|there| same_second(there, modified)));
+        }
+        Ok(self.keeps_dates)
+    }
+
+    fn home(&mut self) -> Result<String> {
+        Ok("/".into())
+    }
+
+    fn alive(&mut self) -> bool {
+        // Each request is its own; ureq keeps the connection open itself.
+        true
+    }
+}
+
+/// Whether two times are the same to the second, give or take one: a date kept by a server
+/// comes back without its fraction.
+fn same_second(a: SystemTime, b: SystemTime) -> bool {
+    a.duration_since(b).or_else(|_| b.duration_since(a)).is_ok_and(|apart| apart < Duration::from_secs(2))
+}
+
+impl Dav {
+    /// PUT of `len` bytes of `src` at `path`, with the modification time `modified` for a server
+    /// that takes one.
+    fn put(&mut self, path: &str, src: &mut dyn Read, len: u64, modified: Option<SystemTime>, progress: Progress) -> Result<()> {
         // Counts what was read off the file, which is what has gone out.
         struct Counting<'a, 'b> {
             src: &'a mut dyn Read,
@@ -322,11 +365,11 @@ impl Conn for Dav {
         }
         let mut counting = Counting { src, done: 0, progress, stopped: false };
         // A length, not chunks: some servers (nginx) refuse a chunked upload.
-        let req = self
-            .request("PUT", &self.url(path, false))
-            .header("Content-Length", len.to_string())
-            .body(ureq::SendBody::from_reader(&mut counting))
-            .map_err(|e| e.to_string())?;
+        let mut req = self.request("PUT", &self.url(path, false)).header("Content-Length", len.to_string());
+        if let Some(secs) = modified.and_then(|at| at.duration_since(SystemTime::UNIX_EPOCH).ok()) {
+            req = req.header("X-OC-Mtime", secs.as_secs().to_string());
+        }
+        let req = req.body(ureq::SendBody::from_reader(&mut counting)).map_err(|e| e.to_string())?;
         let res = self.agent.run(req);
         if counting.stopped {
             // The server may still be writing what arrived, and keep it once the request ends:
@@ -341,15 +384,6 @@ impl Conn for Dav {
             return Err(CANCELLED.into());
         }
         self.ok(res.map_err(|e| self.failed(e))?)
-    }
-
-    fn home(&mut self) -> Result<String> {
-        Ok("/".into())
-    }
-
-    fn alive(&mut self) -> bool {
-        // Each request is its own; ureq keeps the connection open itself.
-        true
     }
 }
 
@@ -388,7 +422,7 @@ mod tests {
     #[test]
     fn addresses_escape_each_segment() {
         let server = Server { id: "x".into(), name: "x".into(), protocol: Protocol::Davs, brand: None, host: "h".into(), port: 443, user: String::new(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
-        let dav = Dav { agent: Agent::new_with_defaults(), origin: "https://h".into(), host: server.host.clone(), auth: None };
+        let dav = Dav { agent: Agent::new_with_defaults(), origin: "https://h".into(), host: server.host.clone(), auth: None, keeps_dates: None };
         assert_eq!(dav.url("/a b/c#d%", false), "https://h/a%20b/c%23d%25");
         assert_eq!(dav.url("/a", true), "https://h/a/");
         assert_eq!(dav.url("/", true), "https://h/");

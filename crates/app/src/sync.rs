@@ -1520,6 +1520,8 @@ pub enum Answer {
         ok: usize,
         failed: usize,
         cancelled: bool,
+        /// Files a server dated itself, for want of a way to keep theirs.
+        undated: usize,
     },
 }
 
@@ -1605,7 +1607,7 @@ pub fn arrived(s: &mut State, ans: Answer) -> bool {
             s.sync.progress_text = tr!("Sincronizando: {done} de {total}…", "Syncing: {done} of {total}…");
             true
         }
-        Answer::SyncFinished { job, ok, failed, cancelled } => {
+        Answer::SyncFinished { job, ok, failed, cancelled, undated } => {
             if s.sync.job_seq != job {
                 return false;
             }
@@ -1626,6 +1628,16 @@ pub fn arrived(s: &mut State, ans: Answer) -> bool {
                     "Sincronização concluída: {ok} itens processados.",
                     "Sync complete: {ok} items processed."
                 )
+            };
+            // A server with no way to keep a file's date gave these the date they arrived:
+            // said, because the next comparison will find them newer on that side.
+            let msg = if undated > 0 {
+                tr!(
+                    "{msg} {undated} arquivos ficaram com a data do envio: o servidor não guarda a data original, e a próxima comparação os verá como mais novos.",
+                    "{msg} {undated} files took the date they were sent: the server doesn't keep the original date, and the next comparison will see them as newer."
+                )
+            } else {
+                msg
             };
             s.sync.progress_text = msg.clone();
             if failed > 0 {
@@ -2820,7 +2832,7 @@ pub fn start_sync(s: &mut State) {
                             total: planned.len(),
                         }));
                     }
-                    emit(Msg::Sync(Answer::SyncFinished { job, ok: 0, failed: planned.len(), cancelled: false }));
+                    emit(Msg::Sync(Answer::SyncFinished { job, ok: 0, failed: planned.len(), cancelled: false, undated: 0 }));
                     return;
                 }
             }
@@ -2839,7 +2851,7 @@ pub fn start_sync(s: &mut State) {
         };
         let total = planned.len();
         let (ok, failed, cancelled) = run_plan(&run, planned, &mut |changes, done| emit(Msg::Sync(Answer::RowStatuses { job, changes, done, total })));
-        emit(Msg::Sync(Answer::SyncFinished { job, ok, failed, cancelled }));
+        emit(Msg::Sync(Answer::SyncFinished { job, ok, failed, cancelled, undated: known.undated.load(Ordering::Relaxed) }));
     });
 }
 
@@ -3098,6 +3110,10 @@ fn copy_item(
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         std::fs::copy(&from, &to).map_err(|e| tr!("Falha ao copiar {}: {e}", "Failed to copy {}: {e}", rel_path))?;
+        // Windows copies a file with its date; elsewhere the copy is dated now, and would read
+        // as newer than what it was copied from.
+        #[cfg(not(windows))]
+        keep_date(&to, std::fs::metadata(&from).and_then(|m| m.modified()).ok());
         return Ok(());
     }
 
@@ -3111,7 +3127,11 @@ fn copy_item(
         let dst_remote = remote_join_rel(server, path, rel_path);
         return servers::with(pool, server, |conn| {
             ensure_remote_parents(conn, server, &server.path(path), rel_path, known);
-            conn.upload_file(&dst_remote, &from, &mut |_| !cancel.load(Ordering::Relaxed))
+            // The date the file has now, not the one the comparison read: it may have changed.
+            let modified = std::fs::metadata(&from).and_then(|m| m.modified()).map_err(|e| tr!("Não consegui ler {}: {e}", "Couldn't read {}: {e}", from.display()))?;
+            let dated = conn.upload_file_dated(&dst_remote, &from, modified, &mut |_| !cancel.load(Ordering::Relaxed))?;
+            known.sent(dated);
+            Ok(())
         });
     }
 
@@ -3128,7 +3148,12 @@ fn copy_item(
         let src_remote = remote_join_rel(server, path, rel_path);
         return servers::with(pool, server, |conn| {
             let mut f = std::fs::File::create(&to).map_err(|e| e.to_string())?;
-            conn.download(&src_remote, &mut f, &mut |_| !cancel.load(Ordering::Relaxed))
+            conn.download(&src_remote, &mut f, &mut |_| !cancel.load(Ordering::Relaxed))?;
+            // The date the server lists, which is what the next comparison sets it against.
+            if let Some(modified) = src_meta.and_then(|m| m.modified) {
+                let _ = f.set_modified(modified);
+            }
+            Ok(())
         });
     }
 
@@ -3193,7 +3218,12 @@ fn copy_item(
             let src_remote = remote_join_rel(server, path, rel_path);
             servers::with(pool, server, |conn| {
                 let mut f = std::fs::File::create(&tmp_file).map_err(|e| e.to_string())?;
-                conn.download(&src_remote, &mut f, &mut |_| !cancel.load(Ordering::Relaxed))
+                conn.download(&src_remote, &mut f, &mut |_| !cancel.load(Ordering::Relaxed))?;
+                // What is sent on reads its date off this file.
+                if let Some(modified) = src_meta.and_then(|m| m.modified) {
+                    let _ = f.set_modified(modified);
+                }
+                Ok(())
             })?;
         }
         SyncLocation::Local(_) => unreachable!(),
@@ -3221,7 +3251,13 @@ fn copy_item(
             let dst_remote = remote_join_rel(server, path, rel_path);
             servers::with(pool, server, |conn| {
                 ensure_remote_parents(conn, server, &server.path(path), rel_path, known);
-                conn.upload_file(&dst_remote, &tmp_file, &mut |_| !cancel.load(Ordering::Relaxed))
+                // The source's date: the temporary file has it (see above), unless the source
+                // gave none.
+                match src_meta.and_then(|m| m.modified) {
+                    Some(modified) => known.sent(conn.upload_file_dated(&dst_remote, &tmp_file, modified, &mut |_| !cancel.load(Ordering::Relaxed))?),
+                    None => conn.upload_file(&dst_remote, &tmp_file, &mut |_| !cancel.load(Ordering::Relaxed))?,
+                }
+                Ok(())
             })?;
         }
         SyncLocation::Local(_) => unreachable!(),
@@ -3285,6 +3321,19 @@ struct Known {
     server: Mutex<std::collections::HashSet<(String, String)>>,
     /// Held while a folder not known yet is found or made.
     making: Mutex<()>,
+    /// Files sent to a server that couldn't keep their date (FTP without MFMT, plain WebDAV):
+    /// the next comparison will read them as newer than what they were copied from.
+    undated: AtomicUsize,
+}
+
+/// Gives the file at `path` the modification time `at`, when there is one.
+#[cfg_attr(windows, allow(dead_code))]
+fn keep_date(path: &Path, at: Option<SystemTime>) {
+    if let Some(at) = at
+        && let Ok(file) = std::fs::File::options().write(true).open(path)
+    {
+        let _ = file.set_modified(at);
+    }
 }
 
 /// The account and folder a Drive side starts at, to tell one side's folders from another's,
@@ -3296,6 +3345,14 @@ fn drive_side(loc: &SyncLocation) -> Option<(String, &str)> {
 }
 
 impl Known {
+    /// Notes a file sent to a server and whether the server kept its date, where that is
+    /// known: only a file known to have lost its date is counted.
+    fn sent(&self, dated: Option<bool>) {
+        if dated == Some(false) {
+            self.undated.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// The folders the comparison saw: each one's row holds its Drive id or its server path.
     fn from_comparison(rows: &[CompareRow], pairs: &[FolderPair]) -> Known {
         let known = Known::default();
@@ -3903,6 +3960,137 @@ mod tests {
         assert!(said == 0 && !right.join("late.txt").exists());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A file's date is kept by hand where the system's copy doesn't keep it (everywhere but
+    /// Windows, where the call isn't built), and only a file known to have lost its date on a
+    /// server is counted.
+    #[test]
+    fn a_copy_keeps_the_date_and_only_known_losses_count() {
+        let path = std::env::temp_dir().join(format!("oe-sync-date-{}", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        let old = UNIX_EPOCH + Duration::from_secs(1_577_934_245);
+        keep_date(&path, None);
+        assert!(std::fs::metadata(&path).unwrap().modified().unwrap() > old + Duration::from_secs(86_400));
+        keep_date(&path, Some(old));
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), old);
+        let _ = std::fs::remove_file(&path);
+
+        let known = Known::default();
+        for dated in [Some(true), None, Some(false), None, Some(false)] {
+            known.sent(dated);
+        }
+        assert_eq!(known.undated.load(Ordering::Relaxed), 2);
+    }
+
+    /// `rclone serve` on a temporary folder, stopped and removed when dropped.
+    struct Served(std::process::Child, PathBuf);
+    impl Drop for Served {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+
+    /// A folder of the computer and a server synchronized both ways, then compared again: what
+    /// is left to do, and how many files the server dated itself. Against `rclone serve`, so
+    /// ignored: `cargo test --release -p openexplorer -- --ignored a_server_synchronized`.
+    fn after_a_run_with(protocol: openexplorer_remote::Protocol, kind: &str, port: u16) -> (Vec<(String, SyncAction)>, usize) {
+        let dir = std::env::temp_dir().join(format!("oe-sync-{kind}-{port}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (left, there) = (dir.join("left"), dir.join("served"));
+        let old = |days: u64| UNIX_EPOCH + Duration::from_secs(1_600_000_000 + days * 86_400 + 7);
+        let put = |path: PathBuf, body: &[u8], modified: SystemTime| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+            std::fs::File::options().write(true).open(&path).unwrap().set_modified(modified).unwrap();
+        };
+        for i in 0..6 {
+            put(left.join(format!("Docs/Year {}/report {i}.txt", 2020 + i % 2)), format!("report {i}").as_bytes(), old(i));
+        }
+        put(left.join("top.bin"), &[5u8; 200_000], old(40));
+        // Only on the server, to come down with its date.
+        put(there.join("Photos/beach.jpg"), &[8u8; 50_000], old(90));
+        put(there.join("notes.txt"), b"from the server", old(91));
+
+        let mut args = vec!["serve".to_string(), kind.into(), there.display().to_string(), "--addr".into(), format!("127.0.0.1:{port}"), "--user".into(), "ana".into(), "--pass".into(), "a pass".into()];
+        if kind == "ftp" {
+            args.extend(["--passive-port".into(), format!("{}-{}", port + 1, port + 40)]);
+        }
+        let child = std::process::Command::new("rclone").args(&args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().expect("rclone on the PATH");
+        let _served = Served(child, dir.clone());
+        let started = std::time::Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(started.elapsed() < Duration::from_secs(20), "rclone serve {kind} didn't start");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let mut server = Server { id: format!("sync-{port}"), name: "test".into(), protocol, brand: None, host: "127.0.0.1".into(), port, user: "ana".into(), root: String::new(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
+        openexplorer_remote::probe(&mut server, Some("a pass")).unwrap_or_else(|e| panic!("{kind}: {e}"));
+        // The run logs in with the password of the credential store, which a test doesn't
+        // write to: the connections it will use are opened here and left in the pool.
+        let pool = Pool::default();
+        let open: Vec<_> = (0..3).map(|_| pool.take(&server, || Some("a pass".into())).unwrap()).collect();
+        open.into_iter().for_each(|lease| lease.done());
+
+        let servers = [server.clone()];
+        let (left_loc, right_loc) = (SyncLocation::Local(left.clone()), SyncLocation::Server { server_id: server.id.clone(), server_name: server.name.clone(), path: Vec::new() });
+        let (drives, cancel) = (HashMap::new(), AtomicBool::new(false));
+        let opts = SyncOptions { mode: SyncMode::Bidirectional, ..SyncOptions::default() };
+        let compared = || {
+            let (l, r) = scan_both(&left_loc, &right_loc, &opts.filter, true, &pool, &servers, &drives, &cancel, &|_| {}).unwrap_or_else(|e| panic!("{kind}: {e}"));
+            let (mut rows, _) = compare_maps(0, &left_loc, &right_loc, l, r, &opts, SystemTime::now(), &cancel, &|_, _| {});
+            rows.iter_mut().enumerate().for_each(|(i, r)| r.id = i);
+            rows
+        };
+        let rows = compared();
+        let planned: Vec<CompareRow> = rows.iter().filter(|r| r.enabled && r.action != SyncAction::None).cloned().collect();
+        // 3 folders and 7 files to send, 1 folder and 2 files to fetch.
+        assert_eq!(planned.iter().filter(|r| r.action == SyncAction::CopyRight).count(), 10, "{kind}: {planned:?}");
+        assert_eq!(planned.iter().filter(|r| r.action == SyncAction::CopyLeft).count(), 3, "{kind}: {planned:?}");
+
+        let pairs = [FolderPair { id: 1, left: Some(left_loc.clone()), right: Some(right_loc.clone()) }];
+        let known = Known::from_comparison(&rows, &pairs);
+        let run = Run { pairs: &pairs, skip_recycle_bin: true, segmented: false, pool: &pool, servers: &servers, drives: &drives, cancel: &cancel, known: &known, at_once: AtOnce { uploads: 2, downloads: 2, disk: 2 } };
+        let mut failures = Vec::new();
+        let (ok, failed, _) = run_plan(&run, planned, &mut |changes, _| failures.extend(changes.into_iter().filter(|(_, s)| matches!(s, RowStatus::Failed(_)))));
+        assert_eq!((ok, failed), (13, 0), "{kind}: {failures:?}");
+
+        // Everything arrived, and what came down has the date the server listed.
+        assert_eq!(std::fs::read(there.join("Docs/Year 2021/report 3.txt")).unwrap(), b"report 3", "{kind}");
+        assert_eq!(std::fs::read(left.join("notes.txt")).unwrap(), b"from the server", "{kind}");
+        let came = std::fs::metadata(left.join("Photos/beach.jpg")).unwrap().modified().unwrap();
+        assert!(came.duration_since(old(90)).is_ok_and(|d| d < Duration::from_secs(60)), "{kind}: beach.jpg came dated {came:?}");
+
+        let left_over = compared().into_iter().filter(|r| r.action != SyncAction::None).map(|r| (r.rel_path, r.action)).collect();
+        (left_over, known.undated.load(Ordering::Relaxed))
+    }
+
+    /// SFTP keeps a file's date (SETSTAT): after a run, the comparison finds nothing to do.
+    #[test]
+    #[ignore = "needs rclone"]
+    fn a_server_synchronized_by_sftp_compares_as_the_same() {
+        assert_eq!(after_a_run_with(openexplorer_remote::Protocol::Sftp, "sftp", 22310), (Vec::new(), 0));
+    }
+
+    /// WebDAV keeps it where the server takes `X-OC-Mtime`, as rclone's, ownCloud and Nextcloud do.
+    #[test]
+    #[ignore = "needs rclone"]
+    fn a_server_synchronized_by_webdav_compares_as_the_same() {
+        assert_eq!(after_a_run_with(openexplorer_remote::Protocol::Dav, "webdav", 28110), (Vec::new(), 0));
+    }
+
+    /// An FTP server with no MFMT (rclone's) dates what it is sent itself: the run says how
+    /// many files, and the comparison then finds each newer on the server. What came down from
+    /// it compares as the same.
+    #[test]
+    #[ignore = "needs rclone"]
+    fn an_ftp_server_without_mfmt_is_said_to_date_the_files_itself() {
+        let (left_over, undated) = after_a_run_with(openexplorer_remote::Protocol::Ftp, "ftp", 21310);
+        assert_eq!(undated, 7);
+        assert_eq!(left_over.len(), 7, "{left_over:?}");
+        assert!(left_over.iter().all(|(path, action)| *action == SyncAction::CopyLeft && (path.starts_with("Docs/") || path == "top.bin")), "{left_over:?}");
     }
 
     /// What a run between two folders of the computer costs with 1, 2, 4 and 8 files at a time:

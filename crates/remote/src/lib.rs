@@ -445,6 +445,29 @@ pub trait Conn: Send {
         send_file(self, path, local, progress)
     }
 
+    /// Whether the protocol has a request that gives a file a date, which
+    /// [`Conn::set_modified`] then makes. Not so by default: of a service that has none, or
+    /// whose uploads carry the date themselves, nothing here says whether a date was kept.
+    fn sets_dates(&self) -> bool {
+        false
+    }
+
+    /// Gives the file at `path` the modification time `at`. `false` when the server has no way
+    /// to (FTP without MFMT) or won't: nothing by default.
+    fn set_modified(&mut self, _path: &str, _at: SystemTime) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// [`Conn::upload_file`] of a file that is to keep the date `modified` on the server, as a
+    /// synchronization needs: with the date of the upload, the copy would read as newer than
+    /// what it was copied from, and be copied again the next time. Returns whether the server
+    /// kept the date, or `None` where that isn't known (see [`Conn::sets_dates`]). A date the
+    /// server can't or won't keep is not a failed upload.
+    fn upload_file_dated(&mut self, path: &str, local: &std::path::Path, modified: SystemTime, progress: Progress) -> Result<Option<bool>> {
+        self.upload_file(path, local, progress)?;
+        Ok(if self.sets_dates() { Some(self.set_modified(path, modified).unwrap_or(false)) } else { None })
+    }
+
     /// Whether `path` is a symbolic link itself.
     fn is_link(&mut self, path: &str) -> Result<bool>;
 
@@ -900,8 +923,9 @@ mod tests {
         fn download(&mut self, _: &str, _: &mut dyn Write, _: Progress) -> Result<()> {
             unimplemented!()
         }
-        fn upload(&mut self, _: &str, _: &mut dyn Read, _: u64, _: Progress) -> Result<()> {
-            unimplemented!()
+        fn upload(&mut self, path: &str, _: &mut dyn Read, _: u64, _: Progress) -> Result<()> {
+            self.0.push((path.into(), false, false));
+            Ok(())
         }
         fn home(&mut self) -> Result<String> {
             unimplemented!()
@@ -912,6 +936,21 @@ mod tests {
         fn alive(&mut self) -> bool {
             true
         }
+    }
+
+    /// A service with no request for a file's date (it may keep the date by itself, as
+    /// Telegram's uploads do, or not at all) sends the file and says nothing of the date: it is
+    /// not counted among the ones known to have lost it.
+    #[test]
+    fn a_service_that_sets_no_dates_says_nothing_of_them() {
+        let local = std::env::temp_dir().join(format!("oe-remote-dated-{}", std::process::id()));
+        std::fs::write(&local, b"x").unwrap();
+        let mut c = Fake(Vec::new());
+        assert!(!c.sets_dates());
+        assert_eq!(c.upload_file_dated("/a.txt", &local, SystemTime::UNIX_EPOCH, &mut |_| true), Ok(None));
+        assert_eq!(c.0, [("/a.txt".to_string(), false, false)]);
+        assert_eq!(c.set_modified("/a.txt", SystemTime::UNIX_EPOCH), Ok(false));
+        let _ = std::fs::remove_file(&local);
     }
 
     #[test]

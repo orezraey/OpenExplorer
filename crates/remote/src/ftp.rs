@@ -2,7 +2,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use openexplorer_i18n::{t, tr};
 use suppaftp::list::ListParser;
@@ -15,6 +15,9 @@ pub struct Ftp {
     s: RustlsFtpStream,
     /// The server lists folders with MLSD, whose dates and sizes don't need guessing.
     mlsd: bool,
+    /// Whether the server takes MFMT, which gives a file a modification time: as its features
+    /// say, or not known yet when they couldn't be read.
+    mfmt: Option<bool>,
     /// A transfer stopped midway (ABOR): the server's answers may be out of step from here.
     broken: bool,
 }
@@ -97,19 +100,34 @@ impl Ftp {
             }
         }
         s.transfer_type(FileType::Binary).map_err(|e| said(host, e))?;
-        let features = s.feat().unwrap_or_default();
-        let has = |f: &str| features.keys().any(|k| k.eq_ignore_ascii_case(f));
-        if has("UTF8") {
+        // What the server lists among its features, or nothing known when the list can't be
+        // read: suppaftp gives up on a list with a line it doesn't expect (rclone's has a blank
+        // one), though the server has the features all the same.
+        let features = s.feat().ok();
+        let lists = |f: &str| features.as_ref().map(|all| all.keys().any(|k| k.eq_ignore_ascii_case(f)));
+        if lists("UTF8") != Some(false) {
             let _ = s.opts("UTF8", Some("ON"));
         }
-        let mlsd = has("MLST");
-        Ok(Ftp { s, mlsd, broken: false })
+        // With no list to go by, MLST is tried on the root: where it answers, folders are
+        // listed by MLSD, with dates to the second (LIST gives the minute, or only the day for
+        // a file of last year, and a date compared against one never matches).
+        let mlsd = match lists("MLST") {
+            Some(listed) => listed,
+            None => s.mlst(Some("/")).is_ok(),
+        };
+        Ok(Ftp { s, mlsd, mfmt: lists("MFMT"), broken: false })
     }
 
     /// Whether `path` is a folder: it can be entered.
     fn enters(&mut self, path: &str) -> bool {
         self.s.cwd(path).is_ok()
     }
+}
+
+/// The command that gives `path` the modification time `at`: the time as `YYYYMMDDHHMMSS` in
+/// UTC, to the second.
+fn mfmt(path: &str, at: SystemTime) -> String {
+    format!("MFMT {} {path}", chrono::DateTime::<chrono::Utc>::from(at).format("%Y%m%d%H%M%S"))
 }
 
 fn secure(host: &str, e: FtpError) -> String {
@@ -266,6 +284,36 @@ impl Conn for Ftp {
         }
     }
 
+    fn sets_dates(&self) -> bool {
+        true
+    }
+
+    /// MFMT, where the server lists it among its features: `MFMT 20240131235959 path`, in UTC.
+    /// Not asked of a server that doesn't list it. One whose features couldn't be read is
+    /// asked, and not again once it says it has no such command. A file's date refused says
+    /// no more than that it wasn't kept.
+    fn set_modified(&mut self, path: &str, at: SystemTime) -> Result<bool> {
+        if self.mfmt == Some(false) {
+            return Ok(false);
+        }
+        match self.s.custom_command(mfmt(path, at), &[Status::File]) {
+            Ok(_) => {
+                self.mfmt = Some(true);
+                Ok(true)
+            }
+            Err(FtpError::UnexpectedResponse(r)) => {
+                if self.mfmt.is_none() && matches!(r.status.code(), 500 | 502) {
+                    self.mfmt = Some(false);
+                }
+                Ok(false)
+            }
+            Err(e) => {
+                self.broken = true;
+                Err(said(server(), e))
+            }
+        }
+    }
+
     fn home(&mut self) -> Result<String> {
         self.s.pwd().map_err(|e| said(server(), e))
     }
@@ -282,6 +330,101 @@ impl Conn for Ftp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An FTP server's control connection, enough to log in: it lists `features`, takes MFMT
+    /// unless the path holds "locked", and keeps every command it hears.
+    fn fake(features: &'static [&'static str]) -> (Server, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = heard.clone();
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else { return };
+            let mut out = stream.try_clone().unwrap();
+            let mut say = move |line: &str| out.write_all(format!("{line}\r\n").as_bytes()).is_ok();
+            say("220 ready");
+            for line in BufReader::new(stream).lines() {
+                let Ok(line) = line else { return };
+                log.lock().unwrap().push(line.clone());
+                let (verb, rest) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+                let answered = match verb.to_ascii_uppercase().as_str() {
+                    "USER" => say("331 password"),
+                    "PASS" => say("230 in"),
+                    // A feature named "" is a blank line, as rclone's list has; "no MFMT" is a
+                    // server that has no such command, whatever its list says.
+                    "FEAT" => say("211-Features:") && features.iter().filter(|f| **f != "no MFMT").all(|f| say(&if f.is_empty() { String::new() } else { format!(" {f}") })) && say("211 End"),
+                    "MLST" if features.iter().any(|f| f.starts_with("MLST")) => say("250-Start") && say(&format!(" type=dir;modify=20200102030405; {rest}")) && say("250 End"),
+                    "MLST" | "MFMT" if verb.eq_ignore_ascii_case("MLST") || features.contains(&"no MFMT") => say("500 no such command"),
+                    "MFMT" if rest.contains("locked") => say("550 not allowed"),
+                    "MFMT" => say(&format!("213 Modify={}", rest.replacen(' ', "; ", 1))),
+                    "QUIT" => return,
+                    _ => say("200 fine"),
+                };
+                if !answered {
+                    return;
+                }
+            }
+        });
+        let server = Server { id: "x".into(), name: "x".into(), protocol: Protocol::Ftp, brand: None, host: "127.0.0.1".into(), port, user: "u".into(), root: "/".into(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
+        (server, heard)
+    }
+
+    /// A server that lists MFMT is given a file's date in UTC to the second; one that refuses
+    /// it for a file says so and goes on working; one that doesn't list it is never asked.
+    #[test]
+    fn a_files_date_goes_by_mfmt_where_the_server_lists_it() {
+        // 2020-01-02 03:04:05 UTC, and a fraction that isn't sent.
+        let at = SystemTime::UNIX_EPOCH + Duration::from_millis(1_577_934_245_700);
+        assert_eq!(mfmt("/Photos/a b.txt", at), "MFMT 20200102030405 /Photos/a b.txt");
+
+        let (server, heard) = fake(&["UTF8", "MFMT", "MLST type*;size*;modify*;"]);
+        let mut c = Ftp::connect(&server, "p", &crate::tls::Trust::default()).unwrap();
+        assert!(c.mfmt == Some(true) && c.mlsd);
+        assert_eq!(c.set_modified("/Photos/a b.txt", at), Ok(true));
+        assert_eq!(c.set_modified("/Photos/locked.txt", at), Ok(false));
+        assert!(c.alive(), "a refused date leaves the connection as it was");
+        assert_eq!(c.set_modified("/again.txt", at), Ok(true));
+        let said: Vec<String> = heard.lock().unwrap().iter().filter(|l| l.starts_with("MFMT")).cloned().collect();
+        assert_eq!(said, ["MFMT 20200102030405 /Photos/a b.txt", "MFMT 20200102030405 /Photos/locked.txt", "MFMT 20200102030405 /again.txt"]);
+
+        let (server, heard) = fake(&["UTF8"]);
+        let mut c = Ftp::connect(&server, "p", &crate::tls::Trust::default()).unwrap();
+        assert!(c.mfmt == Some(false) && !c.mlsd);
+        assert_eq!(c.set_modified("/a.txt", at), Ok(false));
+        assert!(!heard.lock().unwrap().iter().any(|l| l.starts_with("MFMT") || l.starts_with("MLST")), "{:?}", heard.lock().unwrap());
+    }
+
+    /// A list of features that can't be read (a blank line in it, as rclone's has) says nothing
+    /// of what the server can do: MLST is tried, so folders list by MLSD with dates to the
+    /// second, and MFMT is tried on the first file and not again once the server has no such
+    /// command.
+    #[test]
+    fn features_that_cant_be_read_are_found_by_trying() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_577_934_245);
+        let commands = |heard: &std::sync::Mutex<Vec<String>>, verb: &str| heard.lock().unwrap().iter().filter(|l| l.starts_with(verb)).count();
+
+        // rclone's: MLST among them, no MFMT.
+        let (server, heard) = fake(&["UTF8", "MLST Type*;Modify*;Size*;", "", "no MFMT"]);
+        let mut c = Ftp::connect(&server, "p", &crate::tls::Trust::default()).unwrap();
+        assert!(c.mlsd && c.mfmt.is_none(), "MLST answered, MFMT not known yet");
+        assert_eq!(commands(&heard, "OPTS UTF8 ON"), 1);
+        assert_eq!(c.set_modified("/a.txt", at), Ok(false));
+        assert_eq!(c.mfmt, Some(false));
+        assert_eq!(c.set_modified("/b.txt", at), Ok(false));
+        assert_eq!(commands(&heard, "MFMT"), 1, "asked once");
+        assert!(c.alive());
+
+        // One that takes MFMT though its list can't be read, and has no MLST.
+        let (server, heard) = fake(&["", "UTF8"]);
+        let mut c = Ftp::connect(&server, "p", &crate::tls::Trust::default()).unwrap();
+        assert!(!c.mlsd && c.mfmt.is_none());
+        // A file it won't date doesn't say the command is missing.
+        assert_eq!(c.set_modified("/locked.txt", at), Ok(false));
+        assert_eq!(c.mfmt, None);
+        assert_eq!(c.set_modified("/a.txt", at), Ok(true));
+        assert_eq!((c.mfmt, commands(&heard, "MFMT")), (Some(true), 2));
+    }
 
     /// Both ways of listing, MLSD and LIST, against `rclone serve ftp`, whatever it offers.
     #[test]
