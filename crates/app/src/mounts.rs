@@ -10,10 +10,11 @@ use std::path::{Path, PathBuf};
 
 use crate::model::DriveKind;
 
-/// Whether `dir` is a disk's top (`C:\`, `/`), which goes up to Este Computador; not a
-/// computer on the network (`\\servidor`).
-pub fn is_disk_root(dir: &Path) -> bool {
-    !dir.as_os_str().is_empty() && dir.parent().is_none() && crate::network::unc(dir).is_none()
+/// Whether `dir` is a disk's top, which goes up to Este Computador: one of `drives` (a volume
+/// mounted in a folder too, `/media/ana/PEN`, `/Volumes/PEN`), or a top with nothing above it
+/// (`C:\`, `/`) that isn't a computer on the network (`\\servidor`).
+pub fn is_disk_root(dir: &Path, drives: &[(PathBuf, DriveKind)]) -> bool {
+    drives.iter().any(|(d, _)| d == dir) || (!dir.as_os_str().is_empty() && dir.parent().is_none() && crate::network::unc(dir).is_none())
 }
 
 /// The id of disk `root` in Este Computador's listing.
