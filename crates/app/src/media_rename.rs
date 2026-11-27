@@ -649,8 +649,10 @@ pub struct MediaState {
     pub format: TextEdit,
     pub parsed: Vec<ParsedFile>,
     /// The title most of the files name, as [`norm_title`] writes it: the one the batch
-    /// searches by default. A file that names another is of another show or movie.
+    /// searches by default.
     pub batch_title: String,
+    /// The title last searched, written the same way: the user may have typed another.
+    pub searched_title: String,
     pub detected_year: Option<u32>,
     pub candidates: Vec<Candidate>,
     pub selected: Option<usize>,
@@ -669,17 +671,40 @@ pub struct MediaState {
     pub analyze_input: TextEdit,
     pub popup: Option<MediaPopup>,
     pub open_dropdown: Option<PrefDropdown>,
+    /// The match as it was when the title picker opened or a search began: Cancel there goes
+    /// back to it.
+    before: Option<MatchBefore>,
+}
+
+/// What a search and the title picker change, kept to put back.
+#[derive(Clone)]
+struct MatchBefore {
+    candidates: Vec<Candidate>,
+    selected: Option<usize>,
+    episodes: Vec<EpisodeInfo>,
+    episodes_for: Option<String>,
+    query: String,
+    searched_title: String,
+    // What the Match menu sets before it searches.
+    source: DataSource,
+    kind: MediaKind,
+    order: EpisodeOrder,
+    format: String,
 }
 
 impl MediaState {
     pub fn new(items: &[Entry]) -> Self {
+        Self::with_keys(items, MediaKeys::load())
+    }
+
+    /// The state with these keys rather than those of the system's credential store.
+    pub fn with_keys(items: &[Entry], keys: MediaKeys) -> Self {
         let parsed: Vec<ParsedFile> = items.iter().map(|e| parse_filename(&shown(&e.name), e.is_dir)).collect();
         let (query_text, kind, detected_year) = detect_batch_query(&parsed);
         let default_format = match kind {
             MediaKind::Series => SERIES_PRESETS[0].template,
             MediaKind::Movie => MOVIE_PRESETS[0].template,
         };
-        let keys = MediaKeys::load();
         let source = if !keys.tmdb.is_empty() || keys.tvdb.is_empty() { DataSource::Tmdb } else { DataSource::Tvdb };
         Self {
             source,
@@ -688,6 +713,7 @@ impl MediaState {
             lang: MediaLang::PtBr,
             match_mode: MatchMode::Opportunistic,
             batch_title: norm_title(&query_text),
+            searched_title: String::new(),
             query: TextEdit::new(query_text),
             format: TextEdit::new(default_format),
             parsed,
@@ -707,10 +733,36 @@ impl MediaState {
             keys,
             popup: None,
             open_dropdown: None,
+            before: None,
+        }
+    }
+
+    /// Opens the title picker, keeping the match as it is for Cancel to go back to.
+    pub fn open_picker(&mut self) {
+        self.keep_before();
+        self.popup = Some(MediaPopup::SelectMatch);
+    }
+
+    /// Keeps the match as it is, unless one is kept already (a search from inside the picker).
+    fn keep_before(&mut self) {
+        if self.before.is_none() {
+            self.before = Some(MatchBefore {
+                candidates: self.candidates.clone(),
+                selected: self.selected,
+                episodes: self.episodes.clone(),
+                episodes_for: self.episodes_for.clone(),
+                query: self.query.text.clone(),
+                searched_title: self.searched_title.clone(),
+                source: self.source,
+                kind: self.kind,
+                order: self.order,
+                format: self.format.text.clone(),
+            });
         }
     }
 
     pub fn clear_match(&mut self) {
+        self.before = None;
         self.candidates.clear();
         self.selected = None;
         self.episodes.clear();
@@ -820,14 +872,39 @@ impl MediaState {
         }
     }
 
-    /// Closes the open popup. Leaving the picker without confirming goes back to the candidate
-    /// whose episodes are loaded, instead of keeping the one only highlighted there.
+    /// Closes the open popup without confirming what it shows. The title picker goes back to
+    /// the match as it was when it opened (a search made there replaces the candidates, and its
+    /// first result would stay as the match); Preferences drops a key typed and not saved.
     pub fn close_popup(&mut self) {
-        if self.popup == Some(MediaPopup::SelectMatch)
-            && let Some(id) = &self.episodes_for
-            && let Some(i) = self.candidates.iter().position(|c| c.id == *id)
-        {
-            self.selected = Some(i);
+        match self.popup {
+            Some(MediaPopup::SelectMatch) => {
+                if let Some(before) = self.before.take() {
+                    self.candidates = before.candidates;
+                    self.selected = before.selected;
+                    self.episodes = before.episodes;
+                    self.episodes_for = before.episodes_for;
+                    self.query = TextEdit::new(before.query);
+                    self.searched_title = before.searched_title;
+                    (self.source, self.kind, self.order) = (before.source, before.kind, before.order);
+                    self.format = TextEdit::new(before.format);
+                    // A search or a list of episodes still on its way is of what was left.
+                    self.search_seq += 1;
+                    self.episodes_seq += 1;
+                    self.searching = false;
+                    self.loading_episodes = false;
+                    self.error = None;
+                } else if let Some(id) = &self.episodes_for
+                    && let Some(i) = self.candidates.iter().position(|c| c.id == *id)
+                {
+                    // The candidate whose episodes are loaded, not the one only highlighted.
+                    self.selected = Some(i);
+                }
+            }
+            Some(MediaPopup::Preferences) => {
+                self.tmdb_key_edit = TextEdit::new(self.keys.tmdb.clone());
+                self.tvdb_key_edit = TextEdit::new(self.keys.tvdb.clone());
+            }
+            _ => {}
         }
         self.popup = None;
     }
@@ -893,9 +970,16 @@ impl MediaState {
     /// batch's, or drops some ("Show" and "Show US"), is the same; a file that names no title
     /// goes with the others.
     fn names_another_title(&self, parsed: &ParsedFile) -> bool {
-        let (title, batch) = (norm_title(&parsed.title), &self.batch_title);
-        let starts = |long: &str, short: &str| long.strip_prefix(short).is_some_and(|rest| rest.is_empty() || rest.starts_with(' '));
-        !title.is_empty() && !batch.is_empty() && !starts(&title, batch) && !starts(batch, &title)
+        let title = norm_title(&parsed.title);
+        !title.is_empty() && !same_title(&title, self.matched_title())
+    }
+
+    /// The title the match is for, among those the files name: the one searched when files
+    /// name it (the user picked one of the batch's shows), else the one most of them name
+    /// (the search spelled it another way: "TBBT" for The Big Bang Theory).
+    fn matched_title(&self) -> &str {
+        let searched = self.searched_title.as_str();
+        if !searched.is_empty() && self.parsed.iter().any(|p| !p.title.is_empty() && same_title(&norm_title(&p.title), searched)) { searched } else { &self.batch_title }
     }
 
     /// Why the match leaves item `idx` as it is, for its row to say: only when that isn't plain.
@@ -1077,6 +1161,13 @@ fn norm_title(s: &str) -> String {
         .join(" ")
 }
 
+/// Whether two titles, as [`norm_title`] writes them, are of the same show or movie: one may
+/// add words to the other ("Show" and "Show US"). An empty one is of any.
+fn same_title(a: &str, b: &str) -> bool {
+    let starts = |long: &str, short: &str| long.strip_prefix(short).is_some_and(|rest| rest.is_empty() || rest.starts_with(' '));
+    a.is_empty() || b.is_empty() || starts(a, b) || starts(b, a)
+}
+
 /// Returns `true` when the top search candidate is a clear, unambiguous match (so we can apply
 /// it immediately without interrupting the user with a picker modal, just like FileBot).
 pub fn is_confident_match(query: &str, detected_year: Option<u32>, cands: &[Candidate]) -> bool {
@@ -1118,6 +1209,8 @@ pub fn save_keys(s: &mut State) {
 
 pub fn match_with(s: &mut State, source: DataSource, kind: MediaKind) {
     if let Some(br) = &mut s.batch_rename {
+        // Before the menu's choice changes anything: Cancel in the picker undoes it too.
+        br.media.keep_before();
         br.media.source = source;
         br.media.order = EpisodeOrder::Airdate;
         br.media.set_kind(kind);
@@ -1135,6 +1228,7 @@ pub fn match_with(s: &mut State, source: DataSource, kind: MediaKind) {
 /// Matches as Anime using Absolute episode ordering and the default Anime preset (if on a preset).
 pub fn match_anime(s: &mut State, source: DataSource) {
     if let Some(br) = &mut s.batch_rename {
+        br.media.keep_before();
         br.media.source = source;
         br.media.kind = MediaKind::Series;
         br.media.order = EpisodeOrder::Absolute;
@@ -1174,7 +1268,7 @@ pub fn start_search(s: &mut State) {
     let m = &mut br.media;
     let query = m.query.text.trim().to_string();
     if query.is_empty() {
-        m.popup = Some(MediaPopup::SelectMatch);
+        m.open_picker();
         m.error = Some(t("Digite o nome da série, anime ou filme para buscar.", "Type the series, anime or movie title to search.").into());
         return;
     }
@@ -1188,6 +1282,9 @@ pub fn start_search(s: &mut State) {
         return;
     }
 
+    // The results replace the candidates: Cancel in the picker goes back to these.
+    m.keep_before();
+    m.searched_title = norm_title(&query);
     m.search_seq += 1;
     let seq = m.search_seq;
     let source = m.source;
@@ -1227,6 +1324,8 @@ pub fn select_candidate(s: &mut State, idx: usize) {
     if idx >= br.media.candidates.len() {
         return;
     }
+    // Confirmed: there's nothing to go back to.
+    br.media.before = None;
     br.media.selected = Some(idx);
     br.media.popup = None;
     br.media.episodes.clear();
@@ -1296,6 +1395,7 @@ pub fn arrived(s: &mut State, ans: Answer) {
                             && is_confident_match(&br.media.query.text, br.media.detected_year, &br.media.candidates)
                         {
                             // High confidence: auto-apply immediately without interrupting the user.
+                            br.media.before = None;
                             br.media.selected = Some(0);
                             br.media.error = None;
                             should_fetch_eps = br.media.candidates[0].kind == MediaKind::Series;

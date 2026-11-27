@@ -579,7 +579,7 @@ impl RuleConfig {
                 skip_empty: false,
             },
             RuleKind::Mapping => Self::Mapping {
-                entries: vec![(String::new(), String::new())],
+                entries: Vec::new(),
                 allow_reuse: false,
                 partial_match: false,
                 inverse: false,
@@ -1100,6 +1100,11 @@ impl RuleEditorState {
         }
         self.kind = kind;
         self.config = RuleConfig::default_for(kind);
+        // Each new rule draws its own names: with the one seed every rule started with, two
+        // batches got the same "random" names. Kept in the rule, so its preview holds still.
+        if let RuleConfig::Random { seed, .. } = &mut self.config {
+            *seed = rand::random();
+        }
         self.meta_target = None;
         self.script_status = None;
         self.show_scripts_menu = false;
@@ -1261,7 +1266,15 @@ impl RuleEditorState {
             }
             RuleConfig::PascalScript { code } => *code = self.edit_a.text.clone(),
             RuleConfig::UserInput { lines, .. } => *lines = self.edit_a.text.clone(),
-            RuleConfig::CleanUp { .. } | RuleConfig::Mapping { .. } => {}
+            RuleConfig::Mapping { entries, .. } => {
+                // A pair typed and not added with "+" would be lost when the rule is saved.
+                if !self.map_key.text.is_empty() || !self.map_val.text.is_empty() {
+                    entries.push((std::mem::take(&mut self.map_key.text), std::mem::take(&mut self.map_val.text)));
+                    self.map_key = TextEdit::new("");
+                    self.map_val = TextEdit::new("");
+                }
+            }
+            RuleConfig::CleanUp { .. } => {}
         }
     }
 
@@ -1274,10 +1287,12 @@ impl RuleEditorState {
             | MetaTagTarget::PascalScript => &mut self.edit_a,
             MetaTagTarget::ReplaceWith | MetaTagTarget::RearrangePattern => &mut self.edit_b,
         };
+        // At the caret (the end, in a field never touched), over what is selected: appended to
+        // a script, it landed after the program's `end.` and did nothing.
         if target == MetaTagTarget::PascalScript {
-            edit.text.push_str(&format!("MetaTag('{token}')"));
+            edit.insert(&format!("MetaTag('{token}')"));
         } else {
-            edit.text.push_str(&token);
+            edit.insert(&token);
         }
         self.sync_edits_to_config();
     }
@@ -1332,6 +1347,11 @@ impl Default for RulesState {
 
 impl RulesState {
     pub fn new() -> Self {
+        Self::with_presets(load_presets())
+    }
+
+    /// The state with these presets rather than those of the file on disk.
+    pub fn with_presets(presets: Vec<RulePreset>) -> Self {
         Self {
             rules: Vec::new(),
             selected: None,
@@ -1346,7 +1366,7 @@ impl RulesState {
             tag_cat_open: false,
             tag_search: TextEdit::new(""),
             tag_selected: 0,
-            presets: load_presets(),
+            presets,
             preset_name: TextEdit::new(""),
             analyze_input: TextEdit::new(""),
         }
@@ -1762,6 +1782,9 @@ enum Prepared<'a> {
     Nothing,
     /// Remove and Replace: the text they look for.
     Find(Result<Regex, String>),
+    /// Remove whose text holds a meta tag (its editor has the button for one): each item
+    /// fills it in, so each has its own text to look for.
+    FindEach,
     /// Case: each fragment kept as typed, with the regex that finds it.
     Fragments(Vec<(Regex, &'a str)>),
     /// Rearrange by delimiters: `None` with no delimiter to split at.
@@ -1777,6 +1800,7 @@ enum Prepared<'a> {
 impl<'a> Prepared<'a> {
     fn of(cfg: &'a RuleConfig) -> Self {
         match cfg {
+            RuleConfig::Remove { text, .. } if rules_meta::has_tags(text) => Self::FindEach,
             RuleConfig::Remove { text: find, case_sensitive, whole_words, wildcards, .. } | RuleConfig::Replace { find, case_sensitive, whole_words, wildcards, .. }
                 if !find.is_empty() =>
             {
@@ -1899,11 +1923,19 @@ fn apply_single_rule(cfg: &RuleConfig, prepared: &Prepared, current: &str, item:
             let next_base: String = chars[..lo].iter().chain(&chars[hi..]).collect();
             Ok(format!("{next_base}{ext}"))
         }
-        RuleConfig::Remove { occurrences, skip_ext, wildcards, .. } => {
-            // Nothing prepared: there's no text to remove.
-            let Prepared::Find(re) = prepared else { return Ok(current.to_string()) };
+        RuleConfig::Remove { text, occurrences, case_sensitive, whole_words, skip_ext, wildcards } => {
+            let per_item;
+            let re = match prepared {
+                Prepared::Find(re) => re.as_ref().map_err(String::clone)?,
+                Prepared::FindEach => {
+                    per_item = find_regex(&rules_meta::expand_tags(text, item, loc), *case_sensitive, *whole_words, *wildcards)?;
+                    &per_item
+                }
+                // Nothing prepared: there's no text to remove.
+                _ => return Ok(current.to_string()),
+            };
             let (stem, ext) = split_stem_ext(current, item.is_dir, *skip_ext);
-            let next_base = replace_occurrences(&stem, re.as_ref().map_err(String::clone)?, "", *occurrences, *wildcards);
+            let next_base = replace_occurrences(&stem, re, "", *occurrences, *wildcards);
             Ok(format!("{next_base}{ext}"))
         }
         RuleConfig::Replace { replace, occurrences, skip_ext, wildcards, .. } => {
@@ -2179,15 +2211,18 @@ fn apply_single_rule(cfg: &RuleConfig, prepared: &Prepared, current: &str, item:
             if *fix_spaces {
                 s = s.split_whitespace().collect::<Vec<_>>().join(" ");
             }
-            if *prepare_sharepoint {
-                s = s
-                    .chars()
-                    .map(|c| if matches!(c, '~' | '"' | '#' | '%' | '&' | '*' | ':' | '<' | '>' | '?' | '/' | '\\' | '{' | '|' | '}') { '_' } else { c })
-                    .collect::<String>()
-                    .trim_matches(['.', ' '])
-                    .to_string();
+            let cleaned = format!("{s}{ext}");
+            if !*prepare_sharepoint {
+                return Ok(cleaned);
             }
-            Ok(format!("{s}{ext}"))
+            // The characters SharePoint refuses go from the extension too, as the box says
+            // ("always includes the extension"): only this step, the rest left it alone.
+            Ok(cleaned
+                .chars()
+                .map(|c| if matches!(c, '~' | '"' | '#' | '%' | '&' | '*' | ':' | '<' | '>' | '?' | '/' | '\\' | '{' | '|' | '}') { '_' } else { c })
+                .collect::<String>()
+                .trim_matches(['.', ' '])
+                .to_string())
         }
         RuleConfig::Translit { auto_case, skip_ext, .. } => {
             let Prepared::Alphabet(pairs) = prepared else { return Ok(current.to_string()) };
@@ -3287,7 +3322,87 @@ mod tests {
             *replace_dot = true;
             *prepare_sharepoint = true;
         }
-        assert_eq!(one(cfg, file("relatorio.final#v2.txt")).0, "relatorio final_v2.txt");
+        assert_eq!(one(cfg.clone(), file("relatorio.final#v2.txt")).0, "relatorio final_v2.txt");
+        // SharePoint's own characters go from the extension too, as its box says ("always
+        // includes the extension"): the rest of the rule still leaves the extension alone.
+        assert_eq!(one(cfg, file("relatorio.final#v2.t~t")).0, "relatorio final_v2.t_t");
+    }
+
+    #[test]
+    fn remove_fills_in_the_meta_tags_its_button_inserts() {
+        let cfg = RuleConfig::Remove { text: "_:File_Extension:".into(), occurrences: Occurrences::All, case_sensitive: false, whole_words: false, skip_ext: true, wildcards: false };
+        let items = [file("relatorio_pdf.pdf"), file("foto_jpg.jpg"), file("nota_pdf.txt")];
+        let out = evaluate_rules(&[rule(cfg)], &items, &[true; 3], &Location::Local(PathBuf::from("C:/tmp")));
+        assert_eq!(out.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["relatorio.pdf", "foto.jpg", "nota_pdf.txt"]);
+    }
+
+    #[test]
+    fn a_word_between_colons_that_is_no_meta_tag_stays_as_typed() {
+        // A character class of a regex.
+        let cfg = RuleConfig::Regex { pattern: "[[:digit:]]+".into(), replace: "#".into(), case_sensitive: false, skip_ext: true };
+        assert_eq!(one(cfg, file("foto 123.jpg")), ("foto #.jpg".to_string(), None));
+        // A text to remove, where names take a colon (a server, Google Drive).
+        let cfg = RuleConfig::Remove { text: ":rascunho:".into(), occurrences: Occurrences::All, case_sensitive: false, whole_words: false, skip_ext: true, wildcards: false };
+        assert_eq!(one(cfg, file("nota :rascunho: final.txt")).0, "nota  final.txt");
+        // A real tag beside it is still filled in.
+        let mut cfg = RuleConfig::default_for(RuleKind::Insert);
+        if let RuleConfig::Insert { text, .. } = &mut cfg {
+            *text = ":nada: :File_Extension: ".into();
+        }
+        assert_eq!(one(cfg, file("a.txt")).0, ":nada: txt a.txt");
+    }
+
+    #[test]
+    fn a_meta_tag_goes_where_the_caret_is() {
+        let mut ed = RuleEditorState::from_config(RuleConfig::default_for(RuleKind::Insert));
+        ed.edit_a = TextEdit::new("ab");
+        ed.edit_a.set_caret(1);
+        ed.insert_meta_tag(MetaTagTarget::InsertText, "File_Size");
+        assert_eq!(ed.edit_a.text, "a:File_Size:b");
+        // In a script it lands inside the program, not after its `end.`.
+        let mut ed = RuleEditorState::from_config(RuleConfig::default_for(RuleKind::PascalScript));
+        ed.edit_a = TextEdit::new("begin\n  FileName := ;\nend.");
+        ed.edit_a.set_caret("begin\n  FileName := ".len());
+        ed.insert_meta_tag(MetaTagTarget::PascalScript, "File_Size");
+        assert_eq!(ed.edit_a.text, "begin\n  FileName := MetaTag(':File_Size:');\nend.");
+        // A field never touched takes it at its end, as before.
+        let mut ed = RuleEditorState::from_config(RuleConfig::default_for(RuleKind::Insert));
+        ed.edit_a = TextEdit::new("ab");
+        ed.insert_meta_tag(MetaTagTarget::InsertText, "File_Size");
+        assert_eq!(ed.edit_a.text, "ab:File_Size:");
+    }
+
+    #[test]
+    fn a_mapping_pair_typed_but_not_added_is_saved_with_the_rule() {
+        let mut rs = RulesState::new();
+        rs.open_add_at(None);
+        rs.editor.switch_kind(RuleKind::Mapping);
+        // A new mapping starts with no rows, not with an empty one.
+        assert!(matches!(&rs.editor.config, RuleConfig::Mapping { entries, .. } if entries.is_empty()));
+        rs.editor.map_key = TextEdit::new("antigo");
+        rs.editor.map_val = TextEdit::new("novo");
+        rs.commit_editor();
+        let RuleConfig::Mapping { entries, .. } = &rs.rules[0].config else { panic!() };
+        assert_eq!(entries, &[("antigo".to_string(), "novo".to_string())]);
+        assert!(rs.editor.map_key.text.is_empty() && rs.editor.map_val.text.is_empty());
+    }
+
+    #[test]
+    fn each_new_random_rule_draws_its_own_names() {
+        let seed_of = |ed: &RuleEditorState| match &ed.config {
+            RuleConfig::Random { seed, .. } => *seed,
+            _ => panic!(),
+        };
+        let mut a = RuleEditorState::from_config(RuleConfig::default_for(RuleKind::Insert));
+        a.switch_kind(RuleKind::Random);
+        let mut b = RuleEditorState::from_config(RuleConfig::default_for(RuleKind::Insert));
+        b.switch_kind(RuleKind::Random);
+        assert_ne!(seed_of(&a), seed_of(&b));
+        // The rule keeps its seed: the preview shows the same names at every drawing.
+        let rules = [rule(a.config.clone())];
+        let items = [file("a.txt"), file("b.txt")];
+        let loc = Location::Local(PathBuf::from("C:/tmp"));
+        assert_eq!(evaluate_rules(&rules, &items, &[true; 2], &loc), evaluate_rules(&rules, &items, &[true; 2], &loc));
     }
 
     #[test]

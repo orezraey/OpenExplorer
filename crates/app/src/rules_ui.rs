@@ -155,7 +155,7 @@ fn num_stepper(
             .on_press(move |s: &mut State| {
                 let e = ed_mut(s);
                 let cur = e.nums[slot].text.trim().parse::<i64>().unwrap_or(val);
-                let next = (cur + delta).clamp(min, max);
+                let next = cur.saturating_add(delta).clamp(min, max);
                 e.nums[slot] = TextEdit::new(next.to_string());
                 on_set(s, next);
             })
@@ -466,15 +466,15 @@ pub fn rules_workspace(
                 .cursor(Cursor::Pointer)
                 .fill(if active { k.alpha(k.c.text_accent, if k.dark { 0.16 } else { 0.09 }) } else { Color::TRANSPARENT })
                 .hover_fill(k.c.hover)
+                // A click selects; two open the rule. (A click on the rule already selected opened
+                // it, so the row just added couldn't be clicked without its editor coming up.)
                 .on_press(move |s: &mut State| {
-                    let double = s.batch_rename.as_ref().is_some_and(|b| !b.rules.all_selected && b.rules.selected == Some(i));
-                    if double {
-                        s.open_rule_editor(Some(i));
-                    } else if let Some(b) = &mut s.batch_rename {
+                    if let Some(b) = &mut s.batch_rename {
                         b.rules.selected = Some(i);
                         b.rules.all_selected = false;
                     }
                 })
+                .on_double_press(move |s: &mut State| s.open_rule_editor(Some(i)))
                 .on_secondary_press(move |s: &mut State, at: rune::PointerPress, _: &mut Tx| {
                     if let Some(b) = &mut s.batch_rename {
                         b.rules.selected = Some(i);
@@ -983,7 +983,7 @@ pub fn rule_editor_window_view(s: &State, cx: &mut rune::Cx<State>) -> El {
     let br = match &s.batch_rename {
         Some(br) => br.as_ref(),
         None => {
-            default_br = BatchRename::new(crate::model::Location::Local(std::path::PathBuf::new()), Vec::new(), Vec::new());
+            default_br = BatchRename::placeholder();
             &default_br
         }
     };

@@ -1090,7 +1090,8 @@ fn batch_rename_window_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
                 return true;
             }
             if br.media.popup.is_some() {
-                br.media.close_popup();
+                // As the popup's own Cancel does.
+                batch_rename::close_popup(s);
                 return true;
             }
             if br.rules.stack_menu.is_some() {

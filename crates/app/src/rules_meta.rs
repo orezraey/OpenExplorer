@@ -437,7 +437,13 @@ pub fn forget() {
 
 /// Whether `input` holds a `:TagName:` placeholder, so it reads differently for each item.
 pub fn has_tags(input: &str) -> bool {
-    input.contains(':') && TAG_REGEX.is_match(input)
+    input.contains(':') && TAG_REGEX.captures_iter(input).any(|caps| is_tag(&caps[1]))
+}
+
+/// Whether `name` is a meta tag. A word between colons that isn't one is text as typed: a
+/// regex's `[[:digit:]]`, a name with colons on a server.
+fn is_tag(name: &str) -> bool {
+    META_TAGS.iter().any(|tag| tag.name == name)
 }
 
 /// Expands all `:TagName:` placeholders inside `input` for `entry` at `loc`.
@@ -448,7 +454,7 @@ pub fn expand_tags(input: &str, entry: &Entry, loc: &Location) -> String {
     TAG_REGEX
         .replace_all(input, |caps: &regex::Captures| {
             let tag_name = &caps[1];
-            resolve_tag(tag_name, entry, loc).unwrap_or_default()
+            if is_tag(tag_name) { resolve_tag(tag_name, entry, loc).unwrap_or_default() } else { caps[0].to_string() }
         })
         .into_owned()
 }

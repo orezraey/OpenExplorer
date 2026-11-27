@@ -92,8 +92,19 @@ enum Matcher {
 
 impl BatchRename {
     pub fn new(loc: Location, items: Vec<Entry>, other_names: Vec<String>) -> Self {
-        let n = items.len();
         let media = MediaState::new(&items);
+        Self::with(loc, items, other_names, media, crate::rules_rename::RulesState::new())
+    }
+
+    /// An empty batch for the windows to draw while there is none (as they close): built
+    /// without the credential store and the presets file a real one reads.
+    pub fn placeholder() -> Self {
+        let media = MediaState::with_keys(&[], media_rename::MediaKeys::default());
+        Self::with(Location::Local(PathBuf::new()), Vec::new(), Vec::new(), media, crate::rules_rename::RulesState::with_presets(Vec::new()))
+    }
+
+    fn with(loc: Location, items: Vec<Entry>, other_names: Vec<String>, media: MediaState, rules: crate::rules_rename::RulesState) -> Self {
+        let n = items.len();
         let mut search = TextEdit::new("");
         search.focused = true;
         static SERIAL: AtomicU64 = AtomicU64::new(1);
@@ -112,7 +123,7 @@ impl BatchRename {
             simple_analyze_open: false,
             simple_analyze_input: TextEdit::new(""),
             media,
-            rules: crate::rules_rename::RulesState::new(),
+            rules,
         }
     }
 
@@ -333,20 +344,19 @@ impl BatchRename {
         };
 
         // The folders the batch renames, where items come from many folders (a search's
-        // results): an item inside one of them would have its path change under it, and
-        // neither the batch nor its undo would find it.
-        let renamed_folders: HashSet<String> = if matches!(self.loc, Location::Found(_)) {
-            self.items
-                .iter()
-                .enumerate()
-                .filter(|(i, item)| item.is_dir && self.checked.get(*i).copied().unwrap_or(false) && rows[*i].changed)
-                .filter_map(|(_, item)| self.loc.local_path(item))
-                .map(|path| ops::path_key(&path))
-                .collect()
-        } else {
-            HashSet::new()
+        // results, on the computer or on a server): an item inside one of them would have its
+        // path change under it, and neither the batch nor its undo would find it.
+        let renamed_folders: HashSet<String> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(i, item)| item.is_dir && self.checked.get(*i).copied().unwrap_or(false) && rows[*i].changed)
+            .filter_map(|(_, item)| self.found_path(item))
+            .collect();
+        let in_renamed_folder = |item: &Entry| {
+            !renamed_folders.is_empty()
+                && self.found_path(item).is_some_and(|path| std::iter::successors(path.rsplit_once('/'), |(dir, _)| dir.rsplit_once('/')).any(|(dir, _)| renamed_folders.contains(dir)))
         };
-        let in_renamed_folder = |item: &Entry| !renamed_folders.is_empty() && self.loc.local_path(item).is_some_and(|path| path.ancestors().skip(1).any(|dir| renamed_folders.contains(&ops::path_key(dir))));
 
         let mut changed_count = 0;
         let mut error_count = 0;
@@ -384,6 +394,18 @@ impl BatchRename {
         }
 
         Preview { regex_error: None, rows: Rc::new(rows), changed_count, error_count, waiting: false }
+    }
+}
+
+impl BatchRename {
+    /// Where `item` is, with `/` between folders, when the batch lists a search's results: its
+    /// items come from many folders, and one can be inside another. `None` in a plain folder.
+    fn found_path(&self, item: &Entry) -> Option<String> {
+        match &self.loc {
+            Location::Found(_) => self.loc.local_path(item).map(|path| ops::path_key(&path).replace(std::path::MAIN_SEPARATOR, "/")),
+            Location::Server { find: Some(_), .. } => servers::path_of(&self.loc, item),
+            _ => None,
+        }
     }
 }
 
@@ -692,7 +714,7 @@ pub fn batch_rename_window_view(s: &State, cx: &mut Cx<State>) -> El {
     let br = match &s.batch_rename {
         Some(br) => br.as_ref(),
         None => {
-            default_br = BatchRename::new(Location::Local(PathBuf::new()), Vec::new(), Vec::new());
+            default_br = BatchRename::placeholder();
             &default_br
         }
     };
@@ -1020,7 +1042,7 @@ fn media_workspace(
         )
         .child(crate::rules_ui::tool_btn(k, "btn-media-pick", t("Buscar título…", "Pick title…"), !busy, |s| {
             if let Some(b) = &mut s.batch_rename {
-                b.media.popup = Some(MediaPopup::SelectMatch);
+                b.media.open_picker();
             }
         }))
         .child(crate::rules_ui::tool_btn(k, "btn-media-presets", t("Presets", "Presets"), true, |s| {
@@ -1127,7 +1149,7 @@ fn media_workspace(
             .child(info_col)
             .child(crate::rules_ui::tool_btn(k, "btn-media-change", t("Trocar…", "Change…"), true, |s| {
                 if let Some(b) = &mut s.batch_rename {
-                    b.media.popup = Some(MediaPopup::SelectMatch);
+                    b.media.open_picker();
                 }
             }))
     } else {
@@ -1240,10 +1262,17 @@ fn media_workspace(
         .child(footer)
 }
 
-fn close_popup(s: &mut State) {
+pub(crate) fn close_popup(s: &mut State) {
+    let mut refetch = false;
     if let Some(b) = &mut s.batch_rename {
+        let picker = b.media.popup == Some(MediaPopup::SelectMatch);
         b.media.close_popup();
         b.media.open_dropdown = None;
+        // The picker went back to a show whose episodes were still on their way when it opened.
+        refetch = picker && !b.media.loading_episodes && b.media.episodes_for.is_none() && b.media.active_candidate().is_some_and(|c| c.kind == MediaKind::Series);
+    }
+    if refetch {
+        media_rename::fetch_selected_episodes(s);
     }
 }
 
@@ -1360,7 +1389,7 @@ fn render_media_popup(s: &State, k: &rune_kit::Kit, br: &BatchRename, popup: Med
                     false,
                     Box::new(|s| {
                         if let Some(b) = &mut s.batch_rename {
-                            b.media.popup = Some(MediaPopup::SelectMatch);
+                            b.media.open_picker();
                         }
                     }),
                 ))
@@ -1426,10 +1455,17 @@ fn render_media_popup(s: &State, k: &rune_kit::Kit, br: &BatchRename, popup: Med
                     Some(tpl.into()),
                     active,
                     Box::new(move |s| {
+                        let mut reordered = false;
                         if let Some(b) = &mut s.batch_rename {
                             b.media.format = TextEdit::new(tpl);
+                            reordered = b.media.order != EpisodeOrder::Absolute;
                             b.media.order = EpisodeOrder::Absolute;
                             b.media.popup = None;
+                        }
+                        // The episodes loaded are in the order left: the absolute one is another
+                        // list, as when the order changes in Preferences.
+                        if reordered {
+                            media_rename::fetch_selected_episodes(s);
                         }
                     }),
                 ));
@@ -2367,6 +2403,131 @@ mod tests {
         assert!(p.rows[2].note.is_some());
         assert!(p.rows[0].note.is_none());
         assert!(p.can_submit());
+
+        // The user searched the other show, and picked it: now its file is the one named.
+        br.media.searched_title = "beta".into();
+        br.media.candidates[0].title = "Beta".into();
+        let p = br.preview();
+        assert_eq!(p.rows[2].next, "Beta - S01E02 - Two.mkv");
+        assert!(!p.rows[0].changed && !p.rows[1].changed && p.rows[0].note.is_some() && p.rows[2].note.is_none(), "{p:?}");
+        // A search no file names (another spelling of the title) names the files of most.
+        br.media.searched_title = "the alpha show".into();
+        let p = br.preview();
+        assert!(p.rows[0].changed && p.rows[1].changed && !p.rows[2].changed, "{p:?}");
+    }
+
+    #[test]
+    fn closing_the_media_preferences_drops_a_key_typed_but_not_saved() {
+        let mut br = local_br(&["a.mkv"], &[]);
+        br.media.keys = crate::media_rename::MediaKeys { tmdb: "saved".into(), tvdb: String::new() };
+        br.media.tmdb_key_edit = TextEdit::new("typed and left");
+        br.media.tvdb_key_edit = TextEdit::new("typed too");
+        br.media.popup = Some(MediaPopup::Preferences);
+        br.media.close_popup();
+        assert_eq!(br.media.tmdb_key_edit.text, "saved");
+        assert_eq!(br.media.tvdb_key_edit.text, "");
+    }
+
+    #[test]
+    fn cancelling_the_title_picker_keeps_the_match_as_it_was() {
+        use crate::media_rename::{Answer, Candidate, DataSource, MediaKind};
+        let movie = |id: &str, title: &str| Candidate { id: id.into(), source: DataSource::Tmdb, kind: MediaKind::Movie, title: title.into(), original_title: None, year: Some(2010), overview: String::new(), poster_url: None };
+        let mut br = local_br(&["Inception.2010.mkv"], &[]);
+        br.mode = Mode::Media;
+        // No key: nothing of this test asks the services anything.
+        br.media.keys = Default::default();
+        br.media.candidates = vec![movie("1", "Inception")];
+        br.media.selected = Some(0);
+        let (named, query) = (br.preview().rows[0].next.clone(), br.media.query.text.clone());
+        assert!(named.starts_with("Inception"), "{named}");
+
+        // In the picker another title is searched, and its results arrive.
+        br.media.open_picker();
+        br.media.query = TextEdit::new("Interstellar");
+        br.media.search_seq = 7;
+        let mut s = crate::init();
+        s.batch_rename = Some(Box::new(br));
+        let found = vec![movie("2", "Interstellar"), movie("3", "Interstellar 2")];
+        crate::media_rename::arrived(&mut s, Answer::Search { seq: 7, result: Ok(found.clone()) });
+        let b = s.batch_rename.as_mut().unwrap();
+        assert_eq!(b.media.active_candidate().map(|c| c.title.as_str()), Some("Interstellar"));
+
+        // Cancel: the files keep the names of the match there was, not the first result's.
+        b.media.close_popup();
+        assert_eq!(b.media.active_candidate().map(|c| c.title.as_str()), Some("Inception"));
+        assert_eq!(b.media.query.text, query);
+        assert_eq!(b.preview().rows[0].next, named);
+
+        // Picked instead, the new title stays when the picker closes.
+        b.media.open_picker();
+        b.media.search_seq = 8;
+        crate::media_rename::arrived(&mut s, Answer::Search { seq: 8, result: Ok(found) });
+        crate::media_rename::select_candidate(&mut s, 1);
+        let b = s.batch_rename.as_mut().unwrap();
+        b.media.close_popup();
+        assert_eq!(b.media.active_candidate().map(|c| c.title.as_str()), Some("Interstellar 2"));
+    }
+
+    #[test]
+    fn a_rule_opens_on_two_clicks_not_on_one() {
+        let mut br = local_br(&["a.txt"], &[]);
+        br.mode = Mode::Rules;
+        br.rules.rules = vec![crate::rules_rename::Rule::new(crate::rules_rename::RuleConfig::default_for(crate::rules_rename::RuleKind::Insert))];
+        // As after adding it: the rule is the selected one.
+        br.rules.selected = Some(0);
+        let mut s = crate::init();
+        s.batch_rename = Some(Box::new(br));
+        let mut rt = rune::Runtime::new(s, batch_rename_window_view, (860.0, 620.0), rune::Env::new(false, 1.0));
+        rt.frame(1.0 / 60.0);
+        let (x, y) = rt.find("rule-row-0").expect("the rule's row");
+        let editing = |rt: &mut rune::Runtime<State>| {
+            let mut index = None;
+            rt.update(|s, _| index = s.batch_rename.as_ref().unwrap().rules.editor.edit_index);
+            index
+        };
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(editing(&mut rt), None);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(editing(&mut rt), Some(0));
+    }
+
+    #[test]
+    fn two_clicks_on_a_rules_own_controls_do_not_open_it() {
+        use crate::rules_rename::{Rule, RuleConfig, RuleKind};
+        let mut br = local_br(&["a.txt"], &[]);
+        br.mode = Mode::Rules;
+        br.rules.rules = vec![Rule::new(RuleConfig::default_for(RuleKind::Insert)), Rule::new(RuleConfig::default_for(RuleKind::Delete))];
+        let mut s = crate::init();
+        s.batch_rename = Some(Box::new(br));
+        let mut rt = rune::Runtime::new(s, batch_rename_window_view, (860.0, 620.0), rune::Env::new(false, 1.0));
+        rt.frame(1.0 / 60.0);
+        let click = |rt: &mut rune::Runtime<State>, key: &str| {
+            let (x, y) = rt.find(key).unwrap_or_else(|| panic!("{key}"));
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+            rt.frame(1.0 / 60.0);
+        };
+        let state = |rt: &mut rune::Runtime<State>| {
+            let mut out = (None, Vec::new());
+            rt.update(|s, _| {
+                let rules = &s.batch_rename.as_ref().unwrap().rules;
+                out = (rules.editor.edit_index, rules.rules.iter().map(|r| r.enabled).collect());
+            });
+            out
+        };
+        // Its box, off and on again.
+        click(&mut rt, "rule-en-0");
+        assert_eq!(state(&mut rt), (None, vec![false, true]));
+        click(&mut rt, "rule-en-0");
+        assert_eq!(state(&mut rt), (None, vec![true, true]));
+        // Two rules removed one after the other, at the same place.
+        click(&mut rt, "rule-del-0");
+        click(&mut rt, "rule-del-0");
+        assert_eq!(state(&mut rt), (None, vec![]));
     }
 
     #[test]
@@ -2386,6 +2547,37 @@ mod tests {
         // Without the folder, the file can go.
         br.checked[0] = false;
         assert!(br.preview().can_submit());
+    }
+
+    #[test]
+    fn a_folder_and_a_file_in_it_are_not_renamed_together_on_a_server() {
+        let server = openexplorer_remote::Server {
+            id: "s".into(),
+            name: "s".into(),
+            protocol: openexplorer_remote::Protocol::Sftp,
+            brand: None,
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            root: "/".into(),
+            key: None,
+            host_key: None,
+            cert: None,
+            connections: 1,
+            implicit: false,
+        };
+        // A search's results there: each item's id is its path under the folder searched.
+        let loc = Location::Server { server: Box::new(server), path: vec!["docs".into()], find: Some("x".into()) };
+        let item = |path: &str, is_dir: bool| Entry { id: path.into(), is_dir, ..file(path.rsplit('/').next().unwrap()) };
+        let items = vec![item("x-pasta", true), item("x-pasta/x-nota.txt", false), item("x-solto.txt", false)];
+        let paths: Vec<_> = items.iter().map(|e| servers::path_of(&loc, e)).collect();
+        assert_eq!(paths[1].as_deref().and_then(|p| p.rsplit_once('/')).map(|(dir, _)| dir), paths[0].as_deref(), "{paths:?}");
+        let mut br = BatchRename::new(loc, items, vec![]);
+        br.search = TextEdit::new("x-");
+        br.replace = TextEdit::new("y-");
+        let p = br.preview();
+        assert!(p.rows[0].error.is_none() && p.rows[2].error.is_none(), "{p:?}");
+        assert!(p.rows[1].error.is_some());
     }
 
     #[test]
