@@ -865,6 +865,35 @@ impl Walk<'_> {
     }
 }
 
+/// Pane `p`'s tree open down to the folder it shows, each folder on the way holding only the
+/// next one, and the last's parent also `siblings`: the README's screenshots (`showcase`),
+/// which mustn't read the folders of the computer or the accounts they're taken with. Nothing
+/// on the way is asked for, so following it later opens the same rows.
+pub fn stage(s: &mut State, p: usize, siblings: &[&str]) {
+    let chain = chain(s, &s.panes[p].loc.clone());
+    for (i, node) in chain.iter().enumerate().take(chain.len().saturating_sub(1)) {
+        s.tree.open[p].insert(node.id.clone());
+        if !matches!(*kids_of(s, node), Kids::Unknown) {
+            continue;
+        }
+        let mut kids = vec![chain[i + 1].clone()];
+        if i + 2 == chain.len() {
+            kids.extend(siblings.iter().filter_map(|name| match &node.to {
+                Some(Location::Local(dir)) => Some(local_node(&s.places, dir.join(name))),
+                Some(Location::Drive { email, space, path }) => {
+                    let mut path = path.clone();
+                    path.push((format!("showcase:{name}"), name.to_string()));
+                    Some(drive_folder_node(email, space.clone(), path))
+                }
+                _ => None,
+            }));
+        }
+        s.tree.kids.insert(node.id.clone(), Kids::Ready(sorted(kids)));
+    }
+    s.tree.follow[p] = false;
+    s.tree.version += 1;
+}
+
 /// Whether pane `p`'s tree still has to bring the folder shown into view.
 pub fn following(s: &State, p: usize) -> bool {
     s.tree.follow[p]

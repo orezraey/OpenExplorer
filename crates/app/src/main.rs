@@ -33,6 +33,7 @@ mod network;
 mod onedrive;
 mod ops;
 mod settings;
+mod showcase;
 mod sharing;
 mod places;
 mod relay;
@@ -3297,6 +3298,10 @@ fn main() {
                 s.panes[1].set_entries(Ok(vec![d("0AAa", "Equipe de design"), d("0AAb", "Financeiro"), d("0AAc", "Projetos 2026")]));
             }),
             ("accounts-hub", accounts_hub_scene),
+            // The README's screenshots (`showcase`).
+            ("readme-main", showcase::main_scene),
+            ("readme-conflict", showcase::conflict_scene),
+            ("readme-search", showcase::search_scene),
             ("accounts-hub-empty", |s| {
                 s.accounts.clear();
                 s.servers.list.clear();
