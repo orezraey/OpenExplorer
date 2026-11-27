@@ -40,11 +40,30 @@ pub(crate) fn kit(dark: bool) -> Kit {
     k
 }
 
+/// What each window's view starts with. The whole window is zoomed by the system's text size
+/// (Windows: Acessibilidade > Tamanho do texto; GNOME: text scaling), so text grows with the
+/// rows and boxes that hold it. And the `Kit` controls that take its hover default (text
+/// fields, check boxes, selects, toasts) hover with `hover`, also in the layer of menus and
+/// dialogs, which a window's `hover_motion_within` doesn't reach: the app's 80 ms glide, or at
+/// once. Its `Button` and `Menu` take none.
+pub(crate) fn window_kit(s: &State, cx: &mut Cx<State>, hover: Anim) -> Kit {
+    cx.zoom(cx.system_text_scale());
+    let mut k = kit(s.settings.theme.dark(cx.system_dark()));
+    k.motion = k.motion.hover_motion(hover, hover);
+    k
+}
+
+/// The hover the main and account windows glide with: the app's 80 ms curve while Opções keeps
+/// hover animations on, at once otherwise.
+pub(crate) fn hover_motion(s: &State) -> Anim {
+    if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT }
+}
+
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if s.is_placeholder {
         return el();
     }
-    let k = kit(s.settings.theme.dark(cx.system_dark()));
+    let k = window_kit(s, cx, hover_motion(s));
     cx.caption_color(k.c.text_base);
     let title_leading = row()
         .gap(8.0)
@@ -116,10 +135,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         // pane (over a pane, its own handler took them first).
         .on_button(|s: &mut State, button, _: &mut Tx| crate::side_button_in_window(s, button))
         // Fluid 80 ms hover transition when hover animations are on; instant otherwise.
-        .hover_motion_within(
-            if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT },
-            if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT },
-        )
+        .hover_motion_within(hover_motion(s), hover_motion(s))
         .on_key(|s: &mut State, ev: &KeyEvent, _: &mut Tx| {
             if ev.key == rune::Key::Escape && (s.view_menu_open || s.view_mode_menu.is_some() || s.search_scope_menu.is_some()) {
                 s.view_menu_open = false;
@@ -2216,7 +2232,7 @@ pub fn account_window_view(s: &State, cx: &mut Cx<State>) -> El {
     if s.is_placeholder {
         return el();
     }
-    let k = kit(s.settings.theme.dark(cx.system_dark()));
+    let k = window_kit(s, cx, hover_motion(s));
     let default_form;
     let f = match &s.account_form {
         Some(f) => f.as_ref(),
@@ -2267,10 +2283,7 @@ pub fn account_window_view(s: &State, cx: &mut Cx<State>) -> El {
         .fill(window_bg)
         .child(titlebar)
         .child(content)
-        .hover_motion_within(
-            if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT },
-            if s.settings.hover_animated() { crate::anim::hover_curve() } else { Anim::INSTANT },
-        );
+        .hover_motion_within(hover_motion(s), hover_motion(s));
 
     rune_kit::root(root, layer)
 }
@@ -5830,11 +5843,11 @@ fn path_bar(s: &State, k: &Kit, p: usize) -> El {
             path = path.child(icon(&icons::CHEVRON, 12.0).color(k.c.icon_faint));
         }
         let to = c.to;
+        let step = row().key(format!("crumb-{i}")).role("link").label(c.label.clone());
+        // The last step is the folder shown, which screen readers say is the current one.
+        let step = if i == last { step.current(rune::Current::Location) } else { step };
         path = path.child(
-            row()
-                .key(format!("crumb-{i}"))
-                .role("link")
-                .label(c.label.clone())
+            step
                 .h(22.0)
                 .px(5.0)
                 .center_y()
@@ -6384,6 +6397,10 @@ fn tree_line(s: &State, k: &Kit, p: usize, line: &crate::tree::Line) -> El {
         .label(node.label.clone())
         .level(depth as u32 + 1)
         .checked(on);
+    if on {
+        // Screen readers say the folder the pane shows is the current one.
+        item = item.current(rune::Current::Location);
+    }
     if node.opens && !empty {
         item = item.expanded(open);
     }
