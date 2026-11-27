@@ -278,15 +278,15 @@ pub(crate) fn v_bar(k: &Kit, key: &str, viewport: El) -> El {
 /// it before [`xy_bars`] builds the bars, to size content that fills the viewport's height from
 /// its last layout.
 pub(crate) fn height_change(key: &str) -> f32 {
-    let bars = kept(key);
-    if !bars.sideways.get() {
-        return 0.0;
-    }
-    match (bars.built_x.get(), h_shows(bars.pos.get())) {
-        (false, true) => -GUTTER,
-        (true, false) => GUTTER,
+    let id = (rune::current_runtime_id(), key.to_owned());
+    BARS.with(|bars| match bars.borrow().get(&id) {
+        Some(bars) if bars.sideways.get() => match (bars.built_x.get(), h_shows(bars.pos.get())) {
+            (false, true) => -GUTTER,
+            (true, false) => GUTTER,
+            _ => 0.0,
+        },
         _ => 0.0,
-    }
+    })
 }
 
 /// A `scroll_xy()` viewport keyed `key` with a vertical bar on the right, starting `top` points
@@ -315,15 +315,15 @@ fn build(k: &Kit, key: &str, viewport: El, top: f32, sideways: Option<Option<Wak
     bars.sync();
 
     let watch = bars.clone();
-    let viewport = viewport.chain_scroll_offset(move |at| watch.follow(at)).scroll_bar_styled(v_style(k, top));
     let bottom = if shows_x { GUTTER } else { 0.0 };
+    // The gutters are the padding of the area `rune-kit` wraps the viewport in, so the pointer
+    // over the vertical thumb is inside that area, where the kit hears it (its hover colour).
+    let viewport = viewport.chain_scroll_offset(move |at| watch.follow(at)).scroll_bar_styled(v_style(k, top)).pr(GUTTER).pb(bottom);
     let trough = trough(k);
     let mut wrap = col()
         .key(format!("bars-{key}"))
         .min_w(0.0)
         .min_h(0.0)
-        .pr(GUTTER)
-        .pb(bottom)
         .child(el().key("v-gutter").pin(None, Some(top), Some(0.0), Some(bottom)).w(GUTTER).fill(trough).live_opacity(&bars.v_on).wheel_scrolls(key))
         .child(viewport)
         .child(arrow(k, "up", &icons::SCROLL_UP, key, &bars, [0.0, -1.0], &bars.ends[0]).pin(None, Some(top), Some(0.0), None))
