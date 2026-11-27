@@ -918,6 +918,8 @@ pub(crate) fn shared_footer(k: &rune_kit::Kit, br: &BatchRename, preview: &Previ
 
     let warn_text: Option<String> = if let Some(err) = extra_error {
         Some(err.to_string())
+    } else if preview.waiting {
+        Some(t("Calculando meta tags…", "Computing meta tags…").into())
     } else if preview.error_count > 0 {
         Some(if preview.error_count == 1 {
             t("1 item com conflito ou nome inválido", "1 item has a conflict or invalid name").into()

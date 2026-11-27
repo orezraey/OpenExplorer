@@ -596,6 +596,9 @@ pub struct MediaState {
     pub candidates: Vec<Candidate>,
     pub selected: Option<usize>,
     pub episodes: Vec<EpisodeInfo>,
+    /// The id of the candidate `episodes` were loaded for: the picker highlights another before
+    /// its own arrive, and names must never mix one show's title with another's episodes.
+    pub episodes_for: Option<String>,
     pub searching: bool,
     pub loading_episodes: bool,
     pub error: Option<String>,
@@ -632,6 +635,7 @@ impl MediaState {
             candidates: Vec::new(),
             selected: None,
             episodes: Vec::new(),
+            episodes_for: None,
             searching: false,
             loading_episodes: false,
             error: None,
@@ -650,6 +654,7 @@ impl MediaState {
         self.candidates.clear();
         self.selected = None;
         self.episodes.clear();
+        self.episodes_for = None;
         self.searching = false;
         self.loading_episodes = false;
         self.error = None;
@@ -747,6 +752,26 @@ impl MediaState {
         self.selected.and_then(|i| self.candidates.get(i))
     }
 
+    /// The loaded episodes, if they belong to the active candidate; none otherwise.
+    fn active_episodes(&self) -> &[EpisodeInfo] {
+        match (self.active_candidate(), &self.episodes_for) {
+            (Some(cand), Some(id)) if cand.id == *id => &self.episodes,
+            _ => &[],
+        }
+    }
+
+    /// Closes the open popup. Leaving the picker without confirming goes back to the candidate
+    /// whose episodes are loaded, instead of keeping the one only highlighted there.
+    pub fn close_popup(&mut self) {
+        if self.popup == Some(MediaPopup::SelectMatch)
+            && let Some(id) = &self.episodes_for
+            && let Some(i) = self.candidates.iter().position(|c| c.id == *id)
+        {
+            self.selected = Some(i);
+        }
+        self.popup = None;
+    }
+
     pub fn set_kind(&mut self, kind: MediaKind) {
         if self.kind == kind {
             return;
@@ -800,11 +825,12 @@ impl MediaState {
     }
 
     fn resolve_episode(&self, idx: usize, parsed: &ParsedFile) -> Option<EpisodeInfo> {
+        let episodes = self.active_episodes();
         // 1. Absolute order: match by absolute number (or parsed episode).
         if self.order == EpisodeOrder::Absolute {
             let target_abs = parsed.absolute.or_else(|| parsed.episodes.first().copied());
             if let Some(num) = target_abs {
-                if let Some(found) = self.episodes.iter().find(|e| e.absolute == Some(num) || e.episode == num) {
+                if let Some(found) = episodes.iter().find(|e| e.absolute == Some(num) || e.episode == num) {
                     return Some(found.clone());
                 }
                 if self.match_mode == MatchMode::Opportunistic {
@@ -816,7 +842,7 @@ impl MediaState {
 
         // 2. Season + Episode match.
         if let (Some(s), Some(&e)) = (parsed.season, parsed.episodes.first()) {
-            if let Some(found) = self.episodes.iter().find(|ep| ep.season == s && ep.episode == e) {
+            if let Some(found) = episodes.iter().find(|ep| ep.season == s && ep.episode == e) {
                 return Some(found.clone());
             }
             if self.match_mode == MatchMode::Opportunistic {
@@ -827,7 +853,7 @@ impl MediaState {
 
         // 3. Episode-only (e.g. anime `- 05`) when in Airdate/DVD order.
         if let Some(&e) = parsed.episodes.first() {
-            if let Some(found) = self.episodes.iter().find(|ep| ep.absolute == Some(e) || (ep.season == 1 && ep.episode == e)) {
+            if let Some(found) = episodes.iter().find(|ep| ep.absolute == Some(e) || (ep.season == 1 && ep.episode == e)) {
                 return Some(found.clone());
             }
             if self.match_mode == MatchMode::Opportunistic {
@@ -836,11 +862,18 @@ impl MediaState {
             return None;
         }
 
-        // 4. Opportunistic sequential fallback when filename had no episode number at all.
+        // 4. Opportunistic sequential fallback, only when no file of the batch has an episode
+        // number: then the files are taken in order, folders left out. Mixed with numbered
+        // files, an extra or a trailer would take some episode's name.
         if self.match_mode == MatchMode::Opportunistic
-            && let Some(found) = self.episodes.get(idx)
+            && self.parsed.iter().all(|p| p.episodes.is_empty() && p.absolute.is_none())
         {
-            return Some(found.clone());
+            let nth = self.parsed[..idx].iter().filter(|p| !p.ext.is_empty()).count();
+            if !parsed.ext.is_empty()
+                && let Some(found) = episodes.get(nth)
+            {
+                return Some(found.clone());
+            }
         }
 
         None
@@ -1117,6 +1150,7 @@ pub fn select_candidate(s: &mut State, idx: usize) {
     br.media.selected = Some(idx);
     br.media.popup = None;
     br.media.episodes.clear();
+    br.media.episodes_for = None;
     br.media.error = None;
     fetch_selected_episodes(s);
 }
@@ -1173,6 +1207,7 @@ pub fn arrived(s: &mut State, ans: Answer) {
                         }
                         br.media.candidates = cands;
                         br.media.episodes.clear();
+                        br.media.episodes_for = None;
                         if br.media.candidates.is_empty() {
                             br.media.selected = None;
                             br.media.popup = Some(MediaPopup::SelectMatch);
@@ -1219,6 +1254,7 @@ pub fn arrived(s: &mut State, ans: Answer) {
                 match result {
                     Ok(eps) => {
                         br.media.episodes = eps;
+                        br.media.episodes_for = Some(candidate_id);
                         br.media.error = None;
                     }
                     Err(e) => {
@@ -1356,7 +1392,21 @@ fn tmdb_episodes(api_key: &str, id: &str, seasons: &[u32], order: EpisodeOrder, 
         }
     }
 
-    // Standard Airdate season fetch.
+    // Standard Airdate season fetch. Absolute numbers count from the first episode of the show,
+    // so absolute order reads every season (anime files rarely name one): with only season 1,
+    // episode 30 of a show whose season 1 has 24 would never be found.
+    let all_seasons: Vec<u32>;
+    let seasons = if order == EpisodeOrder::Absolute {
+        let count = tmdb_get(api_key, &format!("/tv/{id}"), &[("language", lang.tmdb_code())])?
+            .get("number_of_seasons")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .clamp(1, 100) as u32;
+        all_seasons = (1..=count).collect();
+        &all_seasons[..]
+    } else {
+        seasons
+    };
     let mut eps = Vec::new();
     let mut abs_counter = 0u32;
     for &season in seasons {
@@ -1497,18 +1547,31 @@ fn tvdb_episodes(api_key: &str, id: &str, order: EpisodeOrder, lang: MediaLang) 
         EpisodeOrder::Absolute => "absolute",
     };
     let lang_code = lang.tvdb_code();
-    let json = if lang != MediaLang::EnUs {
-        tvdb_get(api_key, &format!("/series/{id}/episodes/{order_str}/{lang_code}"), &[("page", "0")])
-            .or_else(|_| tvdb_get(api_key, &format!("/series/{id}/episodes/{order_str}"), &[("page", "0")]))?
-    } else {
-        tvdb_get(api_key, &format!("/series/{id}/episodes/{order_str}"), &[("page", "0")])?
-    };
-
-    let list = json
-        .pointer("/data/episodes")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    // TVDB pages long series (`links.next`): read every page, not just the first.
+    let mut list: Vec<serde_json::Value> = Vec::new();
+    let mut translated = lang != MediaLang::EnUs;
+    for page in 0..100u32 {
+        let page_str = page.to_string();
+        let params = [("page", page_str.as_str())];
+        let json = if translated {
+            match tvdb_get(api_key, &format!("/series/{id}/episodes/{order_str}/{lang_code}"), &params) {
+                Ok(json) => json,
+                // No translation: the rest in the original language, from this page on.
+                Err(_) => {
+                    translated = false;
+                    tvdb_get(api_key, &format!("/series/{id}/episodes/{order_str}"), &params)?
+                }
+            }
+        } else {
+            tvdb_get(api_key, &format!("/series/{id}/episodes/{order_str}"), &params)?
+        };
+        let episodes = json.pointer("/data/episodes").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let more = json.pointer("/links/next").is_some_and(|v| !v.is_null()) && !episodes.is_empty();
+        list.extend(episodes);
+        if !more {
+            break;
+        }
+    }
 
     let mut eps = Vec::new();
     for (idx, ep) in list.into_iter().enumerate() {

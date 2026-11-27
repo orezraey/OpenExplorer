@@ -1049,6 +1049,7 @@ fn init_batch_rename_window() -> State {
 }
 
 fn setup_batch_rename_window(_: &mut State, waker: Waker) {
+    rules_meta::set_waker(waker.clone());
     *BATCH_RENAME_WAKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker);
 }
 
@@ -1065,7 +1066,9 @@ fn poll_batch_rename_window(s: &mut State, _now: f64, tx: &mut Tx) -> bool {
         s.batch_rename_synced_render = Some(s.settings.text_render);
         tx.set_font_smoothing(s.settings.text_render.smoothing());
     }
-    std::mem::take(&mut s.batch_rename_dirty)
+    // A meta tag computed in the background changes the preview.
+    let tags = rules_meta::take_changed();
+    std::mem::take(&mut s.batch_rename_dirty) || tags
 }
 
 fn batch_rename_window_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
@@ -1083,7 +1086,7 @@ fn batch_rename_window_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
                 return true;
             }
             if br.media.popup.is_some() {
-                br.media.popup = None;
+                br.media.close_popup();
                 return true;
             }
             if br.rules.stack_menu.is_some() {

@@ -298,6 +298,77 @@ pub fn rename(from: &Path, name: &str) -> Result<PathBuf, String> {
     std::fs::rename(from, &to).map(|_| to).map_err(|e| tr!("Não consegui renomear: {e}", "Couldn't rename: {e}"))
 }
 
+/// Renames each `(from, to)` together, through temporary names, so they can swap or chain
+/// (`a` → `b` and `b` → `a`, or `a` → `b` and `b` → `c`). Each `to` must be free or the `from` of
+/// another pair; nothing is touched until that holds. When a rename fails, every item goes back
+/// to its first name, and the error says which (if any) couldn't, under their temporary name.
+pub fn rename_together(moves: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    for (from, to) in moves {
+        let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if let Some(why) = invalid_name(&name) {
+            return Err(why);
+        }
+        if to.exists() && !moves.iter().any(|(other, _)| same_file(other, to)) {
+            return Err(tr!("Já existe um item chamado \"{}\" aqui.", "There's already an item named \"{}\" here.", name));
+        }
+        if !from.exists() {
+            return Err(tr!("\"{}\" não está mais aqui.", "\"{}\" is no longer here.", from.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+        }
+    }
+    let pid = std::process::id();
+    // Phase 1: every item to a free temporary name in its own folder.
+    let mut staged: Vec<PathBuf> = Vec::with_capacity(moves.len());
+    for (idx, (from, _)) in moves.iter().enumerate() {
+        let tmp = (0usize..).map(|n| from.with_file_name(format!(".oe-batch-tmp-{pid}-{idx}-{n}"))).find(|p| !p.exists()).expect("a free name");
+        if let Err(e) = std::fs::rename(from, &tmp) {
+            let stuck = put_back(moves, &staged, 0);
+            return Err(with_stuck(tr!("Não consegui renomear \"{}\": {e}", "Couldn't rename \"{}\": {e}", from.display()), &stuck));
+        }
+        staged.push(tmp);
+    }
+    // Phase 2: each to its new name. `std::fs::rename` would replace a file that appeared there
+    // meanwhile, so a taken name stops the batch.
+    for (k, ((_, to), tmp)) in moves.iter().zip(&staged).enumerate() {
+        let result = if to.exists() {
+            Err(tr!("Já existe um item chamado \"{}\" aqui.", "There's already an item named \"{}\" here.", to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()))
+        } else {
+            std::fs::rename(tmp, to).map_err(|e| tr!("Não consegui renomear: {e}", "Couldn't rename: {e}"))
+        };
+        if let Err(e) = result {
+            let stuck = put_back(moves, &staged, k);
+            return Err(with_stuck(e, &stuck));
+        }
+    }
+    Ok(())
+}
+
+/// Undoes [`rename_together`] after a failure: the first `placed` items leave their new names
+/// for their temporary ones, then every temporary name goes back to the item's first name. The
+/// temporary names that couldn't go back.
+fn put_back(moves: &[(PathBuf, PathBuf)], staged: &[PathBuf], placed: usize) -> Vec<PathBuf> {
+    for ((_, to), tmp) in moves.iter().zip(staged).take(placed).rev() {
+        let _ = std::fs::rename(to, tmp);
+    }
+    let mut stuck = Vec::new();
+    for ((from, _), tmp) in moves.iter().zip(staged).rev() {
+        if !tmp.exists() {
+            continue;
+        }
+        if from.exists() || std::fs::rename(tmp, from).is_err() {
+            stuck.push(tmp.clone());
+        }
+    }
+    stuck
+}
+
+fn with_stuck(err: String, stuck: &[PathBuf]) -> String {
+    if stuck.is_empty() {
+        return tr!("{err} Nada foi renomeado.", "{err} Nothing was renamed.");
+    }
+    let names: Vec<String> = stuck.iter().map(|p| p.display().to_string()).collect();
+    tr!("{err} Ficaram com nome temporário: {}", "{err} Left under a temporary name: {}", names.join(", "))
+}
+
 /// Same path ignoring case, as Windows compares names: renaming `a.txt` to `A.txt` is allowed.
 fn same_file(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()

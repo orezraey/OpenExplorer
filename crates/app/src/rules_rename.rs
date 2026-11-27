@@ -1035,6 +1035,9 @@ pub struct RuleEditorState {
     pub config: RuleConfig,
     /// Index in `RulesState::rules` when editing an existing rule, or `None` when adding.
     pub edit_index: Option<usize>,
+    /// The edited rule as it was when the editor opened. The batch window stays usable meanwhile,
+    /// so deleting or moving rules there can shift `edit_index`: saving looks the rule up again.
+    pub edit_original: Option<RuleConfig>,
     /// Optional insertion slot (`Adicionar regra (acima)` / `(abaixo)`) when adding a new rule.
     pub insert_at: Option<usize>,
     /// Active Meta Tags sub-picker target inside the independent Rule Editor window.
@@ -1066,6 +1069,7 @@ impl RuleEditorState {
             kind,
             config,
             edit_index: None,
+            edit_original: None,
             insert_at: None,
             meta_target: None,
             edit_a: TextEdit::new(""),
@@ -1360,6 +1364,7 @@ impl RulesState {
         self.all_selected = false;
         self.editor = RuleEditorState::from_config(rule.config.clone());
         self.editor.edit_index = Some(idx);
+        self.editor.edit_original = Some(rule.config.clone());
         self.popup = None;
         self.stack_menu = None;
     }
@@ -1367,10 +1372,19 @@ impl RulesState {
     pub fn commit_editor(&mut self) {
         self.editor.sync_edits_to_config();
         let config = self.editor.config.clone();
-        match (self.editor.edit_index, self.editor.insert_at) {
-            (Some(idx), _) if idx < self.rules.len() => {
-                self.rules[idx].config = config;
+        // The rule edited, found again if the list changed while the editor was open; gone, the
+        // edits become a new rule rather than overwrite another.
+        let edited = self.editor.edit_index.and_then(|idx| match &self.editor.edit_original {
+            Some(original) if self.rules.get(idx).is_some_and(|r| &r.config == original) => Some(idx),
+            Some(original) => self.rules.iter().position(|r| &r.config == original),
+            None => (idx < self.rules.len()).then_some(idx),
+        });
+        match (edited, self.editor.insert_at) {
+            (Some(idx), _) => {
+                self.rules[idx].config = config.clone();
                 self.selected = Some(idx);
+                self.editor.edit_index = Some(idx);
+                self.editor.edit_original = Some(config);
             }
             (None, Some(pos)) if pos <= self.rules.len() => {
                 self.rules.insert(pos, Rule::new(config));
@@ -1790,7 +1804,9 @@ fn apply_single_rule(cfg: &RuleConfig, current: &str, item: &Entry, loc: &Locati
                     let search_from_char = if *rtl { 0 } else { start_char };
                     let byte_off: usize = chars[..search_from_char].iter().map(|c| c.len_utf8()).sum();
                     let found_byte = if *rtl {
-                        stem[..start_char.min(len)].rfind(until_delim)
+                        // `start_char` counts characters; slice at its byte offset.
+                        let start_byte: usize = chars[..start_char.min(len)].iter().map(|c| c.len_utf8()).sum();
+                        stem[..start_byte].rfind(until_delim)
                     } else {
                         stem[byte_off..].find(until_delim).map(|rel| byte_off + rel)
                     };
@@ -2942,6 +2958,76 @@ mod tests {
         })];
         let ui_res = evaluate_rules(&ui_rules, &[file("orig.txt")], &[true], &loc);
         assert_eq!(ui_res[0].0, "custom_name.txt");
+    }
+
+    #[test]
+    fn accents_never_break_the_delete_rule_or_scripts() {
+        // Delete from position 3, counted from the right, up to "-": the slice is by characters.
+        let cfg = RuleConfig::Delete {
+            from_mode: DeleteFrom::Position,
+            from_pos: 3,
+            from_delim: String::new(),
+            until_mode: DeleteUntil::Delimiter,
+            until_count: 1,
+            until_delim: "-".into(),
+            delete_current: false,
+            skip_ext: true,
+            rtl: true,
+            keep_delimiters: false,
+        };
+        let loc = Location::Local(PathBuf::from("C:/tmp"));
+        // It used to slice inside "ã" and panic.
+        let out = evaluate_rules(&[rule(cfg.clone())], &[file("ããã-xy.txt")], &[true], &loc);
+        assert_eq!(out[0].0, "ããã-xy.txt");
+        // From the last character, back to "-": "xy" goes.
+        let mut cfg = cfg;
+        if let RuleConfig::Delete { from_pos, .. } = &mut cfg {
+            *from_pos = 1;
+        }
+        let out = evaluate_rules(&[rule(cfg)], &[file("ããã-xy.txt")], &[true], &loc);
+        assert_eq!(out[0].0, "ããã-.txt");
+        // A (* comment *) with accents compiles.
+        assert!(rules_script::compile("(* ação *) begin FileName := 'x' + FileName; end.").is_ok());
+    }
+
+    #[test]
+    fn saving_the_editor_finds_the_rule_again_after_the_list_changed() {
+        let mut rs = RulesState::new();
+        for text in ["a", "b", "c"] {
+            let mut cfg = RuleConfig::default_for(RuleKind::Insert);
+            if let RuleConfig::Insert { text: t, .. } = &mut cfg {
+                *t = text.into();
+            }
+            rs.rules.push(Rule::new(cfg));
+        }
+        rs.open_edit(1);
+        // Meanwhile, in the batch window, the first rule goes.
+        rs.selected = Some(0);
+        rs.remove_selected();
+        rs.editor.edit_a = TextEdit::new("B");
+        rs.commit_editor();
+        let texts: Vec<String> = rs.rules.iter().map(|r| match &r.config {
+            RuleConfig::Insert { text, .. } => text.clone(),
+            _ => String::new(),
+        }).collect();
+        assert_eq!(texts, ["B", "c"]);
+    }
+
+    #[test]
+    fn a_short_avi_file_reads_no_tag_and_does_not_panic() {
+        let dir = std::env::temp_dir().join(format!("oe-rules-avi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // "avih" 42 bytes from the end: past the old check, short of the 48 bytes read.
+        let mut data = b"RIFF\0\0\0\0AVI ".to_vec();
+        data.resize(64, 0);
+        data.extend_from_slice(b"avih");
+        data.resize(64 + 42, 0);
+        std::fs::write(dir.join("v.avi"), &data).unwrap();
+        let entry = Entry { name: "v.avi".into(), ..file("v.avi") };
+        let got = rules_meta::resolve_tag("AVI_Width", &entry, &Location::Local(dir.clone()));
+        assert_eq!(got.as_deref(), Some(""));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

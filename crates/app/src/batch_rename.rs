@@ -66,11 +66,13 @@ pub struct Preview {
     pub rows: Vec<RowPreview>,
     pub changed_count: usize,
     pub error_count: usize,
+    /// Meta tags (hashes) still being computed in the background: the names aren't final yet.
+    pub waiting: bool,
 }
 
 impl Preview {
     pub fn can_submit(&self) -> bool {
-        self.regex_error.is_none() && self.changed_count > 0 && self.error_count == 0
+        self.regex_error.is_none() && self.changed_count > 0 && self.error_count == 0 && !self.waiting
     }
 }
 
@@ -168,6 +170,7 @@ impl BatchRename {
 
     /// Computes the live before/after preview and validates invalid names and collisions.
     pub fn preview(&self) -> Preview {
+        crate::rules_meta::begin_pass();
         let mut rows: Vec<RowPreview> = match self.mode {
             Mode::Simple => {
                 let search = self.search.text.as_str();
@@ -187,7 +190,7 @@ impl BatchRename {
                                     RowPreview { next: current.clone(), current, changed: false, error: None }
                                 })
                                 .collect();
-                            return Preview { regex_error: Some(format_regex_error(&e)), rows, changed_count: 0, error_count: 0 };
+                            return Preview { regex_error: Some(format_regex_error(&e)), rows, changed_count: 0, error_count: 0, waiting: false };
                         }
                     }
                 } else if self.case_insensitive {
@@ -244,6 +247,12 @@ impl BatchRename {
                 .collect(),
         };
 
+        // Hashes still on their way: the names will change, so no conflict is judged yet.
+        if crate::rules_meta::waited() {
+            let changed_count = rows.iter().enumerate().filter(|(i, r)| self.checked.get(*i).copied().unwrap_or(false) && r.changed).count();
+            return Preview { regex_error: None, rows, changed_count, error_count: 0, waiting: true };
+        }
+
         // Collision & validity checks.
         let case_insensitive_fs = matches!(self.loc, Location::Local(_) | Location::Found(_));
         let norm = |name: &str| -> String {
@@ -289,6 +298,21 @@ impl BatchRename {
             }
         }
 
+        // Servers rename one item at a time and refuse a name that's still taken, so a swap or a
+        // chain (`a` → `b` while `b` → `c`) would stop halfway: the names the batch frees count
+        // as taken there.
+        let server = matches!(self.loc, Location::Server { .. });
+        let freed: HashSet<(Option<PathBuf>, String)> = if server {
+            self.items
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| self.checked.get(*i).copied().unwrap_or(false) && rows[*i].changed)
+                .map(|(i, item)| (group_of(item), norm(&rows[i].current)))
+                .collect()
+        } else {
+            HashSet::new()
+        };
+
         let mut changed_count = 0;
         let mut error_count = 0;
         for (i, item) in self.items.iter().enumerate() {
@@ -310,6 +334,8 @@ impl BatchRename {
                     Some(t("Nome duplicado", "Duplicate name").into())
                 } else if occupied.contains(&key) {
                     Some(t("Já existe", "Already exists").into())
+                } else if freed.contains(&key) && key.1 != norm(&rows[i].current) {
+                    Some(t("Troca de nomes: faça em duas etapas neste servidor", "Name swap: do it in two steps on this server").into())
                 } else {
                     None
                 }
@@ -320,7 +346,7 @@ impl BatchRename {
             }
         }
 
-        Preview { regex_error: None, rows, changed_count, error_count }
+        Preview { regex_error: None, rows, changed_count, error_count, waiting: false }
     }
 }
 
@@ -553,37 +579,16 @@ fn run_local_batch(jobs: Vec<(PathBuf, String)>, rec: &undo::Rec) -> Result<Stri
         return Ok(batch_done_msg(done));
     }
 
-    // Two-phase rename for overlapping chains/swaps.
-    let pid = std::process::id();
-    let mut staged: Vec<(PathBuf, PathBuf, String)> = Vec::with_capacity(jobs.len());
-    for (idx, (from, name)) in jobs.into_iter().enumerate() {
-        let mut attempt = 0usize;
-        let tmp = loop {
-            let candidate = from.with_file_name(format!(".oe-batch-tmp-{pid}-{idx}-{attempt}"));
-            if !candidate.exists() {
-                break candidate;
-            }
-            attempt += 1;
-        };
-        if let Err(e) = std::fs::rename(&from, &tmp) {
-            // Roll back any items already moved to temporary names.
-            for (orig, staged_tmp, _) in staged.into_iter().rev() {
-                let _ = std::fs::rename(&staged_tmp, &orig);
-            }
-            let label = from.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-            return Err(batch_err(0, &label, &e.to_string()));
-        }
-        staged.push((from, tmp, name));
-    }
-
-    let mut done = 0usize;
-    for (orig_from, tmp, name) in staged {
-        let label = orig_from.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-        let to = ops::rename(&tmp, &name).map_err(|e| batch_err(done, &label, &e))?;
-        rec.add([Step::Move { from: to, to: orig_from }]);
-        done += 1;
-    }
-    Ok(batch_done_msg(done))
+    // Swaps and chains go together through temporary names; a failure puts every item back.
+    let n = jobs.len();
+    let moves: Vec<(PathBuf, PathBuf)> = jobs.into_iter().map(|(from, name)| {
+        let to = from.with_file_name(name.trim());
+        (from, to)
+    }).collect();
+    ops::rename_together(&moves)?;
+    // One step takes them all back, as separate moves would each find their name still taken.
+    rec.add_items([Step::MoveMany { moves: moves.into_iter().map(|(from, to)| (to, from)).collect() }], n);
+    Ok(batch_done_msg(n))
 }
 
 fn batch_done_msg(done: usize) -> String {
@@ -1192,7 +1197,7 @@ fn media_workspace(
 
 fn close_popup(s: &mut State) {
     if let Some(b) = &mut s.batch_rename {
-        b.media.popup = None;
+        b.media.close_popup();
         b.media.open_dropdown = None;
     }
 }
@@ -2165,6 +2170,114 @@ mod tests {
         assert_eq!(std::fs::read(&a).unwrap(), b"from-b");
         assert_eq!(std::fs::read(&b).unwrap(), b"from-a");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_swap_batch_puts_every_item_back() {
+        let dir = std::env::temp_dir().join(format!("oe-batch-rename-rollback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in ["a.txt", "b.txt", "c.txt", "x.txt"] {
+            std::fs::write(dir.join(n), n).unwrap();
+        }
+        // c → x can't go: x is taken by a file outside the batch, as a hidden one would be.
+        let rec = undo::Rec::default();
+        let res = run_local_batch(vec![(dir.join("a.txt"), "b.txt".into()), (dir.join("b.txt"), "a.txt".into()), (dir.join("c.txt"), "x.txt".into())], &rec);
+        assert!(res.is_err());
+        let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["a.txt", "b.txt", "c.txt", "x.txt"]);
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "a.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn server_swaps_are_refused_in_the_preview() {
+        let server = openexplorer_remote::Server {
+            id: "s".into(),
+            name: "s".into(),
+            protocol: openexplorer_remote::Protocol::Sftp,
+            brand: None,
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            root: "/".into(),
+            key: None,
+            host_key: None,
+            cert: None,
+            connections: 1,
+            implicit: false,
+        };
+        let loc = Location::Server { server: Box::new(server), path: vec![], find: None };
+        let mut br = BatchRename::new(loc, vec![file("a.txt"), file("b.txt")], vec![]);
+        br.mode = Mode::Rules;
+        br.rules.rules = vec![crate::rules_rename::Rule::new(crate::rules_rename::RuleConfig::Mapping {
+            entries: vec![("a".into(), "b".into()), ("b".into(), "a".into())],
+            allow_reuse: true,
+            partial_match: false,
+            inverse: false,
+            case_sensitive: true,
+            skip_ext: true,
+        })];
+        let p = br.preview();
+        assert_eq!(p.rows[0].next, "b.txt");
+        assert_eq!(p.rows[1].next, "a.txt");
+        assert!(!p.can_submit(), "{p:?}");
+        assert!(p.rows.iter().all(|r| r.error.is_some()));
+    }
+
+    #[test]
+    fn media_names_never_mix_two_shows() {
+        use crate::media_rename::{Candidate, DataSource, EpisodeInfo, MediaKind, MediaPopup};
+        let mut br = BatchRename::new(Location::Local(PathBuf::from("C:/tmp")), vec![file("Show S01E01.mkv"), file("Behind the scenes.mkv")], vec![]);
+        let cand = |id: &str, title: &str| Candidate { id: id.into(), source: DataSource::Tmdb, kind: MediaKind::Series, title: title.into(), original_title: None, year: None, overview: String::new(), poster_url: None };
+        br.media.candidates = vec![cand("1", "Alpha"), cand("2", "Beta")];
+        br.media.selected = Some(0);
+        br.media.episodes = vec![
+            EpisodeInfo { season: 1, episode: 1, absolute: Some(1), title: "Alpha Pilot".into() },
+            EpisodeInfo { season: 1, episode: 2, absolute: Some(2), title: "Alpha Two".into() },
+        ];
+        br.media.episodes_for = Some("1".into());
+        assert_eq!(br.media.format_item(0, &br.loc).as_deref(), Some("Alpha - S01E01 - Alpha Pilot.mkv"));
+        // An extra without a number, among numbered files, is left alone.
+        assert_eq!(br.media.format_item(1, &br.loc), None);
+        // Beta only highlighted in the picker: it never takes Alpha's episode titles.
+        br.media.selected = Some(1);
+        br.media.popup = Some(MediaPopup::SelectMatch);
+        assert_eq!(br.media.format_item(0, &br.loc).as_deref(), Some("Beta - S01E01.mkv"));
+        // Leaving the picker without confirming goes back to Alpha.
+        br.media.close_popup();
+        assert_eq!(br.media.selected, Some(0));
+    }
+
+    #[test]
+    fn hash_tags_wait_in_the_background() {
+        let dir = std::env::temp_dir().join(format!("oe-batch-rename-hash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "abc").unwrap();
+        let mut br = BatchRename::new(Location::Local(dir.clone()), vec![file("a.txt")], vec![]);
+        br.mode = Mode::Rules;
+        let mut cfg = crate::rules_rename::RuleConfig::default_for(crate::rules_rename::RuleKind::Insert);
+        if let crate::rules_rename::RuleConfig::Insert { text, .. } = &mut cfg {
+            *text = ":Hash_CRC32: ".into();
+        }
+        br.rules.rules = vec![crate::rules_rename::Rule::new(cfg)];
+        let first = br.preview();
+        assert!(first.waiting && !first.can_submit(), "{first:?}");
+        let mut done = None;
+        for _ in 0..500 {
+            let p = br.preview();
+            if !p.waiting {
+                done = Some(p);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let p = done.expect("the hash arrives");
+        assert_eq!(p.rows[0].next, "352441C2 a.txt");
+        assert!(p.can_submit());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
