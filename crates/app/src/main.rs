@@ -37,6 +37,7 @@ mod showcase;
 mod sharing;
 mod places;
 mod relay;
+mod scrollbars;
 mod servers;
 mod services;
 mod sysicons;
@@ -939,6 +940,8 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     for view in &s.views {
         changed |= view.columns_stale.replace(false);
     }
+    // A viewport's content became wider or narrower than it: its bottom scroll bar comes or goes.
+    changed |= scrollbars::take_stale();
     changed |= notice(s, now, &mut |text, how| tx.announce(text, how));
     // Smooth Ctrl+wheel / pinch zoom, keyboard selection glide, and sort row reorder animations.
     let mut anim_wake = false;

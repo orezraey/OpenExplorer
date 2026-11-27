@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 
 use rune::{Align, Anim, Color, Cursor, Cx, Drag, DragOutcome, El, GrowthSpec, Icon, KeyEvent, LiveRegion, Phase, ScrollSpec, Span, Tx, col, el, icon, row, text};
-use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, ScrollBar, ScrollBarStyle, Toast, ToastRegion, context_menu};
+use rune_kit::{Button, ButtonVariant, Dialog as Modal, Kit, MenuItem, Toast, ToastRegion, context_menu};
 
 use crate::conflict::{self, Choice};
 use crate::model::{Kind, Location, SortCol, Space, ViewMode, crumbs, format_bytes, format_long, format_size, format_size_exact, format_time, format_time_secs, shown};
@@ -1076,7 +1076,6 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                     );
                     lines_col = lines_col.child(entry);
                 }
-                let bar = bar_style(k);
                 col()
                     .key("log-box")
                     .w_full()
@@ -1086,7 +1085,7 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
                     .fill(k.c.bg_base)
                     .border(1.0, k.c.border_weak)
                     .clip_rounded(k.radius.md)
-                    .child(col().key("log-scroll").w_full().h_full().scroll(ScrollSpec { stick_bottom: false }).child(lines_col).scroll_bar_styled(bar))
+                    .child(crate::scrollbars::v_bar(k, "log-scroll", col().key("log-scroll").w_full().h_full().scroll(ScrollSpec { stick_bottom: false }).child(lines_col)).w_full().h_full())
             };
 
             col()
@@ -1103,15 +1102,8 @@ fn options_dialog(s: &State, k: &Kit, opt: &crate::settings::OptionsView, window
     let main_scroll: El = if opt.tab == OptionsTab::Logs {
         col().key("opt-main-body").w_full().grow(1.0).min_h(0.0).padding(16.0).child(page)
     } else {
-        let bar = bar_style(k);
-        col()
-            .key("opt-main-scroll")
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .scroll(ScrollSpec { stick_bottom: false })
-            .child(col().w_full().padding(16.0).pr(20.0).child(page))
-            .scroll_bar_styled(bar)
+        let page = col().key("opt-main-scroll").w_full().h_full().scroll(ScrollSpec { stick_bottom: false }).child(col().w_full().padding(16.0).child(page));
+        crate::scrollbars::v_bar(k, "opt-main-scroll", page).w_full().grow(1.0)
     };
 
     let footer = row()
@@ -1407,9 +1399,7 @@ fn transfers(s: &State, k: &Kit) -> El {
         .children(grips);
     // Only the rows in view are built: copying a 5,000-file folder makes 5,000 rows.
     let kit = k.clone();
-    // As in the file list: the bar runs below the header, beside the rows.
-    let bar = bar_style(k).track_offset(QUEUE_HEADER_H, 0.0);
-    let rows = col().key("queue-rows").w_full().pr(bar.strip()).growth(GrowthSpec::default()).virtual_rows(
+    let rows = col().key("queue-rows").w_full().growth(GrowthSpec::default()).virtual_rows(
         s.transfers.len(),
         22.0,
         |s: &State, i| Cow::Owned(format!("t-{:p}", std::sync::Arc::as_ptr(&s.transfers[i].progress))),
@@ -1417,7 +1407,7 @@ fn transfers(s: &State, k: &Kit) -> El {
     );
     // One viewport scrolls both ways, as the file list's: sideways when the columns are wider
     // than the window, with the header stuck to the top.
-    let table = col().key("queue-table").w_full().min_w(total + bar.strip()).child(header).child(rows);
+    let table = col().key("queue-table").w_full().min_w(total).child(header).child(rows);
     let any_over = s.transfers.iter().any(|t| t.progress.over());
     let clear_btn = if any_over {
         k.interactive(
@@ -1449,7 +1439,8 @@ fn transfers(s: &State, k: &Kit) -> El {
         .border(1.0, k.c.border_weak)
         .clip_soft(0.0)
         .on_secondary_press(|s: &mut State, at: rune::PointerPress, _: &mut Tx| s.transfer_menu = Some((None, at)))
-        .child(col().key("queue-viewport").w_full().grow(1.0).min_h(0.0).scroll_xy().child(table).scroll_bar_styled(bar))
+        // As in the file list: the bar runs below the header, beside the rows.
+        .child(crate::scrollbars::xy_bars(k, "queue-viewport", col().key("queue-viewport").w_full().h_full().scroll_xy().child(table), QUEUE_HEADER_H, s.waker.clone()).w_full().grow(1.0))
         .child(
             row()
                 .key("queue-foot")
@@ -2619,7 +2610,6 @@ fn account_pick_body(
         );
     }
 
-    let bar = bar_style(k);
     let scroll_panel = col()
         .key("picker-panel-wrap")
         .w_full()
@@ -2637,14 +2627,13 @@ fn account_pick_body(
                 .border(1.0, panel_border)
                 .clip_rounded(8.0)
                 .child(
-                    col()
-                        .key("picker-scroll")
-                        .w_full()
-                        .h_full()
-                        .min_h(0.0)
-                        .scroll(ScrollSpec { stick_bottom: false })
-                        .child(scroll_inner)
-                        .scroll_bar_styled(bar),
+                    crate::scrollbars::v_bar(
+                        k,
+                        "picker-scroll",
+                        col().key("picker-scroll").w_full().h_full().min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(scroll_inner),
+                    )
+                    .w_full()
+                    .h_full(),
                 ),
         );
 
@@ -3218,7 +3207,6 @@ fn account_configure_body(
         }
     };
 
-    let bar = bar_style(k);
     let centered_inner = row()
         .w_full()
         .justify_center()
@@ -3258,14 +3246,13 @@ fn account_configure_body(
                         .border(1.0, panel_border)
                         .clip_rounded(8.0)
                         .child(
-                            col()
-                                .key("configure-scroll")
-                                .w_full()
-                                .h_full()
-                                .min_h(0.0)
-                                .scroll(ScrollSpec { stick_bottom: false })
-                                .child(centered_inner)
-                                .scroll_bar_styled(bar),
+                            crate::scrollbars::v_bar(
+                                k,
+                                "configure-scroll",
+                                col().key("configure-scroll").w_full().h_full().min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(centered_inner),
+                            )
+                            .w_full()
+                            .h_full(),
                         ),
                 ),
         )
@@ -4806,15 +4793,8 @@ fn accounts_hub(s: &State, k: &Kit) -> El {
         cards
     };
 
-    let bar = bar_style(k);
-    let scroll = col()
-        .key("accounts-scroll")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .scroll(ScrollSpec { stick_bottom: false })
-        .child(col().w_full().pr(bar.strip()).pb(16.0).child(list_content))
-        .scroll_bar_styled(bar);
+    let scroll = col().key("accounts-scroll").w_full().h_full().scroll(ScrollSpec { stick_bottom: false }).child(col().w_full().pb(16.0).child(list_content));
+    let scroll = crate::scrollbars::v_bar(k, "accounts-scroll", scroll).w_full().grow(1.0);
 
     let main_col = col()
         .key("accounts-main")
@@ -6446,15 +6426,13 @@ fn tree_content_width(lines: &[crate::tree::Line]) -> f32 {
 /// (its rows come and go as it scrolls), naming the row the keyboard is on for screen readers.
 fn tree(s: &State, k: &Kit, p: usize) -> El {
     let lines = std::rc::Rc::new(crate::tree::lines(s, p));
-    let bar = bar_style(k);
-    let strip = bar.strip();
     let min_w = tree_content_width(&lines);
     let (keys, kit, n) = (lines.clone(), k.clone(), lines.len());
     let rows = col()
         .key("tree")
         .w_full()
         .min_w(min_w)
-        .pb(strip + 6.0)
+        .pb(6.0)
         .growth(GrowthSpec::default())
         .virtual_rows(n, ROW_H, move |_: &State, i| Cow::Owned(format!("t:{}", keys[i].key())), move |s: &State, i| tree_line(s, &kit, p, &lines[i]))
         .virtual_rows_version((s.tree.version, s.panes[p].moves, s.accounts.len(), s.servers.list.len()));
@@ -6477,16 +6455,14 @@ fn tree(s: &State, k: &Kit, p: usize) -> El {
         .scroll_xy()
         .child(rows);
     let viewport = s.edges[p].tree.on(viewport);
-    // Reserve `strip` on the right for the vertical scrollbar so scrolled folder names clip
-    // cleanly before the bar instead of bleeding behind it.
+    // The bars sit in gutters of their own, so scrolled folder names clip cleanly before them.
     col()
         .key(format!("tree-wrap-{p}"))
         .w(s.layout.tree[p])
         .h_full()
-        .pr(strip)
         .fill(tree_bg)
         .clip_rounded(0.0)
-        .child(with_scroll_bars(k, &key, viewport, bar.track_offset(0.0, -strip), false))
+        .child(crate::scrollbars::xy_bars(k, &key, viewport, 0.0, s.waker.clone()).w_full().h_full())
 }
 // ---------------------------------------------------------------------------------------------
 // File list
@@ -6514,190 +6490,6 @@ fn grip(k: &Kit, key: &str, edge: f32, height: f32, size: impl Fn(&mut State) ->
                 s.layout.save();
             }
         })
-}
-
-/// The app's scroll bars: a thumb dark enough to see at rest (the kit's is a faint line on a
-/// light theme), wider and darker under the pointer. Shown always, the bar sits over the
-/// viewport's end edge: what it scrolls leaves [`ScrollBarStyle::strip`] of room there.
-fn bar_style(k: &Kit) -> ScrollBarStyle {
-    ScrollBarStyle::from_kit(k).thumb(k.alpha(k.c.text_base, 0.3)).thumb_hover(k.alpha(k.c.text_base, 0.5)).width(8.0).hover_width(10.0)
-}
-
-/// Live state for a horizontal scrollbar overlaid at the bottom of a `scroll_xy()` viewport,
-/// appearing automatically only when the content overflows horizontally (`max[0] > 0.5`).
-struct HBar {
-    pos: std::cell::Cell<rune::ScrollPos>,
-    hover: std::cell::Cell<bool>,
-    drag: std::cell::Cell<Option<(f32, f32)>>,
-    rest_color: std::cell::Cell<Color>,
-    hover_color: std::cell::Cell<Color>,
-    v_strip: std::cell::Cell<f32>,
-    track: rune::Live<[f32; 4]>,
-    thumb: rune::Live<[f32; 4]>,
-    fill: rune::Live<Color>,
-    opacity: rune::Live<f32>,
-}
-
-impl HBar {
-    const STRIP: f32 = 12.0;
-    const THUMB: f32 = 4.0;
-    const THUMB_HOVER: f32 = 6.0;
-    const EDGE: f32 = 3.0;
-    const INSET: f32 = 4.0;
-    const MIN_THUMB: f32 = 28.0;
-
-    fn metrics(&self, at: rune::ScrollPos) -> Option<(f32, f32, f32, f32)> {
-        if at.max[0] <= 0.5 {
-            return None;
-        }
-        let right_clear = if at.max[1] > 0.5 { self.v_strip.get() } else { 0.0 };
-        let track_len = (at.viewport[0] - right_clear - 2.0 * Self::INSET).max(0.0);
-        if track_len < Self::MIN_THUMB {
-            return None;
-        }
-        let thumb_w = (track_len * at.viewport[0] / (at.viewport[0] + at.max[0]).max(1.0))
-            .max(Self::MIN_THUMB)
-            .min(track_len);
-        let travel = (track_len - thumb_w).max(0.0);
-        let thumb_x = if at.max[0] > 0.0 { travel * (at.offset[0] / at.max[0]).clamp(0.0, 1.0) } else { 0.0 };
-        Some((track_len, thumb_x, thumb_w, travel))
-    }
-
-    fn sync(&self) {
-        let at = self.pos.get();
-        let active = self.hover.get() || self.drag.get().is_some();
-        self.fill.set(if active { self.hover_color.get() } else { self.rest_color.get() });
-        if let Some((track_len, thumb_x, thumb_w, _)) = self.metrics(at) {
-            let thick = if active { Self::THUMB_HOVER } else { Self::THUMB };
-            self.track.set([Self::INSET, (at.viewport[1] - Self::STRIP).max(0.0), track_len, Self::STRIP]);
-            self.thumb.set([thumb_x, Self::STRIP - Self::EDGE - thick, thumb_w, thick]);
-            self.opacity.set(1.0);
-        } else {
-            self.track.set([0.0; 4]);
-            self.thumb.set([0.0; 4]);
-            self.opacity.set(0.0);
-        }
-    }
-
-    fn follow(&self, at: rune::ScrollPos) {
-        self.pos.set(at);
-        self.sync();
-    }
-
-    fn on_drag(&self, target: &str, d: &mut Drag, tx: &mut Tx) {
-        tx.live_only();
-        let at = self.pos.get();
-        let Some((_, thumb_x, thumb_w, travel)) = self.metrics(at) else {
-            self.drag.set(None);
-            return;
-        };
-        match d.phase {
-            Phase::Down => {
-                // Click on thumb: grab it; click on track: jump thumb center to pointer.
-                let start_off = if d.x >= thumb_x && d.x <= thumb_x + thumb_w {
-                    at.offset[0]
-                } else if travel > 0.0 {
-                    let next = ((d.x - thumb_w * 0.5) / travel * at.max[0]).clamp(0.0, at.max[0]);
-                    tx.scroll_to_instant(target, next, at.offset[1]);
-                    next
-                } else {
-                    at.offset[0]
-                };
-                self.drag.set(Some((d.x, start_off)));
-                self.sync();
-            }
-            Phase::Move => {
-                if let Some((start_x, start_off)) = self.drag.get()
-                    && travel > 0.0
-                {
-                    let next = (start_off + (d.x - start_x) / travel * at.max[0]).clamp(0.0, at.max[0]);
-                    tx.scroll_to_instant(target, next, at.offset[1]);
-                }
-            }
-            Phase::Up => {
-                self.drag.set(None);
-                self.sync();
-            }
-        }
-    }
-}
-
-fn kept_hbar(key: &str) -> std::rc::Rc<HBar> {
-    use std::cell::RefCell;
-    use std::collections::HashMap;
-    use std::rc::Rc;
-    thread_local! {
-        static HBARS: RefCell<HashMap<(u64, String), Rc<HBar>>> = RefCell::new(HashMap::new());
-    }
-    let id = (rune::current_runtime_id(), key.to_owned());
-    HBARS.with(|bars| {
-        let mut bars = bars.borrow_mut();
-        if bars.len() >= 64 && !bars.contains_key(&id) {
-            bars.clear();
-        }
-        bars.entry(id)
-            .or_insert_with(|| {
-                Rc::new(HBar {
-                    pos: std::cell::Cell::new(rune::ScrollPos::default()),
-                    hover: std::cell::Cell::new(false),
-                    drag: std::cell::Cell::new(None),
-                    rest_color: std::cell::Cell::new(Color::TRANSPARENT),
-                    hover_color: std::cell::Cell::new(Color::TRANSPARENT),
-                    v_strip: std::cell::Cell::new(14.0),
-                    track: rune::Live::new([0.0; 4]),
-                    thumb: rune::Live::new([0.0; 4]),
-                    fill: rune::Live::new(Color::TRANSPARENT),
-                    opacity: rune::Live::new(0.0),
-                })
-            })
-            .clone()
-    })
-}
-
-/// Attaches both the vertical `rune-kit` scrollbar and an automatic bottom horizontal scrollbar
-/// (visible only when content overflows sideways) to a `scroll_xy()` viewport keyed `key`.
-/// When `v_overlaps` is true, the horizontal track leaves room on the right for the vertical bar.
-fn with_scroll_bars(k: &Kit, key: &str, viewport: El, v_bar: ScrollBarStyle, v_overlaps: bool) -> El {
-    let hbar = kept_hbar(key);
-    hbar.rest_color.set(k.alpha(k.c.text_base, 0.34));
-    hbar.hover_color.set(k.alpha(k.c.text_base, 0.56));
-    hbar.v_strip.set(if v_overlaps { v_bar.strip() } else { 0.0 });
-    hbar.sync();
-
-    let (watch, hover_bar, drag_bar) = (hbar.clone(), hbar.clone(), hbar.clone());
-    let target = key.to_owned();
-    let viewport = viewport.chain_scroll_offset(move |at| watch.follow(at)).scroll_bar_styled(v_bar);
-
-    let thumb = el()
-        .key("h-thumb")
-        .absolute(0.0, 0.0)
-        .live_rect(&hbar.thumb)
-        .radius(HBar::THUMB_HOVER / 2.0)
-        .live_fill(&hbar.fill);
-
-    let track = el()
-        .key(format!("h-bar-{key}"))
-        .absolute(0.0, 0.0)
-        .live_rect(&hbar.track)
-        .live_opacity(&hbar.opacity)
-        .cursor(Cursor::Pointer)
-        .a11y_hidden()
-        .on_hover_change_any(move |inside, tx| {
-            tx.live_only();
-            hover_bar.hover.set(inside);
-            hover_bar.sync();
-        })
-        .on_drag_any(move |d: &mut Drag, tx: &mut Tx| drag_bar.on_drag(&target, d, tx))
-        .child(thumb);
-
-    col()
-        .key(format!("xy-bars-{key}"))
-        .w_full()
-        .h_full()
-        .min_w(0.0)
-        .min_h(0.0)
-        .child(viewport)
-        .child(track)
 }
 
 /// The scroll view of pane `p`'s file list.
@@ -6762,13 +6554,13 @@ const LIST_HORIZ_MAX: usize = 2000;
 /// no view.
 const LIST_SPARE_COLS: usize = 2;
 
-fn grid_columns_for(viewport_w: f32, tile_w: f32, bar_w: f32) -> usize {
-    let avail = (viewport_w - bar_w - 2.0 * GRID_PAD + GRID_GAP).max(tile_w + GRID_GAP);
+fn grid_columns_for(viewport_w: f32, tile_w: f32) -> usize {
+    let avail = (viewport_w - 2.0 * GRID_PAD + GRID_GAP).max(tile_w + GRID_GAP);
     (avail / (tile_w + GRID_GAP)).floor().max(1.0) as usize
 }
 
-fn list_rows_for(viewport_h: f32, bar_w: f32) -> usize {
-    ((viewport_h - bar_w - 8.0) / ROW_H).floor().max(1.0) as usize
+fn list_rows_for(viewport_h: f32) -> usize {
+    ((viewport_h - 8.0) / ROW_H).floor().max(1.0) as usize
 }
 
 fn wire_entry_interactions(el: El, p: usize, id: &str) -> El {
@@ -6855,8 +6647,6 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
     let n = pane.entries.len();
     let show_header = mode == ViewMode::Details;
     let header_h = if show_header { HEADER_H } else { 0.0 };
-    let bar = bar_style(k).track_offset(header_h, 0.0);
-    let bar_strip = bar.strip();
 
     // How the items are laid out, for the keyboard and its menu (`lasso::Flow`).
     let flow = &s.views[p].flow;
@@ -6954,7 +6744,6 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
             col()
                 .key("rows")
                 .w_full()
-                .pr(bar_strip)
                 .pb(2.0 * row_h)
                 .growth(GrowthSpec::default())
                 .virtual_rows(n, row_h, move |s: &State, i| Cow::Owned(row_key(&s.panes[p].entries[i].id)), build)
@@ -7002,7 +6791,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                 // Windows Explorer List view: flows top-to-bottom per column and left-to-right
                 // across columns, scrolling horizontally when there are more columns than fit.
                 let vp_h = s.views[p].rect[3];
-                let rows_per_col = if vp_h > 0.0 { list_rows_for(vp_h, bar_strip) } else { s.list_rows[p].max(1) };
+                let rows_per_col = if vp_h > 0.0 { list_rows_for(vp_h) } else { s.list_rows[p].max(1) };
                 let num_cols = n.div_ceil(rows_per_col);
                 flow.set(crate::lasso::Flow {
                     per_line: rows_per_col,
@@ -7020,7 +6809,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                 let built = crate::lasso::column_window(scroll.x, s.views[p].rect[2], 4.0, step, LIST_SPARE_COLS, num_cols);
                 s.views[p].columns.set(built);
                 let width = 8.0 + num_cols as f32 * step - LIST_COL_GAP;
-                let height = 8.0 + rows_per_col as f32 * ROW_H + bar_strip;
+                let height = 8.0 + rows_per_col as f32 * ROW_H;
                 let mut cols_row = el().key("rows-list").w(width).h(height);
                 for c in built.0..built.1 {
                     let start = c * rows_per_col;
@@ -7035,7 +6824,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
             } else {
                 // Very large folders stay virtualized in multi-column rows.
                 let vp_w = s.views[p].rect[2];
-                let cols = if vp_w > 0.0 { grid_columns_for(vp_w, LIST_COL_W, bar_strip) } else { s.grid_cols[p].max(1) };
+                let cols = if vp_w > 0.0 { grid_columns_for(vp_w, LIST_COL_W) } else { s.grid_cols[p].max(1) };
                 let vrows = n.div_ceil(cols);
                 flow.set(crate::lasso::Flow {
                     per_line: cols,
@@ -7059,8 +6848,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                     .key("rows-list-virt")
                     .w_full()
                     .pt(4.0)
-                    .pr(bar_strip)
-                    .pb(2.0 * ROW_H)
+                        .pb(2.0 * ROW_H)
                     .growth(GrowthSpec::default())
                     .virtual_rows(vrows, ROW_H, move |_, row_idx| Cow::Owned(format!("lr-{row_idx}")), build)
                     .virtual_rows_version((pane.version, mode, cols, s.renaming.as_ref().map(|(rp, e)| (*rp, e.id.clone()))))
@@ -7069,7 +6857,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         ViewMode::ExtraLargeIcons | ViewMode::LargeIcons | ViewMode::MediumIcons => {
             let (tile_w, tile_h, icon_size) = mode.tile_metrics();
             let vp_w = s.views[p].rect[2];
-            let cols = if vp_w > 0.0 { grid_columns_for(vp_w, tile_w, bar_strip) } else { s.grid_cols[p].max(1) };
+            let cols = if vp_w > 0.0 { grid_columns_for(vp_w, tile_w) } else { s.grid_cols[p].max(1) };
             let grid_rows = n.div_ceil(cols);
             flow.set(crate::lasso::Flow {
                 per_line: cols,
@@ -7132,7 +6920,6 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                 .key("rows-grid")
                 .w_full()
                 .pt(GRID_PAD)
-                .pr(bar_strip)
                 .pb(2.0 * GRID_PAD)
                 .growth(GrowthSpec::default())
                 .virtual_rows(grid_rows, row_h, move |_, row_idx| Cow::Owned(format!("gr-{row_idx}")), build)
@@ -7376,7 +7163,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         col()
             .key("table")
             .w_full()
-            .min_w(total + bar_strip)
+            .min_w(total)
             .children(hover_pill)
             .children(kbd_sel_pill)
             .child(header)
@@ -7473,7 +7260,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
             let mode = s.panes[p].view_mode;
             if mode.is_grid() {
                 let (tile_w, tile_h, _) = mode.tile_metrics();
-                let new_cols = grid_columns_for(r[2], tile_w, bar_strip);
+                let new_cols = grid_columns_for(r[2], tile_w);
                 let visible_rows = (r[3] / (tile_h + GRID_GAP)).floor().max(1.0) as usize;
                 s.page_rows[p] = (visible_rows * new_cols).max(1);
                 if s.grid_cols[p] != new_cols {
@@ -7482,8 +7269,8 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
                     tx.live_only();
                 }
             } else if mode == ViewMode::List {
-                let new_rows = list_rows_for(r[3], bar_strip);
-                let new_cols = grid_columns_for(r[2], LIST_COL_W, bar_strip);
+                let new_rows = list_rows_for(r[3]);
+                let new_cols = grid_columns_for(r[2], LIST_COL_W);
                 // A page: a column's items, or past LIST_HORIZ_MAX, where the items run in rows,
                 // the rows in view.
                 s.page_rows[p] = if s.panes[p].entries.len() > LIST_HORIZ_MAX { new_rows * new_cols } else { new_rows };
@@ -7514,7 +7301,7 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
         .child(table);
     let key = list_key(p);
     let viewport = s.edges[p].list.on(viewport);
-    col().key("list").w(0.0).grow(1.0).h_full().min_w(0.0).child(with_scroll_bars(k, &key, viewport, bar, true))
+    col().key("list").w(0.0).grow(1.0).h_full().min_w(0.0).child(crate::scrollbars::xy_bars(k, &key, viewport, header_h, s.waker.clone()).w_full().h_full())
 }
 
 // ---------------------------------------------------------------------------------------------
