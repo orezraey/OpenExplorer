@@ -70,6 +70,14 @@ pub enum Dialog {
     OneDriveLink(Box<crate::onedrive::MakeLink>),
     /// Envios inacabados of a B2 bucket.
     B2Unfinished(Box<crate::b2::Unfinished>),
+    /// Sincronizar - Opções: sync mode, rules and hash comparison.
+    SyncOptions(Box<crate::sync::OptionsDialog>),
+    /// Sincronizar - Filtro: name/date/size/subfolder filters.
+    SyncFilter(Box<crate::sync::FilterDialog>),
+    /// Sincronizar - Procurar pasta (local or cloud/server).
+    SyncBrowse(Box<crate::sync::BrowseDialog>),
+    /// Sincronizar - Salvar perfil de sincronização.
+    SyncSave(Box<crate::sync::SaveDialog>),
 }
 
 /// The main window's close button, Alt+F4 or the taskbar's Fechar janela: with transfers still

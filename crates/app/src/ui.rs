@@ -69,6 +69,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let main_content = match s.main_tab {
         MainTab::Explore => panes(s, &k, backdrop, &mut layer),
         MainTab::Accounts => accounts_hub(s, &k),
+        MainTab::Sync => crate::sync_ui::sync_view(s, &k, backdrop, &mut layer),
     };
     let body = col()
         .key("window")
@@ -98,6 +99,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                         }
                     }
                     MainTab::Accounts => crate::refresh_all_quotas(s),
+                    MainTab::Sync => crate::sync::start_compare(s),
                 }
                 return true;
             }
@@ -1709,6 +1711,10 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, backdrop: bool, layer: &mut
         Dialog::DropboxDeleted(v) => crate::dropbox::deleted_dialog(k, v, layer),
         Dialog::OneDriveLink(m) => crate::onedrive::link_dialog(k, m, layer),
         Dialog::B2Unfinished(d) => crate::b2::unfinished_dialog(k, d, layer),
+        Dialog::SyncOptions(o) => crate::sync_ui::options_dialog(s, k, o, layer),
+        Dialog::SyncFilter(f) => crate::sync_ui::filter_dialog(s, k, f, layer),
+        Dialog::SyncBrowse(b) => crate::sync_ui::browse_dialog(s, k, b, layer),
+        Dialog::SyncSave(d) => crate::sync_ui::save_dialog(s, k, d, layer),
     }
 }
 
@@ -3375,6 +3381,7 @@ fn toolbar(s: &State, k: &Kit) -> El {
     let refresh_help = match s.main_tab {
         MainTab::Explore => t("Recarregar a pasta atual (F5)", "Reload the current folder (F5)"),
         MainTab::Accounts => t("Atualizar o espaço utilizado nas contas (F5)", "Refresh storage usage across accounts (F5)"),
+        MainTab::Sync => t("Comparar pastas configuradas (F5)", "Compare configured folders (F5)"),
     };
 
     row()
@@ -3388,6 +3395,7 @@ fn toolbar(s: &State, k: &Kit) -> El {
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
         .child(nav_tab("tab-explore", MainTab::Explore, &icons::TAB_EXPLORE, t("Explorar", "Explore"), None, false))
         .child(nav_tab("tab-accounts", MainTab::Accounts, &icons::TAB_ACCOUNTS, t("Contas", "Accounts"), Some(total_accounts), waiting_oauth))
+        .child(nav_tab("tab-sync", MainTab::Sync, &icons::TAB_SYNC, t("Sincronizar", "Sync"), None, s.sync.is_busy()))
         .child(sep())
         .child(
             tool(k, "reload-all", &icons::REFRESH, t("Atualizar", "Refresh"), true, |s: &mut State, _| match s.main_tab {
@@ -3397,6 +3405,7 @@ fn toolbar(s: &State, k: &Kit) -> El {
                     }
                 }
                 MainTab::Accounts => crate::refresh_all_quotas(s),
+                MainTab::Sync => crate::sync::start_compare(s),
             })
             .help(refresh_help),
         )
@@ -4227,13 +4236,38 @@ fn gutter(s: &State, k: &Kit) -> El {
         })
         .child(icon(glyph, 16.0).color(ink))
     };
+
+    let left_syncable = !s.tabs[0].is_picker() && crate::sync::SyncLocation::from_location(&s.panes[0].loc).is_some();
+    let right_syncable = !s.tabs[1].is_picker() && crate::sync::SyncLocation::from_location(&s.panes[1].loc).is_some();
+    let sync_ready = left_syncable && right_syncable;
+    let sync_ink = if sync_ready { k.c.text_base } else { k.alpha(k.c.icon_faint, 0.65) };
+    let sync_help = t(
+        "Sincronizar a pasta do painel esquerdo com a do painel direito",
+        "Synchronize the left pane folder with the right pane folder",
+    );
+    let sync_btn = el()
+        .key("gutter-sync")
+        .role("button")
+        .label(sync_help)
+        .help(sync_help)
+        .size(28.0, 28.0)
+        .mb(10.0)
+        .center()
+        .radius(k.radius.sm)
+        .hover(k.c.hover)
+        .press(k.c.pressed)
+        .cursor(Cursor::Pointer)
+        .on_press(crate::sync::open_from_panes)
+        .child(icon(&icons::TAB_SYNC, 16.0).color(sync_ink));
+
     col()
         .key("gutter")
         .w(40.0)
         .h_full()
         .items_center()
-        .pt(126.0)
+        .pt(96.0)
         .gap(6.0)
+        .child(sync_btn)
         .child(arrow("copy-right", &icons::COPY_RIGHT, t("Copiar a seleção do painel esquerdo para o direito", "Copy the selection from the left pane to the right"), 0, 1))
         .child(arrow("copy-left", &icons::COPY_LEFT, t("Copiar a seleção do painel direito para o esquerdo", "Copy the selection from the right pane to the left"), 1, 0))
 }

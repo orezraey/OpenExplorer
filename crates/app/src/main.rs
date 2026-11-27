@@ -36,6 +36,8 @@ mod places;
 mod relay;
 mod servers;
 mod services;
+mod sync;
+mod sync_ui;
 mod sysicons;
 mod tabs;
 mod telegram;
@@ -116,6 +118,8 @@ enum Msg {
     Telegram(telegram::Answer),
     /// What the caches take, measured or cleared for Opções › Cache.
     Caches(caches::Answer),
+    /// Background progress or result from folder synchronization.
+    Sync(sync::Answer),
     /// Installing the search service ended: search again in the panes `reload` shows.
     Installed { reload: Vec<Location>, result: Result<String, String> },
     /// A drag of Drive items `ids` out of pane `from` ended.
@@ -142,12 +146,14 @@ pub enum MainTab {
     #[default]
     Explore,
     Accounts,
+    Sync,
 }
 
 struct State {
     main_tab: MainTab,
     accounts_filter: Option<servers::Provider>,
     accounts_search: rune::TextEdit,
+    sync: sync::SyncState,
     panes: [Pane; 2],
     tabs: [tabs::PaneTabs; 2],
     /// Whether each pane's left folder tree is shown.
@@ -334,6 +340,7 @@ impl State {
             main_tab: MainTab::Explore,
             accounts_filter: None,
             accounts_search: rune::TextEdit::new(""),
+            sync: sync::SyncState::load(),
             panes: [Pane::new(loc.clone()), Pane::new(loc)],
             tabs: [tabs::PaneTabs::initial(), tabs::PaneTabs::initial()],
             show_tree: [true, true],
@@ -541,6 +548,7 @@ fn init() -> State {
         main_tab: MainTab::Explore,
         accounts_filter: None,
         accounts_search: rune::TextEdit::new(""),
+        sync: sync::SyncState::load(),
         panes,
         tabs: [tabs::PaneTabs::initial(), tabs::PaneTabs::initial()],
         show_tree: [true, true],
@@ -979,6 +987,9 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             Msg::OneDrive(answer) => onedrive::arrived(s, answer, tx, now),
             Msg::Telegram(answer) => telegram::arrived(s, answer),
             Msg::Caches(answer) => caches::arrived(s, answer),
+            Msg::Sync(answer) => {
+                changed |= sync::arrived(s, answer);
+            }
             Msg::Changes { email, result } => watch::arrived(s, email, result, now),
             Msg::Quota { email, result } => {
                 if s.accounts.iter().any(|a| a.email == email) {
