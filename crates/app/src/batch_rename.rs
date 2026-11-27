@@ -5,6 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use openexplorer_i18n::{t, tr};
 use regex::{NoExpand, Regex, RegexBuilder};
@@ -29,6 +31,9 @@ pub enum Mode {
 
 /// State of the independent "Renomear em massa" window.
 pub struct BatchRename {
+    /// A number no other batch of this run has: what is kept for a batch's items (the preview
+    /// table's rows) is kept by it.
+    pub serial: u64,
     pub mode: Mode,
     pub loc: Location,
     pub items: Vec<Entry>,
@@ -65,7 +70,8 @@ pub struct RowPreview {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preview {
     pub regex_error: Option<String>,
-    pub rows: Vec<RowPreview>,
+    /// Shared: the table builds its rows from them after the view that made them returns.
+    pub rows: Rc<Vec<RowPreview>>,
     pub changed_count: usize,
     pub error_count: usize,
     /// Meta tags (hashes) still being computed in the background: the names aren't final yet.
@@ -86,12 +92,13 @@ enum Matcher {
 
 impl BatchRename {
     pub fn new(loc: Location, items: Vec<Entry>, other_names: Vec<String>) -> Self {
-        crate::rules_meta::clear_cache();
         let n = items.len();
         let media = MediaState::new(&items);
         let mut search = TextEdit::new("");
         search.focused = true;
+        static SERIAL: AtomicU64 = AtomicU64::new(1);
         Self {
+            serial: SERIAL.fetch_add(1, Ordering::Relaxed),
             mode: Mode::Simple,
             loc,
             items,
@@ -192,7 +199,7 @@ impl BatchRename {
                                     RowPreview { next: current.clone(), current, changed: false, error: None, note: None }
                                 })
                                 .collect();
-                            return Preview { regex_error: Some(format_regex_error(&e)), rows, changed_count: 0, error_count: 0, waiting: false };
+                            return Preview { regex_error: Some(format_regex_error(&e)), rows: Rc::new(rows), changed_count: 0, error_count: 0, waiting: false };
                         }
                     }
                 } else if self.case_insensitive {
@@ -262,7 +269,7 @@ impl BatchRename {
         // Hashes still on their way: the names will change, so no conflict is judged yet.
         if crate::rules_meta::waited() {
             let changed_count = rows.iter().enumerate().filter(|(i, r)| self.checked.get(*i).copied().unwrap_or(false) && r.changed).count();
-            return Preview { regex_error: None, rows, changed_count, error_count: 0, waiting: true };
+            return Preview { regex_error: None, rows: Rc::new(rows), changed_count, error_count: 0, waiting: true };
         }
 
         // Collision & validity checks.
@@ -376,7 +383,7 @@ impl BatchRename {
             }
         }
 
-        Preview { regex_error: None, rows, changed_count, error_count, waiting: false }
+        Preview { regex_error: None, rows: Rc::new(rows), changed_count, error_count, waiting: false }
     }
 }
 
@@ -2391,6 +2398,194 @@ mod tests {
         let res = run_local_batch(vec![(dir.join("X"), "Y".into()), (dir.join("X").join("f.txt"), "g.txt".into())], &rec);
         assert!(res.is_err());
         assert!(dir.join("X").join("f.txt").exists() && !dir.join("Y").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tag_read_from_the_file_arrives_in_the_background() {
+        let dir = std::env::temp_dir().join(format!("oe-batch-rename-sign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("foto.bin"), [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        std::fs::write(dir.join("notas.bin"), "nothing known").unwrap();
+        let mut br = BatchRename::new(Location::Local(dir.clone()), vec![file("foto.bin"), file("notas.bin")], vec![]);
+        br.mode = Mode::Rules;
+        let mut cfg = crate::rules_rename::RuleConfig::default_for(crate::rules_rename::RuleKind::Extension);
+        if let crate::rules_rename::RuleConfig::Extension { set_new, detect_binary, .. } = &mut cfg {
+            (*set_new, *detect_binary) = (false, true);
+        }
+        br.rules.rules = vec![crate::rules_rename::Rule::new(cfg)];
+        // The window never reads the files itself: the first preview waits for them.
+        let first = br.preview();
+        assert!(first.waiting && !first.can_submit(), "{first:?}");
+        assert_eq!(first.rows[0].next, "foto.bin");
+        let mut done = None;
+        for _ in 0..500 {
+            let p = br.preview();
+            if !p.waiting {
+                done = Some(p);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let p = done.expect("the signatures arrive");
+        assert_eq!(p.rows[0].next, "foto.png");
+        assert_eq!(p.rows[1].next, "notas.bin");
+        assert!(p.can_submit());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_preview_table_builds_only_the_rows_in_view() {
+        let items: Vec<Entry> = (0..10_000).map(|i| file(&format!("foto {i:05}.jpg"))).collect();
+        let mut br = BatchRename::new(Location::Local(PathBuf::from("C:/tmp")), items, vec![]);
+        br.search = TextEdit::new("foto");
+        br.replace = TextEdit::new("praia");
+        let mut s = crate::init();
+        s.batch_rename = Some(Box::new(br));
+        let mut rt = rune::Runtime::new(s, batch_rename_window_view, (860.0, 620.0), rune::Env::new(false, 1.0));
+        let texts = |rt: &mut rune::Runtime<State>| {
+            rt.frame(1.0 / 60.0);
+            rt.frame(1.0 / 60.0);
+            rt.elements().into_iter().filter_map(|e| e.text).collect::<Vec<_>>()
+        };
+        let shown = texts(&mut rt);
+        assert!(shown.iter().any(|t| t == "praia 00000.jpg"), "{shown:?}");
+        let built = shown.iter().filter(|t| t.starts_with("praia ")).count();
+        assert!(built < 200, "{built} rows built");
+        assert!(!shown.iter().any(|t| t == "praia 09999.jpg"));
+
+        // A change in what to replace reaches the rows already built.
+        rt.update(|s, _| s.batch_rename.as_mut().unwrap().replace = TextEdit::new("serra"));
+        let shown = texts(&mut rt);
+        assert!(shown.iter().any(|t| t == "serra 00000.jpg") && !shown.iter().any(|t| t.starts_with("praia ")), "{shown:?}");
+
+        // A click on a row's box unchecks its item, and the row shows it left alone.
+        let (x, y) = rt.find("rules-chk-foto 00002.jpg").expect("the third row's box");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        let shown = texts(&mut rt);
+        rt.update(|s, _| assert_eq!(s.batch_rename.as_ref().unwrap().checked[..4], [true, true, false, true]));
+        assert!(!shown.iter().any(|t| t == "serra 00002.jpg") && shown.iter().any(|t| t == "serra 00003.jpg"), "{shown:?}");
+
+        // The other two tabs draw the same table, as short.
+        for mode in [Mode::Media, Mode::Rules] {
+            rt.update(move |s, _| s.batch_rename.as_mut().unwrap().mode = mode);
+            let shown = texts(&mut rt);
+            let built = shown.iter().filter(|t| t.starts_with("foto ")).count();
+            assert!(shown.iter().any(|t| t == "foto 00000.jpg") && built < 400, "{mode:?}: {built} names built");
+        }
+
+        // Scrolled to its end, the table builds the last rows and lets go of the first.
+        rt.update(|s, tx| {
+            s.batch_rename.as_mut().unwrap().mode = Mode::Simple;
+            tx.scroll_into_view_in("rules-preview-scroll", crate::rules_ui::preview_row_key("foto 09999.jpg"));
+        });
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        let shown = texts(&mut rt);
+        assert!(shown.iter().any(|t| t == "serra 09999.jpg"), "{shown:?}");
+        assert!(!shown.iter().any(|t| t == "serra 00000.jpg"));
+    }
+
+    /// The names of a batch of `n` files, for the benchmarks below.
+    fn many(n: usize) -> Vec<Entry> {
+        (0..n).map(|i| file(&format!("Report_Final.of.the.Project_{i:06} (copy) [2024-03-15] DVD.pdf"))).collect()
+    }
+
+    /// What one preview pass costs for 10,000 names, rule by rule. Run the three with
+    /// `cargo test --release -p openexplorer -- --ignored --nocapture batch_rename_cost`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn batch_rename_cost_preview() {
+        use crate::rules_rename::{Occurrences, Rule, RuleConfig, RuleKind};
+        let mut br = BatchRename::new(Location::Local(PathBuf::from("C:/tmp")), many(10_000), vec![]);
+        br.mode = Mode::Rules;
+        let mut clean_up = RuleConfig::default_for(RuleKind::CleanUp);
+        if let RuleConfig::CleanUp { strip_parens, strip_brackets, replace_dot, replace_underscore, .. } = &mut clean_up {
+            (*strip_parens, *strip_brackets, *replace_dot, *replace_underscore) = (true, true, true, true);
+        }
+        let mut case = RuleConfig::default_for(RuleKind::Case);
+        if let RuleConfig::Case { force_fragments, .. } = &mut case {
+            *force_fragments = true;
+        }
+        let replace = RuleConfig::Replace { find: "final".into(), replace: "v2".into(), occurrences: Occurrences::All, case_sensitive: false, whole_words: false, skip_ext: true, wildcards: false };
+        let rows = (0..20).map(|i| (format!("term{i}"), format!("new{i}"))).chain([("project".to_string(), "work".to_string())]).collect();
+        let mapping = RuleConfig::Mapping { entries: rows, allow_reuse: true, partial_match: true, inverse: false, case_sensitive: false, skip_ext: true };
+        let date = RuleConfig::default_for(RuleKind::ReformatDate);
+        let stack = vec![clean_up.clone(), case.clone(), replace.clone(), date.clone(), RuleConfig::default_for(RuleKind::Serialize)];
+        for (label, rules) in [("Replace", vec![replace]), ("Clean Up", vec![clean_up]), ("Case with fragments", vec![case]), ("Reformat Date", vec![date]), ("Mapping of 21 rows", vec![mapping]), ("a stack of 5", stack)] {
+            br.rules.rules = rules.into_iter().map(Rule::new).collect();
+            let mut runs: Vec<f64> = (0..5)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    assert_eq!(br.preview().error_count, 0);
+                    started.elapsed().as_secs_f64() * 1e3
+                })
+                .collect();
+            runs.sort_by(f64::total_cmp);
+            println!("preview of 10,000 names, {label}: {:.1} ms best, {:.1} ms median of 5", runs[0], runs[2]);
+        }
+    }
+
+    /// What a change costs the batch window: the handler, the view and a frame, as the real
+    /// loop does (no GPU).
+    #[test]
+    #[ignore = "benchmark"]
+    fn batch_rename_cost_window() {
+        for n in [10_000usize, 100_000] {
+            let mut br = BatchRename::new(Location::Local(PathBuf::from("C:/tmp")), many(n), vec![]);
+            br.search = TextEdit::new("Final");
+            br.replace = TextEdit::new("v2");
+            let mut s = crate::init();
+            s.batch_rename = Some(Box::new(br));
+            let mut rt = rune::Runtime::new(s, batch_rename_window_view, (860.0, 620.0), rune::Env::new(false, 1.0));
+            let started = std::time::Instant::now();
+            rt.frame(0.1);
+            let first = started.elapsed().as_secs_f64() * 1e3;
+            let mut runs: Vec<f64> = (0..9)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    rt.update(|s, _| {
+                        let b = s.batch_rename.as_mut().unwrap();
+                        b.replace_all = !b.replace_all;
+                    });
+                    rt.frame(0.1);
+                    started.elapsed().as_secs_f64() * 1e3
+                })
+                .collect();
+            runs.sort_by(f64::total_cmp);
+            println!("window with {n} files: first frame {first:.0} ms, a change and its frame {:.1} ms best, {:.1} ms median of 9", runs[0], runs[4]);
+        }
+    }
+
+    /// Renaming 10,000 files where each takes the next one's name, against renaming them one
+    /// by one to names nobody has.
+    #[test]
+    #[ignore = "benchmark"]
+    fn batch_rename_cost_chain() {
+        let dir = std::env::temp_dir().join(format!("oe-batch-rename-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = 10_000;
+        for i in 0..n {
+            std::fs::write(dir.join(format!("f_{i:06}.txt")), b"x").unwrap();
+        }
+        let started = std::time::Instant::now();
+        for i in 0..n {
+            std::fs::rename(dir.join(format!("f_{i:06}.txt")), dir.join(format!("g_{i:06}.txt"))).unwrap();
+        }
+        let raw = started.elapsed().as_secs_f64();
+        let jobs = (0..n).map(|i| (dir.join(format!("g_{i:06}.txt")), format!("f_{i:06}.txt"))).collect();
+        let started = std::time::Instant::now();
+        run_local_batch(jobs, &undo::Rec::default()).unwrap();
+        let plain = started.elapsed().as_secs_f64();
+        let jobs = (0..n).map(|i| (dir.join(format!("f_{i:06}.txt")), format!("f_{:06}.txt", i + 1))).collect();
+        let started = std::time::Instant::now();
+        run_local_batch(jobs, &undo::Rec::default()).unwrap();
+        let chain = started.elapsed().as_secs_f64();
+        println!("{n} files on disk: fs::rename alone {raw:.1} s, the batch {plain:.1} s, a chain through temporary names {chain:.1} s");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

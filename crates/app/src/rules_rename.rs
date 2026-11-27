@@ -1767,9 +1767,11 @@ enum Prepared<'a> {
     /// Rearrange by delimiters: `None` with no delimiter to split at.
     Delimiters(Option<Regex>),
     /// Reformat Date: `None` with a format left empty.
-    Date(Result<Option<DatePlan<'a>>, String>),
+    Date(Result<Option<Box<DatePlan<'a>>>, String>),
     /// Regular Expressions: `None` when the pattern holds a meta tag, which each item fills in.
     Pattern(Option<Result<Regex, String>>),
+    /// Translit: the alphabet's pairs, read from its text.
+    Alphabet(Vec<(String, String)>),
 }
 
 impl<'a> Prepared<'a> {
@@ -1792,9 +1794,10 @@ impl<'a> Prepared<'a> {
             RuleConfig::ReformatDate { find_fmt, replace_fmt, custom_short_months, short_months, custom_long_months, long_months, .. } => {
                 let short = month_names(*custom_short_months, short_months, EN_SHORT_MONTHS);
                 let long = month_names(*custom_long_months, long_months, EN_LONG_MONTHS);
-                Self::Date(DatePlan::new(find_fmt, replace_fmt, short, long))
+                Self::Date(DatePlan::new(find_fmt, replace_fmt, short, long).map(|plan| plan.map(Box::new)))
             }
             RuleConfig::Regex { pattern, case_sensitive, .. } if !pattern.is_empty() => Self::Pattern((!rules_meta::has_tags(pattern)).then(|| pattern_regex(pattern, *case_sensitive))),
+            RuleConfig::Translit { alphabet, direction, .. } => Self::Alphabet(parse_translit_alphabet(alphabet, *direction)),
             _ => Self::Nothing,
         }
     }
@@ -1932,7 +1935,7 @@ fn apply_single_rule(cfg: &RuleConfig, prepared: &Prepared, current: &str, item:
             }
             // Through the tags, which read each file once: the preview runs again at every change.
             if *detect_binary
-                && let Some(detected_ext) = rules_meta::resolve_tag("BinarySign_Extension", item, loc).filter(|ext| !ext.is_empty())
+                && let Some(detected_ext) = rules_meta::resolve_tag("BinarySign_Extension", item, loc).filter(|ext| !ext.is_empty() && ext != rules_meta::PENDING)
             {
                 let stem = match out.rfind('.') {
                     Some(i) if i > 0 => &out[..i],
@@ -2186,11 +2189,11 @@ fn apply_single_rule(cfg: &RuleConfig, prepared: &Prepared, current: &str, item:
             }
             Ok(format!("{s}{ext}"))
         }
-        RuleConfig::Translit { alphabet, direction, auto_case, skip_ext } => {
+        RuleConfig::Translit { auto_case, skip_ext, .. } => {
+            let Prepared::Alphabet(pairs) = prepared else { return Ok(current.to_string()) };
             let (stem, ext) = split_stem_ext(current, item.is_dir, *skip_ext);
-            let pairs = parse_translit_alphabet(alphabet, *direction);
             let mut out = stem;
-            for (src, dst) in &pairs {
+            for (src, dst) in pairs {
                 if src.is_empty() {
                     continue;
                 }
@@ -3226,7 +3229,7 @@ mod tests {
         data.resize(64 + 42, 0);
         std::fs::write(dir.join("v.avi"), &data).unwrap();
         let entry = Entry { name: "v.avi".into(), ..file("v.avi") };
-        let got = rules_meta::resolve_tag("AVI_Width", &entry, &Location::Local(dir.clone()));
+        let got = rules_meta::resolve_tag_when_read("AVI_Width", &entry, &Location::Local(dir.clone()));
         assert_eq!(got.as_deref(), Some(""));
         let _ = std::fs::remove_dir_all(&dir);
     }
