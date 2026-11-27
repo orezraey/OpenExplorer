@@ -594,6 +594,8 @@ pub fn drives_changed(s: &mut State, drives: Vec<(PathBuf, DriveKind)>) {
     for open in &mut s.tree.open {
         open.retain(|id| !under(id));
     }
+    // A letter that changed hands shows by its kind until the shell names the new disk.
+    s.drive_names.retain(|d, _| !moved.contains(d));
     s.local_drives = drives;
     let fixed = fixed_icons(&s.places, &s.local_drives).into_iter().chain(crate::sysicons::home_key());
     s.icons.refix(fixed, moved.into_iter().map(IconKey::Path));
@@ -603,13 +605,24 @@ pub fn drives_changed(s: &mut State, drives: Vec<(PathBuf, DriveKind)>) {
 }
 
 /// Asks the system for the disks' names in the background (see [`crate::mounts::names`]).
+/// One at a time: the shell can hang on a network drive whose server is down, and asking again
+/// meanwhile would only leave another thread waiting. Asked while one runs, it runs again after.
 pub fn read_drive_names(s: &mut State) {
+    if s.names_asking {
+        s.names_again = true;
+        return;
+    }
+    s.names_asking = true;
     let drives = s.local_drives.clone();
     background(s, move |emit| emit(Msg::DriveNames(crate::mounts::names(&drives))));
 }
 
 /// The disks' names the system gave.
 pub fn drive_names(s: &mut State, names: Vec<(PathBuf, String)>) {
+    s.names_asking = false;
+    if std::mem::take(&mut s.names_again) {
+        read_drive_names(s);
+    }
     let names: HashMap<PathBuf, String> = names.into_iter().collect();
     // Names read for disks since mounted or removed: the newer reading is on its way.
     let current = names.len() == s.local_drives.len() && s.local_drives.iter().all(|(d, _)| names.contains_key(d));

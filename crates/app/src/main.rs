@@ -262,6 +262,9 @@ struct State {
     /// The disks' names as the system shows them ("AltMount (\\server) (X:)"), read in the
     /// background; a disk not in it shows by its kind (see [`mounts::names`]).
     drive_names: HashMap<PathBuf, String>,
+    /// A names job runs, and another is due once it ends (see [`tree::read_drive_names`]).
+    names_asking: bool,
+    names_again: bool,
     /// The desktop and the user's folders, read at start.
     places: places::Places,
     /// What each pane's tree has open, and the folders read for it.
@@ -444,6 +447,8 @@ impl State {
             undo: Default::default(),
             local_drives: Vec::new(),
             drive_names: HashMap::new(),
+            names_asking: false,
+            names_again: false,
             places: Default::default(),
             tree: tree::Tree::new(std::iter::empty()),
             layout: Default::default(),
@@ -679,6 +684,8 @@ fn init() -> State {
         undo: Default::default(),
         local_drives: mounts::list(),
         drive_names: HashMap::new(),
+        names_asking: false,
+        names_again: false,
         places,
         tree,
         layout: layout::Layout::load(),
@@ -3787,9 +3794,23 @@ mod tests {
         // A disk mounted joins the list.
         tree::drives_changed(&mut s, vec![(disk("C"), model::DriveKind::Fixed), (disk("E"), model::DriveKind::Removable), (disk("W"), model::DriveKind::Fixed), (disk("X"), model::DriveKind::Network)]);
         assert_eq!(rows(&s).into_iter().map(|(id, _)| id).collect::<Vec<_>>(), ["C:\\", "E:\\", "W:\\", "X:\\"]);
-        // Names read before E: came are left for the newer reading.
+        // One names job at a time: asked while one runs, it runs again after.
+        assert!(s.names_asking);
+        tree::read_drive_names(&mut s);
+        assert!(s.names_again);
+        // Names read before E: came are left for the newer reading, which starts now.
         tree::drive_names(&mut s, vec![(disk("C"), "Antigo (C:)".into()), (disk("W"), "Zeta (W:)".into()), (disk("X"), alt.into())]);
         assert_eq!(rows(&s)[0].1, "Disco Local (C:)");
+        assert!(s.names_asking && !s.names_again);
+        // A letter taken by another disk loses the old disk's name.
+        tree::drives_changed(&mut s, vec![(disk("C"), model::DriveKind::Fixed), (disk("E"), model::DriveKind::Removable), (disk("W"), model::DriveKind::Fixed), (disk("X"), model::DriveKind::Removable)]);
+        assert_eq!(rows(&s)[3].1, model::DriveKind::Removable.label("X:"));
+        // A tab left on Este Computador lists the disks as they are when it comes back.
+        tabs::open_new_tab(&mut s, 0, Location::Mock(Vec::new()));
+        tree::drives_changed(&mut s, vec![(disk("C"), model::DriveKind::Fixed), (disk("W"), model::DriveKind::Fixed)]);
+        tabs::select_tab(&mut s, 0, 0);
+        assert_eq!(s.panes[0].loc, Location::Computer);
+        assert_eq!(rows(&s).into_iter().map(|(id, _)| id).collect::<Vec<_>>(), ["C:\\", "W:\\"]);
         // A disk opens at its root; Up comes back to it.
         let w = s.panes[0].entries.iter().find(|e| e.id == "W:\\").cloned().unwrap();
         assert_eq!(folder_in(&Location::Computer, &w), Location::Local(disk("W")));

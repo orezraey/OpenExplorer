@@ -149,7 +149,7 @@ fn linux_mounts(mountinfo: &str, home: Option<&std::path::Path>) -> Vec<(PathBuf
             continue;
         }
         let path = PathBuf::from(&at);
-        let in_home = home.is_some_and(|h| path.strip_prefix(h).is_ok_and(|r| r.components().count() > 0 && !r.to_string_lossy().split('/').any(|c| c.starts_with('.'))));
+        let in_home = home.is_some_and(|h| in_home(&path, h));
         // WSL keeps its own workings under /mnt/wslg; its Windows disks (/mnt/c) do show.
         let shown = (["/media/", "/run/media/", "/mnt/"].iter().any(|p| at.starts_with(p)) && !at.starts_with("/mnt/wslg/")) || in_home;
         if !shown {
@@ -170,6 +170,12 @@ fn linux_mounts(mountinfo: &str, home: Option<&std::path::Path>) -> Vec<(PathBuf
     }
     out[1..].sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+
+/// Whether `path` is below the home folder `home`, and not inside a hidden folder there.
+#[cfg_attr(windows, allow(dead_code))]
+fn in_home(path: &Path, home: &Path) -> bool {
+    path.strip_prefix(home).is_ok_and(|r| r.components().count() > 0 && !r.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')))
 }
 
 /// A mount point as mountinfo writes it, with `\040` for a space and the like.
@@ -248,7 +254,7 @@ mod mac {
             let fs = unsafe { CStr::from_ptr(m.f_fstypename.as_ptr()) }.to_string_lossy().into_owned();
             let flags = m.f_flags as i32;
             let path = PathBuf::from(&at);
-            let in_home = home.as_ref().is_some_and(|h| path.strip_prefix(h).is_ok_and(|r| r.components().count() > 0));
+            let in_home = home.as_ref().is_some_and(|h| super::in_home(&path, h));
             if flags & libc::MNT_DONTBROWSE != 0 || !(at.starts_with("/Volumes/") || in_home) {
                 continue;
             }
