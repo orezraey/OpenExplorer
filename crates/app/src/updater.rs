@@ -846,17 +846,33 @@ fn handoff_windows_installed(staged: &Staged, install_dir: &Path) -> Result<(), 
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    let pid = std::process::id();
-    let setup = staged.file_path.to_string_lossy();
-    let exe = install_dir.join("openexplorer.exe");
-    let exe_str = exe.to_string_lossy();
-    let ver = &staged.version;
-
     // A small temporary batch script waits for our PID to exit, runs Inno Setup silently
     // (which handles UAC, stops/updates the OpenExplorerIndex service and warms the GPU cache),
     // and relaunches Open Explorer with --update-receipt on success.
+    let pid = std::process::id();
     let script_path = std::env::temp_dir().join(format!("openexplorer-update-{pid}.cmd"));
-    let script = format!(
+    fs::write(&script_path, installed_script(pid)).map_err(|e| e.to_string())?;
+    std::process::Command::new("cmd.exe")
+        .args(["/C", &script_path.to_string_lossy()])
+        .env("OE_SETUP", &staged.file_path)
+        .env("OE_EXE", install_dir.join("openexplorer.exe"))
+        .env("OE_VER", &staged.version)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// The Windows update scripts are pure ASCII and take every path from the environment: cmd.exe
+// decodes a batch file in the console's OEM code page (850 on a Portuguese Windows), so a path
+// written into the file, such as C:\Users\Cauã\AppData\Roaming\OpenExplorer\updates\setup.exe,
+// turned into garbage and the installer never ran. Environment variables reach cmd as UTF-16.
+
+/// The script that runs the downloaded Inno Setup installer once process `pid` has exited.
+/// It reads OE_SETUP (the installer), OE_EXE (the program to relaunch) and OE_VER.
+#[cfg(any(windows, test))]
+fn installed_script(pid: u32) -> String {
+    format!(
         "@echo off\r\n\
          setlocal\r\n\
          :wait\r\n\
@@ -865,21 +881,47 @@ fn handoff_windows_installed(staged: &Staged, install_dir: &Path) -> Result<(), 
            timeout /t 1 /nobreak >NUL\r\n\
            goto wait\r\n\
          )\r\n\
-         \"{setup}\" /SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS\r\n\
+         \"%OE_SETUP%\" /SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS\r\n\
          if errorlevel 1 (\r\n\
-           start \"\" \"{exe_str}\" --update-error install-failed\r\n\
+           start \"\" \"%OE_EXE%\" --update-error install-failed\r\n\
          ) else (\r\n\
-           start \"\" \"{exe_str}\" --update-receipt \"{ver}\"\r\n\
+           start \"\" \"%OE_EXE%\" --update-receipt \"%OE_VER%\"\r\n\
          )\r\n\
          del \"%~f0\" >NUL 2>&1\r\n"
-    );
-    fs::write(&script_path, script).map_err(|e| e.to_string())?;
-    std::process::Command::new("cmd.exe")
-        .args(["/C", &script_path.to_string_lossy()])
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    )
+}
+
+/// The script that swaps a portable executable once process `pid` has exited. It reads OE_SRC
+/// (the new executable), OE_DST (the one to replace), OE_OLD (its backup name) and OE_VER.
+#[cfg(any(windows, test))]
+fn portable_script(pid: u32) -> String {
+    format!(
+        "@echo off\r\n\
+         setlocal\r\n\
+         :wait\r\n\
+         tasklist /FI \"PID eq {pid}\" 2>NUL | find /I \"{pid}\" >NUL\r\n\
+         if not errorlevel 1 (\r\n\
+           timeout /t 1 /nobreak >NUL\r\n\
+           goto wait\r\n\
+         )\r\n\
+         del /F /Q \"%OE_OLD%\" >NUL 2>&1\r\n\
+         move /Y \"%OE_DST%\" \"%OE_OLD%\" >NUL\r\n\
+         if errorlevel 1 (\r\n\
+           start \"\" \"%OE_DST%\" --update-error replace-failed\r\n\
+           del \"%~f0\" >NUL 2>&1\r\n\
+           exit /b 1\r\n\
+         )\r\n\
+         copy /Y \"%OE_SRC%\" \"%OE_DST%\" >NUL\r\n\
+         if errorlevel 1 (\r\n\
+           move /Y \"%OE_OLD%\" \"%OE_DST%\" >NUL\r\n\
+           start \"\" \"%OE_DST%\" --update-error copy-failed\r\n\
+           del \"%~f0\" >NUL 2>&1\r\n\
+           exit /b 1\r\n\
+         )\r\n\
+         del /F /Q \"%OE_OLD%\" >NUL 2>&1\r\n\
+         start \"\" \"%OE_DST%\" --update-receipt \"%OE_VER%\"\r\n\
+         del \"%~f0\" >NUL 2>&1\r\n"
+    )
 }
 
 #[cfg(not(windows))]
@@ -893,42 +935,17 @@ fn handoff_windows_portable(staged: &Staged, exe_path: &Path) -> Result<(), Stri
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let pid = std::process::id();
-    let src = staged.file_path.to_string_lossy();
-    let dst = exe_path.to_string_lossy();
-    let old = format!("{dst}.old");
-    let ver = &staged.version;
+    let mut old = exe_path.as_os_str().to_os_string();
+    old.push(".old");
 
     let script_path = std::env::temp_dir().join(format!("openexplorer-update-{pid}.cmd"));
-    let script = format!(
-        "@echo off\r\n\
-         setlocal\r\n\
-         :wait\r\n\
-         tasklist /FI \"PID eq {pid}\" 2>NUL | find /I \"{pid}\" >NUL\r\n\
-         if not errorlevel 1 (\r\n\
-           timeout /t 1 /nobreak >NUL\r\n\
-           goto wait\r\n\
-         )\r\n\
-         del /F /Q \"{old}\" >NUL 2>&1\r\n\
-         move /Y \"{dst}\" \"{old}\" >NUL\r\n\
-         if errorlevel 1 (\r\n\
-           start \"\" \"{dst}\" --update-error replace-failed\r\n\
-           del \"%~f0\" >NUL 2>&1\r\n\
-           exit /b 1\r\n\
-         )\r\n\
-         copy /Y \"{src}\" \"{dst}\" >NUL\r\n\
-         if errorlevel 1 (\r\n\
-           move /Y \"{old}\" \"{dst}\" >NUL\r\n\
-           start \"\" \"{dst}\" --update-error copy-failed\r\n\
-           del \"%~f0\" >NUL 2>&1\r\n\
-           exit /b 1\r\n\
-         )\r\n\
-         del /F /Q \"{old}\" >NUL 2>&1\r\n\
-         start \"\" \"{dst}\" --update-receipt \"{ver}\"\r\n\
-         del \"%~f0\" >NUL 2>&1\r\n"
-    );
-    fs::write(&script_path, script).map_err(|e| e.to_string())?;
+    fs::write(&script_path, portable_script(pid)).map_err(|e| e.to_string())?;
     std::process::Command::new("cmd.exe")
         .args(["/C", &script_path.to_string_lossy()])
+        .env("OE_SRC", &staged.file_path)
+        .env("OE_DST", exe_path)
+        .env("OE_OLD", old)
+        .env("OE_VER", &staged.version)
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| e.to_string())?;
@@ -1143,6 +1160,47 @@ fn cleanup_leftovers() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_update_scripts_are_ascii_and_take_paths_from_the_environment() {
+        for script in [installed_script(1234), portable_script(1234)] {
+            assert!(script.is_ascii(), "{script}");
+            assert!(!script.contains(":\\"), "no path may be written into the script: {script}");
+        }
+        assert!(installed_script(1234).contains("\"%OE_SETUP%\" /SILENT"));
+        assert!(portable_script(1234).contains("copy /Y \"%OE_SRC%\" \"%OE_DST%\""));
+    }
+
+    /// The bug behind "install-failed" on a profile like C:\Users\Cauã: the installer path was
+    /// written into the batch file and cmd.exe, in a new console with the OEM code page, read it
+    /// as garbage. Through the environment it arrives intact.
+    #[cfg(windows)]
+    #[test]
+    fn a_non_ascii_installer_path_reaches_cmd_through_the_environment() {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let dir = std::env::temp_dir().join(format!("oe-update-test-{}", std::process::id())).join("Cauã ação");
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("ran.txt");
+        let setup = dir.join("setup.cmd");
+        fs::write(&setup, "@echo off\r\necho %* > \"%~dp0ran.txt\"\r\n").unwrap();
+        // The installer line of `installed_script`, run the way the handoff runs it.
+        let line = installed_script(1234).lines().find(|l| l.contains("%OE_SETUP%")).unwrap().trim().to_string();
+        let script = dir.parent().unwrap().join("run.cmd");
+        fs::write(&script, format!("@echo off\r\n{line}\r\nexit /b %errorlevel%\r\n")).unwrap();
+
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/C", &script.to_string_lossy()])
+            .env("OE_SETUP", &setup)
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .unwrap();
+        let ran = fs::read_to_string(&marker).unwrap_or_default();
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+        assert!(status.success(), "{status:?}");
+        assert!(ran.contains("/SILENT /SUPPRESSMSGBOXES"), "{ran}");
+    }
 
     #[test]
     fn semver_comparison_and_policy_match_spotifast() {
