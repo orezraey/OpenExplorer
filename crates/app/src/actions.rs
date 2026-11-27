@@ -557,6 +557,9 @@ pub fn open_found_folder(s: &mut State, p: usize, e: &Entry) {
     let Some((email, id)) = found_folder(&loc, e) else { return };
     let under_search = crate::folder_in(&loc, e);
     s.status = tr!("Abrindo “{}”…", "Opening “{}”…", shown(&e.name));
+    // The pane stays on the results meanwhile: a folder opened since, or still being looked
+    // up, gives way to this one, whichever answer comes first.
+    s.panes[p].moves += 1;
     let account = email.clone();
     let find = move |d: &Drive| match d.place(&id) {
         Ok(place) => Ok(Reached { loc: address::folder_location(account, &id, place), reveal: None }),
