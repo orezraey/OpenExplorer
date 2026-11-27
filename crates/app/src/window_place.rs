@@ -1,8 +1,11 @@
 //! The main window reopens where it was closed, as Explorer's does: its place, its size, and
-//! maximized or not. What it was is kept in the settings (`Settings::window`) when it closes.
+//! maximized or not. What it was is kept in the settings (`Settings::window`) as it moves and
+//! when it closes.
 
 use std::cell::RefCell;
+use std::time::{Duration, Instant};
 
+use rune::Tx;
 use serde::{Deserialize, Serialize};
 
 use crate::State;
@@ -35,6 +38,49 @@ thread_local! {
     static MAIN: RefCell<Option<rune::WindowHandle>> = const { RefCell::new(None) };
     /// Whether the main window was maximized the last time it was shown (not minimized).
     static WAS_MAXIMIZED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// When the place the main window moved to is written to the settings file, if it moved
+    /// since the last write.
+    static WRITE_AT: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// How long the window rests before its new place is written, so a drag writes once.
+const WRITE_AFTER: Duration = Duration::from_secs(1);
+
+/// `App::on_placement`: the main window moved, was resized, maximized or restored. Its place goes
+/// into the settings at once and to the file once it rests, so it reopens there even after the
+/// program was ended without closing (a crash, Task Manager). Wayland never calls it: there the
+/// place is kept only on close (`remember`).
+pub fn placed(s: &mut State, p: rune::WindowPlacement, tx: &mut Tx) -> bool {
+    if s.is_placeholder {
+        return false;
+    }
+    if let Some(saved) = Saved::of(&p, WAS_MAXIMIZED.with(std::cell::Cell::get))
+        && s.settings.window != Some(saved)
+    {
+        s.settings.window = Some(saved);
+        WRITE_AT.with(|w| w.set(Some(Instant::now() + WRITE_AFTER)));
+        tx.wake_after(WRITE_AFTER);
+    }
+    false
+}
+
+/// Drops a write `placed` armed, so a test never writes the real settings file.
+#[cfg(test)]
+pub fn forget_unwritten() {
+    WRITE_AT.with(|w| w.set(None));
+}
+
+/// From the main window's `poll`: writes the place it moved to, once it rested `WRITE_AFTER`.
+/// Woken a little early, it asks to be woken again when that time comes.
+pub fn write_when_rested(s: &State, tx: &mut Tx) {
+    let Some(at) = WRITE_AT.with(std::cell::Cell::get) else { return };
+    let now = Instant::now();
+    if now >= at {
+        WRITE_AT.with(|w| w.set(None));
+        s.settings.save();
+    } else {
+        tx.wake_after(at - now);
+    }
 }
 
 /// `App::on_window_geometry`: the window's size changed (maximized, restored, minimized). While
@@ -88,11 +134,16 @@ pub fn remember(s: &mut State) {
     if s.is_placeholder {
         return;
     }
-    let Some(placement) = MAIN.with(|m| m.borrow().as_ref().and_then(rune::WindowHandle::placement)) else { return };
-    if let Some(saved) = Saved::of(&placement, WAS_MAXIMIZED.with(std::cell::Cell::get))
+    // A place `placed` took in but has not written yet is written now.
+    let mut unwritten = WRITE_AT.with(std::cell::Cell::take).is_some();
+    if let Some(placement) = MAIN.with(|m| m.borrow().as_ref().and_then(rune::WindowHandle::placement))
+        && let Some(saved) = Saved::of(&placement, WAS_MAXIMIZED.with(std::cell::Cell::get))
         && s.settings.window != Some(saved)
     {
         s.settings.window = Some(saved);
+        unwritten = true;
+    }
+    if unwritten {
         s.settings.save();
     }
 }

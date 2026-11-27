@@ -1316,6 +1316,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     if let Some(focused) = PENDING_MAIN_FOCUS.with(|c| c.take()) {
         main_focus(s, focused, tx);
     }
+    window_place::write_when_rested(s, tx);
     // Mica follows Opções while the window lives; turned on again, it comes back only in a window
     // made for it (only its creation makes a window transparent). Turned off, the view paints the
     // window's own background at once and fades it in over Mica, and Mica goes once that's done:
@@ -1355,8 +1356,9 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             tree::learn(s, p);
         }
     }
-    // The 256 px icons only while a pane in view shows Large or Extra large icons.
-    let big = s.panes[..s.settings.pane_layout.count()].iter().any(|p| matches!(p.view_mode, model::ViewMode::LargeIcons | model::ViewMode::ExtraLargeIcons));
+    // The 256 px icons only while a pane in view draws its icons past 64 pt: Large or Extra
+    // large icons, or Medium ones zoomed by the system's text size.
+    let big = s.panes[..s.settings.pane_layout.count()].iter().any(|p| p.view_mode.tile_metrics().2 * ui::text_zoom() > 64.0);
     s.icons.set_big(big);
     let mut changed = std::mem::take(&mut s.main_dirty) | s.icons.settle();
     // List scrolled sideways to columns its view didn't build.
@@ -4026,6 +4028,7 @@ fn main() {
             window_place::resized();
             false
         })
+        .on_placement(window_place::placed)
         .on_close(|s, _| window_place::remember(s));
     let place = window_place::options(initial.window);
     // Experimental: Mica shows through a transparent window, which only its creation sets.
@@ -4633,6 +4636,74 @@ mod tests {
         });
         frames(&mut rt);
         assert!(!ring(&mut rt), "the hidden tree never took focus");
+    }
+
+    /// The system's text size zooms the whole window: a step of the path takes 1.5 times its
+    /// share of the window's width at 150 %. Layout boxes (`target`), not the drawn ones, which
+    /// glide to them.
+    #[test]
+    fn the_window_follows_the_system_text_size() {
+        let mut rt = rune::Runtime::new(init(), ui::view, (1600.0, 1000.0), rune::Env::new(false, 1.0));
+        let share = |rt: &mut rune::Runtime<State>| {
+            for _ in 0..3 {
+                rt.frame(1.0 / 60.0);
+            }
+            let els = rt.elements();
+            let h = els.iter().find(|e| e.key.as_deref() == Some("crumb-0")).expect("the path's first step").target[3];
+            let w = els.iter().map(|e| e.target[2]).fold(0.0, f32::max);
+            h / w
+        };
+        let normal = share(&mut rt);
+        rt.set_system_text_scale(1.5);
+        let large = share(&mut rt);
+        assert!((large / normal - 1.5).abs() < 0.01, "{normal} -> {large}");
+    }
+
+    /// A move of the main window goes into the settings at once (the file is written once it
+    /// rests, not here: a test writes no file), and the same place again changes nothing.
+    #[test]
+    fn a_moved_window_is_kept_at_once() {
+        let mut rt = rune::Runtime::new(init(), ui::view, (1600.0, 1000.0), rune::Env::new(false, 1.0));
+        rt.frame(1.0 / 60.0);
+        let moved = rune::WindowPlacement { position: (300, 200), content_size: (1300, 850), scale: 1.0, ..Default::default() };
+        let kept = window_place::Saved { position: (300, 200), size: (1300, 850), maximized: false };
+        rt.update(|s, tx| {
+            assert!(!window_place::placed(s, moved, tx), "nothing the view reads changed");
+            assert_eq!(s.settings.window, Some(kept));
+            let maximized = rune::WindowPlacement { maximized: true, restore: Some(((300, 200), (1300, 850))), ..moved };
+            window_place::placed(s, maximized, tx);
+            assert_eq!(s.settings.window, Some(window_place::Saved { maximized: true, ..kept }));
+        });
+        window_place::forget_unwritten();
+    }
+
+    /// Screen readers hear which folder is the current one: the path's last step and the tree's
+    /// row of the folder the pane shows.
+    #[test]
+    fn the_folder_shown_is_the_current_location() {
+        fn labels(v: &serde_json::Value, out: &mut Vec<String>) {
+            match v {
+                serde_json::Value::Object(o) => {
+                    if o.get("current").and_then(|c| c.as_str()) == Some("location")
+                        && let Some(l) = o.get("label").or_else(|| o.get("name")).and_then(|l| l.as_str())
+                    {
+                        out.push(l.to_string());
+                    }
+                    o.values().for_each(|c| labels(c, out));
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(|c| labels(c, out)),
+                _ => {}
+            }
+        }
+        let mut rt = rune::Runtime::new(init(), ui::view, (1600.0, 1000.0), rune::Env::new(false, 1.0));
+        for _ in 0..3 {
+            rt.frame(1.0 / 60.0);
+        }
+        let mut last = String::new();
+        rt.update(|s, _| last = model::crumbs(&s.panes[0].loc).pop().expect("a step").label);
+        let mut current = Vec::new();
+        labels(&rt.accessibility_json(), &mut current);
+        assert!(current.contains(&last), "{last:?} not among {current:?}");
     }
 
     /// The hover highlight follows the pointer to the row under it and fades when it leaves the

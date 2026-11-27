@@ -974,7 +974,8 @@ pub fn rule_editor_window_view(s: &State, cx: &mut rune::Cx<State>) -> El {
     if s.is_placeholder {
         return el();
     }
-    let k = ui::kit(s.settings.theme.dark(cx.system_dark()));
+    // Its hover is instant, as the window's own (`hover_motion_within` below).
+    let k = ui::window_kit(s, cx, Anim::INSTANT);
     cx.caption_color(k.c.text_base);
 
     let window_bg = if k.dark { rune::oklch(0.24, 0.0, 0.0) } else { k.c.page };
