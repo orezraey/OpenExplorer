@@ -2813,7 +2813,7 @@ pub fn start_sync(s: &mut State) {
         }
     }
     let known = Known::from_comparison(&s.sync.rows, &pairs);
-    let at_once = AtOnce { uploads: s.settings.uploads.into(), downloads: s.settings.downloads.into(), disk: DISK_AT_ONCE };
+    let at_once = AtOnce { uploads: s.settings.uploads.into(), downloads: s.settings.downloads.into(), disk: DISK_AT_ONCE, bin: BIN_AT_ONCE };
 
     background(s, move |emit| {
         let mut drives: HashMap<String, Arc<Drive>> = HashMap::new();
@@ -2864,6 +2864,8 @@ pub struct AtOnce {
     pub downloads: usize,
     /// From a folder of the computer to another.
     pub disk: usize,
+    /// Files sent to the Recycle Bin in one request.
+    pub bin: usize,
 }
 
 /// Files copied at once between two folders of the computer: many small files go several
@@ -2924,6 +2926,47 @@ impl Run<'_> {
     }
 }
 
+/// How many files go to the Recycle Bin in one request. One request for several files costs
+/// less than half of one each; past ten or so more makes no difference, and a request can't
+/// be stopped half way, so it is kept short enough for Cancelar to answer soon.
+const BIN_AT_ONCE: usize = 25;
+/// How many of those requests go at the same time. Two take two thirds of the time of one;
+/// four take as long as one.
+const BIN_REQUESTS: usize = 2;
+
+impl Run<'_> {
+    /// The folder of the computer `row`'s file is deleted from, when what is deleted there
+    /// goes to the Recycle Bin: not with the Recycle Bin skipped in Opções, nor on a shared
+    /// folder or a network drive, which have none.
+    fn bin_of(&self, row: &CompareRow) -> Option<&Path> {
+        let (left, right) = self.sides(row).ok()?;
+        let side = match row.action {
+            SyncAction::DeleteRight => right,
+            SyncAction::DeleteLeft => left,
+            _ => return None,
+        };
+        match side {
+            SyncLocation::Local(base) if !self.skip_recycle_bin && !crate::network::is_remote(base) => Some(base),
+            _ => None,
+        }
+    }
+
+    /// Sends the files of `rows` to the Recycle Bin in one request, and says how each ended.
+    /// A file that is gone already is done. When the request fails, nothing says which file
+    /// it was or how far it went, so each file is then deleted by itself and answers for itself.
+    fn recycle(&self, rows: &[&CompareRow]) -> Vec<Result<(), String>> {
+        let there: Vec<PathBuf> = rows.iter().filter_map(|row| Some(local_join_rel(self.bin_of(row)?, &row.rel_path))).filter(|path| path.exists()).collect();
+        let together = catch_panic(t("mover para a Lixeira", "move to the Recycle Bin"), || match there.is_empty() {
+            true => Ok(()),
+            false => trash::delete_all(&there).map_err(|e| e.to_string()),
+        });
+        match together {
+            Ok(()) => rows.iter().map(|_| Ok(())).collect(),
+            Err(_) => rows.iter().map(|row| self.one(row)).collect(),
+        }
+    }
+}
+
 /// Which way a file is copied, which says how many go at once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Way {
@@ -2953,14 +2996,21 @@ const TOLD_EVERY: Duration = Duration::from_millis(40);
 /// done. Returns how many went well, how many failed, and whether it was cancelled.
 ///
 /// The order is what keeps it safe: folders are made first (the shallowest first), then files
-/// are copied, then files are deleted, then folders (the deepest first). Only the copies of
-/// files go several at a time, each way by its own count.
+/// are copied, then files are deleted, then folders (the deepest first). The copies of files
+/// go several at a time, each way by its own count, and so do the files sent to the Recycle
+/// Bin, several in a request.
 fn run_plan(run: &Run, planned: Vec<CompareRow>, told: &mut dyn FnMut(Vec<(usize, RowStatus)>, usize)) -> (usize, usize, bool) {
     let depth = |r: &CompareRow| r.rel_path.matches('/').count();
     let copies = |r: &CompareRow| matches!(r.action, SyncAction::CopyRight | SyncAction::CopyLeft);
     let mut make: Vec<&CompareRow> = planned.iter().filter(|r| copies(r) && r.is_dir).collect();
     let copy: Vec<&CompareRow> = planned.iter().filter(|r| copies(r) && !r.is_dir).collect();
-    let delete: Vec<&CompareRow> = planned.iter().filter(|r| !copies(r) && !r.is_dir && r.action != SyncAction::None).collect();
+    // Files deleted from a folder of the computer that has a Recycle Bin go to it together;
+    // whether a side has one is asked once, not of each file.
+    let mut has_bin: HashMap<(usize, bool), bool> = HashMap::new();
+    let (binned, delete): (Vec<&CompareRow>, Vec<&CompareRow>) = planned
+        .iter()
+        .filter(|r| !copies(r) && !r.is_dir && r.action != SyncAction::None)
+        .partition(|r| *has_bin.entry((r.pair_index, r.action == SyncAction::DeleteRight)).or_insert_with(|| run.bin_of(r).is_some()));
     let mut unmake: Vec<&CompareRow> = planned.iter().filter(|r| !copies(r) && r.is_dir && r.action != SyncAction::None).collect();
     make.sort_by_key(|r| depth(r));
     unmake.sort_by_key(|r| std::cmp::Reverse(depth(r)));
@@ -2972,12 +3022,17 @@ fn run_plan(run: &Run, planned: Vec<CompareRow>, told: &mut dyn FnMut(Vec<(usize
         // No pair to go by: it fails when it runs, whichever group it is in.
         (Err(_), _) => Way::Disk,
     };
-    let mut groups: Vec<(usize, Vec<&CompareRow>)> = vec![(1, make)];
+    // A job is the rows done in one go: one row, or the files of one request to the Recycle Bin.
+    fn each(rows: Vec<&CompareRow>) -> Vec<Vec<&CompareRow>> {
+        rows.into_iter().map(|r| vec![r]).collect()
+    }
+    let mut groups: Vec<(usize, Vec<Vec<&CompareRow>>)> = vec![(1, each(make))];
     for of in [Way::Disk, Way::Up, Way::Down] {
         let rows: Vec<&CompareRow> = copy.iter().copied().filter(|r| way(r) == of).collect();
-        groups.push((run.workers(of, &rows), rows));
+        groups.push((run.workers(of, &rows), each(rows)));
     }
-    groups.extend([(1, delete), (1, unmake)]);
+    let requests: Vec<Vec<&CompareRow>> = binned.chunks(run.at_once.bin.max(1)).map(|files| files.to_vec()).collect();
+    groups.extend([(run.at_once.disk.clamp(1, BIN_REQUESTS), requests), (1, each(delete)), (1, each(unmake))]);
 
     let (mut ok, mut failed, mut done) = (0usize, 0usize, 0usize);
     for (workers, rows) in groups {
@@ -2998,13 +3053,17 @@ fn run_plan(run: &Run, planned: Vec<CompareRow>, told: &mut dyn FnMut(Vec<(usize
                         if i >= rows.len() || run.cancel.load(Ordering::Relaxed) {
                             return;
                         }
-                        let row = rows[i];
-                        let _ = send.send((row.id, RowStatus::Running));
-                        let status = match run.one(row) {
-                            Ok(()) => RowStatus::Done,
-                            Err(e) => RowStatus::Failed(e),
+                        let job = &rows[i];
+                        for row in job {
+                            let _ = send.send((row.id, RowStatus::Running));
+                        }
+                        let ended = match job[..] {
+                            [row] => vec![run.one(row)],
+                            _ => run.recycle(job),
                         };
-                        let _ = send.send((row.id, status));
+                        for (row, ended) in job.iter().zip(ended) {
+                            let _ = send.send((row.id, ended.map_or_else(RowStatus::Failed, |()| RowStatus::Done)));
+                        }
                     }
                 });
             }
@@ -3910,7 +3969,7 @@ mod tests {
 
         let pairs = [FolderPair { id: 1, left: Some(left_loc.clone()), right: Some(right_loc.clone()) }];
         let known = Known::default();
-        let at_once = AtOnce { uploads: 1, downloads: 1, disk: 4 };
+        let at_once = AtOnce { uploads: 1, downloads: 1, disk: 4, bin: BIN_AT_ONCE };
         let run = Run { pairs: &pairs, skip_recycle_bin: true, segmented: false, pool: &pool, servers: &[], drives: &drives, cancel: &cancel, known: &known, at_once };
         let mut told: Vec<(usize, RowStatus)> = Vec::new();
         let mut counts = Vec::new();
@@ -4052,7 +4111,7 @@ mod tests {
 
         let pairs = [FolderPair { id: 1, left: Some(left_loc.clone()), right: Some(right_loc.clone()) }];
         let known = Known::from_comparison(&rows, &pairs);
-        let run = Run { pairs: &pairs, skip_recycle_bin: true, segmented: false, pool: &pool, servers: &servers, drives: &drives, cancel: &cancel, known: &known, at_once: AtOnce { uploads: 2, downloads: 2, disk: 2 } };
+        let run = Run { pairs: &pairs, skip_recycle_bin: true, segmented: false, pool: &pool, servers: &servers, drives: &drives, cancel: &cancel, known: &known, at_once: AtOnce { uploads: 2, downloads: 2, disk: 2, bin: BIN_AT_ONCE } };
         let mut failures = Vec::new();
         let (ok, failed, _) = run_plan(&run, planned, &mut |changes, _| failures.extend(changes.into_iter().filter(|(_, s)| matches!(s, RowStatus::Failed(_)))));
         assert_eq!((ok, failed), (13, 0), "{kind}: {failures:?}");
@@ -4093,6 +4152,190 @@ mod tests {
         assert!(left_over.iter().all(|(path, action)| *action == SyncAction::CopyLeft && (path.starts_with("Docs/") || path == "top.bin")), "{left_over:?}");
     }
 
+    /// A folder of the test's own under the temp folder, named as nothing else is, and what it
+    /// sent to the system's Recycle Bin taken out of it again when dropped: only the entries
+    /// that came from this folder, whatever else the Recycle Bin holds.
+    #[cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
+    struct Binned(PathBuf, String);
+    #[cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
+    impl Binned {
+        fn new(what: &str) -> Binned {
+            let name = format!("oe-sync-bin-{what}-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos());
+            let dir = std::env::temp_dir().join(&name);
+            std::fs::create_dir_all(&dir).unwrap();
+            Binned(dir, name)
+        }
+        /// The names of this folder's files that are in the Recycle Bin now, sorted.
+        fn in_the_bin(&self) -> Vec<String> {
+            let mut names: Vec<String> = self.entries().iter().map(|i| i.name.to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        }
+        fn entries(&self) -> Vec<trash::TrashItem> {
+            trash::os_limited::list().unwrap_or_default().into_iter().filter(|i| i.original_parent.to_string_lossy().contains(&self.1)).collect()
+        }
+    }
+    #[cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
+    impl Drop for Binned {
+        fn drop(&mut self) {
+            let _ = trash::os_limited::purge_all(self.entries());
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Files a run deletes from a folder of the computer go to the Recycle Bin several in a
+    /// request, each as an entry of its own that can be restored; one that can't be deleted
+    /// fails by itself, one that is gone already is done, and folders go after their files.
+    /// Through the system's own Recycle Bin: the files are the test's, and leave it at the end.
+    #[cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
+    #[test]
+    fn files_deleted_go_to_the_recycle_bin_several_in_a_request() {
+        let bin = Binned::new("run");
+        let (left, right) = (bin.0.join("left"), bin.0.join("right"));
+        std::fs::create_dir_all(&left).unwrap();
+        // 60 files in two folders and at the top: more than two requests' worth.
+        let mut names = Vec::new();
+        for i in 0..60 {
+            let rel = match i % 3 {
+                0 => format!("top {i:02}.txt"),
+                1 => format!("Old/a {i:02}.txt"),
+                _ => format!("Old/Older/b {i:02}.txt"),
+            };
+            let path = local_join_rel(&right, &rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+            names.push(rel);
+        }
+        let (left_loc, right_loc) = (SyncLocation::Local(left), SyncLocation::Local(right.clone()));
+        let (pool, drives, cancel, opts) = (Pool::default(), HashMap::new(), AtomicBool::new(false), SyncOptions::default());
+        let (l, r) = scan_both(&left_loc, &right_loc, &opts.filter, true, &pool, &[], &drives, &cancel, &|_| {}).unwrap();
+        let (mut rows, _) = compare_maps(0, &left_loc, &right_loc, l, r, &opts, SystemTime::now(), &cancel, &|_, _| {});
+        rows.iter_mut().enumerate().for_each(|(i, r)| r.id = i);
+        assert!(rows.len() == 62 && rows.iter().all(|r| r.action == SyncAction::DeleteRight));
+
+        // One is gone before the run gets to it, and one can't be deleted: held open with no
+        // sharing, which only Windows refuses a delete for.
+        std::fs::remove_file(right.join("top 00.txt")).unwrap();
+        #[cfg(windows)]
+        let held = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::File::options().read(true).share_mode(0).open(right.join("top 03.txt")).unwrap()
+        };
+
+        let pairs = [FolderPair { id: 1, left: Some(left_loc.clone()), right: Some(right_loc.clone()) }];
+        let known = Known::default();
+        let run = Run { pairs: &pairs, skip_recycle_bin: false, segmented: false, pool: &pool, servers: &[], drives: &drives, cancel: &cancel, known: &known, at_once: AtOnce { uploads: 1, downloads: 1, disk: 4, bin: BIN_AT_ONCE } };
+        assert_eq!(run.bin_of(&rows[5]), Some(right.as_path()));
+        let mut told: Vec<(usize, RowStatus)> = Vec::new();
+        let (ok, failed, cancelled) = run_plan(&run, rows.clone(), &mut |changes, _| told.extend(changes));
+        let locked = if cfg!(windows) { 1 } else { 0 };
+        assert_eq!((ok, failed, cancelled), (62 - locked, locked, false), "{:?}", told.iter().filter(|(_, s)| matches!(s, RowStatus::Failed(_))).collect::<Vec<_>>());
+        #[cfg(windows)]
+        drop(held);
+
+        // Each row started once and ended once; only the file held open failed.
+        for row in &rows {
+            let its: Vec<&RowStatus> = told.iter().filter(|(id, _)| *id == row.id).map(|(_, s)| s).collect();
+            assert_eq!((its.len(), its[0]), (2, &RowStatus::Running), "{}: {its:?}", row.rel_path);
+            assert_eq!(matches!(its[1], RowStatus::Failed(_)), cfg!(windows) && row.rel_path == "top 03.txt", "{}: {:?}", row.rel_path, its[1]);
+        }
+        // The folders went after every file in them.
+        let ended = |path: &str| told.iter().rposition(|(id, _)| rows.iter().any(|r| r.id == *id && r.rel_path == path)).unwrap();
+        let last_file = names.iter().filter(|n| n.starts_with("Old/")).map(|n| ended(n)).max().unwrap();
+        assert!(last_file < ended("Old/Older") && ended("Old/Older") < ended("Old"));
+
+        // Nothing is left but the file that was held, and each file deleted is an entry of the
+        // Recycle Bin by its own name: 58 of them (60 less the one gone before and the one
+        // held), besides the folders.
+        let left_there: Vec<String> = std::fs::read_dir(&right).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left_there, if cfg!(windows) { vec!["top 03.txt".to_string()] } else { Vec::<String>::new() });
+        let binned = bin.in_the_bin();
+        let files: Vec<&String> = binned.iter().filter(|n| n.ends_with(".txt")).collect();
+        assert_eq!(files.len(), 60 - 1 - locked, "{binned:?}");
+        assert!(files.iter().any(|n| *n == "b 59.txt") && !files.iter().any(|n| *n == "top 00.txt"));
+
+        // With the Recycle Bin skipped in Opções, no file is asked of it.
+        let skipping = Run { skip_recycle_bin: true, ..run };
+        assert_eq!(skipping.bin_of(&rows[5]), None);
+    }
+
+    /// What sending files to the system's Recycle Bin costs one at a time and several in one
+    /// request: 100 empty files each way. They are the test's own and leave the Recycle Bin at
+    /// the end. Run it with `cargo test --release -p openexplorer -- --ignored --nocapture recycle_cost`.
+    #[cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
+    #[test]
+    #[ignore = "benchmark"]
+    fn recycle_cost() {
+        let bin = Binned::new("cost");
+        let make = |round: usize| -> Vec<PathBuf> {
+            (0..100)
+                .map(|i| {
+                    let path = bin.0.join(format!("round {round} file {i:03}.txt"));
+                    std::fs::write(&path, b"").unwrap();
+                    path
+                })
+                .collect()
+        };
+        let mut line = String::new();
+        for (round, at_a_time) in [1usize, 10, 25, 50, 100, 1, 50].into_iter().enumerate() {
+            let files = make(round);
+            let started = std::time::Instant::now();
+            for chunk in files.chunks(at_a_time) {
+                trash::delete_all(chunk).unwrap();
+            }
+            line += &format!("  {at_a_time} at a time {:.2} s", started.elapsed().as_secs_f64());
+            assert!(files.iter().all(|f| !f.exists()));
+        }
+        println!("100 files to the Recycle Bin:{line}");
+        // Requests at the same time, each of 25 files.
+        let mut line = String::new();
+        for (round, threads) in [2usize, 4, 1, 4].into_iter().enumerate() {
+            let files = make(10 + round);
+            let started = std::time::Instant::now();
+            let next = AtomicUsize::new(0);
+            let chunks: Vec<&[PathBuf]> = files.chunks(25).collect();
+            std::thread::scope(|sc| {
+                for _ in 0..threads {
+                    sc.spawn(|| {
+                        while let Some(chunk) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            trash::delete_all(*chunk).unwrap();
+                        }
+                    });
+                }
+            });
+            line += &format!("  {threads} requests at once {:.2} s", started.elapsed().as_secs_f64());
+            assert!(files.iter().all(|f| !f.exists()));
+        }
+        println!("100 files in requests of 25:{line}");
+
+        // A run that deletes 200 files of the right side: one at a time, as it was, and as a
+        // run does it now.
+        let (left, right) = (bin.0.join("left"), bin.0.join("right"));
+        std::fs::create_dir_all(&left).unwrap();
+        let (left_loc, right_loc) = (SyncLocation::Local(left), SyncLocation::Local(right.clone()));
+        let (pool, drives, cancel, opts) = (Pool::default(), HashMap::new(), AtomicBool::new(false), SyncOptions::default());
+        let pairs = [FolderPair { id: 1, left: Some(left_loc.clone()), right: Some(right_loc.clone()) }];
+        let mut line = String::new();
+        for (round, (disk, several)) in [(1usize, 1usize), (DISK_AT_ONCE, BIN_AT_ONCE), (1, BIN_AT_ONCE), (1, 1), (DISK_AT_ONCE, BIN_AT_ONCE), (1, BIN_AT_ONCE)].into_iter().enumerate() {
+            std::fs::create_dir_all(&right).unwrap();
+            for i in 0..200 {
+                std::fs::write(right.join(format!("run {round} file {i:03}.txt")), b"").unwrap();
+            }
+            let (l, r) = scan_both(&left_loc, &right_loc, &opts.filter, true, &pool, &[], &drives, &cancel, &|_| {}).unwrap();
+            let (mut rows, _) = compare_maps(0, &left_loc, &right_loc, l, r, &opts, SystemTime::now(), &cancel, &|_, _| {});
+            rows.iter_mut().enumerate().for_each(|(i, r)| r.id = i);
+            assert!(rows.len() == 200 && rows.iter().all(|r| r.action == SyncAction::DeleteRight));
+            let known = Known::default();
+            let run = Run { pairs: &pairs, skip_recycle_bin: false, segmented: false, pool: &pool, servers: &[], drives: &drives, cancel: &cancel, known: &known, at_once: AtOnce { uploads: 1, downloads: 1, disk, bin: several } };
+            let started = std::time::Instant::now();
+            let ended = run_plan(&run, rows, &mut |_, _| {});
+            line += &format!("  {several} in a request, {} at once {:.2} s", disk.clamp(1, BIN_REQUESTS), started.elapsed().as_secs_f64());
+            assert_eq!(ended, (200, 0, false));
+        }
+        println!("a run deleting 200 files:{line}");
+        assert_eq!(bin.in_the_bin().len(), 2300);
+    }
+
     /// What a run between two folders of the computer costs with 1, 2, 4 and 8 files at a time:
     /// 20,000 files of 4 KB in 200 folders, then 40 files of 16 MB. The trees are made under
     /// the temp folder (`oe-sync-run-bench`) and removed at the end. Run it with
@@ -4122,7 +4365,7 @@ mod tests {
                 let (mut rows, _) = compare_maps(0, &left_loc, &right_loc, l, r, &opts, SystemTime::now(), &cancel, &|_, _| {});
                 rows.iter_mut().enumerate().for_each(|(i, r)| r.id = i);
                 let known = Known::default();
-                let run = Run { pairs: &pairs, skip_recycle_bin: true, segmented: false, pool: &pool, servers: &[], drives: &drives, cancel: &cancel, known: &known, at_once: AtOnce { uploads: 1, downloads: 1, disk } };
+                let run = Run { pairs: &pairs, skip_recycle_bin: true, segmented: false, pool: &pool, servers: &[], drives: &drives, cancel: &cancel, known: &known, at_once: AtOnce { uploads: 1, downloads: 1, disk, bin: BIN_AT_ONCE } };
                 let (started, mut told) = (std::time::Instant::now(), 0);
                 let (ok, failed, _) = run_plan(&run, rows, &mut |_, _| told += 1);
                 assert_eq!((ok, failed), (folders + folders * files, 0));
@@ -4153,7 +4396,7 @@ mod tests {
             FolderPair { id: 4, left: Some(disk("a")), right: Some(on("single")) },
         ];
         let (pool, drives, cancel, known) = (Pool::default(), HashMap::new(), AtomicBool::new(false), Known::default());
-        let run = Run { pairs: &pairs, skip_recycle_bin: true, segmented: false, pool: &pool, servers: &servers, drives: &drives, cancel: &cancel, known: &known, at_once: AtOnce { uploads: 5, downloads: 3, disk: 4 } };
+        let run = Run { pairs: &pairs, skip_recycle_bin: true, segmented: false, pool: &pool, servers: &servers, drives: &drives, cancel: &cancel, known: &known, at_once: AtOnce { uploads: 5, downloads: 3, disk: 4, bin: BIN_AT_ONCE } };
         let rows = |pair_index: usize, n: usize| -> Vec<CompareRow> {
             (0..n).map(|i| CompareRow { id: i, pair_index, rel_path: format!("f{i}"), is_dir: false, left: None, right: None, action: SyncAction::CopyRight, enabled: true, status: RowStatus::Pending }).collect()
         };
