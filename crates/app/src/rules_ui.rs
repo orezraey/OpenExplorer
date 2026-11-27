@@ -22,7 +22,7 @@ use crate::{State, ui};
 // ---------------------------------------------------------------------------------------------
 // Small Reusable Controls (ReNamer-precise, instant response, dark/light aware)
 
-fn instant_checkbox(k: &rune_kit::Kit, accent: Color, key: String, checked: bool, label: &str, on_press: impl Fn(&mut State) + 'static) -> El {
+pub(crate) fn instant_checkbox(k: &rune_kit::Kit, accent: Color, key: String, checked: bool, label: &str, on_press: impl Fn(&mut State) + 'static) -> El {
     let mut box_el = row()
         .size(15.0, 15.0)
         .center()
@@ -114,7 +114,7 @@ fn radio_btn(k: &rune_kit::Kit, accent: Color, key: String, selected: bool, labe
     r
 }
 
-fn field_colors(k: &rune_kit::Kit, invalid: bool) -> (Color, Color) {
+pub(crate) fn field_colors(k: &rune_kit::Kit, invalid: bool) -> (Color, Color) {
     let fill = if k.dark { rune::oklch(0.155, 0.0, 0.0) } else { k.c.bg_base };
     let border = if invalid {
         k.c.danger.fg
@@ -196,7 +196,7 @@ fn num_stepper(
         )
 }
 
-fn tool_btn(k: &rune_kit::Kit, key: &'static str, label: &str, enabled: bool, on_press: fn(&mut State)) -> El {
+pub(crate) fn tool_btn(k: &rune_kit::Kit, key: &'static str, label: &str, enabled: bool, on_press: fn(&mut State)) -> El {
     let mut r = row()
         .key(key)
         .role("button")
@@ -605,39 +605,104 @@ pub fn rules_workspace(
         .child(stack_viewport)
         .child(stack_menu_el);
 
-    // Middle utility bar: Arquivos | Analisar | Exportar | Limpar
-    let util_bar = row()
-        .key("rules-util-bar")
-        .w_full()
-        .gap(8.0)
-        .center_y()
-        .child(text(tr!("Arquivos ({})", "Files ({})", br.items.len())).font(k.ty.text_xsmall_medium).color(k.c.text_muted))
-        .child(el().grow(1.0))
-        .child(tool_btn(k, "btn-rules-analyze", t("Analisar", "Analyze"), !br.items.is_empty(), |s| {
+    let util_bar = shared_util_bar(
+        k,
+        br.items.len(),
+        "btn-rules-analyze",
+        !br.items.is_empty(),
+        |s| {
             if let Some(b) = &mut s.batch_rename {
                 let sample = b.items.first().map(|e| crate::model::shown(&e.name)).unwrap_or_default();
                 b.rules.analyze_input = TextEdit::new(sample);
                 b.rules.popup = Some(RulesPopup::Analyze);
             }
-        }))
-        .child(tool_btn(k, "btn-rules-export", t("Copiar prévia", "Copy preview"), !br.items.is_empty(), |s| {
-            if let Some(b) = &s.batch_rename {
-                let p = b.preview();
-                let txt: String = p.rows.iter().map(|r| format!("{}\t{}", r.current, r.next)).collect::<Vec<_>>().join("\n");
-                if let Ok(mut cb) = arboard::Clipboard::new() {
-                    let _ = cb.set_text(txt);
-                }
-            }
-        }))
-        .child(tool_btn(k, "btn-rules-clear", t("Limpar regras", "Clear rules"), !rs.rules.is_empty(), |s| {
+        },
+        "btn-rules-export",
+        "btn-rules-clear",
+        t("Limpar regras", "Clear rules"),
+        !rs.rules.is_empty(),
+        |s| {
             if let Some(b) = &mut s.batch_rename {
-                b.rules.rules.clear();
-                b.rules.selected = None;
+                b.rules.clear_all();
             }
-        }));
+        },
+    );
+    let preview_panel = shared_preview_panel(k, br, preview, all_checked, panel_bg, panel_border, accent_bg);
+    let footer = shared_footer(k, br, preview, preview.can_submit(), None);
 
-    // ReNamer-style preview table: Estado | Nome | Novo Nome | Erro (resizable columns + grid dividers)
-    let pcols = rs.preview_cols;
+    if let Some(popup) = rs.popup {
+        match popup {
+            RulesPopup::Presets => render_presets_modal(k, br, panel_border, layer),
+            RulesPopup::Analyze => render_analyze_modal(k, br, panel_border, layer),
+            RulesPopup::Comment(idx) => render_comment_modal(k, br, idx, layer),
+        }
+    }
+
+    col()
+        .key("content")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .px(16.0)
+        .pt(6.0)
+        .pb(14.0)
+        .gap(8.0)
+        .motion(Spring::NONE)
+        .instant_changes()
+        .child(mode_tabs)
+        .child(rule_toolbar)
+        .child(stack_panel)
+        .child(util_bar)
+        .child(preview_panel)
+        .child(footer)
+}
+
+pub(crate) fn copy_preview_to_clipboard(s: &mut State) {
+    if let Some(b) = &s.batch_rename {
+        let p = b.preview();
+        let txt: String = p.rows.iter().map(|r| format!("{}\t{}", r.current, r.next)).collect::<Vec<_>>().join("\n");
+        if let Ok(mut cb) = arboard::Clipboard::new() {
+            let _ = cb.set_text(txt);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn shared_util_bar(
+    k: &rune_kit::Kit,
+    item_count: usize,
+    analyze_key: &'static str,
+    can_analyze: bool,
+    on_analyze: fn(&mut State),
+    export_key: &'static str,
+    clear_key: &'static str,
+    clear_label: &str,
+    can_clear: bool,
+    on_clear: fn(&mut State),
+) -> El {
+    row()
+        .key("shared-util-bar")
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .child(text(tr!("Arquivos ({})", "Files ({})", item_count)).font(k.ty.text_xsmall_medium).color(k.c.text_muted))
+        .child(el().grow(1.0))
+        .child(tool_btn(k, analyze_key, t("Analisar", "Analyze"), can_analyze, on_analyze))
+        .child(tool_btn(k, export_key, t("Copiar prévia", "Copy preview"), item_count > 0, copy_preview_to_clipboard))
+        .child(tool_btn(k, clear_key, clear_label, can_clear, on_clear))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn shared_preview_panel(
+    k: &rune_kit::Kit,
+    br: &BatchRename,
+    preview: &Preview,
+    all_checked: bool,
+    panel_bg: Color,
+    panel_border: Color,
+    accent_bg: Color,
+) -> El {
+    let pcols = br.rules.preview_cols;
     let prev_hdr_h = 30.0;
     let mut table_header = row()
         .key("rules-preview-header")
@@ -708,10 +773,18 @@ pub fn rules_workspace(
     }
 
     let total = br.items.len();
+    let has_regex_err = preview.regex_error.is_some();
     let mut rows_col = col().key("rules-preview-rows").w_full();
     for (i, rp) in preview.rows.iter().enumerate() {
         let on = br.checked.get(i).copied().unwrap_or(false);
-        let has_err = rp.error.is_some();
+        let row_err: Option<&str> = rp.error.as_deref().or_else(|| {
+            if on && has_regex_err {
+                Some(t("Regex inválida", "Invalid regex"))
+            } else {
+                None
+            }
+        });
+        let has_err = row_err.is_some();
         let is_changed = on && rp.changed;
         let arrow_col = if has_err {
             k.c.danger.fg
@@ -729,7 +802,7 @@ pub fn rules_workspace(
         } else {
             k.c.text_faint
         };
-        let status_label = rp.error.as_deref().unwrap_or("OK");
+        let status_label = row_err.unwrap_or("OK");
         let status_col = if has_err { k.c.danger.fg } else { k.c.text_muted };
 
         let mut r = row()
@@ -808,7 +881,7 @@ pub fn rules_workspace(
         .child(table_header)
         .child(rows_col);
 
-    let preview_panel = col()
+    col()
         .key("rules-preview-panel")
         .w_full()
         .grow(1.0)
@@ -826,29 +899,51 @@ pub fn rules_workspace(
                 .scroll_xy()
                 .child(preview_table)
                 .scroll_bar_styled(ui::bar_style(k).track_offset(prev_hdr_h, 0.0)),
-        );
+        )
+}
 
-    // Bottom status bar ("13 arquivos (10,92 GB)") + Renomear button
+pub(crate) fn shared_footer(k: &rune_kit::Kit, br: &BatchRename, preview: &Preview, can_submit: bool, extra_error: Option<&str>) -> El {
+    let total = br.items.len();
     let total_bytes: u64 = br.items.iter().filter_map(|e| e.size).sum();
     let count_text = if total_bytes > 0 {
         tr!("{} itens ({})", "{} items ({})", total, format_bytes(total_bytes))
     } else {
         tr!("{} itens", "{} items", total)
     };
-    let can_submit = preview.can_submit();
     let submit_label = if preview.changed_count > 0 && can_submit {
         tr!("Renomear ({})", "Rename ({})", preview.changed_count)
     } else {
         t("Renomear", "Rename").into()
     };
 
-    let footer = row()
-        .key("rules-footer")
+    let warn_text: Option<String> = if let Some(err) = extra_error {
+        Some(err.to_string())
+    } else if preview.error_count > 0 {
+        Some(if preview.error_count == 1 {
+            t("1 item com conflito ou nome inválido", "1 item has a conflict or invalid name").into()
+        } else {
+            tr!("{} itens com conflito ou nome inválido", "{} items have conflicts or invalid names", preview.error_count)
+        })
+    } else {
+        None
+    };
+
+    let mut status_row = row().gap(8.0).center_y().grow(1.0).min_w(0.0).child(
+        text(count_text).font(k.ty.text_xsmall).color(k.c.text_muted).shrink().min_w(0.0),
+    );
+    if let Some(w) = warn_text {
+        status_row = status_row
+            .child(text("·").font(k.ty.text_xsmall).color(k.c.text_faint))
+            .child(text(w).font(k.ty.text_xsmall).color(k.c.danger.fg).grow(1.0).min_w(0.0).truncate());
+    }
+
+    row()
+        .key("shared-footer")
         .w_full()
         .pt(2.0)
         .gap(8.0)
         .center_y()
-        .child(text(count_text).font(k.ty.text_xsmall).color(k.c.text_muted).grow(1.0).min_w(0.0).truncate())
+        .child(status_row)
         .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close_window).build(k).cursor(Cursor::Pointer))
         .child(
             Button::new(submit_label)
@@ -858,33 +953,7 @@ pub fn rules_workspace(
                 .build(k)
                 .default_button()
                 .cursor(Cursor::Pointer),
-        );
-
-    if let Some(popup) = rs.popup {
-        match popup {
-            RulesPopup::Presets => render_presets_modal(k, br, panel_border, layer),
-            RulesPopup::Analyze => render_analyze_modal(k, br, panel_border, layer),
-            RulesPopup::Comment(idx) => render_comment_modal(k, br, idx, layer),
-        }
-    }
-
-    col()
-        .key("content")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .px(16.0)
-        .pt(6.0)
-        .pb(14.0)
-        .gap(8.0)
-        .motion(Spring::NONE)
-        .instant_changes()
-        .child(mode_tabs)
-        .child(rule_toolbar)
-        .child(stack_panel)
-        .child(util_bar)
-        .child(preview_panel)
-        .child(footer)
+        )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1082,6 +1151,41 @@ fn ed_mut(s: &mut State) -> &mut crate::rules_rename::RuleEditorState {
         Some(b) => &mut b.rules.editor,
         None => unreachable!(),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn field_box(
+    k: &rune_kit::Kit,
+    label: &str,
+    placeholder: &str,
+    leading_icon: Option<&'static rune::Icon>,
+    invalid: bool,
+    edit: &TextEdit,
+    on_edit: impl for<'a> Fn(&'a mut State) -> &'a mut TextEdit + 'static,
+    on_submit: Option<fn(&mut State, &mut Tx)>,
+) -> El {
+    let (fill, border) = field_colors(k, invalid);
+    let mut r = row()
+        .w_full()
+        .h(30.0)
+        .center_y()
+        .radius(k.radius.sm)
+        .fill(fill)
+        .border(1.0, border);
+    if let Some(ic) = leading_icon {
+        r = r.pl(9.0).child(icon(ic, 13.0).color(k.c.text_muted));
+    }
+    let mut input = TextInput::new(edit)
+        .plain()
+        .width(None)
+        .height(28.0)
+        .label(label)
+        .placeholder(placeholder)
+        .on_edit(on_edit);
+    if let Some(sub) = on_submit {
+        input = input.on_submit(sub);
+    }
+    r.child(input.build(k).grow(1.0).w(0.0).min_w(0.0))
 }
 
 fn text_box(
@@ -2903,38 +3007,55 @@ fn render_presets_modal(k: &rune_kit::Kit, br: &BatchRename, panel_border: Color
 }
 
 // ---------------------------------------------------------------------------------------------
-// Modal: Analisar (step-by-step trace of rules)
+// Modal: Analisar (step-by-step trace shared across Simple, Media, and Rules)
 
-fn render_analyze_modal(k: &rune_kit::Kit, br: &BatchRename, panel_border: Color, layer: &mut Vec<El>) {
-    let rs = &br.rules;
-    let sample_in = TextInput::new(&rs.analyze_input)
-        .width(None)
-        .label(t("Texto de entrada", "Sample input"))
-        .on_edit(|s: &mut State| match &mut s.batch_rename {
-            Some(b) => &mut b.rules.analyze_input,
-            None => &mut s.name_edit,
-        })
-        .build(k);
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_steps_analyze_modal(
+    k: &rune_kit::Kit,
+    modal_key: &'static str,
+    title: &'static str,
+    edit: &TextEdit,
+    on_edit: fn(&mut State) -> &mut TextEdit,
+    steps: Vec<(String, String, Option<String>)>,
+    on_close: fn(&mut State),
+    panel_border: Color,
+    layer: &mut Vec<El>,
+) {
+    let sample_in = field_box(
+        k,
+        t("Texto de entrada", "Sample input"),
+        t("Digite um nome de arquivo para testar…", "Type a filename to test…"),
+        None,
+        false,
+        edit,
+        on_edit,
+        None,
+    );
 
     let mut steps_col = col().w_full().pr(12.0).gap(4.0);
-    if let Some(first) = br.items.first() {
-        let steps = rules_rename::analyze_sample(&rs.rules, &rs.analyze_input.text, first, &br.loc);
-        for (idx, (label, out, err)) in steps.into_iter().enumerate() {
-            steps_col = steps_col.child(
-                row()
-                    .key(format!("an-step-{idx}"))
-                    .w_full()
-                    .px(10.0)
-                    .py(6.0)
-                    .gap(8.0)
-                    .center_y()
-                    .radius(4.0)
-                    .fill(k.c.bg_base)
-                    .border(1.0, panel_border)
-                    .child(text(format!("{}. {label}", idx + 1)).font(k.ty.text_xsmall_medium).color(k.c.text_muted).w(150.0).truncate())
-                    .child(text(err.unwrap_or(out)).font(k.ty.text_xsmall).color(k.c.text_base).grow(1.0).truncate()),
-            );
-        }
+    for (idx, (label, out, err)) in steps.into_iter().enumerate() {
+        let has_err = err.is_some();
+        steps_col = steps_col.child(
+            row()
+                .key(format!("an-step-{idx}"))
+                .w_full()
+                .px(10.0)
+                .py(6.0)
+                .gap(8.0)
+                .center_y()
+                .radius(4.0)
+                .fill(k.c.bg_base)
+                .border(1.0, panel_border)
+                .child(text(format!("{}. {label}", idx + 1)).font(k.ty.text_xsmall_medium).color(k.c.text_muted).w(150.0).truncate())
+                .child(
+                    text(err.unwrap_or(out))
+                        .font(k.ty.text_xsmall)
+                        .color(if has_err { k.c.danger.fg } else { k.c.text_base })
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate(),
+                ),
+        );
     }
 
     let body = col()
@@ -2942,17 +3063,46 @@ fn render_analyze_modal(k: &rune_kit::Kit, br: &BatchRename, panel_border: Color
         .px(16.0)
         .pb(16.0)
         .gap(10.0)
-        .child(sample_in)
+        .child(
+            col()
+                .w_full()
+                .gap(4.0)
+                .child(text(t("Texto de entrada:", "Sample input:")).font(k.ty.caption()).color(k.c.text_muted))
+                .child(sample_in),
+        )
         .child(col().w_full().max_h(260.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(steps_col).scroll_bar_styled(ui::bar_style(k)))
-        .child(row().w_full().justify_end().child(Button::new(t("Fechar", "Close")).variant(ButtonVariant::Neutral).on_press(close_popup).build(k).cursor(Cursor::Pointer)));
+        .child(row().w_full().justify_end().child(Button::new(t("Fechar", "Close")).variant(ButtonVariant::Neutral).on_press(on_close).build(k).cursor(Cursor::Pointer)));
 
-    Modal::new("rules-analyze-modal", t("Analisar Regras", "Analyze Rules"))
+    Modal::new(modal_key, title)
         .open(true)
         .child(body)
-        .width(560.0)
+        .width(580.0)
         .fit()
-        .on_close(close_popup)
+        .on_close(on_close)
         .build(k, layer);
+}
+
+fn render_analyze_modal(k: &rune_kit::Kit, br: &BatchRename, panel_border: Color, layer: &mut Vec<El>) {
+    let rs = &br.rules;
+    let steps = if let Some(first) = br.items.first() {
+        rules_rename::analyze_sample(&rs.rules, &rs.analyze_input.text, first, &br.loc)
+    } else {
+        Vec::new()
+    };
+    render_steps_analyze_modal(
+        k,
+        "rules-analyze-modal",
+        t("Analisar Regras", "Analyze Rules"),
+        &rs.analyze_input,
+        |s| match &mut s.batch_rename {
+            Some(b) => &mut b.rules.analyze_input,
+            None => &mut s.name_edit,
+        },
+        steps,
+        close_popup,
+        panel_border,
+        layer,
+    );
 }
 
 fn render_stack_context_menu(k: &rune_kit::Kit, br: &BatchRename, layer: &mut Vec<El>) -> El {

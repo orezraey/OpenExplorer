@@ -579,6 +579,8 @@ pub enum MediaPopup {
     Preferences,
     /// FileBot-style Match Picker modal with poster covers, title, year and manual search.
     SelectMatch,
+    /// Step-by-step analyzer modal for testing media filename detection and formatting.
+    Analyze,
 }
 
 pub struct MediaState {
@@ -602,6 +604,7 @@ pub struct MediaState {
     pub keys: MediaKeys,
     pub tmdb_key_edit: TextEdit,
     pub tvdb_key_edit: TextEdit,
+    pub analyze_input: TextEdit,
     pub popup: Option<MediaPopup>,
     pub open_dropdown: Option<PrefDropdown>,
 }
@@ -636,10 +639,108 @@ impl MediaState {
             episodes_seq: 0,
             tmdb_key_edit: TextEdit::new(keys.tmdb.clone()),
             tvdb_key_edit: TextEdit::new(keys.tvdb.clone()),
+            analyze_input: TextEdit::new(""),
             keys,
             popup: None,
             open_dropdown: None,
         }
+    }
+
+    pub fn clear_match(&mut self) {
+        self.candidates.clear();
+        self.selected = None;
+        self.episodes.clear();
+        self.searching = false;
+        self.loading_episodes = false;
+        self.error = None;
+    }
+
+    pub fn analyze_sample(&self, sample: &str, loc: &Location) -> Vec<(String, String, Option<String>)> {
+        let parsed = parse_filename(sample, false);
+        let mut parsed_parts = vec![format!("\"{}\"", parsed.title), parsed.kind.label().to_string()];
+        if let Some(s) = parsed.season {
+            if let Some(&e) = parsed.episodes.first() {
+                parsed_parts.push(format!("S{s:02}E{e:02}"));
+            } else {
+                parsed_parts.push(format!("S{s:02}"));
+            }
+        } else if let Some(abs) = parsed.absolute.or_else(|| parsed.episodes.first().copied()) {
+            parsed_parts.push(format!("#{abs:02}"));
+        }
+        if let Some(y) = parsed.year {
+            parsed_parts.push(format!("({y})"));
+        }
+
+        let mut steps = vec![(
+            t("Detecção local", "Local parsing").into(),
+            parsed_parts.join(" · "),
+            None,
+        )];
+
+        match self.active_candidate() {
+            None => {
+                steps.push((
+                    t("Correspondência", "Active match").into(),
+                    String::new(),
+                    Some(t("Nenhuma correspondência ativa (clique em Match)", "No active match (click Match)").into()),
+                ));
+                steps.push((t("Formato", "Format").into(), self.format.text.clone(), None));
+                steps.push((t("Resultado", "Result").into(), sample.to_string(), None));
+            }
+            Some(cand) => {
+                let cand_desc = match cand.year {
+                    Some(y) => format!("{} · {} ({y})", cand.source.label(), cand.title),
+                    None => format!("{} · {}", cand.source.label(), cand.title),
+                };
+                match cand.kind {
+                    MediaKind::Movie => {
+                        let strict_mismatch = self.match_mode == MatchMode::Strict
+                            && parsed.year.zip(cand.year).is_some_and(|(fy, cy)| fy != cy);
+                        if strict_mismatch {
+                            steps.push((
+                                t("Correspondência", "Active match").into(),
+                                cand_desc,
+                                Some(t("Ano diverge no modo Estrito", "Year mismatch in Strict mode").into()),
+                            ));
+                            steps.push((t("Formato", "Format").into(), self.format.text.clone(), None));
+                            steps.push((t("Resultado", "Result").into(), sample.to_string(), None));
+                        } else {
+                            let formatted = render_template(&self.format.text, cand, None, &parsed);
+                            let clean = sanitize_filename(&formatted, loc);
+                            let out = if clean.is_empty() { sample.to_string() } else { format!("{clean}{}", parsed.ext) };
+                            steps.push((t("Correspondência", "Active match").into(), cand_desc, None));
+                            steps.push((t("Formato", "Format").into(), self.format.text.clone(), None));
+                            steps.push((t("Resultado", "Result").into(), out, None));
+                        }
+                    }
+                    MediaKind::Series => match self.resolve_episode(0, &parsed) {
+                        Some(ep) => {
+                            let ep_label = if ep.title.is_empty() {
+                                format!("{cand_desc} · S{:02}E{:02}", ep.season, ep.episode)
+                            } else {
+                                format!("{cand_desc} · S{:02}E{:02} \"{}\"", ep.season, ep.episode, ep.title)
+                            };
+                            let formatted = render_template(&self.format.text, cand, Some(&ep), &parsed);
+                            let clean = sanitize_filename(&formatted, loc);
+                            let out = if clean.is_empty() { sample.to_string() } else { format!("{clean}{}", parsed.ext) };
+                            steps.push((t("Correspondência", "Active match").into(), ep_label, None));
+                            steps.push((t("Formato", "Format").into(), self.format.text.clone(), None));
+                            steps.push((t("Resultado", "Result").into(), out, None));
+                        }
+                        None => {
+                            steps.push((
+                                t("Correspondência", "Active match").into(),
+                                cand_desc,
+                                Some(t("Episódio não encontrado para este arquivo", "Episode not found for this file").into()),
+                            ));
+                            steps.push((t("Formato", "Format").into(), self.format.text.clone(), None));
+                            steps.push((t("Resultado", "Result").into(), sample.to_string(), None));
+                        }
+                    },
+                }
+            }
+        }
+        steps
     }
 
     pub fn active_candidate(&self) -> Option<&Candidate> {

@@ -919,6 +919,10 @@ fn batch_rename_window_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
     }
     if ev.key == Key::Escape && ev.mods == Mods::default() {
         if let Some(br) = &mut s.batch_rename {
+            if br.simple_analyze_open {
+                br.simple_analyze_open = false;
+                return true;
+            }
             if br.media.open_dropdown.is_some() {
                 br.media.open_dropdown = None;
                 return true;

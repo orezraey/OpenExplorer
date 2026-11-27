@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use openexplorer_i18n::{t, tr};
 use regex::{NoExpand, Regex, RegexBuilder};
-use rune::{Anim, Color, Cursor, Cx, El, ScrollSpec, TextEdit, Tx, col, el, icon, row, text};
+use rune::{Anim, Color, Cursor, Cx, El, ScrollSpec, Spring, TextEdit, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, Dialog as Modal, ScrollBar};
 
 use crate::actions;
@@ -42,6 +42,8 @@ pub struct BatchRename {
     pub replace_all: bool,
     pub case_insensitive: bool,
     pub use_regex: bool,
+    pub simple_analyze_open: bool,
+    pub simple_analyze_input: TextEdit,
     /// State for the advanced "Mídia · TMDB / TVDB" tab.
     pub media: MediaState,
     /// State for the composable ReNamer-style "Regras (Avançado)" tab.
@@ -96,9 +98,72 @@ impl BatchRename {
             replace_all: false,
             case_insensitive: false,
             use_regex: false,
+            simple_analyze_open: false,
+            simple_analyze_input: TextEdit::new(""),
             media,
             rules: crate::rules_rename::RulesState::new(),
         }
+    }
+
+    pub fn analyze_simple_sample(&self, sample: &str) -> Vec<(String, String, Option<String>)> {
+        let mode_str = format!(
+            "{} · {} · {}",
+            if self.use_regex { t("Expressão Regular", "Regular Expression") } else { t("Texto literal", "Literal text") },
+            if self.replace_all { t("Todas as ocorrências", "All occurrences") } else { t("1ª ocorrência", "1st occurrence") },
+            if self.case_insensitive { t("Ignorar maiúsc./minúsc.", "Case insensitive") } else { t("Sensível a maiúsc.", "Case sensitive") },
+        );
+
+        let search = self.search.text.as_str();
+        let replace = self.replace.text.as_str();
+        let mut steps = vec![(t("Configuração", "Configuration").into(), mode_str, None)];
+
+        if search.is_empty() {
+            steps.push((
+                t("Busca", "Search").into(),
+                t("Termo vazio (nenhuma alteração)", "Empty search term (no change)").into(),
+                None,
+            ));
+            steps.push((t("Resultado", "Result").into(), sample.to_string(), None));
+            return steps;
+        }
+
+        let (matcher, count) = if self.use_regex {
+            match RegexBuilder::new(search).case_insensitive(self.case_insensitive).build() {
+                Ok(re) => {
+                    let c = re.find_iter(sample).count();
+                    (Matcher::Regex(re), c)
+                }
+                Err(e) => {
+                    steps.push((t("Busca", "Search").into(), String::new(), Some(format_regex_error(&e))));
+                    steps.push((t("Resultado", "Result").into(), sample.to_string(), None));
+                    return steps;
+                }
+            }
+        } else if self.case_insensitive {
+            match RegexBuilder::new(&regex::escape(search)).case_insensitive(true).build() {
+                Ok(re) => {
+                    let c = re.find_iter(sample).count();
+                    (Matcher::LiteralCi(re), c)
+                }
+                Err(_) => (Matcher::Literal, sample.matches(search).count()),
+            }
+        } else {
+            (Matcher::Literal, sample.matches(search).count())
+        };
+
+        steps.push((
+            t("Busca", "Search").into(),
+            tr!(
+                "\"{search}\" → \"{replace}\" ({count} ocorrência(s))",
+                "\"{search}\" → \"{replace}\" ({count} match(es))"
+            ),
+            None,
+        ));
+
+        let next = apply_replace(sample, search, replace, self.replace_all, &matcher);
+        let name_err = actions::name_problem(&self.loc, next.trim());
+        steps.push((t("Resultado", "Result").into(), next, name_err));
+        steps
     }
 
     /// Computes the live before/after preview and validates invalid names and collisions.
@@ -516,10 +581,6 @@ pub fn window_title() -> &'static str {
     t("Renomear em massa", "Batch rename")
 }
 
-fn close_window(s: &mut State) {
-    s.close_batch_rename();
-}
-
 /// Renders the independent, movable and resizable "Renomear em massa" native window.
 pub fn batch_rename_window_view(s: &State, cx: &mut Cx<State>) -> El {
     if s.is_placeholder {
@@ -532,7 +593,6 @@ pub fn batch_rename_window_view(s: &State, cx: &mut Cx<State>) -> El {
     let panel_bg = if k.dark { rune::oklch(0.198, 0.0, 0.0) } else { k.c.bg_base };
     let panel_border = if k.dark { rune::oklch(0.285, 0.0, 0.0) } else { k.c.border_weak };
     let accent_bg = k.c.bg_icon_button_contrast;
-    let accent_hover = k.on(k.c.submit_hover, accent_bg);
 
     let title_leading = row()
         .gap(8.0)
@@ -561,64 +621,7 @@ pub fn batch_rename_window_view(s: &State, cx: &mut Cx<State>) -> El {
     let checked_count = br.checked.iter().filter(|c| **c).count();
     let all_checked = total > 0 && checked_count == total;
 
-    // High-contrast, instant-snap checkbox (no sluggish fade, clearly visible in dark & light themes).
-    let check_box = |key: String, checked: bool, on_click: Box<dyn Fn(&mut State) + 'static>| -> El {
-        let mut b = row()
-            .key(key)
-            .role("checkbox")
-            .size(16.0, 16.0)
-            .center()
-            .radius(4.0)
-            .cursor(Cursor::Pointer)
-            .instant_changes()
-            .hover_motion(Anim::INSTANT, Anim::INSTANT)
-            .transition_motion(Anim::INSTANT, Anim::INSTANT)
-            .on_press(move |s: &mut State| on_click(s));
-        if checked {
-            b = b
-                .fill(accent_bg)
-                .hover_fill(accent_hover)
-                .border(1.5, accent_bg)
-                .child(icon(k.glyph.check, 11.0).color(Color::WHITE).instant_changes().transition_motion(Anim::INSTANT, Anim::INSTANT));
-        } else {
-            let off_fill = if k.dark { k.alpha(Color::WHITE, 0.06) } else { k.c.bg_base };
-            let off_border = if k.dark { k.alpha(Color::WHITE, 0.38) } else { k.c.border_strong };
-            b = b.fill(off_fill).hover_fill(k.c.hover).border(1.5, off_border);
-        }
-        b
-    };
-
-    let labeled_check = |key: &'static str, checked: bool, label: &'static str, on_toggle: fn(&mut State)| -> El {
-        let mut box_el = row()
-            .size(16.0, 16.0)
-            .center()
-            .radius(4.0)
-            .instant_changes()
-            .hover_motion(Anim::INSTANT, Anim::INSTANT)
-            .transition_motion(Anim::INSTANT, Anim::INSTANT);
-        if checked {
-            box_el = box_el
-                .fill(accent_bg)
-                .border(1.5, accent_bg)
-                .child(icon(k.glyph.check, 11.0).color(Color::WHITE).instant_changes().transition_motion(Anim::INSTANT, Anim::INSTANT));
-        } else {
-            let off_fill = if k.dark { k.alpha(Color::WHITE, 0.06) } else { k.c.bg_base };
-            let off_border = if k.dark { k.alpha(Color::WHITE, 0.38) } else { k.c.border_strong };
-            box_el = box_el.fill(off_fill).border(1.5, off_border);
-        }
-        row()
-            .key(key)
-            .role("checkbox")
-            .gap(8.0)
-            .py(2.0)
-            .center_y()
-            .cursor(Cursor::Pointer)
-            .on_press(on_toggle)
-            .child(box_el)
-            .child(text(label).font(k.ty.text_small).color(k.c.text_base))
-    };
-
-    // Mode switcher tabs ("Simples" | "Mídia · TMDB / TVDB")
+    // Mode switcher tabs ("Simples" | "Mídia · TMDB / TVDB" | "Regras (Avançado)")
     let tab_btn = |key: &'static str, label: &'static str, target: Mode| -> El {
         let active = br.mode == target;
         row()
@@ -668,28 +671,33 @@ pub fn batch_rename_window_view(s: &State, cx: &mut Cx<State>) -> El {
                 t("Substituir por (vazio remove)…", "Replace with (empty removes)…")
             };
 
-            let search_input = rune_kit::TextInput::new(&br.search)
-                .width(None)
-                .label(t("Procurar por", "Search for"))
-                .leading_icon(&icons::SEARCH)
-                .placeholder(search_placeholder)
-                .on_edit(|s: &mut State| match &mut s.batch_rename {
+            let search_input = crate::rules_ui::field_box(
+                &k,
+                t("Procurar por", "Search for"),
+                search_placeholder,
+                Some(&icons::SEARCH),
+                preview.regex_error.is_some(),
+                &br.search,
+                |s: &mut State| match &mut s.batch_rename {
                     Some(br) => &mut br.search,
                     None => &mut s.name_edit,
-                })
-                .on_submit(|s: &mut State, _: &mut Tx| submit(s))
-                .build(&k);
+                },
+                Some(|s: &mut State, _: &mut Tx| submit(s)),
+            );
 
-            let replace_input = rune_kit::TextInput::new(&br.replace)
-                .width(None)
-                .label(t("Substituir por", "Replace with"))
-                .placeholder(replace_placeholder)
-                .on_edit(|s: &mut State| match &mut s.batch_rename {
+            let replace_input = crate::rules_ui::field_box(
+                &k,
+                t("Substituir por", "Replace with"),
+                replace_placeholder,
+                None,
+                false,
+                &br.replace,
+                |s: &mut State| match &mut s.batch_rename {
                     Some(br) => &mut br.replace,
                     None => &mut s.name_edit,
-                })
-                .on_submit(|s: &mut State, _: &mut Tx| submit(s))
-                .build(&k);
+                },
+                Some(|s: &mut State, _: &mut Tx| submit(s)),
+            );
 
             let inputs_row = row()
                 .key("criteria-inputs")
@@ -721,8 +729,10 @@ pub fn batch_rename_window_view(s: &State, cx: &mut Cx<State>) -> El {
                 .w_full()
                 .gap(18.0)
                 .center_y()
-                .child(labeled_check(
-                    "opt-replace-all",
+                .child(crate::rules_ui::instant_checkbox(
+                    &k,
+                    accent_bg,
+                    "opt-replace-all".into(),
                     br.replace_all,
                     t("Substituir todas as ocorrências", "Replace all occurrences"),
                     |s| {
@@ -731,8 +741,10 @@ pub fn batch_rename_window_view(s: &State, cx: &mut Cx<State>) -> El {
                         }
                     },
                 ))
-                .child(labeled_check(
-                    "opt-case-insensitive",
+                .child(crate::rules_ui::instant_checkbox(
+                    &k,
+                    accent_bg,
+                    "opt-case-insensitive".into(),
                     br.case_insensitive,
                     t("Ignorar maiúsculas/minúsculas", "Case insensitive"),
                     |s| {
@@ -741,11 +753,18 @@ pub fn batch_rename_window_view(s: &State, cx: &mut Cx<State>) -> El {
                         }
                     },
                 ))
-                .child(labeled_check("opt-regex", br.use_regex, t("Usar Regex", "Use Regex"), |s| {
-                    if let Some(br) = &mut s.batch_rename {
-                        br.use_regex = !br.use_regex;
-                    }
-                }));
+                .child(crate::rules_ui::instant_checkbox(
+                    &k,
+                    accent_bg,
+                    "opt-regex".into(),
+                    br.use_regex,
+                    t("Usar Regex", "Use Regex"),
+                    |s| {
+                        if let Some(br) = &mut s.batch_rename {
+                            br.use_regex = !br.use_regex;
+                        }
+                    },
+                ));
 
             let mut criteria_card = col()
                 .key("criteria-card")
@@ -770,189 +789,63 @@ pub fn batch_rename_window_view(s: &State, cx: &mut Cx<State>) -> El {
                 );
             }
 
-            // Preview table header
-            let table_header = row()
-                .key("preview-header")
-                .w_full()
-                .h(34.0)
-                .px(12.0)
-                .gap(10.0)
-                .center_y()
-                .fill(k.c.surface_raised)
-                .border_sides([0.0, 0.0, 1.0, 0.0], panel_border)
-                .child(check_box(
-                    "toggle-all".into(),
-                    all_checked,
-                    Box::new(move |s: &mut State| {
-                        if let Some(br) = &mut s.batch_rename {
-                            let next = !all_checked;
-                            br.checked.iter_mut().for_each(|c| *c = next);
+            let has_fields = !br.search.text.is_empty() || !br.replace.text.is_empty();
+            let util_bar = crate::rules_ui::shared_util_bar(
+                &k,
+                total,
+                "btn-simple-analyze",
+                total > 0,
+                |s| {
+                    if let Some(b) = &mut s.batch_rename {
+                        let sample = b.items.first().map(|e| shown(&e.name)).unwrap_or_default();
+                        b.simple_analyze_input = TextEdit::new(sample);
+                        b.simple_analyze_open = true;
+                    }
+                },
+                "btn-simple-export",
+                "btn-simple-clear",
+                t("Limpar campos", "Clear fields"),
+                has_fields,
+                |s| {
+                    if let Some(b) = &mut s.batch_rename {
+                        let mut search = TextEdit::new("");
+                        search.focused = true;
+                        b.search = search;
+                        b.replace = TextEdit::new("");
+                    }
+                },
+            );
+
+            let preview_panel = crate::rules_ui::shared_preview_panel(&k, br, &preview, all_checked, panel_bg, panel_border, accent_bg);
+            let footer = crate::rules_ui::shared_footer(
+                &k,
+                br,
+                &preview,
+                preview.can_submit(),
+                preview.regex_error.as_deref(),
+            );
+
+            if br.simple_analyze_open {
+                let steps = br.analyze_simple_sample(&br.simple_analyze_input.text);
+                crate::rules_ui::render_steps_analyze_modal(
+                    &k,
+                    "simple-analyze-modal",
+                    t("Analisar Substituição", "Analyze Replace"),
+                    &br.simple_analyze_input,
+                    |s| match &mut s.batch_rename {
+                        Some(b) => &mut b.simple_analyze_input,
+                        None => &mut s.name_edit,
+                    },
+                    steps,
+                    |s| {
+                        if let Some(b) = &mut s.batch_rename {
+                            b.simple_analyze_open = false;
                         }
-                    }),
-                ))
-                .child(
-                    text(t("Nome atual", "Current name"))
-                        .font(k.ty.text_xsmall_medium)
-                        .color(k.c.text_muted)
-                        .grow(1.0)
-                        .w(0.0)
-                        .min_w(0.0),
-                )
-                .child(el().w(18.0))
-                .child(
-                    text(t("Novo nome", "New name"))
-                        .font(k.ty.text_xsmall_medium)
-                        .color(k.c.text_muted)
-                        .grow(1.0)
-                        .w(0.0)
-                        .min_w(0.0),
+                    },
+                    panel_border,
+                    &mut layer,
                 );
-
-            // Preview table rows
-            let mut rows_col = col().key("preview-rows").w_full();
-            for (i, (item, rp)) in br.items.iter().zip(&preview.rows).enumerate() {
-                let on = br.checked.get(i).copied().unwrap_or(false);
-                let has_err = rp.error.is_some();
-                let is_changed = on && rp.changed;
-
-                let cur_color = if on { k.c.text_base } else { k.c.text_faint };
-                let arrow_color = if has_err {
-                    k.c.danger.fg
-                } else if is_changed {
-                    k.c.text_accent
-                } else {
-                    k.c.text_faint
-                };
-                let next_color = if has_err {
-                    k.c.danger.fg
-                } else if is_changed {
-                    k.c.text_accent
-                } else {
-                    k.c.text_faint
-                };
-                let next_font = if is_changed { k.ty.text_small_medium } else { k.ty.text_small };
-
-                let mut right_cell = row()
-                    .grow(1.0)
-                    .w(0.0)
-                    .min_w(0.0)
-                    .gap(6.0)
-                    .center_y()
-                    .child(text(rp.next.clone()).font(next_font).color(next_color).truncate().shrink().min_w(0.0));
-
-                if let Some(err) = &rp.error {
-                    right_cell = right_cell.child(
-                        row()
-                            .px(6.0)
-                            .py(1.0)
-                            .radius(k.radius.sm)
-                            .fill(k.c.danger.bg)
-                            .child(text(err.clone()).font(k.ty.caption()).color(k.c.danger.fg)),
-                    );
-                }
-
-                let mut r = row()
-                    .key(format!("preview-row-{i}"))
-                    .w_full()
-                    .min_h(32.0)
-                    .px(12.0)
-                    .py(5.0)
-                    .gap(10.0)
-                    .center_y()
-                    .hover_fill(k.c.hover)
-                    .child(check_box(
-                        format!("row-check-{i}"),
-                        on,
-                        Box::new(move |s: &mut State| {
-                            if let Some(c) = s.batch_rename.as_mut().and_then(|b| b.checked.get_mut(i)) {
-                                *c = !*c;
-                            }
-                        }),
-                    ))
-                    .child(
-                        row()
-                            .grow(1.0)
-                            .w(0.0)
-                            .min_w(0.0)
-                            .gap(6.0)
-                            .center_y()
-                            .child(ui::entry_icon(s, &br.loc, item, 15.0))
-                            .child(text(rp.current.clone()).font(k.ty.text_small).color(cur_color).truncate().shrink().min_w(0.0)),
-                    )
-                    .child(row().w(18.0).center().child(text("→").font(k.ty.text_small).color(arrow_color)))
-                    .child(right_cell);
-
-                if i + 1 < total {
-                    r = r.border_sides([0.0, 0.0, 1.0, 0.0], panel_border);
-                }
-                rows_col = rows_col.child(r);
             }
-
-            let bar = ui::bar_style(&k);
-            let scroll_area = col()
-                .key("preview-scroll")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .scroll(ScrollSpec { stick_bottom: false })
-                .child(rows_col)
-                .scroll_bar_styled(bar);
-
-            let preview_card = col()
-                .key("preview-card")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .radius(k.radius.md)
-                .fill(panel_bg)
-                .border(1.0, panel_border)
-                .child(table_header)
-                .child(scroll_area);
-
-            let (status_text, status_color) = if preview.error_count > 0 {
-                let msg = if preview.error_count == 1 {
-                    t("1 item com conflito ou nome inválido.", "1 item has a conflict or invalid name.").into()
-                } else {
-                    tr!("{} itens com conflito ou nome inválido.", "{} items have conflicts or invalid names.", preview.error_count)
-                };
-                (msg, k.c.danger.fg)
-            } else if preview.changed_count > 0 {
-                let msg = if preview.changed_count == 1 {
-                    tr!("1 de {total} itens será renomeado.", "1 of {total} items will be renamed.")
-                } else {
-                    tr!("{} de {total} itens serão renomeados.", "{} of {total} items will be renamed.", preview.changed_count)
-                };
-                (msg, k.c.text_muted)
-            } else if br.search.text.is_empty() {
-                (t("Digite um termo para visualizar as alterações.", "Type a search term to preview changes.").into(), k.c.text_faint)
-            } else {
-                (t("Nenhuma ocorrência encontrada.", "No matches found.").into(), k.c.text_muted)
-            };
-
-            let can_submit = preview.can_submit();
-            let submit_label = if preview.changed_count > 0 && can_submit {
-                tr!("Renomear ({})", "Rename ({})", preview.changed_count)
-            } else {
-                t("Renomear", "Rename").into()
-            };
-
-            let footer = row()
-                .key("actions")
-                .w_full()
-                .pt(4.0)
-                .gap(8.0)
-                .center_y()
-                .child(text(status_text).font(k.ty.text_xsmall).color(status_color).grow(1.0).min_w(0.0).truncate())
-                .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close_window).build(&k).cursor(Cursor::Pointer))
-                .child(
-                    Button::new(submit_label)
-                        .variant(ButtonVariant::Submit)
-                        .disabled(!can_submit)
-                        .on_press(submit)
-                        .build(&k)
-                        .default_button()
-                        .cursor(Cursor::Pointer),
-                );
 
             col()
                 .key("content")
@@ -961,14 +854,17 @@ pub fn batch_rename_window_view(s: &State, cx: &mut Cx<State>) -> El {
                 .min_h(0.0)
                 .px(16.0)
                 .pt(6.0)
-                .pb(16.0)
-                .gap(10.0)
+                .pb(14.0)
+                .gap(8.0)
+                .motion(Spring::NONE)
+                .instant_changes()
                 .child(mode_tabs)
                 .child(criteria_card)
-                .child(preview_card)
+                .child(util_bar)
+                .child(preview_panel)
                 .child(footer)
         }
-        Mode::Media => media_workspace(s, &k, br, &preview, all_checked, panel_bg, panel_border, accent_bg, accent_hover, mode_tabs, &mut layer),
+        Mode::Media => media_workspace(s, &k, br, &preview, all_checked, panel_bg, panel_border, accent_bg, mode_tabs, &mut layer),
         Mode::Rules => crate::rules_ui::rules_workspace(s, &k, br, &preview, all_checked, panel_bg, panel_border, accent_bg, mode_tabs, &mut layer),
     };
 
@@ -984,21 +880,10 @@ pub fn batch_rename_window_view(s: &State, cx: &mut Cx<State>) -> El {
     rune_kit::root(root, layer)
 }
 
-/// Splits a filename into `(stem, extension_without_dot)` for FileBot-style extension badges.
-fn split_ext_badge(name: &str, is_dir: bool) -> (&str, Option<&str>) {
-    if is_dir {
-        return (name, None);
-    }
-    match name.rfind('.') {
-        Some(i) if i > 0 && i + 1 < name.len() => (&name[..i], Some(&name[i + 1..])),
-        _ => (name, None),
-    }
-}
-
-/// Renders the FileBot-inspired dual-pane "Mídia · TMDB / TVDB" workspace:
-/// Left pane ("Arquivos originais") | Center ("Match" + "Renomear") | Right pane ("Novos nomes"),
-/// with a clean bottom bar ("Presets ▾", "Preferências ▾", active match pill) and floating
-/// submenus/modals so zero configuration clutter sits on the main screen.
+/// Renders the ReNamer-consistent "Mídia · TMDB / TVDB" workspace:
+/// Top action toolbar (Match, Buscar título, Presets, Editar formato, Preferências),
+/// compact Match & Format summary panel, shared utility bar (Analisar, Copiar prévia, Limpar match),
+/// resizable 4-column preview grid (Estado | Nome | Novo Nome | Erro), and unified footer.
 #[allow(clippy::too_many_arguments)]
 fn media_workspace(
     s: &State,
@@ -1009,136 +894,14 @@ fn media_workspace(
     panel_bg: Color,
     panel_border: Color,
     accent_bg: Color,
-    accent_hover: Color,
     mode_tabs: El,
     layer: &mut Vec<El>,
 ) -> El {
     let m = &br.media;
     let total = br.items.len();
-
-    let ext_badge = |ext: &str, muted: bool| -> El {
-        let bg = if muted {
-            k.alpha(k.c.text_base, 0.08)
-        } else if k.dark {
-            rune::oklch(0.68, 0.14, 78.0)
-        } else {
-            rune::oklch(0.74, 0.15, 78.0)
-        };
-        let fg = if muted { k.c.text_faint } else { rune::oklch(0.18, 0.03, 75.0) };
-        row()
-            .px(6.0)
-            .py(1.5)
-            .radius(4.0)
-            .fill(bg)
-            .child(text(ext.to_lowercase()).font(k.ty.caption()).color(fg))
-    };
-
-    let check_box = |key: String, checked: bool, on_click: Box<dyn Fn(&mut State) + 'static>| -> El {
-        let mut b = row()
-            .key(key)
-            .role("checkbox")
-            .size(16.0, 16.0)
-            .center()
-            .radius(4.0)
-            .cursor(Cursor::Pointer)
-            .instant_changes()
-            .hover_motion(Anim::INSTANT, Anim::INSTANT)
-            .transition_motion(Anim::INSTANT, Anim::INSTANT)
-            .on_press(move |s: &mut State| on_click(s));
-        if checked {
-            b = b
-                .fill(accent_bg)
-                .hover_fill(accent_hover)
-                .border(1.5, accent_bg)
-                .child(icon(k.glyph.check, 11.0).color(Color::WHITE).instant_changes().transition_motion(Anim::INSTANT, Anim::INSTANT));
-        } else {
-            let off_fill = if k.dark { k.alpha(Color::WHITE, 0.06) } else { k.c.bg_base };
-            let off_border = if k.dark { k.alpha(Color::WHITE, 0.38) } else { k.c.border_strong };
-            b = b.fill(off_fill).hover_fill(k.c.hover).border(1.5, off_border);
-        }
-        b
-    };
-
-    // --- Left Pane: Arquivos originais ---
-    let left_header = row()
-        .key("media-left-header")
-        .w_full()
-        .h(34.0)
-        .px(12.0)
-        .gap(8.0)
-        .center_y()
-        .fill(k.c.surface_raised)
-        .border_sides([0.0, 0.0, 1.0, 0.0], panel_border)
-        .child(check_box(
-            "media-toggle-all".into(),
-            all_checked,
-            Box::new(move |s: &mut State| {
-                if let Some(br) = &mut s.batch_rename {
-                    let next = !all_checked;
-                    br.checked.iter_mut().for_each(|c| *c = next);
-                }
-            }),
-        ))
-        .child(text(t("Arquivos originais", "Original Files")).font(k.ty.text_xsmall_medium).color(k.c.text_muted).grow(1.0))
-        .child(text(format!("{total}")).font(k.ty.caption()).color(k.c.text_faint));
-
-    let mut left_rows = col().key("media-left-rows").w_full();
-    for (i, (item, rp)) in br.items.iter().zip(&preview.rows).enumerate() {
-        let on = br.checked.get(i).copied().unwrap_or(false);
-        let (stem, ext) = split_ext_badge(&rp.current, item.is_dir);
-        let mut r = row()
-            .key(format!("media-orig-{i}"))
-            .w_full()
-            .min_h(32.0)
-            .px(10.0)
-            .py(4.0)
-            .gap(8.0)
-            .center_y()
-            .hover_fill(k.c.hover)
-            .child(check_box(
-                format!("media-chk-{i}"),
-                on,
-                Box::new(move |s: &mut State| {
-                    if let Some(c) = s.batch_rename.as_mut().and_then(|b| b.checked.get_mut(i)) {
-                        *c = !*c;
-                    }
-                }),
-            ))
-            .child(text(stem.to_string()).font(k.ty.text_small).color(if on { k.c.text_base } else { k.c.text_faint }).truncate().grow(1.0).w(0.0).min_w(0.0));
-        if let Some(e) = ext {
-            r = r.child(ext_badge(e, !on));
-        }
-        if i + 1 < total {
-            r = r.border_sides([0.0, 0.0, 1.0, 0.0], panel_border);
-        }
-        left_rows = left_rows.child(r);
-    }
-
-    let left_pane = col()
-        .key("media-left-pane")
-        .grow(1.0)
-        .w(0.0)
-        .h_full()
-        .min_w(0.0)
-        .min_h(0.0)
-        .radius(k.radius.md)
-        .fill(panel_bg)
-        .border(1.0, panel_border)
-        .child(left_header)
-        .child(
-            col()
-                .key("media-left-scroll")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .scroll(ScrollSpec { stick_bottom: false })
-                .child(left_rows)
-                .scroll_bar_styled(ui::bar_style(k)),
-        );
-
-    // --- Center Column: Match + Renomear (FileBot-style) ---
     let busy = m.searching || m.loading_episodes;
     let can_submit = preview.can_submit() && !busy;
+    let has_any_key = !m.keys.tmdb.is_empty() || !m.keys.tvdb.is_empty();
 
     let match_btn_label = if m.searching {
         t("Buscando…", "Matching…")
@@ -1148,269 +911,229 @@ fn media_workspace(
         "Match"
     };
 
-    let center_match = col()
-        .key("center-match")
-        .role("button")
-        .w(104.0)
-        .h(58.0)
-        .gap(5.0)
-        .center()
-        .radius(k.radius.md)
-        .fill(panel_bg)
-        .hover_fill(k.c.hover)
-        .border(1.0, k.c.border_base)
-        .cursor(Cursor::Pointer)
-        .on_press(|s: &mut State| {
-            if let Some(b) = &mut s.batch_rename {
-                b.media.popup = Some(MediaPopup::MatchMenu);
-            }
-        })
-        .child(row().w_full().center().child(icon(&icons::SEARCH, 16.0).color(k.c.text_accent)))
-        .child(row().w_full().center().child(text(match_btn_label).font(k.ty.text_xsmall_medium).color(k.c.text_base)));
-
-    let rename_label = if preview.changed_count > 0 && can_submit {
-        tr!("Renomear ({})", "Rename ({})", preview.changed_count)
-    } else {
-        t("Renomear", "Rename").into()
-    };
-
-    let mut center_rename = col()
-        .key("center-rename")
-        .role("button")
-        .w(104.0)
-        .h(58.0)
-        .gap(5.0)
-        .center()
-        .radius(k.radius.md);
-    if can_submit {
-        center_rename = center_rename
-            .fill(accent_bg)
-            .hover_fill(accent_hover)
-            .border(1.0, accent_bg)
-            .cursor(Cursor::Pointer)
-            .default_button()
-            .on_press(submit)
-            .child(row().w_full().center().child(icon(&icons::M_RENAME, 16.0).color(Color::WHITE)))
-            .child(row().w_full().center().child(text(rename_label).font(k.ty.text_xsmall_medium).color(Color::WHITE)));
-    } else {
-        center_rename = center_rename
-            .fill(k.alpha(k.c.text_base, if k.dark { 0.06 } else { 0.05 }))
-            .border(1.0, panel_border)
-            .child(row().w_full().center().child(icon(&icons::M_RENAME, 16.0).color(k.c.text_faint)))
-            .child(row().w_full().center().child(text(rename_label).font(k.ty.text_xsmall_medium).color(k.c.text_faint)));
-    }
-
-    let center_col = col()
-        .key("media-center")
-        .w(112.0)
-        .h_full()
-        .center()
-        .gap(12.0)
-        .child(center_match)
-        .child(center_rename);
-
-    // --- Right Pane: Novos nomes ---
-    let right_header = row()
-        .key("media-right-header")
+    let media_toolbar = row()
+        .key("media-toolbar")
         .w_full()
-        .h(34.0)
-        .px(12.0)
+        .gap(6.0)
+        .center_y()
+        .child(
+            row()
+                .key("btn-media-match")
+                .role("button")
+                .h(28.0)
+                .px(10.0)
+                .gap(5.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .fill(k.alpha(k.c.text_accent, if k.dark { 0.20 } else { 0.12 }))
+                .hover_fill(k.alpha(k.c.text_accent, if k.dark { 0.28 } else { 0.18 }))
+                .border(1.0, k.alpha(k.c.text_accent, 0.45))
+                .cursor(Cursor::Pointer)
+                .on_press(|s: &mut State| {
+                    if let Some(b) = &mut s.batch_rename {
+                        b.media.popup = Some(MediaPopup::MatchMenu);
+                    }
+                })
+                .child(icon(&icons::SEARCH, 12.0).color(k.c.text_accent))
+                .child(text(match_btn_label).font(k.ty.text_xsmall_medium).color(k.c.text_accent)),
+        )
+        .child(crate::rules_ui::tool_btn(k, "btn-media-pick", t("Buscar título…", "Pick title…"), !busy, |s| {
+            if let Some(b) = &mut s.batch_rename {
+                b.media.popup = Some(MediaPopup::SelectMatch);
+            }
+        }))
+        .child(crate::rules_ui::tool_btn(k, "btn-media-presets", t("Presets", "Presets"), true, |s| {
+            if let Some(b) = &mut s.batch_rename {
+                b.media.popup = Some(MediaPopup::PresetsMenu);
+            }
+        }))
+        .child(crate::rules_ui::tool_btn(k, "btn-media-format", t("Editar formato", "Edit format"), true, |s| {
+            if let Some(b) = &mut s.batch_rename {
+                b.media.popup = Some(MediaPopup::EditFormat);
+            }
+        }))
+        .child(el().grow(1.0))
+        .child(
+            row()
+                .key("media-prefs-btn")
+                .role("button")
+                .h(28.0)
+                .px(10.0)
+                .gap(6.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .fill(k.c.surface_raised)
+                .hover_fill(k.c.hover)
+                .border(1.0, k.c.border_weak)
+                .cursor(Cursor::Pointer)
+                .on_press(|s: &mut State| {
+                    if let Some(b) = &mut s.batch_rename {
+                        b.media.popup = Some(MediaPopup::Preferences);
+                    }
+                })
+                .child(el().size(6.0, 6.0).radius(3.0).fill(if has_any_key { k.c.success.fg } else { k.c.warning.fg }))
+                .child(text(t("Preferências", "Preferences")).font(k.ty.text_xsmall_medium).color(k.c.text_base)),
+        );
+
+    let cfg_summary = format!(
+        "{} · {} · {} · {} · {}",
+        m.source.label(),
+        m.kind.label(),
+        m.order.label(),
+        m.lang.label(),
+        m.match_mode.label(),
+    );
+
+    let panel_header = row()
+        .key("media-panel-header")
+        .w_full()
+        .h(28.0)
+        .px(10.0)
         .gap(8.0)
         .center_y()
         .fill(k.c.surface_raised)
         .border_sides([0.0, 0.0, 1.0, 0.0], panel_border)
-        .child(text(t("Novos nomes", "New Names")).font(k.ty.text_xsmall_medium).color(k.c.text_muted).grow(1.0))
-        .child(
-            text(if preview.changed_count > 0 {
-                tr!("{} prontos", "{} ready", preview.changed_count)
-            } else {
-                String::new()
-            })
-            .font(k.ty.caption())
-            .color(k.c.text_accent),
-        );
+        .child(text(t("Correspondência & Formato", "Match & Format")).font(k.ty.text_xsmall_medium).color(k.c.text_muted))
+        .child(el().grow(1.0))
+        .child(text(cfg_summary).font(k.ty.caption()).color(k.c.text_faint).truncate());
 
-    let has_match = m.active_candidate().is_some();
-    let right_body: El = if !has_match {
-        col()
-            .key("media-right-empty")
-            .w_full()
-            .grow(1.0)
-            .center()
-            .padding(24.0)
-            .gap(6.0)
-            .child(icon(&icons::SEARCH, 22.0).color(k.c.text_faint))
-            .child(
-                text(t("Clique em Match para identificar no TMDB ou TVDB", "Click Match to identify via TMDB or TVDB"))
-                    .font(k.ty.text_small)
-                    .color(k.c.text_muted),
-            )
-            .child(
-                text(tr!("Detectado: \"{}\"", "Detected: \"{}\"", m.query.text))
-                    .font(k.ty.caption())
-                    .color(k.c.text_faint),
-            )
-    } else {
-        let mut right_rows = col().key("media-right-rows").w_full();
-        for (i, (item, rp)) in br.items.iter().zip(&preview.rows).enumerate() {
-            let on = br.checked.get(i).copied().unwrap_or(false);
-            let has_err = rp.error.is_some();
-            let is_changed = on && rp.changed;
-            let (stem, ext) = split_ext_badge(&rp.next, item.is_dir);
-            let color = if has_err {
-                k.c.danger.fg
-            } else if is_changed {
-                k.c.text_accent
-            } else {
-                k.c.text_faint
-            };
-            let font = if is_changed { k.ty.text_small_medium } else { k.ty.text_small };
-
-            let mut r = row()
-                .key(format!("media-new-{i}"))
-                .w_full()
-                .min_h(32.0)
-                .px(12.0)
-                .py(4.0)
-                .gap(8.0)
-                .center_y()
-                .hover_fill(k.c.hover)
-                .child(text(stem.to_string()).font(font).color(color).truncate().grow(1.0).w(0.0).min_w(0.0));
-
-            if let Some(err) = &rp.error {
-                r = r.child(
-                    row()
-                        .px(6.0)
-                        .py(1.0)
-                        .radius(k.radius.sm)
-                        .fill(k.c.danger.bg)
-                        .child(text(err.clone()).font(k.ty.caption()).color(k.c.danger.fg)),
-                );
-            } else if let Some(e) = ext {
-                r = r.child(ext_badge(e, !is_changed));
-            }
-            if i + 1 < total {
-                r = r.border_sides([0.0, 0.0, 1.0, 0.0], panel_border);
-            }
-            right_rows = right_rows.child(r);
-        }
-        col()
-            .key("media-right-scroll")
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .scroll(ScrollSpec { stick_bottom: false })
-            .child(right_rows)
-            .scroll_bar_styled(ui::bar_style(k))
-    };
-
-    let right_pane = col()
-        .key("media-right-pane")
-        .grow(1.0)
-        .w(0.0)
-        .h_full()
-        .min_w(0.0)
-        .min_h(0.0)
-        .radius(k.radius.md)
-        .fill(panel_bg)
-        .border(1.0, panel_border)
-        .child(right_header)
-        .child(right_body);
-
-    let dual_panes = row()
-        .key("media-dual-panes")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .gap(8.0)
-        .child(left_pane)
-        .child(center_col)
-        .child(right_pane);
-
-    // --- Compact Bottom Toolbar ---
-    let has_any_key = !m.keys.tmdb.is_empty() || !m.keys.tvdb.is_empty();
-    let presets_btn = Button::new(t("Presets ▾", "Presets ▾"))
-        .variant(ButtonVariant::Neutral)
-        .on_press(|s: &mut State| {
-            if let Some(b) = &mut s.batch_rename {
-                b.media.popup = Some(MediaPopup::PresetsMenu);
-            }
-        })
-        .build(k)
-        .cursor(Cursor::Pointer);
-
-    let prefs_btn = row()
-        .key("media-prefs-btn")
-        .role("button")
-        .h(30.0)
-        .px(10.0)
-        .gap(6.0)
-        .center_y()
-        .radius(k.radius.sm)
-        .fill(k.c.bg_button_neutral)
-        .hover_fill(k.c.hover)
-        .border(1.0, panel_border)
-        .cursor(Cursor::Pointer)
-        .on_press(|s: &mut State| {
-            if let Some(b) = &mut s.batch_rename {
-                b.media.popup = Some(MediaPopup::Preferences);
-            }
-        })
-        .child(el().size(6.0, 6.0).radius(3.0).fill(if has_any_key { k.c.success.fg } else { k.c.warning.fg }))
-        .child(text(t("Preferências", "Preferences")).font(k.ty.text_xsmall_medium).color(k.c.text_base));
-
-    let mut bottom_bar = row()
-        .key("media-bottom-bar")
-        .w_full()
-        .pt(2.0)
-        .gap(8.0)
-        .center_y()
-        .child(presets_btn)
-        .child(prefs_btn);
-
-    if let Some(cand) = m.active_candidate() {
+    let panel_body: El = if let Some(cand) = m.active_candidate() {
         let thumb: El = match cand.poster_url.as_deref().and_then(|u| s.posters.get(u)) {
-            Some(img) => el().size(18.0, 26.0).radius(2.0).pixels(img.pixels()),
-            None => icon(&icons::VIDEO, 14.0).color(k.c.text_accent),
+            Some(img) => el().size(32.0, 48.0).radius(3.0).pixels(img.pixels()),
+            None => row()
+                .size(32.0, 48.0)
+                .radius(3.0)
+                .center()
+                .fill(k.c.surface_raised)
+                .border(1.0, k.c.border_weak)
+                .child(icon(&icons::VIDEO, 15.0).color(k.c.text_accent)),
         };
-        let label = match cand.year {
+        let title_str = match cand.year {
             Some(y) => format!("{} ({y})", cand.title),
             None => cand.title.clone(),
         };
-        let match_pill = row()
-            .key("active-match-pill")
-            .role("button")
-            .h(30.0)
-            .px(8.0)
-            .gap(6.0)
+        let ep_info = if m.loading_episodes {
+            t("Carregando lista de episódios…", "Loading episode list…").to_string()
+        } else if cand.kind == MediaKind::Series {
+            tr!(
+                "Formato: {} · {} episódios carregados",
+                "Format: {} · {} episodes loaded",
+                m.format.text,
+                m.episodes.len()
+            )
+        } else {
+            tr!("Formato: {}", "Format: {}", m.format.text)
+        };
+        let mut info_col = col()
+            .grow(1.0)
+            .w(0.0)
+            .min_w(0.0)
+            .gap(3.0)
+            .child(text(title_str).font(k.ty.text_small_medium).color(k.c.text_accent).w_full().min_w(0.0).truncate())
+            .child(text(ep_info).font(k.ty.caption()).color(k.c.text_muted).w_full().min_w(0.0).truncate());
+        if let Some(err) = &m.error {
+            info_col = info_col.child(text(err.clone()).font(k.ty.caption()).color(k.c.danger.fg).w_full().min_w(0.0).truncate());
+        }
+        row()
+            .key("media-active-match")
+            .w_full()
+            .min_h(72.0)
+            .px(12.0)
+            .py(8.0)
+            .gap(12.0)
             .center_y()
-            .radius(k.radius.sm)
-            .fill(k.alpha(k.c.text_accent, if k.dark { 0.16 } else { 0.09 }))
-            .hover_fill(k.alpha(k.c.text_accent, if k.dark { 0.24 } else { 0.14 }))
-            .border(1.0, k.alpha(k.c.text_accent, 0.35))
-            .cursor(Cursor::Pointer)
-            .on_press(|s: &mut State| {
+            .child(thumb)
+            .child(info_col)
+            .child(crate::rules_ui::tool_btn(k, "btn-media-change", t("Trocar…", "Change…"), true, |s| {
                 if let Some(b) = &mut s.batch_rename {
                     b.media.popup = Some(MediaPopup::SelectMatch);
                 }
-            })
-            .child(thumb)
-            .child(text(label).font(k.ty.text_xsmall_medium).color(k.c.text_accent).truncate())
-            .child(text(t("· Trocar…", "· Change…")).font(k.ty.caption()).color(k.c.text_muted));
-        bottom_bar = bottom_bar.child(match_pill);
-    }
-
-    let status_el = if let Some(err) = &m.error {
-        text(err.clone()).font(k.ty.caption()).color(k.c.danger.fg).truncate().grow(1.0).min_w(0.0)
-    } else if preview.error_count > 0 {
-        text(tr!("{} conflito(s)", "{} conflict(s)", preview.error_count)).font(k.ty.caption()).color(k.c.danger.fg).grow(1.0)
+            }))
     } else {
-        el().grow(1.0)
+        let mut inner = col()
+            .gap(3.0)
+            .items_center()
+            .child(
+                row()
+                    .gap(6.0)
+                    .center_y()
+                    .child(icon(&icons::SEARCH, 14.0).color(k.c.text_accent))
+                    .child(
+                        text(t(
+                            "Clique aqui ou em Match para identificar no TMDB ou TVDB",
+                            "Click here or Match to identify via TMDB or TVDB",
+                        ))
+                        .font(k.ty.body_medium)
+                        .color(k.c.text_muted),
+                    ),
+            )
+            .child(
+                text(tr!(
+                    "Detectado: \"{}\" · Formato: {}",
+                    "Detected: \"{}\" · Format: {}",
+                    m.query.text,
+                    m.format.text
+                ))
+                .font(k.ty.caption())
+                .color(k.c.text_faint),
+            );
+        if let Some(err) = &m.error {
+            inner = inner.child(text(err.clone()).font(k.ty.caption()).color(k.c.danger.fg));
+        }
+        row()
+            .key("media-empty-click")
+            .role("button")
+            .w_full()
+            .min_h(72.0)
+            .px(14.0)
+            .py(8.0)
+            .center()
+            .cursor(Cursor::Pointer)
+            .hover_fill(k.c.hover)
+            .on_press(|s: &mut State| {
+                if let Some(b) = &mut s.batch_rename {
+                    b.media.popup = Some(MediaPopup::MatchMenu);
+                }
+            })
+            .child(inner)
     };
 
-    bottom_bar = bottom_bar
-        .child(status_el)
-        .child(Button::new(t("Cancelar", "Cancel")).variant(ButtonVariant::Neutral).on_press(close_window).build(k).cursor(Cursor::Pointer));
+    let media_panel = col()
+        .key("media-summary-panel")
+        .w_full()
+        .radius(k.radius.md)
+        .fill(panel_bg)
+        .border(1.0, panel_border)
+        .clip_soft(0.0)
+        .child(panel_header)
+        .child(panel_body);
+
+    let can_clear = m.selected.is_some() || !m.candidates.is_empty() || m.error.is_some();
+    let util_bar = crate::rules_ui::shared_util_bar(
+        k,
+        total,
+        "btn-media-analyze",
+        total > 0,
+        |s| {
+            if let Some(b) = &mut s.batch_rename {
+                let sample = b.items.first().map(|e| shown(&e.name)).unwrap_or_default();
+                b.media.analyze_input = TextEdit::new(sample);
+                b.media.popup = Some(MediaPopup::Analyze);
+            }
+        },
+        "btn-media-export",
+        "btn-media-clear",
+        t("Limpar match", "Clear match"),
+        can_clear,
+        |s| {
+            if let Some(b) = &mut s.batch_rename {
+                b.media.clear_match();
+            }
+        },
+    );
+
+    let preview_panel = crate::rules_ui::shared_preview_panel(k, br, preview, all_checked, panel_bg, panel_border, accent_bg);
+    let footer = crate::rules_ui::shared_footer(k, br, preview, can_submit, m.error.as_deref());
 
     // Render any open submenu / modal in the overlay layer.
     if let Some(popup) = m.popup {
@@ -1425,10 +1148,15 @@ fn media_workspace(
         .px(16.0)
         .pt(6.0)
         .pb(14.0)
-        .gap(10.0)
+        .gap(8.0)
+        .motion(Spring::NONE)
+        .instant_changes()
         .child(mode_tabs)
-        .child(dual_panes)
-        .child(bottom_bar)
+        .child(media_toolbar)
+        .child(media_panel)
+        .child(util_bar)
+        .child(preview_panel)
+        .child(footer)
 }
 
 fn close_popup(s: &mut State) {
@@ -1662,16 +1390,19 @@ fn render_media_popup(s: &State, k: &rune_kit::Kit, br: &BatchRename, popup: Med
                 .build(k, layer);
         }
         MediaPopup::EditFormat => {
-            let input = rune_kit::TextInput::new(&m.format)
-                .width(None)
-                .label(t("Formato", "Format"))
-                .placeholder("{n} - {s00e00} - {t}")
-                .on_edit(|s: &mut State| match &mut s.batch_rename {
+            let input = crate::rules_ui::field_box(
+                k,
+                t("Formato", "Format"),
+                "{n} - {s00e00} - {t}",
+                None,
+                false,
+                &m.format,
+                |s: &mut State| match &mut s.batch_rename {
                     Some(b) => &mut b.media.format,
                     None => &mut s.name_edit,
-                })
-                .on_submit(|s: &mut State, _: &mut Tx| close_popup(s))
-                .build(k);
+                },
+                Some(|s: &mut State, _: &mut Tx| close_popup(s)),
+            );
 
             let tokens = text(t(
                 "Tokens: {n} título · {y} ano · {ny} título (ano) · {s00e00} S01E01 · {sxe} 1x01 · {s} temp · {e00} ep · {t} título do episódio · {abs} absoluto",
@@ -1817,27 +1548,33 @@ fn render_media_popup(s: &State, k: &rune_kit::Kit, br: &BatchRename, popup: Med
                     )
             };
 
-            let tmdb_in = rune_kit::TextInput::new(&m.tmdb_key_edit)
-                .width(None)
-                .label("TMDB API Key")
-                .placeholder(t("API Key v3 ou Read Access Token…", "v3 API Key or Read Access Token…"))
-                .on_edit(|s: &mut State| match &mut s.batch_rename {
+            let tmdb_in = crate::rules_ui::field_box(
+                k,
+                "TMDB API Key",
+                t("API Key v3 ou Read Access Token…", "v3 API Key or Read Access Token…"),
+                None,
+                false,
+                &m.tmdb_key_edit,
+                |s: &mut State| match &mut s.batch_rename {
                     Some(b) => &mut b.media.tmdb_key_edit,
                     None => &mut s.name_edit,
-                })
-                .on_submit(|s: &mut State, _: &mut Tx| media_rename::save_keys(s))
-                .build(k);
+                },
+                Some(|s: &mut State, _: &mut Tx| media_rename::save_keys(s)),
+            );
 
-            let tvdb_in = rune_kit::TextInput::new(&m.tvdb_key_edit)
-                .width(None)
-                .label("TVDB API Key")
-                .placeholder(t("TVDB v4 API Key…", "TVDB v4 API Key…"))
-                .on_edit(|s: &mut State| match &mut s.batch_rename {
+            let tvdb_in = crate::rules_ui::field_box(
+                k,
+                "TVDB API Key",
+                t("TVDB v4 API Key…", "TVDB v4 API Key…"),
+                None,
+                false,
+                &m.tvdb_key_edit,
+                |s: &mut State| match &mut s.batch_rename {
                     Some(b) => &mut b.media.tvdb_key_edit,
                     None => &mut s.name_edit,
-                })
-                .on_submit(|s: &mut State, _: &mut Tx| media_rename::save_keys(s))
-                .build(k);
+                },
+                Some(|s: &mut State, _: &mut Tx| media_rename::save_keys(s)),
+            );
 
             let keys_card = card_box("pref-keys-card")
                 .child(
@@ -2039,17 +1776,19 @@ fn render_media_popup(s: &State, k: &rune_kit::Kit, br: &BatchRename, popup: Med
             }
         }
         MediaPopup::SelectMatch => {
-            let query_input = rune_kit::TextInput::new(&m.query)
-                .width(None)
-                .label(t("Título", "Title"))
-                .leading_icon(&icons::SEARCH)
-                .placeholder(t("Digite o nome da série, anime ou filme…", "Type the series, anime or movie title…"))
-                .on_edit(|s: &mut State| match &mut s.batch_rename {
+            let query_input = crate::rules_ui::field_box(
+                k,
+                t("Título", "Title"),
+                t("Digite o nome da série, anime ou filme…", "Type the series, anime or movie title…"),
+                Some(&icons::SEARCH),
+                false,
+                &m.query,
+                |s: &mut State| match &mut s.batch_rename {
                     Some(b) => &mut b.media.query,
                     None => &mut s.name_edit,
-                })
-                .on_submit(|s: &mut State, _: &mut Tx| media_rename::start_search(s))
-                .build(k);
+                },
+                Some(|s: &mut State, _: &mut Tx| media_rename::start_search(s)),
+            );
 
             let search_bar = row()
                 .w_full()
@@ -2226,6 +1965,23 @@ fn render_media_popup(s: &State, k: &rune_kit::Kit, br: &BatchRename, popup: Med
                 .on_close(close_popup)
                 .build(k, layer);
         }
+        MediaPopup::Analyze => {
+            let steps = m.analyze_sample(&m.analyze_input.text, &br.loc);
+            crate::rules_ui::render_steps_analyze_modal(
+                k,
+                "media-analyze-modal",
+                t("Analisar Mídia", "Analyze Media"),
+                &m.analyze_input,
+                |s| match &mut s.batch_rename {
+                    Some(b) => &mut b.media.analyze_input,
+                    None => &mut s.name_edit,
+                },
+                steps,
+                close_popup,
+                panel_border,
+                layer,
+            );
+        }
     }
 }
 
@@ -2378,5 +2134,25 @@ mod tests {
         assert_eq!(std::fs::read(&b).unwrap(), b"from-a");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn simple_and_media_analyzers_produce_trace_steps() {
+        let mut br = local_br(&["Avatar - S01E01 - No horizonte.mkv"], &[]);
+        br.search = TextEdit::new("S01");
+        br.replace = TextEdit::new("Temporada 1 ");
+        let steps = br.analyze_simple_sample("Avatar - S01E01 - No horizonte.mkv");
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[2].1, "Avatar - Temporada 1 E01 - No horizonte.mkv");
+        assert!(steps[2].2.is_none());
+
+        let m_steps = br.media.analyze_sample("Avatar - S01E01 - No horizonte.mkv", &br.loc);
+        assert_eq!(m_steps.len(), 4);
+        assert!(m_steps[0].1.contains("S01E01"));
+
+        br.media.error = Some("erro".into());
+        br.media.clear_match();
+        assert!(br.media.error.is_none());
+        assert!(br.media.selected.is_none());
     }
 }
