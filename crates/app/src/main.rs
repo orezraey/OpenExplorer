@@ -2428,9 +2428,9 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             go_up(s, p);
             return true;
         }
-        // Back to the tree beside the files, as in Explorer.
+        // Back to the tree beside the files, as in Explorer. Its ring comes on once focus lands
+        // there (`on_focus_change`), so a hidden tree shows none.
         Key::Tab if ev.mods.shift => {
-            tree::focus(s, p, true);
             tx.focus(ui::tree_key(p), true);
             return true;
         }
@@ -4013,6 +4013,15 @@ mod tests {
         rt.update(|_, tx| tx.focus(pane_key(0), true));
         frames(&mut rt);
         assert!(!ring(&mut rt), "focus moved on to the list");
+        // Shift+Tab from the list with the tree hidden: focus can't go there, so no ring.
+        rt.update(|s, _| s.show_tree[0] = false);
+        frames(&mut rt);
+        let shift_tab = KeyEvent { key: Key::Tab, mods: Mods { shift: true, ..Mods::default() } };
+        rt.update(|s, tx| {
+            key(s, 0, &shift_tab, tx);
+        });
+        frames(&mut rt);
+        assert!(!ring(&mut rt), "the hidden tree never took focus");
     }
 
     /// The hover highlight follows the pointer to the row under it and fades when it leaves the
