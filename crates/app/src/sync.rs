@@ -1522,6 +1522,8 @@ pub enum Answer {
         cancelled: bool,
         /// Files a server dated itself, for want of a way to keep theirs.
         undated: usize,
+        /// Folders left where they were, for something was still in them.
+        kept: usize,
     },
 }
 
@@ -1607,7 +1609,7 @@ pub fn arrived(s: &mut State, ans: Answer) -> bool {
             s.sync.progress_text = tr!("Sincronizando: {done} de {total}…", "Syncing: {done} of {total}…");
             true
         }
-        Answer::SyncFinished { job, ok, failed, cancelled, undated } => {
+        Answer::SyncFinished { job, ok, failed, cancelled, undated, kept } => {
             if s.sync.job_seq != job {
                 return false;
             }
@@ -1635,6 +1637,15 @@ pub fn arrived(s: &mut State, ans: Answer) -> bool {
                 tr!(
                     "{msg} {undated} arquivos ficaram com a data do envio: o servidor não guarda a data original, e a próxima comparação os verá como mais novos.",
                     "{msg} {undated} files took the date they were sent: the server doesn't keep the original date, and the next comparison will see them as newer."
+                )
+            } else {
+                msg
+            };
+            // A folder to delete that still held something stayed, with what it held.
+            let msg = if kept > 0 {
+                tr!(
+                    "{msg} {kept} pastas não foram excluídas: ainda têm itens que esta sincronização não excluiu.",
+                    "{msg} {kept} folders were not deleted: they still hold items this synchronization didn't delete."
                 )
             } else {
                 msg
@@ -2650,7 +2661,8 @@ fn compare_maps(
         let is_dir = l_opt.as_ref().map(|x| x.is_dir).or_else(|| r_opt.as_ref().map(|x| x.is_dir)).unwrap_or(false);
 
         // What the filter leaves out is still a row, for the table to show as filtered: with
-        // no action, so nothing ever copies or deletes it.
+        // no action, so nothing copies or deletes it, and a folder it is in is not deleted
+        // while it is there (see [`delete_item`]).
         let filtered = |rel_path: String, l_opt: Option<ScannedItem>, r_opt: Option<ScannedItem>| CompareRow {
             id: 0,
             pair_index,
@@ -2832,7 +2844,7 @@ pub fn start_sync(s: &mut State) {
                             total: planned.len(),
                         }));
                     }
-                    emit(Msg::Sync(Answer::SyncFinished { job, ok: 0, failed: planned.len(), cancelled: false, undated: 0 }));
+                    emit(Msg::Sync(Answer::SyncFinished { job, ok: 0, failed: planned.len(), cancelled: false, undated: 0, kept: 0 }));
                     return;
                 }
             }
@@ -2851,7 +2863,7 @@ pub fn start_sync(s: &mut State) {
         };
         let total = planned.len();
         let (ok, failed, cancelled) = run_plan(&run, planned, &mut |changes, done| emit(Msg::Sync(Answer::RowStatuses { job, changes, done, total })));
-        emit(Msg::Sync(Answer::SyncFinished { job, ok, failed, cancelled, undated: known.undated.load(Ordering::Relaxed) }));
+        emit(Msg::Sync(Answer::SyncFinished { job, ok, failed, cancelled, undated: known.undated.load(Ordering::Relaxed), kept: known.kept.load(Ordering::Relaxed) }));
     });
 }
 
@@ -2895,7 +2907,9 @@ impl Run<'_> {
         }
     }
 
-    fn one(&self, row: &CompareRow) -> Result<(), String> {
+    /// Does what `row` says. `false` is a folder to delete left where it is, for something
+    /// is still in it.
+    fn one(&self, row: &CompareRow) -> Result<bool, String> {
         catch_panic(t("sincronizar item", "sync item"), || {
             let (left, right) = self.sides(row)?;
             execute_row(row, left, right, self.skip_recycle_bin, self.segmented, self.pool, self.servers, self.drives, self.cancel, self.known)
@@ -2954,14 +2968,14 @@ impl Run<'_> {
     /// Sends the files of `rows` to the Recycle Bin in one request, and says how each ended.
     /// A file that is gone already is done. When the request fails, nothing says which file
     /// it was or how far it went, so each file is then deleted by itself and answers for itself.
-    fn recycle(&self, rows: &[&CompareRow]) -> Vec<Result<(), String>> {
+    fn recycle(&self, rows: &[&CompareRow]) -> Vec<Result<bool, String>> {
         let there: Vec<PathBuf> = rows.iter().filter_map(|row| Some(local_join_rel(self.bin_of(row)?, &row.rel_path))).filter(|path| path.exists()).collect();
         let together = catch_panic(t("mover para a Lixeira", "move to the Recycle Bin"), || match there.is_empty() {
             true => Ok(()),
             false => trash::delete_all(&there).map_err(|e| e.to_string()),
         });
         match together {
-            Ok(()) => rows.iter().map(|_| Ok(())).collect(),
+            Ok(()) => rows.iter().map(|_| Ok(true)).collect(),
             Err(_) => rows.iter().map(|row| self.one(row)).collect(),
         }
     }
@@ -2999,6 +3013,9 @@ const TOLD_EVERY: Duration = Duration::from_millis(40);
 /// are copied, then files are deleted, then folders (the deepest first). The copies of files
 /// go several at a time, each way by its own count, and so do the files sent to the Recycle
 /// Bin, several in a request.
+///
+/// A folder to delete goes only if nothing is left in it once its rows have run; one that
+/// stays ends as skipped, and is counted in `run.known.kept`, not as done nor as failed.
 fn run_plan(run: &Run, planned: Vec<CompareRow>, told: &mut dyn FnMut(Vec<(usize, RowStatus)>, usize)) -> (usize, usize, bool) {
     let depth = |r: &CompareRow| r.rel_path.matches('/').count();
     let copies = |r: &CompareRow| matches!(r.action, SyncAction::CopyRight | SyncAction::CopyLeft);
@@ -3062,7 +3079,12 @@ fn run_plan(run: &Run, planned: Vec<CompareRow>, told: &mut dyn FnMut(Vec<(usize
                             _ => run.recycle(job),
                         };
                         for (row, ended) in job.iter().zip(ended) {
-                            let _ = send.send((row.id, ended.map_or_else(RowStatus::Failed, |()| RowStatus::Done)));
+                            let status = match ended {
+                                Ok(true) => RowStatus::Done,
+                                Ok(false) => RowStatus::Skipped,
+                                Err(e) => RowStatus::Failed(e),
+                            };
+                            let _ = send.send((row.id, status));
                         }
                     }
                 });
@@ -3079,6 +3101,10 @@ fn run_plan(run: &Run, planned: Vec<CompareRow>, told: &mut dyn FnMut(Vec<(usize
                     match &status {
                         RowStatus::Done => (ok, done) = (ok + 1, done + 1),
                         RowStatus::Failed(_) => (failed, done) = (failed + 1, done + 1),
+                        RowStatus::Skipped => {
+                            done += 1;
+                            run.known.kept.fetch_add(1, Ordering::Relaxed);
+                        }
                         _ => {}
                     }
                     waiting.push((id, status));
@@ -3107,7 +3133,7 @@ fn execute_row(
     drives: &HashMap<String, Arc<Drive>>,
     cancel: &AtomicBool,
     known: &Known,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     match row.action {
         SyncAction::CopyRight => copy_item(
             left,
@@ -3122,7 +3148,8 @@ fn execute_row(
             drives,
             cancel,
             known,
-        ),
+        )
+        .map(|()| true),
         SyncAction::CopyLeft => copy_item(
             right,
             left,
@@ -3136,10 +3163,11 @@ fn execute_row(
             drives,
             cancel,
             known,
-        ),
+        )
+        .map(|()| true),
         SyncAction::DeleteRight => delete_item(right, &row.rel_path, row.is_dir, row.right.as_ref(), skip_recycle_bin, pool, servers_list, drives),
         SyncAction::DeleteLeft => delete_item(left, &row.rel_path, row.is_dir, row.left.as_ref(), skip_recycle_bin, pool, servers_list, drives),
-        SyncAction::None => Ok(()),
+        SyncAction::None => Ok(true),
     }
 }
 
@@ -3324,6 +3352,12 @@ fn copy_item(
     Ok(())
 }
 
+/// Deletes a file, or a folder that holds nothing, and says whether it did. A folder with
+/// something still in it stays, and the answer is `false`: what it holds is what this run
+/// didn't delete (a row switched off, an item the filter leaves out, a folder that was never
+/// read, a hidden item not shown, a file that came after the comparison, one whose own deletion
+/// failed), and deleting the folder would take that too. So it is asked of the folder itself,
+/// when its turn comes, not of the rows.
 fn delete_item(
     root: &SyncLocation,
     rel_path: &str,
@@ -3333,30 +3367,50 @@ fn delete_item(
     pool: &Pool,
     servers_list: &[Server],
     drives: &HashMap<String, Arc<Drive>>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     match root {
         SyncLocation::Local(base) => {
             let target = local_join_rel(base, rel_path);
             if !target.exists() {
-                return Ok(());
+                return Ok(true);
             }
-            if !skip_recycle_bin && !crate::network::is_remote(&target) {
+            // A link to a folder goes alone, as it did: what it points to stays.
+            let whole = is_dir && !std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_symlink());
+            if whole && std::fs::read_dir(&target).map_err(|e| e.to_string())?.next().is_some() {
+                return Ok(false);
+            }
+            let gone = if !skip_recycle_bin && !crate::network::is_remote(&target) {
                 trash::delete(&target).map_err(|e| e.to_string())
+            } else if whole {
+                // Not `remove_dir_all`: should something arrive after the look above, this fails.
+                std::fs::remove_dir(&target).map_err(|e| e.to_string())
             } else if is_dir {
                 std::fs::remove_dir_all(&target).map_err(|e| e.to_string())
             } else {
                 std::fs::remove_file(&target).map_err(|e| e.to_string())
-            }
+            };
+            gone.map(|()| true)
         }
-        SyncLocation::Drive { email, .. } => {
+        SyncLocation::Drive { email, shared_drive_id, .. } => {
             let drive = drives
                 .get(email)
                 .ok_or_else(|| tr!("Conta não conectada: {email}", "Account not connected: {email}"))?;
             let id = meta
                 .map(|m| m.id.as_str())
                 .ok_or_else(|| t("ID do arquivo no Drive ausente.", "Missing Drive file ID.").to_string())?;
+            if is_dir {
+                // What is in the bin isn't listed, so the files this run deleted don't count.
+                let mut holds = false;
+                drive.list(id, shared_drive_id.as_deref(), |page, _| {
+                    holds |= !page.is_empty();
+                    !holds
+                })?;
+                if holds {
+                    return Ok(false);
+                }
+            }
             drive.trash(id)?;
-            Ok(())
+            Ok(true)
         }
         SyncLocation::Server { server_id, path, .. } => {
             let server = servers_list
@@ -3364,7 +3418,24 @@ fn delete_item(
                 .find(|sv| sv.id == *server_id)
                 .ok_or_else(|| t("Servidor não encontrado.", "Server not found.").to_string())?;
             let remote = remote_join_rel(server, path, rel_path);
-            servers::with(pool, server, |conn| conn.remove(&remote, is_dir))
+            servers::with(pool, server, |conn| {
+                // A link to a folder goes alone, as it did.
+                if !is_dir || conn.is_link(&remote)? {
+                    return conn.remove(&remote, is_dir).map(|()| true);
+                }
+                // The listing says whether the folder stays. `remove_dir` then takes no folder
+                // with something in it, except on WebDAV, whose DELETE takes all a folder
+                // holds: there the listing is the only check.
+                match conn.list(&remote) {
+                    Ok(items) if !items.is_empty() => Ok(false),
+                    Ok(_) => conn.remove_dir(&remote).map(|()| true),
+                    // Gone already, as a folder of B2 goes with its last file: done.
+                    Err(e) => match conn.stat(&remote) {
+                        Ok(None) => Ok(true),
+                        _ => Err(e),
+                    },
+                }
+            })
         }
     }
 }
@@ -3383,6 +3454,8 @@ struct Known {
     /// Files sent to a server that couldn't keep their date (FTP without MFMT, plain WebDAV):
     /// the next comparison will read them as newer than what they were copied from.
     undated: AtomicUsize,
+    /// Folders to delete that stayed, for something was still in them (see [`delete_item`]).
+    kept: AtomicUsize,
 }
 
 /// Gives the file at `path` the modification time `at`, when there is one.
@@ -4257,6 +4330,165 @@ mod tests {
         // With the Recycle Bin skipped in Opções, no file is asked of it.
         let skipping = Run { skip_recycle_bin: true, ..run };
         assert_eq!(skipping.bin_of(&rows[5]), None);
+    }
+
+    /// A run that deletes folders of the right side under `root`, with the Recycle Bin or
+    /// without it. One that ends with something in it stays, with what it holds, and ends as
+    /// skipped; one that ends empty goes. What a folder is left holding: a file whose row was
+    /// switched off, one the filter leaves out, a folder the filter left unread, a file that
+    /// came after the comparison, and (on Windows, which refuses it) one that couldn't be deleted.
+    fn folders_with_something_left(root: &Path, skip_recycle_bin: bool) {
+        let (left, right) = (root.join("left"), root.join("right"));
+        std::fs::create_dir_all(&left).unwrap();
+        let put = |rel: &str| {
+            let path = local_join_rel(&right, rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        };
+        for rel in ["A/a.txt", "B/b.txt", "B/kept.txt", "C/c.txt", "C/skip.ini", "D/d.txt", "D/Cache/x.bin", "E/Inner/e.txt", "F/f.txt", "G/g.txt", "H/Deep/h.txt", "H/Deep/skip.ini"] {
+            put(rel);
+        }
+        let (left_loc, right_loc) = (SyncLocation::Local(left), SyncLocation::Local(right.clone()));
+        let (pool, drives, cancel) = (Pool::default(), HashMap::new(), AtomicBool::new(false));
+        let mut opts = SyncOptions::default();
+        opts.filter.exclude_patterns = "*.ini\nCache".into();
+        opts.filter.skip_filtered_dirs = true;
+        let (l, r) = scan_both(&left_loc, &right_loc, &opts.filter, true, &pool, &[], &drives, &cancel, &|_| {}).unwrap();
+        let (mut rows, _) = compare_maps(0, &left_loc, &right_loc, l, r, &opts, SystemTime::now(), &cancel, &|_, _| {});
+        rows.iter_mut().enumerate().for_each(|(i, r)| r.id = i);
+        let row = |path: &str| rows.iter().find(|r| r.rel_path == path).unwrap_or_else(|| panic!("no row for {path}"));
+        assert_eq!((row("C/skip.ini").action, &row("C/skip.ini").status), (SyncAction::None, &RowStatus::Filtered));
+        assert!(rows.iter().all(|r| r.rel_path != "D/Cache/x.bin"), "the folder left out is not read");
+        for folder in ["A", "B", "C", "D", "E", "E/Inner", "F", "G", "H", "H/Deep"] {
+            assert_eq!(row(folder).action, SyncAction::DeleteRight, "{folder}");
+        }
+        // B/kept.txt is switched off in the table: no part of what runs.
+        let planned: Vec<CompareRow> = rows.iter().filter(|r| r.enabled && r.action != SyncAction::None && r.rel_path != "B/kept.txt").cloned().collect();
+        let count = planned.len();
+
+        put("F/new.txt");
+        #[cfg(windows)]
+        let held = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::File::options().read(true).share_mode(0).open(local_join_rel(&right, "G/g.txt")).unwrap()
+        };
+
+        let pairs = [FolderPair { id: 1, left: Some(left_loc.clone()), right: Some(right_loc.clone()) }];
+        let known = Known::default();
+        let run = Run { pairs: &pairs, skip_recycle_bin, segmented: false, pool: &pool, servers: &[], drives: &drives, cancel: &cancel, known: &known, at_once: AtOnce { uploads: 1, downloads: 1, disk: 4, bin: BIN_AT_ONCE } };
+        let mut ended: HashMap<usize, RowStatus> = HashMap::new();
+        let (ok, failed, cancelled) = run_plan(&run, planned, &mut |changes, _| ended.extend(changes));
+        #[cfg(windows)]
+        drop(held);
+
+        let locked = cfg!(windows);
+        for (folder, stays) in [("A", false), ("B", true), ("C", true), ("D", true), ("E", false), ("E/Inner", false), ("F", true), ("G", locked), ("H", true), ("H/Deep", true)] {
+            assert_eq!(ended.get(&row(folder).id), Some(&if stays { RowStatus::Skipped } else { RowStatus::Done }), "{folder}");
+            assert_eq!(local_join_rel(&right, folder).exists(), stays, "{folder}");
+        }
+        for file in ["B/kept.txt", "C/skip.ini", "D/Cache/x.bin", "F/new.txt", "H/Deep/skip.ini"] {
+            assert!(local_join_rel(&right, file).exists(), "{file} is gone");
+        }
+        for file in ["B/b.txt", "C/c.txt", "D/d.txt", "F/f.txt", "H/Deep/h.txt"] {
+            assert!(!local_join_rel(&right, file).exists(), "{file} is still there");
+        }
+        // The folders that stayed are counted apart: neither done nor failed.
+        let kept = 6 + locked as usize;
+        assert_eq!(known.kept.load(Ordering::Relaxed), kept);
+        assert_eq!((ok, failed, cancelled), (count - kept - locked as usize, locked as usize, false));
+    }
+
+    /// Deleted for good (the Recycle Bin skipped in Opções), where what a folder took with it
+    /// could not come back.
+    #[test]
+    fn a_folder_to_delete_stays_while_something_is_left_in_it() {
+        let root = std::env::temp_dir().join(format!("oe-sync-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        folders_with_something_left(&root, true);
+        // On Windows the removal failed once at the file that had been held open, right after
+        // it was let go (why isn't known): tried again for a while.
+        for _ in 0..40 {
+            if std::fs::remove_dir_all(&root).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!root.exists(), "{} was left behind", root.display());
+    }
+
+    /// And through the system's Recycle Bin, which takes a folder with all it holds: nothing
+    /// of what stayed is in it. The files are the test's, and leave it at the end.
+    #[cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
+    #[test]
+    fn a_folder_sent_to_the_recycle_bin_stays_while_something_is_left_in_it() {
+        let bin = Binned::new("kept");
+        folders_with_something_left(&bin.0, false);
+        let binned = bin.in_the_bin();
+        for name in ["kept.txt", "skip.ini", "x.bin", "new.txt", "B", "C", "D", "F", "H", "Deep", "Cache"] {
+            assert!(!binned.iter().any(|n| n == name), "{name} is in the Recycle Bin: {binned:?}");
+        }
+        for name in ["A", "E", "Inner", "a.txt", "e.txt"] {
+            assert!(binned.iter().any(|n| n == name), "{name} is not in the Recycle Bin: {binned:?}");
+        }
+    }
+
+    /// The same on a server, where a folder's removal takes all it holds (WebDAV's DELETE) or
+    /// the app's own removal walks it (FTP, SFTP): a folder holding a file whose row was
+    /// switched off stays with it, and the ones that end empty go. Against `rclone serve`.
+    fn a_server_folder_with_something_left(protocol: openexplorer_remote::Protocol, kind: &str, port: u16) {
+        let dir = std::env::temp_dir().join(format!("oe-sync-kept-{kind}-{port}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (left, there) = (dir.join("left"), dir.join("served"));
+        std::fs::create_dir_all(&left).unwrap();
+        for rel in ["A/a.txt", "B/b.txt", "B/kept.txt", "E/Inner/e.txt"] {
+            let path = local_join_rel(&there, rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let mut args = vec!["serve".to_string(), kind.into(), there.display().to_string(), "--addr".into(), format!("127.0.0.1:{port}"), "--user".into(), "ana".into(), "--pass".into(), "a pass".into()];
+        if kind == "ftp" {
+            args.extend(["--passive-port".into(), format!("{}-{}", port + 1, port + 40)]);
+        }
+        let child = std::process::Command::new("rclone").args(&args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().expect("rclone on the PATH");
+        let _served = Served(child, dir.clone());
+        let started = std::time::Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(started.elapsed() < Duration::from_secs(20), "rclone serve {kind} didn't start");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let mut server = Server { id: format!("kept-{port}"), name: "test".into(), protocol, brand: None, host: "127.0.0.1".into(), port, user: "ana".into(), root: String::new(), key: None, host_key: None, cert: None, connections: 4, implicit: false };
+        openexplorer_remote::probe(&mut server, Some("a pass")).unwrap_or_else(|e| panic!("{kind}: {e}"));
+        let pool = Pool::default();
+        let open: Vec<_> = (0..2).map(|_| pool.take(&server, || Some("a pass".into())).unwrap()).collect();
+        open.into_iter().for_each(|lease| lease.done());
+
+        let servers = [server.clone()];
+        let (left_loc, right_loc) = (SyncLocation::Local(left), SyncLocation::Server { server_id: server.id.clone(), server_name: server.name.clone(), path: Vec::new() });
+        let (drives, cancel, opts) = (HashMap::new(), AtomicBool::new(false), SyncOptions::default());
+        let (l, r) = scan_both(&left_loc, &right_loc, &opts.filter, true, &pool, &servers, &drives, &cancel, &|_| {}).unwrap_or_else(|e| panic!("{kind}: {e}"));
+        let (mut rows, _) = compare_maps(0, &left_loc, &right_loc, l, r, &opts, SystemTime::now(), &cancel, &|_, _| {});
+        rows.iter_mut().enumerate().for_each(|(i, r)| r.id = i);
+        assert!(rows.len() == 8 && rows.iter().all(|r| r.action == SyncAction::DeleteRight), "{kind}: {rows:?}");
+        let planned: Vec<CompareRow> = rows.iter().filter(|r| r.rel_path != "B/kept.txt").cloned().collect();
+
+        let pairs = [FolderPair { id: 1, left: Some(left_loc.clone()), right: Some(right_loc.clone()) }];
+        let known = Known::from_comparison(&rows, &pairs);
+        let run = Run { pairs: &pairs, skip_recycle_bin: true, segmented: false, pool: &pool, servers: &servers, drives: &drives, cancel: &cancel, known: &known, at_once: AtOnce { uploads: 2, downloads: 2, disk: 2, bin: BIN_AT_ONCE } };
+        let mut ended: HashMap<usize, RowStatus> = HashMap::new();
+        let (ok, failed, _) = run_plan(&run, planned, &mut |changes, _| ended.extend(changes));
+        assert_eq!((ok, failed, known.kept.load(Ordering::Relaxed)), (6, 0, 1), "{kind}: {ended:?}");
+        let b = rows.iter().find(|r| r.rel_path == "B").unwrap().id;
+        assert_eq!(ended.get(&b), Some(&RowStatus::Skipped), "{kind}");
+        assert!(there.join("B/kept.txt").exists() && !there.join("B/b.txt").exists(), "{kind}");
+        assert!(!there.join("A").exists() && !there.join("E").exists(), "{kind}");
+    }
+
+    #[test]
+    #[ignore = "needs rclone"]
+    fn a_server_folder_to_delete_stays_while_something_is_left_in_it() {
+        a_server_folder_with_something_left(openexplorer_remote::Protocol::Dav, "webdav", 28130);
+        a_server_folder_with_something_left(openexplorer_remote::Protocol::Sftp, "sftp", 22330);
+        a_server_folder_with_something_left(openexplorer_remote::Protocol::Ftp, "ftp", 21330);
     }
 
     /// What sending files to the system's Recycle Bin costs one at a time and several in one
