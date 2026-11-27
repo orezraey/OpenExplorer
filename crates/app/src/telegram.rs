@@ -341,7 +341,7 @@ pub fn tick(s: &mut State, now: f64) {
     w.unshown.retain(|id| ids.contains(id));
     let unshown: Vec<i64> = w.unshown.iter().copied().collect();
     for id in unshown {
-        if (0..2).all(|p| reload(s, p, id)) {
+        if (0..crate::layout::MAX_PANES).all(|p| reload(s, p, id)) {
             s.servers.telegram_watch.unshown.remove(&id);
         }
     }
@@ -390,7 +390,7 @@ fn polled(s: &mut State, id: i64, result: Result<bool, String>) {
         Err(e) => openexplorer_gdrive::log(&format!("telegram: ver o que mudou: {e}")),
         Ok(false) => {}
         Ok(true) => {
-            if !(0..2).all(|p| reload(s, p, id)) {
+            if !(0..crate::layout::MAX_PANES).all(|p| reload(s, p, id)) {
                 s.servers.telegram_watch.unshown.insert(id);
             }
         }
@@ -638,7 +638,7 @@ mod tests {
         let items: Vec<Entry> = s.panes[0].entries.iter().filter(|e| wanted.contains(&e.name.as_str())).cloned().collect();
         assert_eq!(items.len(), wanted.len(), "{wanted:?} in {:?}", names(s, 0));
         s.status.clear();
-        s.clip = Some(Clip { mode, from: s.panes[0].loc.clone(), items });
+        s.clip = Some(Clip { mode, from: s.panes[0].loc.clone(), items, picked_at: 0.0 });
         actions::paste(s, 1);
         settle(s);
     }

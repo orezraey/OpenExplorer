@@ -767,7 +767,7 @@ fn changes_arrived(s: &mut State, id: String, wait: u64, result: Result<Changes,
     }
     let Some(server) = s.servers.list.iter().find(|sv| sv.id == id).cloned() else { return };
     let stale = |path: &[String]| changes.touches(&server.path(path));
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         let reload = matches!(&s.panes[p].loc, Location::Server { server: sv, path, find: None } if sv.id == id && stale(path));
         if reload && !s.panes[p].loading {
             crate::load(s, p);
@@ -883,7 +883,7 @@ mod batches {
     fn paste_now(s: &mut State, names: &[&str], mode: ClipMode) {
         let items: Vec<Entry> = s.panes[0].entries.iter().filter(|e| names.is_empty() || names.contains(&e.name.as_str())).cloned().collect();
         s.status.clear();
-        s.clip = Some(Clip { mode, from: s.panes[0].loc.clone(), items });
+        s.clip = Some(Clip { mode, from: s.panes[0].loc.clone(), items, picked_at: 0.0 });
         actions::paste(s, 1);
     }
 
@@ -1029,6 +1029,19 @@ mod batches {
         open(&mut s, 0, Location::Local(local.clone()));
         open(&mut s, 1, folder(&sv, vec!["U".into()]));
         paste_now(&mut s, &[], ClipMode::Copy);
+        let wait_start = Instant::now();
+        loop {
+            crate::poll(&mut s, 0.0, &mut rune::Tx::default());
+            if matches!(&s.dialog, Some(crate::actions::Dialog::Conflict(_))) {
+                crate::actions::answer_conflict(&mut s, Some(crate::conflict::Choice::KeepBoth));
+                break;
+            }
+            if !s.status.is_empty() && !s.status.ends_with('…') {
+                break;
+            }
+            assert!(wait_start.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(10));
+        }
         settle(&mut s);
         let st = stages(&s, 302);
         assert_eq!(count(&st, Stage::Done), 302, "{}", s.status);

@@ -30,6 +30,8 @@ pub struct TabSlot {
     /// What that text last searched (see `State::searched`), so coming back doesn't search
     /// again, and leaving doesn't search the next tab with this text.
     pub searched: String,
+    /// Selected Google Drive search scope for this tab.
+    pub search_scope: crate::model::DriveSearchScope,
 }
 
 /// State of the "+" new-tab picker inside a pane.
@@ -68,7 +70,7 @@ impl PaneTabs {
     /// Starts with a single active tab whose `Pane` lives in `s.panes[p]`.
     pub fn initial() -> Self {
         Self {
-            items: vec![TabSlot { id: 1, pane: None, search: String::new(), searched: String::new() }],
+            items: vec![TabSlot { id: 1, pane: None, search: String::new(), searched: String::new(), search_scope: crate::model::DriveSearchScope::Here }],
             active: Some(0),
             last_active: Some(0),
             picker: PickerState::default(),
@@ -105,6 +107,7 @@ pub fn tab_header(s: &State, loc: &Location) -> (Option<IconKey>, &'static Icon,
             Some(node) => (node.icon, node.fallback, node.label),
             None => (Some(IconKey::Computer), &icons::COMPUTER, t("Este Computador", "This PC").into()),
         },
+        Location::Computer => (Some(IconKey::Computer), &icons::COMPUTER, t("Este Computador", "This PC").into()),
         Location::Mock(_) => (None, &icons::LAB, t("Drive simulado", "Simulated drive").into()),
         Location::Drive { email, .. } => {
             let label = s
@@ -117,6 +120,7 @@ pub fn tab_header(s: &State, loc: &Location) -> (Option<IconKey>, &'static Icon,
                 .to_string();
             (None, &icons::PROVIDER_GDRIVE, label)
         }
+        Location::DriveSearch(_) => (None, &icons::PROVIDER_GDRIVE, t("Todas as contas", "All accounts").into()),
         Location::Server { server, .. } => {
             let provider = Provider::of_server(server);
             let label = match provider {
@@ -169,6 +173,7 @@ fn reset_transient(s: &mut State, p: usize) {
         s.renaming = None;
     }
     s.address[p] = None;
+    s.search_scope_menu = None;
     s.tabs[p].picker.filter_open = false;
     s.live[p].fetch_add(1, Ordering::Relaxed);
 }
@@ -180,11 +185,13 @@ fn stash_active(s: &mut State, p: usize) {
         let live = std::mem::replace(&mut s.panes[p], placeholder);
         let search = std::mem::take(&mut s.search[p].text);
         let searched = std::mem::take(&mut s.searched[p]);
+        let search_scope = std::mem::take(&mut s.search_scope[p]);
         set_search(s, p, String::new(), String::new());
         if let Some(slot) = s.tabs[p].items.get_mut(cur) {
             slot.pane = Some(live);
             slot.search = search;
             slot.searched = searched;
+            slot.search_scope = search_scope;
         }
         s.tabs[p].last_active = Some(cur);
         s.tabs[p].active = None;
@@ -204,19 +211,21 @@ fn set_search(s: &mut State, p: usize, text: String, searched: String) {
 
 /// Takes tab `idx`'s pane and search state into `s.panes[p]` and makes it the active tab.
 fn bring_in(s: &mut State, p: usize, idx: usize) {
-    let (pane, search, searched) = {
+    let (pane, search, searched, search_scope) = {
         let slot = &mut s.tabs[p].items[idx];
-        (slot.pane.take(), std::mem::take(&mut slot.search), std::mem::take(&mut slot.searched))
+        (slot.pane.take(), std::mem::take(&mut slot.search), std::mem::take(&mut slot.searched), slot.search_scope)
     };
     if let Some(pane) = pane {
         s.panes[p] = pane;
     }
+    s.search_scope[p] = search_scope;
     set_search(s, p, search, searched);
     s.tabs[p].active = Some(idx);
     s.tabs[p].last_active = Some(idx);
     s.icons_for[p] = u64::MAX;
     // If the tab was still loading when left, kick off a fresh listing.
-    if s.panes[p].loading {
+    // Este Computador lists the disks as they are now: some may have come or gone meanwhile.
+    if s.panes[p].loading || s.panes[p].loc == Location::Computer {
         crate::list(s, p, false);
     }
     crate::tree::follow(s, p);
@@ -268,12 +277,24 @@ pub fn open_new_tab(s: &mut State, p: usize, loc: Location) {
     stash_active(s, p);
     let id = s.tabs[p].alloc_id();
     let idx = s.tabs[p].items.len();
-    s.tabs[p].items.push(TabSlot { id, pane: None, search: String::new(), searched: String::new() });
+    let scope = match &loc {
+        Location::DriveSearch(_) => crate::model::DriveSearchScope::AllAccounts,
+        Location::Drive { space: crate::model::Space::Search(q), path, .. } if path.is_empty() => {
+            if q.within == openexplorer_gdrive::search::Within::Everything {
+                crate::model::DriveSearchScope::Account
+            } else {
+                crate::model::DriveSearchScope::Here
+            }
+        }
+        _ => crate::model::DriveSearchScope::Here,
+    };
+    s.tabs[p].items.push(TabSlot { id, pane: None, search: String::new(), searched: String::new(), search_scope: scope });
     s.tabs[p].active = Some(idx);
     s.tabs[p].last_active = Some(idx);
     s.tabs[p].picker.filter_open = false;
     s.tabs[p].picker.search = rune::TextEdit::new("");
     s.panes[p] = Pane::new(loc);
+    s.search_scope[p] = scope;
     set_search(s, p, String::new(), String::new());
     s.icons_for[p] = u64::MAX;
     crate::list(s, p, false);
@@ -295,6 +316,7 @@ pub fn close_tab(s: &mut State, p: usize, idx: usize) {
         if s.tabs[p].items.is_empty() {
             s.tabs[p].last_active = None;
             s.panes[p] = Pane::new(Location::Mock(Vec::new()));
+            s.search_scope[p] = crate::model::DriveSearchScope::Here;
             set_search(s, p, String::new(), String::new());
             return;
         }
@@ -326,7 +348,7 @@ pub fn close_active_tab(s: &mut State, p: usize) {
 
 /// Cleans up inactive tabs whose location or history references a removed account or server.
 pub fn purge_locations(s: &mut State, gone: impl Fn(&Location) -> bool, fallback: &Location) {
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         for slot in &mut s.tabs[p].items {
             if let Some(pane) = &mut slot.pane {
                 pane.back.retain(|l| !gone(l));
@@ -374,7 +396,7 @@ pub fn moved(loc: &Location, from: &Location, to: Option<&Location>) -> Option<L
 /// Whether a pane or a tab shows folder `from` or a folder inside it.
 pub fn any_inside(s: &State, from: &Location) -> bool {
     let inside = |pane: &Pane| pane.back.iter().chain(&pane.forward).chain([&pane.loc]).any(|l| moved(l, from, None).is_some());
-    (0..2).any(|p| (!s.tabs[p].is_picker() && inside(&s.panes[p])) || s.tabs[p].items.iter().filter_map(|slot| slot.pane.as_ref()).any(inside))
+    (0..crate::layout::MAX_PANES).any(|p| (!s.tabs[p].is_picker() && inside(&s.panes[p])) || s.tabs[p].items.iter().filter_map(|slot| slot.pane.as_ref()).any(inside))
 }
 
 /// Voltar's and Avançar's steps inside folder `from` follow it to `to`, or go when it's
@@ -397,7 +419,7 @@ fn remap_history(pane: &mut Pane, from: &Location, to: Option<&Location>) {
 /// Moves the panes and tabs inside folder `from` to where [`moved`] says, and their history
 /// with them, so none shows or goes back to a folder that was renamed or deleted.
 pub fn repoint(s: &mut State, from: &Location, to: Option<&Location>) {
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         remap_history(&mut s.panes[p], from, to);
         for pane in s.tabs[p].items.iter_mut().filter_map(|slot| slot.pane.as_mut()) {
             remap_history(pane, from, to);
@@ -437,7 +459,7 @@ pub fn changed(s: &mut State, reload: &[Location]) {
 
 /// Closes any open provider filter dropdown in the "+" picker.
 pub fn close_picker_filter(s: &mut State) {
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         s.tabs[p].picker.filter_open = false;
     }
 }
@@ -556,7 +578,7 @@ mod tests {
 
         // A tab left in the folder, and the other pane in it, both move.
         let mut s = State::placeholder();
-        s.tabs = [PaneTabs::initial(), PaneTabs::initial()];
+        s.tabs = std::array::from_fn(|_| PaneTabs::initial());
         s.panes[0] = Pane::new(local(r"C:\Fotos\2024"));
         s.panes[0].back = vec![local(r"C:\"), local(r"C:\Fotos")];
         open_new_tab(&mut s, 0, Location::Mock(Vec::new()));

@@ -5,7 +5,7 @@
 //!
 //! A server has no recycle bin: Excluir deletes for good, after asking.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -17,8 +17,9 @@ use rune::{Icon, TextEdit, Tx};
 
 use crate::accounts::Account;
 use crate::actions::Then;
-use crate::model::{Entry, Location};
-use crate::ops::{self, CANCELLED, Progress};
+use crate::conflict::{self, Decision, FileInfo, Resolver};
+use crate::model::{Entry, Location, shown};
+use crate::ops::{self, CANCELLED, Progress, Stage};
 use crate::transfers::{self, End, Op};
 use crate::undo;
 use crate::{Msg, Part, State, background, catch_panic};
@@ -75,7 +76,7 @@ impl Servers {
 }
 
 pub fn entry(item: Item) -> Entry {
-    Entry { id: item.name.clone(), name: item.name, is_dir: item.is_dir, size: item.size, modified: item.modified, target: None, mime: None, md5: None, starred: false }
+    Entry { id: item.name.clone(), name: item.name, is_dir: item.is_dir, size: item.size, modified: item.modified, target: None, mime: None, md5: None, starred: false, drive_origin: None }
 }
 
 /// A server's folder: the location at `path` under its root.
@@ -303,6 +304,7 @@ fn transfer<P: Send + Sync + 'static>(
     server: &Server,
     reload: Vec<Location>,
     at_once: usize,
+    slots: Arc<crate::work::Slots>,
     batch: transfers::Batch,
     prepare: impl FnOnce(&mut dyn Conn, &transfers::Batch) -> Result<P, String> + Send + 'static,
     joins: impl Fn(&P, usize) -> bool + Send + Sync + 'static,
@@ -317,8 +319,17 @@ fn transfer<P: Send + Sync + 'static>(
             let failed = std::sync::Mutex::new(None);
             std::thread::scope(|scope| {
                 for _ in 0..workers {
+                    let slots = &slots;
                     scope.spawn(|| {
+                        let done = || next.load(std::sync::atomic::Ordering::Relaxed) >= batch.rows().len() || batch.rows().iter().all(|p| p.over());
+                        if done() {
+                            return;
+                        }
                         let ran = with(&pool, &server, |c| {
+                            // The slot comes once the connection is held: a worker waiting for
+                            // the server's pool (two batches on one server) holds none, so it
+                            // doesn't keep another transfer from starting.
+                            let Some(_slot) = slots.acquire_unless(done) else { return Ok(()) };
                             let most = c.batches().0.max(1);
                             // A row taken that doesn't join the run before it starts the next.
                             let mut held = None;
@@ -334,7 +345,9 @@ fn transfer<P: Send + Sync + 'static>(
                                     }
                                 }
                                 for ((_, p), r) in rows.iter().zip(step(c, &shared, &rows)) {
-                                    p.end(r);
+                                    if p.stage() != Stage::Skipped {
+                                        p.end(r);
+                                    }
                                 }
                             }
                             Ok(())
@@ -355,6 +368,11 @@ fn transfer<P: Send + Sync + 'static>(
     });
 }
 
+fn child_place(place: &str, name: &str) -> String {
+    let s = shown(name);
+    if place.is_empty() { s } else { format!("{place}\\{s}") }
+}
+
 /// Downloads `items` of the server folder `from` into the folder `dst` on the computer, a row
 /// each in the queue, several at once; then `then` (Recortar: deleting them from the server).
 pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf, then: Then, reload: Vec<Location>) {
@@ -363,6 +381,11 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
     let to = End::local(&dst);
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Download, items.iter().map(|e| (end(from, Some(&e.name)), to.clone())));
     let at_once = usize::from(s.settings.downloads);
+    s.download_slots.set_limit(at_once);
+    let slots = s.download_slots.clone();
+    let may_have_more = items.len() > 1 || items.iter().any(|e| e.is_dir);
+    let resolver = (then != Then::Open).then(|| crate::actions::make_resolver(s, Op::Download, may_have_more, &batch));
+    let src_root = end(from, None).text;
     let sizes: Vec<(bool, Option<u64>, String)> = items.iter().zip(&paths).map(|(e, p)| (e.is_dir, e.size, p.clone())).collect();
     let prepare = move |c: &mut dyn Conn, batch: &transfers::Batch| {
         for (p, (is_dir, size, path)) in batch.rows().iter().zip(&sizes) {
@@ -375,33 +398,147 @@ pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf,
     };
     let one = move |c: &mut dyn Conn, (claimed, paths): &(std::sync::Mutex<HashSet<PathBuf>>, Vec<String>), i: usize, p: &Progress| {
         let e = &items[i];
-        let local = {
-            let mut claimed = claimed.lock().unwrap_or_else(|e| e.into_inner());
-            let local = ops::unique_where(&dst, &ops::windows_name(&e.name), &|p| claimed.contains(p));
-            claimed.insert(local.clone());
-            local
+        let raw_name = ops::windows_name(&e.name);
+        let desired = dst.join(&raw_name);
+        let (local, created) = match &resolver {
+            None => {
+                let mut claimed = claimed.lock().unwrap_or_else(|e| e.into_inner());
+                let local = ops::unique_where(&dst, &raw_name, &|p| claimed.contains(p));
+                claimed.insert(local.clone());
+                (local, true)
+            }
+            Some(res) => {
+                if e.is_dir {
+                    if desired.is_dir() {
+                        claimed.lock().unwrap_or_else(|e| e.into_inner()).insert(desired.clone());
+                        (desired, false)
+                    } else if desired.exists() {
+                        let free = conflict::numbered_local(&dst, &raw_name, true, &|p| claimed.lock().unwrap_or_else(|e| e.into_inner()).contains(p));
+                        let renamed = free.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| raw_name.clone());
+                        let dst_info = FileInfo::local(&desired).unwrap_or_else(|| FileInfo {
+                            name: raw_name.clone(),
+                            place: dst.display().to_string(),
+                            is_dir: false,
+                            size: None,
+                            modified: None,
+                            kind: conflict::kind_of(&raw_name, false, None),
+                        });
+                        match res.resolve(FileInfo::entry(e, src_root.clone()), dst_info, renamed, || p.cancelled()) {
+                            Decision::Cancel => return Err(CANCELLED.into()),
+                            Decision::Skip => {
+                                p.skip();
+                                return Ok(());
+                            }
+                            Decision::KeepBoth | Decision::Replace => {
+                                let mut g = claimed.lock().unwrap_or_else(|e| e.into_inner());
+                                let free = conflict::numbered_local(&dst, &raw_name, true, &|p| g.contains(p));
+                                g.insert(free.clone());
+                                (free, true)
+                            }
+                        }
+                    } else {
+                        let mut g = claimed.lock().unwrap_or_else(|e| e.into_inner());
+                        if !g.contains(&desired) {
+                            g.insert(desired.clone());
+                            (desired, true)
+                        } else {
+                            let free = conflict::numbered_local(&dst, &raw_name, true, &|p| g.contains(p));
+                            g.insert(free.clone());
+                            (free, true)
+                        }
+                    }
+                } else {
+                    let (exists_on_disk, renamed_name) = {
+                        let mut g = claimed.lock().unwrap_or_else(|e| e.into_inner());
+                        if !desired.exists() && !g.contains(&desired) {
+                            g.insert(desired.clone());
+                            (false, String::new())
+                        } else {
+                            let free = conflict::numbered_local(&dst, &raw_name, false, &|p| g.contains(p));
+                            let rn = free.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| raw_name.clone());
+                            (desired.exists(), rn)
+                        }
+                    };
+                    if !exists_on_disk && renamed_name.is_empty() {
+                        (desired, true)
+                    } else if !exists_on_disk {
+                        let mut g = claimed.lock().unwrap_or_else(|e| e.into_inner());
+                        let free = conflict::numbered_local(&dst, &raw_name, false, &|p| g.contains(p));
+                        g.insert(free.clone());
+                        (free, true)
+                    } else {
+                        let dst_info = FileInfo::local(&desired).unwrap_or_else(|| FileInfo {
+                            name: raw_name.clone(),
+                            place: dst.display().to_string(),
+                            is_dir: false,
+                            size: None,
+                            modified: None,
+                            kind: conflict::kind_of(&raw_name, false, None),
+                        });
+                        match res.resolve(FileInfo::entry(e, src_root.clone()), dst_info, renamed_name, || p.cancelled()) {
+                            Decision::Cancel => return Err(CANCELLED.into()),
+                            Decision::Skip => {
+                                p.skip();
+                                return Ok(());
+                            }
+                            Decision::Replace if !desired.is_dir() => {
+                                let mut g = claimed.lock().unwrap_or_else(|e| e.into_inner());
+                                if g.contains(&desired) {
+                                    let free = conflict::numbered_local(&dst, &raw_name, false, &|p| g.contains(p));
+                                    g.insert(free.clone());
+                                    (free, true)
+                                } else {
+                                    g.insert(desired.clone());
+                                    (desired, false)
+                                }
+                            }
+                            Decision::KeepBoth | Decision::Replace => {
+                                let mut g = claimed.lock().unwrap_or_else(|e| e.into_inner());
+                                let free = conflict::numbered_local(&dst, &raw_name, false, &|p| g.contains(p));
+                                g.insert(free.clone());
+                                (free, true)
+                            }
+                        }
+                    }
+                }
+            }
         };
-        if let Err(err) = fetch(c, &paths[i], e.is_dir, e.modified, &local, p, 0) {
-            // What arrived of an item cancelled midway is no use.
-            if err == CANCELLED {
+        let mut kept = false;
+        let place = if e.is_dir { child_place(&src_root, &e.name) } else { src_root.clone() };
+        if let Err(err) = fetch(c, &paths[i], e.is_dir, e.modified, &local, created, &place, resolver.as_ref(), &mut kept, p, 0) {
+            // What arrived of an item cancelled midway is no use (never remove pre-existing files/folders).
+            if err == CANCELLED && created {
                 let _ = if e.is_dir { std::fs::remove_dir_all(&local) } else { std::fs::remove_file(&local) };
             }
             return Err(err);
         }
         match then {
             Then::Nothing => Ok(()),
-            Then::Trash => c.remove(&paths[i], e.is_dir),
+            Then::Trash => if !kept { c.remove(&paths[i], e.is_dir) } else { Ok(()) },
             Then::Open => ops::open(&local),
         }
     };
     let step = move |c: &mut dyn Conn, shared: &(std::sync::Mutex<HashSet<PathBuf>>, Vec<String>), rows: &[(usize, &Progress)]| rows.iter().map(|(i, p)| one(c, shared, *i, p)).collect();
-    transfer(s, server, reload, at_once, batch, prepare, |_, _| false, step);
+    transfer(s, server, reload, at_once, slots, batch, prepare, |_, _| false, step);
 }
 
 /// A file or a folder and all it holds, from `path` on the server to `local`, `depth` folders
-/// down from where the download started. Two names the server tells apart but Windows doesn't
-/// ("Nota" and "nota", "a:b" and "a_b") each get their own file.
-fn fetch(c: &mut dyn Conn, path: &str, is_dir: bool, modified: Option<SystemTime>, local: &Path, p: &Progress, depth: usize) -> Result<(), String> {
+/// down from where the download started. Writes files via a `.openexplorer-part` temp file so
+/// overwriting an existing file is atomic and cancellation never destroys the previous file.
+#[allow(clippy::too_many_arguments)]
+fn fetch(
+    c: &mut dyn Conn,
+    path: &str,
+    is_dir: bool,
+    modified: Option<SystemTime>,
+    local: &Path,
+    created: bool,
+    src_place: &str,
+    resolver: Option<&Resolver>,
+    kept: &mut bool,
+    p: &Progress,
+    depth: usize,
+) -> Result<(), String> {
     if p.cancelled() {
         return Err(CANCELLED.into());
     }
@@ -409,17 +546,71 @@ fn fetch(c: &mut dyn Conn, path: &str, is_dir: bool, modified: Option<SystemTime
         if depth > DEEPEST {
             return Err(tr!("{path}: pastas demais umas dentro das outras (um link que volta para cima?).", "{path}: too many folders inside one another (a link that loops back up?)."));
         }
-        std::fs::create_dir(local).map_err(|e| tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", local.display()))?;
+        if created || !local.exists() {
+            std::fs::create_dir_all(local).map_err(|e| tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", local.display()))?;
+        }
+        let mut child_taken = HashSet::<PathBuf>::new();
         for it in c.list(path)? {
             if it.is_dir && c.passed_over(&child(path, &it.name)) {
                 continue;
             }
-            let to = ops::unique_in(local, &ops::windows_name(&it.name));
-            fetch(c, &child(path, &it.name), it.is_dir, it.modified, &to, p, depth + 1)?;
+            let raw_name = ops::windows_name(&it.name);
+            let desired = local.join(&raw_name);
+            let (to, child_created) = match resolver {
+                None => {
+                    let to = ops::unique_where(local, &raw_name, &|x| child_taken.contains(x));
+                    child_taken.insert(to.clone());
+                    (to, true)
+                }
+                Some(res) => {
+                    if it.is_dir && desired.is_dir() {
+                        child_taken.insert(desired.clone());
+                        (desired, false)
+                    } else if desired.exists() {
+                        let free = conflict::numbered_local(local, &raw_name, it.is_dir, &|x| child_taken.contains(x));
+                        let renamed = free.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| raw_name.clone());
+                        let dst_info = FileInfo::local(&desired).unwrap_or_else(|| FileInfo {
+                            name: raw_name.clone(),
+                            place: local.display().to_string(),
+                            is_dir: desired.is_dir(),
+                            size: None,
+                            modified: None,
+                            kind: conflict::kind_of(&raw_name, desired.is_dir(), None),
+                        });
+                        match res.resolve(FileInfo::remote(&it, src_place.to_string()), dst_info, renamed, || p.cancelled()) {
+                            Decision::Cancel => return Err(CANCELLED.into()),
+                            Decision::Skip => {
+                                *kept = true;
+                                p.unsize(it.size.unwrap_or(0));
+                                continue;
+                            }
+                            Decision::Replace if !it.is_dir && !desired.is_dir() && !child_taken.contains(&desired) => {
+                                child_taken.insert(desired.clone());
+                                (desired, false)
+                            }
+                            Decision::KeepBoth | Decision::Replace => {
+                                let free = conflict::numbered_local(local, &raw_name, it.is_dir, &|x| child_taken.contains(x));
+                                child_taken.insert(free.clone());
+                                (free, true)
+                            }
+                        }
+                    } else if !child_taken.contains(&desired) {
+                        child_taken.insert(desired.clone());
+                        (desired, true)
+                    } else {
+                        let free = conflict::numbered_local(local, &raw_name, it.is_dir, &|x| child_taken.contains(x));
+                        child_taken.insert(free.clone());
+                        (free, true)
+                    }
+                }
+            };
+            let next_place = if it.is_dir { child_place(src_place, &it.name) } else { src_place.to_string() };
+            fetch(c, &child(path, &it.name), it.is_dir, it.modified, &to, child_created, &next_place, resolver, kept, p, depth + 1)?;
         }
         return Ok(());
     }
-    let mut file = std::fs::File::create_new(local).map_err(|e| tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", local.display()))?;
+    let part = ops::part_path(local);
+    let mut file = std::fs::File::create_new(&part).map_err(|e| tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", local.display()))?;
     let mut last = 0;
     let got = c.download(path, &mut file, &mut |n| {
         p.reached(&mut last, n);
@@ -427,19 +618,25 @@ fn fetch(c: &mut dyn Conn, path: &str, is_dir: bool, modified: Option<SystemTime
     });
     if let Err(e) = got {
         drop(file);
-        let _ = std::fs::remove_file(local);
+        let _ = std::fs::remove_file(&part);
         return Err(cancelled(e));
     }
     // Dated as on the server, as a copy on the disk is.
     if let Some(m) = modified {
         let _ = file.set_modified(m);
     }
+    drop(file);
+    if let Err(e) = std::fs::rename(&part, local) {
+        let _ = std::fs::remove_file(&part);
+        return Err(tr!("Não consegui criar {}: {e}", "Couldn't create {}: {e}", local.display()));
+    }
     Ok(())
 }
 
 /// Uploads `sources` (files and folders on the computer) into the server folder `to` shows, a
-/// row each in the queue, several at once, a taken name getting a free one ("nome (2).ext").
-/// With `remove` (Recortar), each original goes to the Recycle Bin once all of it arrived.
+/// row each in the queue, several at once, prompting on destination collisions (or merging
+/// existing folders). With `remove` (Recortar), each original goes to the Recycle Bin once all
+/// of it arrived without skipped items.
 pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool, reload: Vec<Location>) {
     let Some((server, dir)) = target(to) else {
         s.status = t("Abra uma pasta do servidor para enviar para ela.", "Open a folder on the server to upload to it.").into();
@@ -447,8 +644,14 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
     };
     let server = server.clone();
     let dest = end(to, None);
-    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Upload, sources.iter().map(|p| (End::local(p), dest.clone())));
+    let op = if remove { Op::Move } else { Op::Upload };
+    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, sources.iter().map(|p| (End::local(p), dest.clone())));
     let at_once = usize::from(s.settings.uploads);
+    s.upload_slots.set_limit(at_once);
+    let slots = s.upload_slots.clone();
+    let may_have_more = sources.len() > 1 || sources.iter().any(|p| p.is_dir());
+    let resolver = crate::actions::make_resolver(s, op, may_have_more, &batch);
+    let dst_place = dest.text;
     let measured = sources.clone();
     let listed = dir.clone();
     let prepare = move |c: &mut dyn Conn, batch: &transfers::Batch| {
@@ -462,57 +665,134 @@ pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool,
         }
         // Lowercased: a server on Windows (or many NAS) takes "Nota.txt" and "nota.txt" for one
         // file, and an upload under the other spelling would replace it.
-        let taken: HashSet<String> = c.list(&listed)?.into_iter().map(|i| i.name.to_lowercase()).collect();
-        Ok((std::sync::Mutex::new(taken), small))
+        let existing: HashMap<String, Item> = c.list(&listed)?.into_iter().map(|i| (i.name.to_lowercase(), i)).collect();
+        let taken: HashSet<String> = existing.keys().cloned().collect();
+        Ok((std::sync::Mutex::new((existing, taken)), small))
     };
-    let step = move |c: &mut dyn Conn, (taken, _): &(std::sync::Mutex<HashSet<String>>, Vec<bool>), rows: &[(usize, &Progress)]| {
-        // Each row's name, taken before any is sent.
-        let targets: Vec<(String, bool)> = rows
-            .iter()
-            .map(|(i, _)| {
-                let src = &sources[*i];
-                let is_dir = src.is_dir();
-                let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let mut taken = taken.lock().unwrap_or_else(|e| e.into_inner());
-                let name = free_name(&name, is_dir, &taken);
-                taken.insert(name.to_lowercase());
-                (child(&dir, &name), is_dir)
-            })
-            .collect();
-        let sent: Vec<Result<(), String>> = match rows {
-            [(i, p)] => vec![send(c, &sources[*i], &targets[0].0, p)],
-            // Small files, together.
-            _ => {
-                let files: Vec<(String, PathBuf)> = rows.iter().zip(&targets).map(|((i, _), (to, _))| (to.clone(), sources[*i].clone())).collect();
-                let mut last = vec![0u64; rows.len()];
-                c.upload_files(&files, &mut |k, n| {
-                    let p = rows[k].1;
-                    p.reached(&mut last[k], n);
-                    !p.cancelled()
-                })
-                .into_iter()
-                .map(|r| r.map_err(cancelled))
-                .collect()
-            }
-        };
-        rows.iter()
-            .zip(&targets)
-            .zip(sent)
-            .map(|(((i, _), (target, is_dir)), r)| {
-                if let Err(e) = r {
-                    if e == CANCELLED {
-                        let _ = c.remove(target, *is_dir);
+    // What the folder holds already, and the names taken there since.
+    type Taken = std::sync::Mutex<(HashMap<String, Item>, HashSet<String>)>;
+    let step = move |c: &mut dyn Conn, (state, _): &(Taken, Vec<bool>), rows: &[(usize, &Progress)]| {
+        enum Action {
+            /// `replace`: the target is a file already on the server that this one overwrites, so
+            /// a cancelled or failed send never removes it (it isn't the upload's to remove).
+            Send { idx: usize, target: String, is_dir: bool, merge: bool, replace: bool },
+            Skip,
+            Cancel,
+        }
+        let mut actions = Vec::with_capacity(rows.len());
+        let mut to_batch: Vec<(usize, String, PathBuf, bool)> = Vec::new();
+        for (i, p) in rows {
+            let src = &sources[*i];
+            let is_dir = src.is_dir();
+            let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let key = name.to_lowercase();
+            let ex = {
+                let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+                let ex = g.0.get(&key).cloned();
+                if ex.is_none() && !g.1.contains(&key) {
+                    g.1.insert(key.clone());
+                }
+                ex
+            };
+            let act = match ex {
+                None => Action::Send { idx: *i, target: child(&dir, &name), is_dir, merge: false, replace: false },
+                Some(ex) if is_dir && ex.is_dir => {
+                    Action::Send { idx: *i, target: child(&dir, &ex.name), is_dir: true, merge: true, replace: false }
+                }
+                Some(ex) => {
+                    let renamed = {
+                        let g = state.lock().unwrap_or_else(|e| e.into_inner());
+                        free_name(&name, is_dir, &g.1)
+                    };
+                    let src_info = FileInfo::local(src).unwrap_or_else(|| FileInfo {
+                        name: name.clone(),
+                        place: src.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+                        is_dir,
+                        size: None,
+                        modified: None,
+                        kind: conflict::kind_of(&name, is_dir, None),
+                    });
+                    match resolver.resolve(src_info, FileInfo::remote(&ex, dst_place.clone()), renamed, || p.cancelled()) {
+                        Decision::Cancel => Action::Cancel,
+                        Decision::Skip => Action::Skip,
+                        Decision::Replace if !is_dir && !ex.is_dir => {
+                            Action::Send { idx: *i, target: child(&dir, &ex.name), is_dir: false, merge: false, replace: true }
+                        }
+                        Decision::KeepBoth | Decision::Replace => {
+                            let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+                            let free = free_name(&name, is_dir, &g.1);
+                            g.1.insert(free.to_lowercase());
+                            Action::Send { idx: *i, target: child(&dir, &free), is_dir, merge: false, replace: false }
+                        }
                     }
-                    return Err(e);
                 }
-                if remove {
-                    trash::delete(&sources[*i]).map_err(|e| tr!("Enviado, mas não consegui mover o original para a Lixeira: {e}", "Uploaded, but couldn't move the original to the Recycle Bin: {e}"))?;
+            };
+            if let Action::Send { idx, target, is_dir: false, replace, .. } = &act
+                && rows.len() > 1
+            {
+                to_batch.push((idx.to_owned(), target.clone(), sources[*idx].clone(), *replace));
+            }
+            actions.push(act);
+        }
+
+        // Fast batch path when all rows in this group are small files to upload.
+        if to_batch.len() == rows.len() && rows.len() > 1 {
+            let files: Vec<(String, PathBuf)> = to_batch.iter().map(|(_, t, p, _)| (t.clone(), p.clone())).collect();
+            let mut last = vec![0u64; rows.len()];
+            let sent = c.upload_files(&files, &mut |k, n| {
+                let p = rows[k].1;
+                p.reached(&mut last[k], n);
+                !p.cancelled()
+            });
+            return rows
+                .iter()
+                .zip(to_batch)
+                .zip(sent)
+                .map(|(((i, _), (_, target, _, replace)), r)| {
+                    if let Err(e) = r.map_err(cancelled) {
+                        // What a cancelled send left is removed, unless the file was there before.
+                        if e == CANCELLED && !replace {
+                            let _ = c.remove(&target, false);
+                        }
+                        return Err(e);
+                    }
+                    if remove {
+                        trash::delete(&sources[*i]).map_err(|e| tr!("Enviado, mas não consegui mover o original para a Lixeira: {e}", "Uploaded, but couldn't move the original to the Recycle Bin: {e}"))?;
+                    }
+                    Ok(())
+                })
+                .collect();
+        }
+
+        rows.iter()
+            .zip(actions)
+            .map(|((i, p), act)| match act {
+                Action::Cancel => Err(CANCELLED.into()),
+                Action::Skip => {
+                    p.skip();
+                    Ok(())
                 }
-                Ok(())
+                Action::Send { target, is_dir, merge, replace, .. } => {
+                    let mut kept = false;
+                    let place = if is_dir { child_place(&dst_place, &sources[*i].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()) } else { dst_place.clone() };
+                    let r = send(c, &sources[*i], &target, merge, &place, &resolver, &mut kept, p);
+                    if let Err(e) = r {
+                        // What a cancelled send left is removed, unless it was there before: a
+                        // folder merged into, or a file this one replaces.
+                        if e == CANCELLED && !merge && !replace {
+                            let _ = c.remove(&target, is_dir);
+                        }
+                        return Err(e);
+                    }
+                    if remove && !kept {
+                        trash::delete(&sources[*i]).map_err(|e| tr!("Enviado, mas não consegui mover o original para a Lixeira: {e}", "Uploaded, but couldn't move the original to the Recycle Bin: {e}"))?;
+                    }
+                    Ok(())
+                }
             })
             .collect()
     };
-    transfer(s, &server, reload, at_once, batch, prepare, |(_, small): &(_, Vec<bool>), i| small[i], step);
+    transfer(s, &server, reload, at_once, slots, batch, prepare, |(_, small): &(_, Vec<bool>), i| small[i], step);
 }
 
 /// `name`, or the first "nome (2).ext" whose lowercase isn't in `taken` (lowercased names).
@@ -528,22 +808,69 @@ pub(crate) fn free_name(name: &str, is_dir: bool, taken: &HashSet<String>) -> St
 }
 
 /// A file or a folder and all it holds, from the computer to `target` on the server.
-fn send(c: &mut dyn Conn, src: &Path, target: &str, p: &Progress) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+fn send(c: &mut dyn Conn, src: &Path, target: &str, merge: bool, dst_place: &str, resolver: &Resolver, kept: &mut bool, p: &Progress) -> Result<(), String> {
     if p.cancelled() {
         return Err(CANCELLED.into());
     }
     if src.is_dir() {
-        c.mkdir(target)?;
+        let existing: HashMap<String, Item> = if merge {
+            c.list(target)?.into_iter().map(|i| (i.name.to_lowercase(), i)).collect()
+        } else {
+            c.mkdir(target)?;
+            HashMap::new()
+        };
+        let mut taken: HashSet<String> = existing.keys().cloned().collect();
         let items = std::fs::read_dir(src).map_err(|e| tr!("Não consegui ler {}: {e}", "Couldn't read {}: {e}", src.display()))?;
         // Where the server takes files in batches, the folder's small files go together.
         let (most, largest) = c.batches();
         let mut small = Vec::new();
         for item in items {
             let item = item.map_err(|e| tr!("Não consegui ler {}: {e}", "Couldn't read {}: {e}", src.display()))?;
-            let (from, to) = (item.path(), child(target, &item.file_name().to_string_lossy()));
+            let from = item.path();
+            let raw_name = item.file_name().to_string_lossy().into_owned();
+            let is_dir = from.is_dir();
+            let key = raw_name.to_lowercase();
+            let (child_name, child_merge) = match existing.get(&key) {
+                None => {
+                    let chosen = if taken.contains(&key) { free_name(&raw_name, is_dir, &taken) } else { raw_name.clone() };
+                    taken.insert(chosen.to_lowercase());
+                    (chosen, false)
+                }
+                Some(ex) if is_dir && ex.is_dir => (ex.name.clone(), true),
+                Some(ex) => {
+                    let renamed = free_name(&raw_name, is_dir, &taken);
+                    let src_info = FileInfo::local(&from).unwrap_or_else(|| FileInfo {
+                        name: raw_name.clone(),
+                        place: src.display().to_string(),
+                        is_dir,
+                        size: None,
+                        modified: None,
+                        kind: conflict::kind_of(&raw_name, is_dir, None),
+                    });
+                    match resolver.resolve(src_info, FileInfo::remote(ex, dst_place.to_string()), renamed, || p.cancelled()) {
+                        Decision::Cancel => return Err(CANCELLED.into()),
+                        Decision::Skip => {
+                            *kept = true;
+                            p.unsize(ops::measure(&from, &|| p.cancelled()));
+                            continue;
+                        }
+                        Decision::Replace if !is_dir && !ex.is_dir => (ex.name.clone(), false),
+                        Decision::KeepBoth | Decision::Replace => {
+                            let free = free_name(&raw_name, is_dir, &taken);
+                            taken.insert(free.to_lowercase());
+                            (free, false)
+                        }
+                    }
+                }
+            };
+            let to = child(target, &child_name);
             match item.metadata() {
-                Ok(m) if most > 1 && m.is_file() && m.len() <= largest => small.push((to, from)),
-                _ => send(c, &from, &to, p)?,
+                Ok(m) if !is_dir && most > 1 && m.is_file() && m.len() <= largest => small.push((to, from)),
+                _ => {
+                    let next_place = if is_dir { child_place(dst_place, &child_name) } else { dst_place.to_string() };
+                    send(c, &from, &to, child_merge, &next_place, resolver, kept, p)?;
+                }
             }
         }
         for files in small.chunks(most.max(1)) {
@@ -706,6 +1033,8 @@ pub enum Provider {
     Sftp,
     Ftp,
     WebDav,
+    /// A cloud reached through WebDAV, ready-made (see `services.rs`).
+    Service(Brand),
 }
 
 /// A selectable account or protocol entry (including multi-version variants like Custom Client ID
@@ -729,11 +1058,13 @@ pub enum ProviderVariant {
     Telegram,
     WebDav,
     WebDavHttp,
+    Service(Brand),
 }
 
 impl ProviderVariant {
-    /// All supported variants sorted alphabetically (A–Z) for "Todas as nuvens".
-    pub const ALL_AZ: [ProviderVariant; 17] = [
+    /// All supported variants sorted alphabetically (A–Z) for "Todas as nuvens": these and
+    /// the services.
+    const BUILT_IN: [ProviderVariant; 17] = [
         ProviderVariant::B2,
         ProviderVariant::Dropbox,
         ProviderVariant::DropboxCustom,
@@ -753,8 +1084,16 @@ impl ProviderVariant {
         ProviderVariant::WebDavHttp,
     ];
 
+    /// Every variant, A–Z by label.
+    pub fn all_az() -> Vec<ProviderVariant> {
+        let mut all: Vec<ProviderVariant> = ProviderVariant::BUILT_IN.into_iter().chain(crate::services::all().iter().map(|s| ProviderVariant::Service(s.brand))).collect();
+        all.sort_by_key(|v| v.label().to_lowercase());
+        all
+    }
+
     pub fn provider(self) -> Provider {
         match self {
+            ProviderVariant::Service(b) => Provider::Service(b),
             ProviderVariant::B2 => Provider::B2,
             ProviderVariant::Dropbox | ProviderVariant::DropboxCustom => Provider::Dropbox,
             ProviderVariant::Ftp | ProviderVariant::Ftps => Provider::Ftp,
@@ -788,6 +1127,7 @@ impl ProviderVariant {
             ProviderVariant::Telegram => "Telegram",
             ProviderVariant::WebDav => "WebDav",
             ProviderVariant::WebDavHttp => "WebDav (HTTP)",
+            ProviderVariant::Service(b) => Provider::Service(b).label(),
         }
     }
 
@@ -810,6 +1150,7 @@ impl ProviderVariant {
             ProviderVariant::Telegram => t("Canal privado de armazenamento na sua conta", "Private storage channel in your account"),
             ProviderVariant::WebDav => t("Servidor WebDAV seguro via HTTPS", "Secure WebDAV server over HTTPS"),
             ProviderVariant::WebDavHttp => t("Servidor WebDAV sem criptografia (porta 80)", "Unencrypted WebDAV server (port 80)"),
+            ProviderVariant::Service(b) => Provider::Service(b).subtitle(),
         }
     }
 
@@ -818,6 +1159,15 @@ impl ProviderVariant {
     }
 
     pub fn in_category(self, category: Category) -> bool {
+        if let ProviderVariant::Service(b) = self {
+            let business = crate::services::of(b).is_some_and(|s| s.business);
+            return match category {
+                Category::All => true,
+                Category::Personal => !business,
+                Category::Business => business,
+                Category::Nas => false,
+            };
+        }
         match category {
             Category::All => true,
             Category::Personal => matches!(
@@ -918,7 +1268,13 @@ impl Provider {
             Provider::Sftp => "SFTP",
             Provider::Ftp => "FTP",
             Provider::WebDav => "WebDAV",
+            Provider::Service(b) => crate::services::of(b).map_or("WebDAV", |s| s.name),
         }
+    }
+
+    /// Every provider: these and the WebDAV services.
+    pub fn all() -> Vec<Provider> {
+        Provider::ALL.into_iter().chain(crate::services::all().iter().map(|s| Provider::Service(s.brand))).collect()
     }
 
     pub fn subtitle(self) -> &'static str {
@@ -934,6 +1290,7 @@ impl Provider {
             Provider::Sftp => t("SSH seguro · porta 22", "Secure SSH · port 22"),
             Provider::Ftp => t("FTP / FTPS · porta 21", "FTP / FTPS · port 21"),
             Provider::WebDav => "HTTPS / HTTP",
+            Provider::Service(b) => crate::services::of(b).map_or("WebDAV", |s| s.about()),
         }
     }
 
@@ -949,7 +1306,12 @@ impl Provider {
             Provider::OwnCloud => &crate::icons::PROVIDER_OWNCLOUD,
             Provider::Sftp => &crate::icons::PROVIDER_SFTP,
             Provider::Ftp => &crate::icons::PROVIDER_FTP,
-            Provider::WebDav => &crate::icons::PROVIDER_WEBDAV,
+            Provider::Service(Brand::Koofr) => &crate::icons::PROVIDER_KOOFR,
+            Provider::Service(Brand::MailRu) => &crate::icons::PROVIDER_MAILRU,
+            Provider::Service(Brand::Yandex) => &crate::icons::PROVIDER_YANDEX,
+            Provider::Service(Brand::Onlime) => &crate::icons::PROVIDER_ONLIME,
+            // The others' brand files don't allow it without asking (see `icons.rs`).
+            Provider::WebDav | Provider::Service(_) => &crate::icons::PROVIDER_WEBDAV,
         }
     }
 
@@ -966,10 +1328,16 @@ impl Provider {
             Provider::Sftp => &[ProviderVariant::Sftp],
             Provider::Ftp => &[ProviderVariant::Ftps, ProviderVariant::Ftp],
             Provider::WebDav => &[ProviderVariant::WebDav, ProviderVariant::WebDavHttp],
+            // Each service is its own single version: the variants are made, not listed.
+            Provider::Service(_) => &[],
         }
     }
 
     pub fn versions_in(self, category: Category, query: &str) -> Vec<ProviderVariant> {
+        if let Provider::Service(b) = self {
+            let v = ProviderVariant::Service(b);
+            return if v.in_category(category) && v.matches_query(query) { vec![v] } else { Vec::new() };
+        }
         self.versions().iter().copied().filter(|v| v.in_category(category) && v.matches_query(query)).collect()
     }
 
@@ -986,6 +1354,7 @@ impl Provider {
             Provider::Sftp => "sftp ssh servidor linux nas chave 22 server key secure",
             Provider::Ftp => "ftp ftps tls ssl servidor nas 21 990 server",
             Provider::WebDav => "webdav dav davs http https servidor nas server",
+            Provider::Service(b) => crate::services::of(b).map_or("webdav", |s| s.keywords),
         };
         self.label().to_lowercase().contains(w) || self.subtitle().to_lowercase().contains(w) || keywords.contains(w)
     }
@@ -999,7 +1368,7 @@ impl Provider {
             Provider::OneDrive => Protocol::OneDrive,
             Provider::Telegram => Protocol::Telegram,
             Provider::Ftp => Protocol::Ftp,
-            Provider::Nextcloud | Provider::OwnCloud | Provider::WebDav => Protocol::Davs,
+            Provider::Nextcloud | Provider::OwnCloud | Provider::WebDav | Provider::Service(_) => Protocol::Davs,
         }
     }
 
@@ -1007,6 +1376,7 @@ impl Provider {
         match self {
             Provider::Nextcloud => Some(Brand::Nextcloud),
             Provider::OwnCloud => Some(Brand::OwnCloud),
+            Provider::Service(b) => Some(b),
             _ => None,
         }
     }
@@ -1015,6 +1385,7 @@ impl Provider {
         match (server.brand, server.protocol) {
             (Some(Brand::Nextcloud), _) => Provider::Nextcloud,
             (Some(Brand::OwnCloud), _) => Provider::OwnCloud,
+            (Some(b), Protocol::Dav | Protocol::Davs) => Provider::Service(b),
             (_, Protocol::Sftp) => Provider::Sftp,
             (_, Protocol::Ftp | Protocol::Ftps) => Provider::Ftp,
             (_, Protocol::Dav | Protocol::Davs) => Provider::WebDav,
@@ -1200,7 +1571,7 @@ impl Form {
             ProviderVariant::WebDavHttp => {
                 self.protocol = Protocol::Dav;
             }
-            ProviderVariant::B2 | ProviderVariant::Mega | ProviderVariant::Telegram | ProviderVariant::Nextcloud | ProviderVariant::OwnCloud | ProviderVariant::Sftp => {}
+            ProviderVariant::B2 | ProviderVariant::Mega | ProviderVariant::Telegram | ProviderVariant::Nextcloud | ProviderVariant::OwnCloud | ProviderVariant::Sftp | ProviderVariant::Service(_) => {}
         }
     }
 
@@ -1246,6 +1617,22 @@ impl Form {
         if provider == Provider::Telegram {
             return crate::telegram::prepare(self);
         }
+        if let Provider::Service(b) = provider
+            && let Some(svc) = crate::services::of(b)
+        {
+            use crate::services::Host;
+            if self.editing.is_none() {
+                self.host = TextEdit::new(match svc.host {
+                    Host::Fixed(h) => h,
+                    Host::Part { .. } | Host::FromUser(_) | Host::Pasted { .. } => "",
+                });
+            }
+            match svc.host {
+                Host::Part { .. } | Host::Pasted { .. } => self.host.focused = true,
+                Host::Fixed(_) | Host::FromUser(_) => self.user.focused = true,
+            }
+            return;
+        }
         if provider == Provider::GoogleDrive {
             let missing = openexplorer_gdrive::ClientConfig::load().is_err();
             self.custom_oauth = missing;
@@ -1265,7 +1652,7 @@ impl Form {
             && let Some(a) = parse_address(h)
         {
             self.protocol = a.protocol;
-            if self.editing.is_none() && !matches!(self.provider, Provider::Nextcloud | Provider::OwnCloud) {
+            if self.editing.is_none() && !matches!(self.provider, Provider::Nextcloud | Provider::OwnCloud | Provider::Service(_)) {
                 self.provider = detect_provider(&a);
             }
         }
@@ -1286,12 +1673,12 @@ impl Form {
     /// picker shows `visible_variants`).
     #[cfg(test)]
     pub fn visible_providers(&self) -> Vec<Provider> {
-        Provider::ALL.into_iter().filter(|p| !p.versions_in(self.category, &self.filter.text).is_empty()).collect()
+        Provider::all().into_iter().filter(|p| !p.versions_in(self.category, &self.filter.text).is_empty()).collect()
     }
 
     /// Individual variants matching both the selected category tab and search text, sorted A–Z.
     pub fn visible_variants(&self) -> Vec<ProviderVariant> {
-        ProviderVariant::ALL_AZ.into_iter().filter(|v| v.in_category(self.category) && v.matches_query(&self.filter.text)).collect()
+        ProviderVariant::all_az().into_iter().filter(|v| v.in_category(self.category) && v.matches_query(&self.filter.text)).collect()
     }
 
     /// The form filled with `server`, to change it; the password stays as stored unless typed.
@@ -1302,11 +1689,15 @@ impl Form {
         f.protocol = server.protocol;
         f.name = TextEdit::new(server.name.clone());
         f.host = TextEdit::new(server.host.clone());
-        f.host.focused = true;
+        // A service whose server isn't shown takes the focus on the user name instead.
+        let host_shown = !matches!(provider, Provider::Service(b)
+            if crate::services::of(b).is_some_and(|s| matches!(s.host, crate::services::Host::Fixed(_) | crate::services::Host::FromUser(_))));
+        f.host.focused = host_shown;
         if server.port != server.protocol.default_port() {
             f.port = TextEdit::new(server.port.to_string());
         }
         f.user = TextEdit::new(server.user.clone());
+        f.user.focused = !host_shown;
         f.folder = TextEdit::new(server.root.clone());
         f.key = TextEdit::new(server.key.clone().unwrap_or_default());
         if server.connections != remote::USUAL_CONNECTIONS {
@@ -1347,9 +1738,19 @@ impl Form {
         f
     }
 
+    /// What the Servidor field stands for: as typed, or, for a ready-made service, its server
+    /// made from the part typed (see [`crate::services::Service::host_for`]).
+    fn host_text(&self) -> String {
+        match self.provider {
+            Provider::Service(b) if let Some(svc) = crate::services::of(b) => svc.host_for(&self.host.text, &self.user.text),
+            _ => self.host.text.trim().to_string(),
+        }
+    }
+
     /// Effective protocol, honoring an explicit URL scheme typed in `Servidor` (`ftps://`, `http://`, etc.).
     pub fn effective_protocol(&self) -> Protocol {
-        let h = self.host.text.trim();
+        let h = self.host_text();
+        let h = h.as_str();
         if h.contains("://")
             && let Some(a) = parse_address(h)
         {
@@ -1361,7 +1762,8 @@ impl Form {
     /// Current `(host, port)` target parsed from the form, used to scope trusted TLS fingerprints.
     pub fn target_endpoint(&self) -> Option<(String, u16, Protocol)> {
         let mut protocol = self.protocol;
-        let raw_host = self.host.text.trim();
+        let raw_host = self.host_text();
+        let raw_host = raw_host.as_str();
         let (host, url_port) = if raw_host.contains("://") {
             let a = parse_address(raw_host)?;
             protocol = a.protocol;
@@ -1397,7 +1799,12 @@ impl Form {
     /// missing.
     fn server(&self, s: &State) -> Result<(Server, Option<String>), String> {
         let mut protocol = self.protocol;
-        let raw_host = self.host.text.trim();
+        let raw_host = self.host_text();
+        let raw_host = raw_host.as_str();
+        let service = match self.provider {
+            Provider::Service(b) => crate::services::of(b),
+            _ => None,
+        };
         let mut user = self.user.text.trim().to_string();
         let explicit_folder = !self.folder.text.trim().is_empty();
         let mut root = self.folder.text.trim().to_string();
@@ -1420,8 +1827,23 @@ impl Form {
         } else {
             split_host_port(raw_host)?
         };
+        // After the address, whose user name fills an empty one.
+        if service.is_some_and(|s| s.lowercase_user) {
+            user = user.to_lowercase();
+        }
         if host.is_empty() {
-            return Err(t("Escreva o endereço do servidor.", "Type the server's address.").into());
+            use crate::services::Host;
+            // A service's server comes from the field it shows, under that field's name.
+            let field = match service.map(|s| (s, s.host)) {
+                Some((s, Host::FromUser(_))) => Some(s.user_label()),
+                Some((_, Host::Part { label, .. })) => Some(t(label.0, label.1)),
+                Some((_, Host::Pasted { .. })) => Some(t("Endereço WebDAV", "WebDAV address")),
+                Some((_, Host::Fixed(_))) | None => None,
+            };
+            return Err(match field {
+                Some(field) => tr!("Preencha \"{field}\".", "Fill in \"{field}\"."),
+                None => t("Escreva o endereço do servidor.", "Type the server's address.").into(),
+            });
         }
         if host.contains('/') || host.contains(' ') {
             return Err(t("O servidor é só o nome ou o IP, sem pastas: a pasta vai em Pasta inicial.", "The server is just the name or IP, without folders: the folder goes in Start folder.").into());
@@ -1434,6 +1856,8 @@ impl Form {
                 root = branded_webdav_root(pasted_path.as_deref().unwrap_or("/"));
             } else if let Some(p) = pasted_path {
                 root = p;
+            } else if let Some(svc) = service {
+                root = svc.root.to_string();
             }
         }
         let port = match (self.port.text.trim(), parsed_port) {
@@ -1449,7 +1873,8 @@ impl Form {
             "" => match brand {
                 Some(Brand::Nextcloud) => format!("Nextcloud ({host})"),
                 Some(Brand::OwnCloud) => format!("ownCloud ({host})"),
-                None => host.clone(),
+                Some(_) if let Some(svc) = service => if user.is_empty() { svc.name.to_string() } else { format!("{} ({user})", svc.name) },
+                Some(_) | None => host.clone(),
             },
             n => n.to_string(),
         };
@@ -1775,10 +2200,15 @@ pub fn submit(s: &mut State) {
         f.untrusted = None;
     }
     background(s, move |emit| {
+        let tried = format!("{}{}", server.address(), server.root);
         let checked = catch_panic(t("conectar ao servidor", "connect to the server"), || {
             let mut server = server;
             Ok(remote::probe(&mut server, secret.as_deref()).map(|_| server))
         });
+        // Where it went, never the password: a refusal says little without it.
+        if let Ok(Err(Refusal::Failed(e))) = &checked {
+            openexplorer_gdrive::log(&format!("falha ao conectar {tried}: {e}"));
+        }
         let result = checked.unwrap_or_else(|e| Err(Refusal::Failed(e)));
         emit(Msg::ServerChecked { attempt, result, secret: keep });
     });
@@ -1814,7 +2244,6 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
             return;
         }
         Err(Refusal::Failed(e)) => {
-            openexplorer_gdrive::log(&format!("falha ao conectar servidor: {e}"));
             form.error = Some(e);
             s.notify_account();
             return;
@@ -1857,7 +2286,7 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
             }
         }
     };
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         let pane = &mut s.panes[p];
         pane.back.iter_mut().chain(pane.forward.iter_mut()).for_each(renew);
     }
@@ -1866,7 +2295,7 @@ pub fn checked(s: &mut State, attempt: u64, result: Result<Server, Refusal>, sec
     }
     s.tree.server_changed(&server.id);
     // The panes on it show it again, read with its new settings.
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         let mut here = s.panes[p].loc.clone();
         let before = here.clone();
         renew(&mut here);
@@ -1915,7 +2344,7 @@ pub fn remove(s: &mut State, id: &str) {
     if s.clip.as_ref().is_some_and(|c| on(&c.from)) {
         s.clip = None;
     }
-    for p in 0..2 {
+    for p in 0..crate::layout::MAX_PANES {
         s.panes[p].back.retain(|l| !on(l));
         s.panes[p].forward.retain(|l| !on(l));
         if !s.tabs[p].is_picker() && on(&s.panes[p].loc) {
@@ -2140,10 +2569,10 @@ pub(crate) mod tests {
         let local = dir.join("x.bin");
         std::fs::write(&local, [0u8; 30]).unwrap();
         let p = Progress::new(None);
-        send(&mut Resends(vec![10, 20, 5, 30]), &local, "/x.bin", &p).unwrap();
+        send(&mut Resends(vec![10, 20, 5, 30]), &local, "/x.bin", false, "", &Resolver::fixed(conflict::Choice::Replace), &mut false, &p).unwrap();
         assert_eq!(p.bytes.load(Ordering::Relaxed), 30);
         let p = Progress::new(None);
-        fetch(&mut Resends(vec![10, 20, 5, 30]), "/x.bin", false, None, &dir.join("y.bin"), &p, 0).unwrap();
+        fetch(&mut Resends(vec![10, 20, 5, 30]), "/x.bin", false, None, &dir.join("y.bin"), true, "", None, &mut false, &p, 0).unwrap();
         assert_eq!(p.bytes.load(Ordering::Relaxed), 30);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2166,7 +2595,7 @@ pub(crate) mod tests {
         s.servers.list = vec![sv.clone()];
         s.panes[0].loc = folder(&sv, vec!["x".into()]);
         s.panes[1].back.push(folder(&sv, vec![]));
-        s.clip = Some(crate::actions::Clip { mode: crate::actions::ClipMode::Copy, from: folder(&sv, vec![]), items: Vec::new() });
+        s.clip = Some(crate::actions::Clip { mode: crate::actions::ClipMode::Copy, from: folder(&sv, vec![]), items: Vec::new(), picked_at: 0.0 });
         remove(&mut s, &sv.id);
         assert!(s.servers.store.servers().is_empty() && s.servers.list.is_empty());
         assert!(!matches!(s.panes[0].loc, Location::Server { .. }) && s.panes[1].back.is_empty() && s.clip.is_none());
@@ -2228,30 +2657,95 @@ pub(crate) mod tests {
     fn results_open_where_they_were_found() {
         let sv = server(Protocol::Ftp, "nas", "/srv");
         let found = Location::Server { server: Box::new(sv.clone()), path: vec!["a".into()], find: Some("x".into()) };
-        let e = |id: &str| Entry { id: id.into(), name: id.rsplit('/').next().unwrap().into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let e = |id: &str| Entry { id: id.into(), name: id.rsplit('/').next().unwrap().into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         assert_eq!(path_of(&found, &e("b/c/x.txt")).as_deref(), Some("/srv/a/b/c/x.txt"));
         assert_eq!(path_of(&folder(&sv, vec!["a".into()]), &e("x.txt")).as_deref(), Some("/srv/a/x.txt"));
         assert!(target(&found).is_none());
         assert_eq!(target(&folder(&sv, vec![])).map(|(_, d)| d), Some("/srv".into()));
     }
 
+    /// A ready-made WebDAV service fills its server and folder: the user types only their login
+    /// (and, where the address holds the account, that part of it), and the server keeps which
+    /// service it is, so editing it opens the same form.
+    #[test]
+    fn ready_made_webdav_services_fill_the_server() {
+        let s = crate::init();
+        let mut f = Form::new();
+        f.filter = TextEdit::new("pcloud");
+        assert_eq!(f.visible_variants(), [ProviderVariant::Service(Brand::PCloudEu), ProviderVariant::Service(Brand::PCloud)]);
+        f.filter = TextEdit::new("");
+        f.category = Category::Nas;
+        assert!(f.visible_providers().iter().all(|p| !matches!(p, Provider::Service(_))));
+        f.category = Category::Business;
+        assert!(f.visible_providers().contains(&Provider::Service(Brand::KDrive)) && !f.visible_providers().contains(&Provider::Service(Brand::Koofr)));
+
+        let mut koofr = Form::for_provider(Provider::Service(Brand::Koofr));
+        assert_eq!((koofr.step, koofr.protocol, koofr.host.text.as_str()), (Step::Configure, Protocol::Davs, "app.koofr.net"));
+        koofr.user = TextEdit::new("ana@exemplo.com");
+        let (sv, _) = koofr.server(&s).unwrap();
+        assert_eq!((sv.host.as_str(), sv.port, sv.root.as_str(), sv.brand, sv.name.as_str()), ("app.koofr.net", 443, "/dav/Koofr", Some(Brand::Koofr), "Koofr (ana@exemplo.com)"));
+        // Editing it opens the service's form again, with what was saved.
+        let again = Form::of(&sv);
+        assert_eq!((again.provider, again.folder.text.as_str()), (Provider::Service(Brand::Koofr), "/dav/Koofr"));
+
+        let mut kdrive = Form::for_provider(Provider::Service(Brand::KDrive));
+        assert!(kdrive.host.text.is_empty() && kdrive.host.focused);
+        kdrive.host = TextEdit::new("123456");
+        kdrive.user = TextEdit::new("ana@exemplo.ch");
+        let (sv, _) = kdrive.server(&s).unwrap();
+        assert_eq!((sv.host.as_str(), sv.root.as_str()), ("123456.connect.kdrive.infomaniak.com", ""));
+
+        let mut onlime = Form::for_provider(Provider::Service(Brand::Onlime));
+        onlime.user = TextEdit::new("web123");
+        assert_eq!(onlime.server(&s).unwrap().0.host, "web123-dav.onlime.ch");
+
+        let mut hidrive = Form::for_provider(Provider::Service(Brand::HiDrive));
+        hidrive.user = TextEdit::new("Ana");
+        assert_eq!(hidrive.server(&s).unwrap().0.user, "ana", "HiDrive takes user names in lower case");
+        let mut stack = Form::for_provider(Provider::Service(Brand::Stack));
+        stack.host = TextEdit::new("minhaconta");
+        stack.user = TextEdit::new("Ana");
+        assert_eq!(stack.server(&s).unwrap().0.user, "ana", "Stack takes user names in lower case");
+        stack.host = TextEdit::new("https://Ana@minhaconta.stack.storage/remote.php/webdav/");
+        stack.user = TextEdit::new("");
+        assert_eq!(stack.server(&s).unwrap().0.user, "ana", "a pasted address's user name too");
+        // Onlime shows no server field: an empty one is asked for by the field it comes from.
+        let mut onlime = Form::for_provider(Provider::Service(Brand::Onlime));
+        assert_eq!(onlime.server(&s).unwrap_err(), "Preencha \"Hospedagem (webNNN)\".");
+        onlime.user = TextEdit::new("web123");
+        let (sv, _) = onlime.server(&s).unwrap();
+        let again = Form::of(&sv);
+        assert!(again.user.focused && !again.host.focused, "editing it focuses a field that is shown");
+
+        // InfiniCLOUD's address is copied whole, path included, and stays InfiniCLOUD.
+        let mut infini = Form::for_provider(Provider::Service(Brand::InfiniCloud));
+        infini.host = TextEdit::new("https://ana.teracloud.jp/dav/");
+        infini.sync_host_scheme();
+        infini.user = TextEdit::new("ana");
+        let (sv, _) = infini.server(&s).unwrap();
+        assert_eq!((infini.provider, sv.host.as_str(), sv.root.as_str(), sv.brand), (Provider::Service(Brand::InfiniCloud), "ana.teracloud.jp", "/dav/", Some(Brand::InfiniCloud)));
+    }
+
     #[test]
     fn unified_catalog_filters_and_configures_presets() {
-        // Verify ALL_AZ is strictly sorted alphabetically (case-insensitive).
-        let az_labels: Vec<String> = ProviderVariant::ALL_AZ.iter().map(|v| v.label().to_lowercase()).collect();
+        // The A–Z list is sorted alphabetically (case-insensitive).
+        let az_labels: Vec<String> = ProviderVariant::all_az().iter().map(|v| v.label().to_lowercase()).collect();
         let mut sorted = az_labels.clone();
         sorted.sort();
         assert_eq!(az_labels, sorted);
 
         let mut f = Form::new();
         assert_eq!(f.step, Step::Pick);
-        assert_eq!(f.visible_providers().len(), 11);
-        assert_eq!(f.visible_variants().len(), 17);
+        let services = crate::services::all().len();
+        assert_eq!(f.visible_providers().len(), 11 + services);
+        assert_eq!(f.visible_variants().len(), 17 + services);
         assert_eq!(f.visible_popular().len(), 8);
+        // The built-in providers per category; the WebDAV services are checked on their own.
+        let built_in = |f: &Form| f.visible_providers().into_iter().filter(|p| !matches!(p, Provider::Service(_))).collect::<Vec<_>>();
         f.category = Category::Personal;
-        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::OneDrive, Provider::Dropbox, Provider::Mega, Provider::Telegram, Provider::Nextcloud, Provider::OwnCloud]);
+        assert_eq!(built_in(&f), [Provider::GoogleDrive, Provider::OneDrive, Provider::Dropbox, Provider::Mega, Provider::Telegram, Provider::Nextcloud, Provider::OwnCloud]);
         f.category = Category::Business;
-        assert_eq!(f.visible_providers(), [Provider::GoogleDrive, Provider::OneDrive, Provider::Dropbox, Provider::B2, Provider::Nextcloud, Provider::OwnCloud, Provider::Sftp, Provider::WebDav]);
+        assert_eq!(built_in(&f), [Provider::GoogleDrive, Provider::OneDrive, Provider::Dropbox, Provider::B2, Provider::Nextcloud, Provider::OwnCloud, Provider::Sftp, Provider::WebDav]);
         f.category = Category::Nas;
         assert_eq!(f.visible_providers(), [Provider::Nextcloud, Provider::OwnCloud, Provider::Sftp, Provider::Ftp, Provider::WebDav]);
         f.category = Category::All;
@@ -2398,7 +2892,7 @@ mod real {
         // Up from the computer: a folder and a file, into the server's root.
         s.status.clear();
         let items = s.panes[1].entries.clone();
-        s.clip = Some(Clip { mode: ClipMode::Copy, from: s.panes[1].loc.clone(), items });
+        s.clip = Some(Clip { mode: ClipMode::Copy, from: s.panes[1].loc.clone(), items, picked_at: 0.0 });
         actions::paste(&mut s, 0);
         settle(&mut s);
         assert!(s.status.starts_with("Enviado"), "{}", s.status);
@@ -2415,7 +2909,7 @@ mod real {
         crate::switch(&mut s, 1, Location::Local(local.join("baixados")));
         let fotos = s.panes[0].entries.iter().find(|e| e.name == "Fotos").cloned().unwrap();
         s.status.clear();
-        s.clip = Some(Clip { mode: ClipMode::Copy, from: s.panes[0].loc.clone(), items: vec![fotos] });
+        s.clip = Some(Clip { mode: ClipMode::Copy, from: s.panes[0].loc.clone(), items: vec![fotos], picked_at: 0.0 });
         actions::paste(&mut s, 1);
         settle(&mut s);
         assert_eq!(std::fs::read(local.join("baixados/Fotos/praia.jpg")).unwrap(), b"areia", "{}", s.status);
@@ -2431,7 +2925,7 @@ mod real {
         let velhas = s.panes[0].entries.iter().find(|e| e.name == "velhas.txt").cloned().unwrap();
         crate::switch(&mut s, 1, folder(&server, vec!["Arquivo".into()]));
         s.status.clear();
-        s.clip = Some(Clip { mode: ClipMode::Cut, from: s.panes[0].loc.clone(), items: vec![velhas] });
+        s.clip = Some(Clip { mode: ClipMode::Cut, from: s.panes[0].loc.clone(), items: vec![velhas], picked_at: 0.0 });
         actions::paste(&mut s, 1);
         settle(&mut s);
         assert!(served.join("Arquivo/velhas.txt").is_file(), "{}", s.status);
@@ -2693,7 +3187,7 @@ mod real {
             s.status = "listado".into();
             settle(s);
             s.status.clear();
-            s.clip = Some(Clip { mode, from: from.clone(), items });
+            s.clip = Some(Clip { mode, from: from.clone(), items, picked_at: 0.0 });
             actions::paste(s, 1);
             settle(s);
         };
@@ -2754,7 +3248,7 @@ mod real {
         let store = Store::at(base.join("servers.json"));
         store.save(server.clone(), Some("s3nh@")).unwrap();
         let pool = std::sync::Arc::new(Pool::default());
-        let fotos = Entry { id: "Fotos".into(), name: "Fotos".into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let fotos = Entry { id: "Fotos".into(), name: "Fotos".into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         let files = crate::relay::ServerFiles { pool, server: server.clone(), top: vec![("/Fotos".into(), fotos)] };
         let list = files.list(&std::sync::atomic::AtomicBool::new(false)).unwrap();
         let mut paths: Vec<&str> = list.iter().map(|v| v.path.as_str()).collect();

@@ -328,7 +328,7 @@ const RETRY: f64 = 120.0;
 pub struct Watch {
     /// The window lost the focus: nothing is read until it's back.
     away: bool,
-    panes: [Option<Turn>; 2],
+    panes: [Option<Turn>; crate::layout::MAX_PANES],
 }
 
 struct Turn {
@@ -355,8 +355,10 @@ fn every(items: usize) -> f64 {
 
 /// Reads again each pane's B2 folder whose turn came.
 pub fn tick(s: &mut State, now: f64) {
-    for p in 0..2 {
-        let shows = matches!(&s.panes[p].loc, Location::Server { server, find: None, .. } if server.is_b2());
+    // A pane the layout hides isn't read: it is once it shows again.
+    let visible = s.settings.pane_layout.count();
+    for p in 0..crate::layout::MAX_PANES {
+        let shows = p < visible && matches!(&s.panes[p].loc, Location::Server { server, find: None, .. } if server.is_b2());
         if !shows {
             s.servers.b2_watch.panes[p] = None;
             continue;
@@ -842,9 +844,12 @@ fn resume_upload(s: &mut State, id: &str) {
     let reload = panes_on(s, &server.id);
     let batch = crate::transfers::queue(&mut s.transfers, s.waker.clone(), crate::transfers::Op::Upload, [(crate::transfers::End::local(&local), crate::servers::end(&into, Some(&file)))]);
     let (pool, path) = (s.servers.pool.clone(), format!("/{bucket}/{name}"));
+    s.upload_slots.set_limit(usize::from(s.settings.uploads));
+    let slots = s.upload_slots.clone();
     background(s, move |emit| {
         let result = catch_panic(t("retomar o envio", "resume the upload"), || {
             batch.rows()[0].size(size);
+            let _slot = slots.acquire_unless(|| batch.rows()[0].over());
             batch.run(|_, p| {
                 crate::servers::with(&pool, &server, |c| {
                     let mut last = 0;
@@ -1102,7 +1107,7 @@ mod tests {
     fn deleting_in_a_bucket_hides_and_the_top_holds_still() {
         let mut s = crate::init();
         s.cache = crate::cache::Cache::memory_only();
-        let e = |id: &str| Entry { id: id.into(), name: id.into(), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false };
+        let e = |id: &str| Entry { id: id.into(), name: id.into(), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         for path in [&["fotos"][..], &["fotos", "2024"]] {
             s.dialog = None;
             s.panes[1].go(at_path(path));
@@ -1121,7 +1126,7 @@ mod tests {
     }
 
     fn file(name: &str) -> Entry {
-        Entry { id: name.into(), name: name.into(), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false }
+        Entry { id: name.into(), name: name.into(), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }
     }
 
     fn item(name: &str) -> b2::Item {

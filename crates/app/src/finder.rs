@@ -52,6 +52,7 @@ fn entry(path: String, is_dir: bool, size: u64, modified: u32) -> Entry {
         mime: None,
         md5: None,
         starred: false,
+        drive_origin: None,
     }
 }
 

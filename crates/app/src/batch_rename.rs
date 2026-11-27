@@ -250,7 +250,7 @@ impl BatchRename {
             let trimmed = name.trim();
             if case_insensitive_fs {
                 trimmed.to_lowercase()
-            } else if matches!(self.loc, Location::Drive { .. }) {
+            } else if matches!(self.loc, Location::Drive { .. } | Location::DriveSearch(_)) {
                 typed(trimmed)
             } else {
                 trimmed.to_string()
@@ -360,7 +360,7 @@ fn format_regex_error(err: &regex::Error) -> String {
 pub fn open(s: &mut State, p: usize, items: Vec<Entry>) {
     let loc = s.panes[p].loc.clone();
     let selected_ids: HashSet<&str> = items.iter().map(|e| e.id.as_str()).collect();
-    let other_names: Vec<String> = if matches!(loc, Location::Found(_)) {
+    let other_names: Vec<String> = if matches!(loc, Location::Found(_) | Location::DriveSearch(_)) {
         Vec::new()
     } else {
         s.panes[p].entries.iter().filter(|e| !selected_ids.contains(e.id.as_str())).map(|e| shown(&e.name)).collect()
@@ -400,7 +400,7 @@ pub fn submit(s: &mut State) {
     let loc = br.loc;
 
     // Follow renamed folders if any open tab or pane is inside them.
-    if !matches!(loc, Location::Mock(_) | Location::Found(_)) {
+    if !matches!(loc, Location::Mock(_) | Location::Found(_) | Location::Computer | Location::DriveSearch(_)) {
         for (item, shown_name) in &pairs {
             if item.is_dir {
                 let raw = if matches!(loc, Location::Drive { .. }) { typed(shown_name) } else { shown_name.clone() };
@@ -493,7 +493,38 @@ pub fn submit(s: &mut State) {
                 },
             );
         }
-        Location::Mock(_) => {
+        Location::DriveSearch(_) => {
+            let mut by_account: Vec<(String, Vec<(Entry, String)>)> = Vec::new();
+            for (item, shown_name) in pairs {
+                let Some(email) = actions::item_account(&loc, &item).map(str::to_string) else { continue };
+                if let Some((_, group)) = by_account.iter_mut().find(|(e, _)| *e == email) {
+                    group.push((item, shown_name));
+                } else {
+                    by_account.push((email, vec![(item, shown_name)]));
+                }
+            }
+            for (email, group) in by_account {
+                let who = email.clone();
+                let reload = actions::account_panes_and(s, &email, &loc);
+                undo::drive_job(
+                    s,
+                    &email,
+                    reload,
+                    move |n| tr!("renomear em massa ({})", "batch rename ({})", undo::items(n)),
+                    move |d, rec| {
+                        let mut done = 0usize;
+                        for (item, shown_name) in group {
+                            let raw = typed(&shown_name);
+                            let file = d.rename(&item.id, &raw).map_err(|e| batch_err(done, &shown(&item.name), &e))?;
+                            rec.add([Step::DriveRename { email: who.clone(), id: item.id, from: file.name, to: item.name }]);
+                            done += 1;
+                        }
+                        Ok(batch_done_msg(done))
+                    },
+                );
+            }
+        }
+        Location::Mock(_) | Location::Computer => {
             s.status = t("Aqui não dá para renomear itens.", "Items can't be renamed here.").into();
         }
     }
@@ -2000,6 +2031,7 @@ mod tests {
             target: None,
             starred: false,
             md5: None,
+            drive_origin: None,
         }
     }
 

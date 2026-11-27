@@ -15,18 +15,21 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use openexplorer_gdrive::api::FOLDER_MIME;
 use openexplorer_gdrive::{Drive, DriveFile};
 
-use crate::model::Entry;
+use crate::conflict::{self, Decision, FileInfo, Resolver};
+use crate::model::{Entry, shown};
 use crate::ops::{self, CANCELLED, Progress, Stage};
 use crate::transfers::Batch;
-use crate::work::Queue;
+use crate::work::{Queue, Slots};
 
 /// What to do with a file whose name is already in the Drive folder it goes into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub enum Clash {
     /// Send it as a new version of the file there (Substituir).
     Replace,
@@ -52,6 +55,8 @@ pub struct Existing {
     pub name: String,
     pub id: String,
     pub kind: Kind,
+    pub size: Option<u64>,
+    pub modified: Option<SystemTime>,
 }
 
 fn kind_of(mime: &str, is_shortcut: bool) -> Kind {
@@ -66,16 +71,41 @@ fn kind_of(mime: &str, is_shortcut: bool) -> Kind {
 impl Existing {
     pub fn of_entry(e: &Entry) -> Existing {
         let mime = e.mime.as_deref().unwrap_or(if e.is_dir { FOLDER_MIME } else { "" });
-        Existing { name: e.name.clone(), id: e.id.clone(), kind: kind_of(mime, e.target.is_some()) }
+        Existing {
+            name: e.name.clone(),
+            id: e.id.clone(),
+            kind: kind_of(mime, e.target.is_some()),
+            size: if e.is_dir { None } else { e.size },
+            modified: e.modified,
+        }
     }
 
     fn of_file(f: &DriveFile) -> Existing {
-        Existing { name: f.name.clone(), id: f.id.clone(), kind: kind_of(&f.mime, f.target.is_some()) }
+        Existing {
+            name: f.name.clone(),
+            id: f.id.clone(),
+            kind: kind_of(&f.mime, f.target.is_some()),
+            size: if f.is_dir { None } else { f.size },
+            modified: f.modified,
+        }
+    }
+
+    fn to_file_info(&self, place: String) -> FileInfo {
+        let is_dir = self.kind == Kind::Folder;
+        FileInfo {
+            name: self.name.clone(),
+            place,
+            is_dir,
+            size: self.size,
+            modified: self.modified,
+            kind: conflict::kind_of(&self.name, is_dir, None),
+        }
     }
 }
 
 /// How one item goes into a Drive folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub enum Put {
     /// As a new item with this name.
     New(String),
@@ -89,6 +119,7 @@ pub enum Put {
 
 /// One item of an upload: where it is on disk, how it goes in, and what to do with clashes
 /// inside it (a merged folder's files).
+#[cfg(test)]
 pub struct Item {
     pub path: PathBuf,
     pub put: Put,
@@ -96,6 +127,7 @@ pub struct Item {
 }
 
 /// Which of `local` (names) are taken in `existing`, by position.
+#[cfg(test)]
 pub fn clashes(local: &[String], existing: &[Existing]) -> Vec<usize> {
     let names: HashSet<&str> = existing.iter().map(|e| e.name.as_str()).collect();
     local.iter().enumerate().filter(|(_, n)| names.contains(n.as_str())).map(|(i, _)| i).collect()
@@ -106,6 +138,7 @@ pub fn clashes(local: &[String], existing: &[Existing]) -> Vec<usize> {
 /// folder is always merged into it. Neither a file and a folder nor a Google Doc can be one
 /// another's new version, so Substituir sends those under a free name, as Manter os dois does;
 /// a free name is one neither Drive nor the other items being sent have.
+#[cfg(test)]
 pub fn resolve(local: &[(String, bool)], existing: &[Existing], clash: impl Fn(usize) -> Clash) -> Vec<Put> {
     let mut there: HashMap<&str, &Existing> = HashMap::new();
     for e in existing {
@@ -143,6 +176,7 @@ pub fn numbered(name: &str, is_dir: bool, taken: &HashSet<String>) -> String {
 }
 
 /// One piece of work of a row.
+#[cfg(test)]
 enum Work {
     /// Put folder `dir` into Drive folder `parent`: make it as `name`, or with `into` use the
     /// folder already there; then queue what's in it, its clashes settled by `clash`.
@@ -152,6 +186,7 @@ enum Work {
     File { row: usize, path: PathBuf, name: String, parent: String, replace: Option<String> },
 }
 
+#[cfg(test)]
 impl Work {
     fn row(&self) -> usize {
         match self {
@@ -174,6 +209,7 @@ impl Work {
 }
 
 /// What a row still has going.
+#[cfg(test)]
 struct Row {
     /// Work queued or running.
     left: AtomicUsize,
@@ -189,7 +225,8 @@ struct Row {
 /// `at_once` folders made and files sent at the same time. With `remove`, a row whose files all
 /// arrived then goes to the Recycle Bin (Recortar and Colar). An item to skip ends its row
 /// at once.
-pub fn run(d: &Drive, batch: &Batch, items: &[Item], parent: &str, remove: bool, at_once: usize) -> Result<String, String> {
+#[cfg(test)]
+pub fn run(d: &Drive, batch: &Batch, items: &[Item], parent: &str, remove: bool, at_once: usize, slots: &Slots) -> Result<String, String> {
     let rows = batch.rows();
     for (p, item) in rows.iter().zip(items) {
         p.size(ops::measure(&item.path, &|| p.cancelled()));
@@ -212,7 +249,9 @@ pub fn run(d: &Drive, batch: &Batch, items: &[Item], parent: &str, remove: bool,
                 while let Some((work, _finished)) = queue.next() {
                     let row = work.row();
                     let (p, st) = (&rows[row], &state[row]);
-                    if p.cancelled() || st.error.lock().map(|e| e.is_some()).unwrap_or(true) {
+                    let skip = || p.cancelled() || st.error.lock().map(|e| e.is_some()).unwrap_or(true);
+                    let _slot = slots.acquire_unless(skip);
+                    if skip() {
                         st.skipped.store(true, Ordering::Relaxed);
                     } else {
                         if p.stage() == Stage::Waiting {
@@ -279,6 +318,7 @@ pub fn listing(d: &Drive, id: &str) -> Result<Vec<Existing>, String> {
 /// folder holds by `clash`. What's skipped comes off the row's size and keeps a move's
 /// original.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn open_folder(d: &Drive, row: usize, dir: &Path, name: &str, parent: &str, into: Option<&str>, clash: Clash, p: &Progress, st: &Row) -> Result<Vec<Work>, String> {
     let (id, existing) = match into {
         Some(id) => (id.to_string(), listing(d, id)?),
@@ -326,12 +366,424 @@ fn send(d: &Drive, path: &Path, name: &str, parent: &str, replace: Option<&str>,
     result.map(|_| ())
 }
 
+fn child_place(place: &str, name: &str) -> String {
+    let s = shown(name);
+    if place.is_empty() { s } else { format!("{place}\\{s}") }
+}
+
+enum CWork {
+    Folder { row: usize, dir: PathBuf, name: String, parent: String, into: Option<String>, dst_place: String },
+    File {
+        row: usize,
+        path: PathBuf,
+        name: String,
+        parent: String,
+        existing: Option<Existing>,
+        taken: Arc<Mutex<HashSet<String>>>,
+        dst_place: String,
+        is_top: bool,
+    },
+}
+
+impl CWork {
+    fn row(&self) -> usize {
+        match self {
+            CWork::Folder { row, .. } | CWork::File { row, .. } => *row,
+        }
+    }
+}
+
+struct CRow {
+    left: AtomicUsize,
+    skipped: AtomicBool,
+    row_skipped: AtomicBool,
+    kept: AtomicBool,
+    error: Mutex<Option<String>>,
+}
+
+/// Uploads `sources` into Drive folder `parent`, checking destination names against
+/// `initial_existing` (or listing `parent` when `None`) and prompting via `resolver` per
+/// colliding file or file/folder mismatch. Existing folders are merged into.
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_conflict(
+    d: &Drive,
+    batch: &Batch,
+    sources: &[PathBuf],
+    parent: &str,
+    dst_place: &str,
+    initial_existing: Option<Vec<Existing>>,
+    remove: bool,
+    at_once: usize,
+    slots: &Slots,
+    resolver: Option<&Resolver>,
+) -> Result<String, String> {
+    let rows = batch.rows();
+    for (p, src) in rows.iter().zip(sources) {
+        p.size(ops::measure(src, &|| p.cancelled()));
+    }
+    let existing = match initial_existing {
+        Some(list) => list,
+        None => listing(d, parent)?,
+    };
+    let mut there: HashMap<String, Existing> = HashMap::new();
+    for e in existing {
+        there.entry(e.name.clone()).or_insert(e);
+    }
+    let taken = Arc::new(Mutex::new(
+        there
+            .keys()
+            .cloned()
+            .chain(sources.iter().filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())))
+            .collect::<HashSet<String>>(),
+    ));
+
+    let state: Vec<CRow> = rows
+        .iter()
+        .map(|_| CRow {
+            left: AtomicUsize::new(1),
+            skipped: AtomicBool::new(false),
+            row_skipped: AtomicBool::new(false),
+            kept: AtomicBool::new(false),
+            error: Mutex::new(None),
+        })
+        .collect();
+
+    let mut first = VecDeque::new();
+    for (row, src) in sources.iter().enumerate() {
+        let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let is_dir = src.is_dir();
+        if is_dir {
+            match there.get(&name) {
+                Some(ex) if ex.kind == Kind::Folder => {
+                    rows[row].add_items(1);
+                    first.push_back(CWork::Folder {
+                        row,
+                        dir: src.clone(),
+                        name: name.clone(),
+                        parent: parent.to_string(),
+                        into: Some(ex.id.clone()),
+                        dst_place: child_place(dst_place, &name),
+                    });
+                }
+                Some(ex) => {
+                    let decision = if let Some(res) = resolver {
+                        let free = {
+                            let g = taken.lock().unwrap_or_else(|e| e.into_inner());
+                            numbered(&name, true, &g)
+                        };
+                        let src_info = FileInfo::local(src).unwrap_or_else(|| FileInfo {
+                            name: name.clone(),
+                            place: src.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+                            is_dir: true,
+                            size: None,
+                            modified: None,
+                            kind: conflict::kind_of(&name, true, None),
+                        });
+                        res.resolve(src_info, ex.to_file_info(dst_place.to_string()), free, || rows[row].cancelled())
+                    } else {
+                        Decision::KeepBoth
+                    };
+                    match decision {
+                        Decision::Skip => {
+                            rows[row].skip();
+                        }
+                        Decision::Cancel => {
+                            rows[row].end(Err(CANCELLED.into()));
+                        }
+                        Decision::KeepBoth | Decision::Replace => {
+                            let free = {
+                                let mut g = taken.lock().unwrap_or_else(|e| e.into_inner());
+                                let free = numbered(&name, true, &g);
+                                g.insert(free.clone());
+                                free
+                            };
+                            rows[row].add_items(1);
+                            first.push_back(CWork::Folder {
+                                row,
+                                dir: src.clone(),
+                                name: free.clone(),
+                                parent: parent.to_string(),
+                                into: None,
+                                dst_place: child_place(dst_place, &free),
+                            });
+                        }
+                    }
+                }
+                None => {
+                    rows[row].add_items(1);
+                    first.push_back(CWork::Folder {
+                        row,
+                        dir: src.clone(),
+                        name: name.clone(),
+                        parent: parent.to_string(),
+                        into: None,
+                        dst_place: child_place(dst_place, &name),
+                    });
+                }
+            }
+        } else {
+            rows[row].add_items(1);
+            first.push_back(CWork::File {
+                row,
+                path: src.clone(),
+                name: name.clone(),
+                parent: parent.to_string(),
+                existing: there.get(&name).cloned(),
+                taken: taken.clone(),
+                dst_place: dst_place.to_string(),
+                is_top: true,
+            });
+        }
+    }
+
+    let queue = Queue::new(first);
+    std::thread::scope(|scope| {
+        for _ in 0..at_once.max(1) {
+            scope.spawn(|| {
+                while let Some((work, _finished)) = queue.next() {
+                    let row = work.row();
+                    let (p, st) = (&rows[row], &state[row]);
+                    let skip = || p.cancelled() || st.error.lock().map(|e| e.is_some()).unwrap_or(true);
+                    match work {
+                        CWork::File { path, mut name, parent, existing, taken, dst_place, is_top, .. } => {
+                            let mut replace: Option<String> = None;
+                            let mut do_send = true;
+                            if skip() {
+                                st.skipped.store(true, Ordering::Relaxed);
+                                do_send = false;
+                            } else if let Some(ex) = existing {
+                                let decision = if let Some(res) = resolver {
+                                    let free = {
+                                        let g = taken.lock().unwrap_or_else(|e| e.into_inner());
+                                        numbered(&name, false, &g)
+                                    };
+                                    let src_info = FileInfo::local(&path).unwrap_or_else(|| FileInfo {
+                                        name: name.clone(),
+                                        place: path.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+                                        is_dir: false,
+                                        size: None,
+                                        modified: None,
+                                        kind: conflict::kind_of(&name, false, None),
+                                    });
+                                    res.resolve(src_info, ex.to_file_info(dst_place), free, skip)
+                                } else {
+                                    Decision::KeepBoth
+                                };
+                                match decision {
+                                    Decision::Cancel => {
+                                        st.skipped.store(true, Ordering::Relaxed);
+                                        do_send = false;
+                                    }
+                                    Decision::Skip => {
+                                        if is_top {
+                                            st.row_skipped.store(true, Ordering::Relaxed);
+                                        } else {
+                                            st.kept.store(true, Ordering::Relaxed);
+                                            p.unsize(ops::measure(&path, &|| p.cancelled()));
+                                        }
+                                        do_send = false;
+                                    }
+                                    Decision::Replace if ex.kind == Kind::File => {
+                                        replace = Some(ex.id);
+                                    }
+                                    Decision::KeepBoth | Decision::Replace => {
+                                        let mut g = taken.lock().unwrap_or_else(|e| e.into_inner());
+                                        let free = numbered(&name, false, &g);
+                                        g.insert(free.clone());
+                                        name = free;
+                                    }
+                                }
+                            }
+                            if do_send {
+                                let _slot = slots.acquire_unless(skip);
+                                if skip() {
+                                    st.skipped.store(true, Ordering::Relaxed);
+                                } else {
+                                    if p.stage() == Stage::Waiting {
+                                        p.begin();
+                                    }
+                                    match send(d, &path, &name, &parent, replace.as_deref(), p) {
+                                        Ok(()) => {}
+                                        Err(e) if e == CANCELLED => st.skipped.store(true, Ordering::Relaxed),
+                                        Err(e) => {
+                                            if let Ok(mut first) = st.error.lock() {
+                                                first.get_or_insert(e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        CWork::Folder { dir, name, parent, into, dst_place, .. } => {
+                            let _slot = slots.acquire_unless(skip);
+                            if skip() {
+                                st.skipped.store(true, Ordering::Relaxed);
+                            } else {
+                                if p.stage() == Stage::Waiting {
+                                    p.begin();
+                                }
+                                match open_folder_conflict(d, row, &dir, &name, &parent, into.as_deref(), &dst_place, resolver, p, st) {
+                                    Ok(more) => {
+                                        st.left.fetch_add(more.len(), Ordering::Relaxed);
+                                        p.add_items(more.len() as u64);
+                                        queue.add(more);
+                                    }
+                                    Err(e) if e == CANCELLED => st.skipped.store(true, Ordering::Relaxed),
+                                    Err(e) => {
+                                        if let Ok(mut first) = st.error.lock() {
+                                            first.get_or_insert(e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    p.item_done();
+                    if st.left.fetch_sub(1, Ordering::Relaxed) == 1 {
+                        if st.row_skipped.load(Ordering::Relaxed) {
+                            p.skip();
+                        } else {
+                            let error = st.error.lock().ok().and_then(|e| e.clone());
+                            p.end(match error {
+                                Some(e) => Err(e),
+                                None if st.skipped.load(Ordering::Relaxed) => Err(CANCELLED.into()),
+                                None => finish(&sources[row], remove && !st.kept.load(Ordering::Relaxed)),
+                            });
+                        }
+                    }
+                }
+            });
+        }
+    });
+    batch.summary()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_folder_conflict(
+    d: &Drive,
+    row: usize,
+    dir: &Path,
+    name: &str,
+    parent: &str,
+    into: Option<&str>,
+    dst_place: &str,
+    resolver: Option<&Resolver>,
+    p: &Progress,
+    st: &CRow,
+) -> Result<Vec<CWork>, String> {
+    let (id, existing) = match into {
+        Some(id) => (id.to_string(), listing(d, id)?),
+        None => (d.create_folder(name, parent)?.id, Vec::new()),
+    };
+    let items: Vec<(PathBuf, String, bool)> = std::fs::read_dir(dir)
+        .map_err(|e| openexplorer_i18n::tr!("Não consegui ler \"{}\": {e}", "Couldn't read \"{}\": {e}", dir.display()))?
+        .flatten()
+        .map(|item| {
+            let path = item.path();
+            let is_dir = path.is_dir();
+            (path, item.file_name().to_string_lossy().into_owned(), is_dir)
+        })
+        .collect();
+    let mut there: HashMap<String, Existing> = HashMap::new();
+    for e in existing {
+        there.entry(e.name.clone()).or_insert(e);
+    }
+    let taken = Arc::new(Mutex::new(
+        there
+            .keys()
+            .cloned()
+            .chain(items.iter().map(|(_, n, _)| n.clone()))
+            .collect::<HashSet<String>>(),
+    ));
+    let mut work = Vec::new();
+    for (path, item_name, is_dir) in items {
+        if is_dir {
+            match there.get(&item_name) {
+                Some(ex) if ex.kind == Kind::Folder => {
+                    work.push(CWork::Folder {
+                        row,
+                        dir: path,
+                        name: item_name.clone(),
+                        parent: id.clone(),
+                        into: Some(ex.id.clone()),
+                        dst_place: child_place(dst_place, &item_name),
+                    });
+                }
+                Some(ex) => {
+                    let decision = if let Some(res) = resolver {
+                        let free = {
+                            let g = taken.lock().unwrap_or_else(|e| e.into_inner());
+                            numbered(&item_name, true, &g)
+                        };
+                        let src_info = FileInfo::local(&path).unwrap_or_else(|| FileInfo {
+                            name: item_name.clone(),
+                            place: dir.display().to_string(),
+                            is_dir: true,
+                            size: None,
+                            modified: None,
+                            kind: conflict::kind_of(&item_name, true, None),
+                        });
+                        res.resolve(src_info, ex.to_file_info(dst_place.to_string()), free, || p.cancelled())
+                    } else {
+                        Decision::KeepBoth
+                    };
+                    match decision {
+                        Decision::Cancel => return Err(CANCELLED.into()),
+                        Decision::Skip => {
+                            p.unsize(ops::measure(&path, &|| p.cancelled()));
+                            st.kept.store(true, Ordering::Relaxed);
+                        }
+                        Decision::KeepBoth | Decision::Replace => {
+                            let free = {
+                                let mut g = taken.lock().unwrap_or_else(|e| e.into_inner());
+                                let free = numbered(&item_name, true, &g);
+                                g.insert(free.clone());
+                                free
+                            };
+                            work.push(CWork::Folder {
+                                row,
+                                dir: path,
+                                name: free.clone(),
+                                parent: id.clone(),
+                                into: None,
+                                dst_place: child_place(dst_place, &free),
+                            });
+                        }
+                    }
+                }
+                None => {
+                    work.push(CWork::Folder {
+                        row,
+                        dir: path,
+                        name: item_name.clone(),
+                        parent: id.clone(),
+                        into: None,
+                        dst_place: child_place(dst_place, &item_name),
+                    });
+                }
+            }
+        } else {
+            work.push(CWork::File {
+                row,
+                path,
+                name: item_name.clone(),
+                parent: id.clone(),
+                existing: there.get(&item_name).cloned(),
+                taken: taken.clone(),
+                dst_place: dst_place.to_string(),
+                is_top: false,
+            });
+        }
+    }
+    Ok(work)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn there(name: &str, id: &str, kind: Kind) -> Existing {
-        Existing { name: name.into(), id: id.into(), kind }
+        Existing { name: name.into(), id: id.into(), kind, size: None, modified: None }
     }
 
     fn local(items: &[(&str, bool)]) -> Vec<(String, bool)> {
@@ -432,7 +884,7 @@ mod tests {
             let items: Vec<Item> = resolve(&local, &existing, |_| clash).into_iter().zip(&sources).filter(|(put, _)| *put != Put::Skip).map(|(put, p)| Item { path: p.clone(), put, clash }).collect();
             let mut list = Vec::new();
             let batch = queue(&mut list, None, Op::Upload, items.iter().map(|it| (End::local(&it.path), End::local(&it.path))));
-            run(&d, &batch, &items, &root.id, false, 4).unwrap()
+            run(&d, &batch, &items, &root.id, false, 4, &Slots::new(4)).unwrap()
         };
         let folder = |list: &[(String, String, Option<String>)]| -> String {
             let pastas: Vec<_> = list.iter().filter(|(n, ..)| n == "Pasta").collect();
@@ -495,6 +947,7 @@ mod tests {
             mime: Some(mime.into()),
             md5: None,
             starred: false,
+            drive_origin: None,
         };
         assert_eq!(Existing::of_entry(&e(FOLDER_MIME, false)).kind, Kind::Folder);
         assert_eq!(Existing::of_entry(&e("image/jpeg", false)).kind, Kind::File);

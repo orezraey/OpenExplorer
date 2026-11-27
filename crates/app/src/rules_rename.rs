@@ -2729,6 +2729,7 @@ mod tests {
             target: None,
             starred: false,
             md5: None,
+            drive_origin: None,
         }
     }
 

@@ -117,6 +117,10 @@ pub struct DriveFile {
     pub starred: bool,
     /// Drive's MD5 of the content, sent with the listing; Google's own formats have none.
     pub md5: Option<String>,
+    /// Shared drive id when the file sits in a shared drive (`None` for My Drive / Shared with me).
+    pub drive_id: Option<String>,
+    /// Whether this account owns the file (set by search / trash listings).
+    pub owned_by_me: Option<bool>,
 }
 
 /// A shared drive (formerly Team Drive): files owned by a group rather than by a person.
@@ -819,6 +823,8 @@ impl From<RawFile> for DriveFile {
             mime: r.mime_type,
             md5: r.md5_checksum,
             starred: r.starred.unwrap_or(false),
+            drive_id: r.drive_id,
+            owned_by_me: r.owned_by_me,
         }
     }
 }

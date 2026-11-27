@@ -11,11 +11,13 @@
 mod accounts;
 mod actions;
 mod address;
+mod anim;
 mod autoscroll;
 mod b2;
 mod batch_rename;
 mod cache;
 mod caches;
+mod conflict;
 mod downloads;
 mod dropbox;
 #[cfg(windows)]
@@ -29,10 +31,12 @@ mod layout;
 mod media_rename;
 mod mega;
 mod model;
+mod mounts;
 mod network;
 mod onedrive;
 mod ops;
 mod settings;
+mod showcase;
 mod sharing;
 mod places;
 mod relay;
@@ -40,13 +44,17 @@ mod rules_meta;
 mod rules_rename;
 mod rules_script;
 mod rules_ui;
+mod scrollbars;
 mod servers;
+mod services;
 mod sysicons;
 mod tabs;
 mod telegram;
 mod transfers;
+mod tray;
 mod tree;
 mod undo;
+mod updater;
 mod uploads;
 mod ui;
 mod watch;
@@ -65,6 +73,7 @@ use openexplorer_gdrive::{ClientConfig, Drive, DriveFile, Quota, oauth};
 use openexplorer_i18n::{t, tr};
 use rune::{AppSpec, DragItem, Key, KeyEvent, LiveRegion, Mods, Tx, Waker};
 
+use layout::MAX_PANES;
 use model::{Entry, Location, MockDrive, Pane, SortCol, Space};
 
 const ROW_H: f32 = 22.0;
@@ -87,14 +96,18 @@ enum Msg {
     ServerChecked { attempt: u64, result: Result<openexplorer_remote::Server, openexplorer_remote::Refusal>, secret: Option<String> },
     /// Computers for Rede; `done` once the network search ended.
     Servers { found: Vec<String>, done: bool },
+    /// The system says a disk was mounted or removed (see [`mounts::watch`]).
+    DrivesMoved,
+    /// The disks' names, as the system shows them (see [`mounts::names`]).
+    DriveNames(Vec<(PathBuf, String)>),
     /// A file operation finished: reload the panes showing `reload`, and say how it went.
     Done { reload: Vec<Location>, result: Result<String, String> },
     /// Something Propriedades number `id` was waiting for.
     Prop { id: u64, update: actions::PropUpdate },
     /// Windows' icon for a file type, a folder or a drive.
     Icon { key: sysicons::IconKey, rgba: Option<sysicons::IconBitmaps> },
-    /// What the Drive folder an upload goes into holds, to check its names against.
-    Clashes { up: actions::Upload, result: Result<Vec<Entry>, String> },
+    /// A transfer worker hit an existing destination item and is waiting for the user's choice.
+    Conflict(Box<conflict::Prompt>),
     /// An account's storage, for the status bar.
     Quota { email: String, result: Result<Quota, String> },
     /// What changed in `email`'s Drive since it was last asked (see [`watch`]).
@@ -128,6 +141,12 @@ enum Msg {
     /// A drag of Drive items `ids` out of pane `from` ended.
     #[cfg(windows)]
     DragEnded { from: usize, ids: Vec<String>, ended: dragout::Ended },
+    /// Built-in updater check, download progress or completion.
+    Update(updater::Answer),
+    /// Shared drive id -> name map learned when listing or searching a Drive account.
+    SharedDrives { email: String, names: HashMap<String, String> },
+    /// Partial account failures during a multi-account Google Drive search.
+    DriveSearchWarnings { pane: usize, request: u64, warnings: Vec<(String, String)> },
 }
 
 /// Which part of a listing a [`Msg::Listed`] is.
@@ -153,12 +172,27 @@ pub enum MainTab {
 
 struct State {
     main_tab: MainTab,
+    view_menu_open: bool,
+    /// Which pane's view-mode dropdown menu is currently open, if any.
+    view_mode_menu: Option<usize>,
+    /// Which pane's Drive search scope dropdown is currently open, if any.
+    search_scope_menu: Option<usize>,
+    /// Selected Drive search scope per pane.
+    search_scope: [model::DriveSearchScope; MAX_PANES],
+    /// Partial account errors for a multi-account Drive search, per pane.
+    drive_search_warnings: [Vec<(String, String)>; MAX_PANES],
+    /// Cached shared drive `id -> name` per connected Google Drive account.
+    shared_drive_names: HashMap<String, HashMap<String, String>>,
+    /// Number of columns per pane in icon-grid view modes (updated from viewport width).
+    grid_cols: [usize; MAX_PANES],
+    /// Number of rows per column in multi-column List view mode (updated from viewport height).
+    list_rows: [usize; MAX_PANES],
     accounts_filter: Option<servers::Provider>,
     accounts_search: rune::TextEdit,
-    panes: [Pane; 2],
-    tabs: [tabs::PaneTabs; 2],
+    panes: [Pane; MAX_PANES],
+    tabs: [tabs::PaneTabs; MAX_PANES],
     /// Whether each pane's left folder tree is shown.
-    show_tree: [bool; 2],
+    show_tree: [bool; MAX_PANES],
     /// The context menu: the pane it was opened in and where.
     menu: Option<(usize, rune::PointerPress)>,
     /// The tree's right-click menu: pane, node, whether it's open, whether it's empty, and where.
@@ -171,37 +205,58 @@ struct State {
     lasso: Option<lasso::Lasso>,
     /// Where each pane's file list viewport is and how far it's scrolled, for the rectangle
     /// selection and the menu the keyboard opens.
-    views: [lasso::Viewport; 2],
+    views: [lasso::Viewport; MAX_PANES],
+    /// Smooth Ctrl+wheel / pinch zoom state for each pane's file list.
+    zoom: [anim::ZoomState; MAX_PANES],
+    /// Gliding keyboard selection highlight for each pane.
+    kbd_sel: [anim::KeyboardSel; MAX_PANES],
+    /// Fading marquee/lasso rectangle after mouse release.
+    lasso_fade: Option<anim::LassoFade>,
+    /// Smooth row reorder glide when sorting a pane's file list.
+    row_reorder: [anim::RowReorder; MAX_PANES],
+    /// Active header column drag-to-reorder state.
+    col_drag: Option<anim::ColDrag>,
     dialog: Option<actions::Dialog>,
     /// The window was asked to close while transfers ran: Fechar o Open Explorer? shows over
     /// everything, the dialog under it untouched (see [`actions::close_requested`]).
     quit_asked: bool,
-    /// Uploads whose clash dialog waits for the one open (or another dialog) to close.
-    clash_waiting: std::collections::VecDeque<actions::ClashAsk>,
+    /// The question came from quitting the whole app (macOS: ⌘Q, Encerrar in the Dock, logging
+    /// out), not from closing the window: Fechar mesmo assim then quits it.
+    quit_app: bool,
+    /// Linux: a menu Rune asks for (a text field's Recortar, Copiar, Colar), drawn in the window
+    /// as the system draws none there.
+    popup: Option<rune::PopupMenuRequest>,
+    /// The same for the account window (Registrar conta), which shares this state.
+    account_popup: Option<rune::PopupMenuRequest>,
+    /// The window opened with the Acrylic background (Opções > Experimental): its page and the
+    /// panes' folder trees show the material. Set at start, as the window's transparency is.
+    acrylic: bool,
+    /// Transfer conflict prompts waiting for the active dialog to close.
+    conflict_waiting: std::collections::VecDeque<conflict::Prompt>,
     /// The name typed in Renomear or Nova pasta, or the e-mail typed in Compartilhar.
     name_edit: rune::TextEdit,
     /// The item being renamed in place, and its pane.
     renaming: Option<(usize, Entry)>,
     /// Each pane's search field.
-    search: [rune::TextEdit; 2],
+    search: [rune::TextEdit; MAX_PANES],
     /// Each pane's path bar while it's a field to type an address in.
-    address: [Option<rune::TextEdit>; 2],
+    address: [Option<rune::TextEdit>; MAX_PANES],
     /// The addresses reached and searches run, which ↑ and ↓ bring back in those fields.
     history: history::History,
     /// The path bar's right-click menu: the pane it was opened in and where.
     address_menu: Option<(usize, rune::PointerPress)>,
     /// Each local pane's field as last seen, and when it may be searched: typing searches the
     /// computer once the keys stop for a moment.
-    typed: [(String, f64); 2],
+    typed: [(String, f64); MAX_PANES],
     /// The words each pane last searched the computer for.
-    searched: [String; 2],
+    searched: [String; MAX_PANES],
     /// What the index said with each pane's search results.
-    found: [Option<finder::Info>; 2],
+    found: [Option<finder::Info>; MAX_PANES],
     /// The search service is being installed.
     installing_finder: bool,
     /// When each pane's search of the computer is asked again, while a disk is still being read
     /// or the service is starting (0: not).
-    found_again: [f64; 2],
+    found_again: [f64; MAX_PANES],
     /// Counts Propriedades dialogs, to tell their background answers apart.
     props_seq: u64,
     /// What Copiar or Recortar picked up.
@@ -210,15 +265,22 @@ struct State {
     undo: undo::History,
     /// Each pane's tree width, which its splitter changes.
     layout: layout::Layout,
-    /// The disks "Este Computador" lists, read at start.
+    /// The disks "Este Computador" lists, read at start and again when the system says one
+    /// was mounted or removed, or the window gets the focus back.
     local_drives: Vec<(PathBuf, model::DriveKind)>,
+    /// The disks' names as the system shows them ("AltMount (\\server) (X:)"), read in the
+    /// background; a disk not in it shows by its kind (see [`mounts::names`]).
+    drive_names: HashMap<PathBuf, String>,
+    /// A names job runs, and another is due once it ends (see [`tree::read_drive_names`]).
+    names_asking: bool,
+    names_again: bool,
     /// The desktop and the user's folders, read at start.
     places: places::Places,
     /// What each pane's tree has open, and the folders read for it.
     tree: tree::Tree,
     /// Each pane's current listing request, bumped by every load: `poll` drops answers for an
     /// older one, and the listing thread stops fetching pages once the pane has moved on.
-    live: [Arc<AtomicU64>; 2],
+    live: [Arc<AtomicU64>; MAX_PANES],
     cache: cache::Cache,
     mock: MockDrive,
     accounts: Vec<StoredAccount>,
@@ -239,14 +301,14 @@ struct State {
     /// The start of a name typed in a list, to reach it.
     typeahead: keyboard::Typeahead,
     /// How many rows each pane's list shows, for Page Up and Page Down (0 before its layout).
-    page_rows: [usize; 2],
+    page_rows: [usize; MAX_PANES],
     /// The pane a drag started in and the files it carried, so a drop back on the same pane
     /// is ignored (the drop can arrive after the drag's end).
     last_drag: Option<(usize, Vec<PathBuf>)>,
     /// A drag of files over a pane, which scrolls its list or tree near their edges, and where
     /// each pane's list and tree are and how far they've scrolled.
     autoscroll: Option<autoscroll::Drag>,
-    edges: [autoscroll::Pane; 2],
+    edges: [autoscroll::Pane; MAX_PANES],
     /// What the last action said ("Copiado: 3 itens.", an error...), shown for a few seconds
     /// in a notice at the bottom right.
     status: String,
@@ -264,6 +326,9 @@ struct State {
     waker: Option<Waker>,
     /// What the user picked in Opções.
     settings: settings::Settings,
+    /// Shared concurrency caps across all upload and download batches.
+    upload_slots: Arc<work::Slots>,
+    download_slots: Arc<work::Slots>,
     /// Copies and moves under way, each with its bar.
     transfers: Vec<transfers::Transfer>,
     /// The transfer queue's right-click menu: the row it was opened on, and where.
@@ -280,11 +345,12 @@ struct State {
     /// Remote TMDB / TVDB poster covers decoded asynchronously for batch rename.
     posters: media_rename::PosterStore,
     /// The listing version each pane's icons were last asked for.
-    icons_for: [u64; 2],
+    icons_for: [u64; MAX_PANES],
     /// State of the independent "Registrar conta" window when open.
     account_form: Option<Box<servers::Form>>,
     account_win: Option<rune::AppHandle<State>>,
     main_win: Option<rune::AppHandle<State>>,
+    tray: Option<rune::Tray>,
     account_dirty: bool,
     /// Whether the account window was last asked to show (and not closed since).
     account_shown: bool,
@@ -312,7 +378,12 @@ struct State {
     rule_editor_synced_font: Option<settings::TextFont>,
     rule_editor_synced_render: Option<settings::TextRender>,
     is_placeholder: bool,
+    /// Built-in updater state (latest release, download progress, staged file).
+    updater: updater::UpdateState,
 }
+
+/// Receipt or error passed via `--update-receipt` / `--update-error` on relaunch after an update.
+static STARTUP_UPDATE_NOTICE: std::sync::Mutex<Option<Result<String, String>>> = std::sync::Mutex::new(None);
 
 /// Whether the main window was created for Mica (Opções, Experimental): only then can Windows
 /// show it, and Opções says whether it did.
@@ -386,22 +457,39 @@ impl State {
         let loc = Location::Mock(Vec::new());
         State {
             main_tab: MainTab::Explore,
+            view_menu_open: false,
+            view_mode_menu: None,
+            search_scope_menu: None,
+            search_scope: [model::DriveSearchScope::Here; MAX_PANES],
+            drive_search_warnings: Default::default(),
+            shared_drive_names: HashMap::new(),
+            grid_cols: [1; MAX_PANES],
+            list_rows: [1; MAX_PANES],
             accounts_filter: None,
             accounts_search: rune::TextEdit::new(""),
-            panes: [Pane::new(loc.clone()), Pane::new(loc)],
-            tabs: [tabs::PaneTabs::initial(), tabs::PaneTabs::initial()],
-            show_tree: [true, true],
+            panes: std::array::from_fn(|_| Pane::new(loc.clone())),
+            tabs: std::array::from_fn(|_| tabs::PaneTabs::initial()),
+            show_tree: [true; MAX_PANES],
             menu: None,
             tree_menu: None,
             renamed: Vec::new(),
             lasso: None,
             views: Default::default(),
+            zoom: Default::default(),
+            kbd_sel: Default::default(),
+            lasso_fade: None,
+            row_reorder: Default::default(),
+            col_drag: None,
             dialog: None,
             quit_asked: false,
-            clash_waiting: Default::default(),
+            quit_app: false,
+            popup: None,
+            account_popup: None,
+            acrylic: false,
+            conflict_waiting: Default::default(),
             name_edit: rune::TextEdit::new(""),
             renaming: None,
-            search: [rune::TextEdit::new(""), rune::TextEdit::new("")],
+            search: std::array::from_fn(|_| rune::TextEdit::new("")),
             address: Default::default(),
             history: Default::default(),
             address_menu: None,
@@ -409,11 +497,14 @@ impl State {
             searched: Default::default(),
             found: Default::default(),
             installing_finder: false,
-            found_again: [0.0; 2],
+            found_again: [0.0; MAX_PANES],
             props_seq: 0,
             clip: None,
             undo: Default::default(),
             local_drives: Vec::new(),
+            drive_names: HashMap::new(),
+            names_asking: false,
+            names_again: false,
             places: Default::default(),
             tree: tree::Tree::new(std::iter::empty()),
             layout: Default::default(),
@@ -453,7 +544,7 @@ impl State {
             logins: 0,
             active: 0,
             typeahead: Default::default(),
-            page_rows: [0; 2],
+            page_rows: [0; MAX_PANES],
             last_drag: None,
             autoscroll: None,
             edges: Default::default(),
@@ -467,6 +558,8 @@ impl State {
             outbox,
             waker: None,
             settings: Default::default(),
+            upload_slots: Arc::new(work::Slots::new(usize::from(settings::Settings::default().uploads))),
+            download_slots: Arc::new(work::Slots::new(usize::from(settings::Settings::default().downloads))),
             transfers: Vec::new(),
             transfer_menu: None,
             transfers_live: 0,
@@ -474,10 +567,11 @@ impl State {
             queue_totals: Default::default(),
             icons: Default::default(),
             posters: Default::default(),
-            icons_for: [u64::MAX; 2],
+            icons_for: [u64::MAX; MAX_PANES],
             account_form: None,
             account_win: None,
             main_win: None,
+            tray: None,
             account_dirty: false,
             account_shown: false,
             account_closes: 0,
@@ -500,6 +594,7 @@ impl State {
             rule_editor_synced_font: None,
             rule_editor_synced_render: None,
             is_placeholder: true,
+            updater: updater::UpdateState::idle(),
         }
     }
 
@@ -707,30 +802,53 @@ fn init() -> State {
     // run was is kept. The simulated drive stays in the tree, for trying things out.
     let places = places::places();
     let start = places.desktop.as_ref().map_or_else(Location::home, |(dir, _)| Location::Local(dir.clone()));
-    let mut panes = [Pane::new(start.clone()), Pane::new(start)];
-    for p in &mut panes {
-        p.load_now(&mock, settings.show_hidden);
-    }
+    // The folder is read once: every pane, shown or not, starts with that listing.
+    let mut first = Pane::new(start.clone());
+    first.load_now(&mock, settings.show_hidden);
+    let mut panes: [Pane; MAX_PANES] = std::array::from_fn(|_| {
+        let mut pane = Pane::new(start.clone());
+        pane.free = first.free;
+        pane.set_entries(first.error.clone().map_or_else(|| Ok(first.entries.clone()), Err));
+        pane
+    });
+    panes[0] = first;
     let accounts = store::accounts();
     let tree = tree::Tree::new(accounts.iter().map(|a| a.email.clone()));
-    State {
+    let mut state = State {
         main_tab: MainTab::Explore,
+        view_menu_open: false,
+        view_mode_menu: None,
+        search_scope_menu: None,
+        search_scope: [model::DriveSearchScope::Here; MAX_PANES],
+        drive_search_warnings: Default::default(),
+        shared_drive_names: HashMap::new(),
+        grid_cols: [1; MAX_PANES],
+        list_rows: [1; MAX_PANES],
         accounts_filter: None,
         accounts_search: rune::TextEdit::new(""),
         panes,
-        tabs: [tabs::PaneTabs::initial(), tabs::PaneTabs::initial()],
-        show_tree: [true, true],
+        tabs: std::array::from_fn(|_| tabs::PaneTabs::initial()),
+        show_tree: [true; MAX_PANES],
         menu: None,
         tree_menu: None,
         renamed: Vec::new(),
         lasso: None,
         views: Default::default(),
+        zoom: Default::default(),
+        kbd_sel: Default::default(),
+        lasso_fade: None,
+        row_reorder: Default::default(),
+        col_drag: None,
         dialog: None,
         quit_asked: false,
-        clash_waiting: Default::default(),
+        quit_app: false,
+        popup: None,
+        account_popup: None,
+        acrylic: settings.acrylic_window(),
+        conflict_waiting: Default::default(),
         name_edit: rune::TextEdit::new(""),
         renaming: None,
-        search: [rune::TextEdit::new(""), rune::TextEdit::new("")],
+        search: std::array::from_fn(|_| rune::TextEdit::new("")),
         address: Default::default(),
         history: history::History::load(),
         address_menu: None,
@@ -738,11 +856,14 @@ fn init() -> State {
         searched: Default::default(),
         found: Default::default(),
         installing_finder: false,
-        found_again: [0.0; 2],
+        found_again: [0.0; MAX_PANES],
         props_seq: 0,
         clip: None,
         undo: Default::default(),
-        local_drives: model::local_drives(),
+        local_drives: mounts::list(),
+        drive_names: HashMap::new(),
+        names_asking: false,
+        names_again: false,
         places,
         tree,
         layout: layout::Layout::load(),
@@ -758,7 +879,7 @@ fn init() -> State {
         logins: 0,
         active: 0,
         typeahead: Default::default(),
-        page_rows: [0; 2],
+        page_rows: [0; MAX_PANES],
         last_drag: None,
         autoscroll: None,
         edges: Default::default(),
@@ -771,6 +892,8 @@ fn init() -> State {
         inbox,
         outbox,
         waker: None,
+        upload_slots: Arc::new(work::Slots::new(usize::from(settings.uploads))),
+        download_slots: Arc::new(work::Slots::new(usize::from(settings.downloads))),
         settings,
         transfers: Vec::new(),
         transfer_menu: None,
@@ -779,10 +902,11 @@ fn init() -> State {
         queue_totals: Default::default(),
         icons: Default::default(),
         posters: Default::default(),
-        icons_for: [u64::MAX; 2],
+        icons_for: [u64::MAX; MAX_PANES],
         account_form: None,
         account_win: None,
         main_win: None,
+        tray: None,
         account_dirty: false,
         account_shown: false,
         account_closes: 0,
@@ -805,7 +929,22 @@ fn init() -> State {
         rule_editor_synced_font: None,
         rule_editor_synced_render: None,
         is_placeholder: false,
+        updater: updater::UpdateState::new(),
+    };
+    if let Some(notice) = STARTUP_UPDATE_NOTICE.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        match notice {
+            Ok(ver) => {
+                updater::clear_staged();
+                openexplorer_gdrive::log(&format!("atualização concluída: v{ver}"));
+                state.status = tr!("Open Explorer atualizado para a versão {ver}.", "Open Explorer updated to version {ver}.");
+            }
+            Err(code) => {
+                openexplorer_gdrive::log(&format!("erro atualização: {code}"));
+                fail(&mut state, updater::error_text(&code));
+            }
+        }
     }
+    state
 }
 
 fn setup(s: &mut State, waker: Waker) {
@@ -825,9 +964,25 @@ fn setup(s: &mut State, waker: Waker) {
     });
     s.posters.start(rune::ImageCache::new(combined.clone()));
     s.waker = Some(combined);
+    // Disks mounted or removed while the app runs show in Este Computador at once.
+    if !rune::is_headless() {
+        tree::read_drive_names(s);
+        let (out, wake) = (s.outbox.clone(), s.waker.clone());
+        mounts::watch(move || {
+            if out.send(Msg::DrivesMoved).is_ok()
+                && let Some(wake) = &wake
+            {
+                wake();
+            }
+        });
+    }
     // Each tree opens down to the folder its pane starts in.
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         tree::follow(s, p);
+    }
+    // Check for updates in the background (at most once per 24 h automatically).
+    if !rune::is_headless() && s.updater.should_auto_check(updater::now_unix()) {
+        actions::check_updates(s, false);
     }
 }
 
@@ -1140,12 +1295,21 @@ const TYPING_PAUSE: f64 = 0.12;
 /// How often a search is asked again while a disk is still being read, in seconds.
 const FOUND_AGAIN: f64 = 1.5;
 
+/// The main window got or lost the focus.
+fn main_focus(s: &mut State, focused: bool, tx: &mut Tx) {
+    accounts::window_focus(s, focused, tx);
+    // A mount the system doesn't tell about (`subst`) shows once the user is back.
+    if focused {
+        s.main_dirty |= tree::read_drives(s);
+    }
+}
+
 fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     if s.is_placeholder {
         return false;
     }
     if let Some(focused) = PENDING_MAIN_FOCUS.with(|c| c.take()) {
-        accounts::window_focus(s, focused, tx);
+        main_focus(s, focused, tx);
     }
     // Mica follows Opções while the window lives; turned on again, it comes back only in a window
     // made for it (only its creation makes a window transparent). Turned off, the view paints the
@@ -1177,7 +1341,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     // Each listing's file types get their icons asked for once.
     let versions = s.panes.each_ref().map(|p| p.version);
     if s.icons_for != versions {
-        let relisted: Vec<usize> = (0..2).filter(|&p| s.icons_for[p] != versions[p]).collect();
+        let relisted: Vec<usize> = (0..MAX_PANES).filter(|&p| s.icons_for[p] != versions[p]).collect();
         s.icons_for = versions;
         let keys = s.panes.iter().flat_map(|p| sysicons::keys_of(&p.entries, &p.loc)).collect();
         s.icons.show(keys);
@@ -1186,19 +1350,77 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             tree::learn(s, p);
         }
     }
+    // The 256 px icons only while a pane in view shows Large or Extra large icons.
+    let big = s.panes[..s.settings.pane_layout.count()].iter().any(|p| matches!(p.view_mode, model::ViewMode::LargeIcons | model::ViewMode::ExtraLargeIcons));
+    s.icons.set_big(big);
     let mut changed = std::mem::take(&mut s.main_dirty) | s.icons.settle();
+    // List scrolled sideways to columns its view didn't build.
+    for view in &s.views {
+        changed |= view.columns_stale.replace(false);
+    }
+    // A viewport's content became wider or narrower than it: its bottom scroll bar comes or goes.
+    changed |= scrollbars::take_stale();
     changed |= notice(s, now, &mut |text, how| tx.announce(text, how));
+    // Smooth Ctrl+wheel / pinch zoom, keyboard selection glide, and sort row reorder animations.
+    let mut anim_wake = false;
+    for p in 0..MAX_PANES {
+        if s.zoom[p].tick(now) {
+            changed = true;
+            if s.zoom[p].is_animating() {
+                anim_wake = true;
+            }
+        }
+        if s.kbd_sel[p].tick(now) {
+            changed = true;
+            if s.kbd_sel[p].is_active() {
+                anim_wake = true;
+            }
+        }
+        if s.row_reorder[p].tick(now) {
+            changed = true;
+            if s.row_reorder[p].is_active() {
+                anim_wake = true;
+            }
+        }
+    }
+    if let Some(fade) = s.lasso_fade {
+        changed = true;
+        if fade.done(now) {
+            s.lasso_fade = None;
+        } else {
+            anim_wake = true;
+        }
+    }
+    // Clipboard Copy/Cut icon wiggle: it runs for a moment after the pick-up, and wakes only
+    // while copied/cut items are visible in an open pane. A copy stays picked up after Colar,
+    // so a wiggle without an end would redraw the window for as long as it shows them.
+    if s.main_tab == MainTab::Explore
+        && s.settings.clipboard_animated()
+        && let Some(clip) = &s.clip
+        && !clip.items.is_empty()
+        && now - clip.picked_at < anim::WIGGLE_TOTAL
+        && {
+            let ids: std::collections::HashSet<&str> = clip.items.iter().map(|c| c.id.as_str()).collect();
+            (0..s.settings.pane_layout.count()).any(|p| !s.tabs[p].is_picker() && s.panes[p].loc == clip.from && s.panes[p].entries.iter().any(|e| ids.contains(e.id.as_str())))
+        }
+    {
+        changed = true;
+        anim_wake = true;
+    }
+    if anim_wake {
+        tx.wake_at(now + 1.0 / 60.0);
+    }
     // A rectangle selection held past the list's edge scrolls it.
     changed |= lasso::step(s, now, tx);
     // A local pane searches the computer as its field is typed in, once the keys pause.
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         if s.search[p].text != s.typed[p].0 {
             s.typed[p] = (s.search[p].text.clone(), now + TYPING_PAUSE);
             tx.wake_at(now + TYPING_PAUSE);
         } else if s.typed[p].1 > 0.0 && now >= s.typed[p].1 {
             s.typed[p].1 = 0.0;
             if s.search[p].text != s.searched[p] {
-                if s.panes[p].loc.is_local() {
+                if s.panes[p].loc.is_local() || s.panes[p].loc == Location::Computer {
                     actions::search_computer(s, p);
                     changed = true;
                 } else if let Location::Server { .. } = s.panes[p].loc {
@@ -1219,7 +1441,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     // A redraw is due while any row moves, and once more when the last one stops.
     let rows = s.transfers.len();
     if s.settings.clear_completed {
-        s.transfers.retain(|t| t.progress.stage() != ops::Stage::Done);
+        s.transfers.retain(|t| !matches!(t.progress.stage(), ops::Stage::Done | ops::Stage::Skipped));
     }
     // The queue's menu goes with its row, and with the queue when that empties and hides.
     let gone = match &s.transfer_menu {
@@ -1245,6 +1467,11 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             Msg::Opened { email, drive } => keep_drive(s, email, drive),
             Msg::TreeKids { id, hidden, result } => tree::arrived(s, id, hidden, result),
             Msg::Servers { found, done } => tree::servers_found(s, found, done),
+            Msg::DrivesMoved => changed |= tree::read_drives(s),
+            Msg::DriveNames(names) => {
+                tree::drive_names(s, names);
+                changed = true;
+            }
             Msg::ServerChecked { attempt, result, secret } => servers::checked(s, attempt, result, secret),
             Msg::Listed { pane, request, part, result, at } => {
                 if s.live[pane].load(Ordering::Relaxed) != request {
@@ -1318,7 +1545,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                         tabs::repoint(s, &from, Some(&to));
                     }
                 }
-                for p in 0..2 {
+                for p in 0..MAX_PANES {
                     if reload.contains(&s.panes[p].loc) {
                         load(s, p);
                     }
@@ -1374,6 +1601,17 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             Msg::Link(answer) => sharing::link_answer(s, answer, tx),
             #[cfg(windows)]
             Msg::DragEnded { from, ids, ended } => drive_drag_ended(s, from, ids, ended),
+            Msg::SharedDrives { email, names } => {
+                if s.accounts.iter().any(|a| a.email == email) {
+                    s.shared_drive_names.insert(email.clone(), names);
+                    name_shared_drives(s, &email);
+                }
+            }
+            Msg::DriveSearchWarnings { pane, request, warnings } => {
+                if s.live[pane].load(Ordering::Relaxed) == request {
+                    s.drive_search_warnings[pane] = warnings;
+                }
+            }
             Msg::Found { pane, request, result, info } => {
                 if s.live[pane].load(Ordering::Relaxed) != request {
                     continue;
@@ -1393,7 +1631,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     Ok(m) => s.status = m,
                     Err(m) => fail(s, m),
                 }
-                for p in 0..2 {
+                for p in 0..MAX_PANES {
                     if reload.contains(&s.panes[p].loc) {
                         load(s, p);
                     }
@@ -1401,7 +1639,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
             Msg::Prop { id, update } => actions::props_update(s, id, update),
             Msg::Icon { key, rgba } => s.icons.arrived(key, rgba),
-            Msg::Clashes { up, result } => actions::clashes_listed(s, up, result),
+            Msg::Conflict(prompt) => actions::enqueue_conflict(s, *prompt),
             Msg::LoggedIn { pane, attempt, result } => {
                 let current = s.login == Some(attempt);
                 if current {
@@ -1443,6 +1681,66 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                     Err(e) => fail(s, e),
                 }
             }
+            Msg::Update(ans) => match ans {
+                updater::Answer::Checked { manual, result } => {
+                    s.updater.checking = false;
+                    s.updater.checked_once = true;
+                    let now_unix = updater::now_unix();
+                    s.updater.last_checked = Some(now_unix);
+                    updater::record_check(now_unix);
+                    match result {
+                        Ok(Some(rel)) => {
+                            openexplorer_gdrive::log(&format!("atualização disponível: v{}", rel.version));
+                            let already_staged_same = matches!(
+                                &s.updater.download,
+                                updater::DownloadState::Ready(st) if st.version == rel.version
+                            );
+                            // A download or install under way stays: a second one would write
+                            // the same file.
+                            let busy = matches!(s.updater.download, updater::DownloadState::Downloading { .. } | updater::DownloadState::Installing);
+                            s.updater.release = Some(rel);
+                            if !already_staged_same && !busy {
+                                s.updater.download = updater::DownloadState::Idle;
+                                if s.updater.support.is_ok()
+                                    && s.updater.offer(s.settings.auto_update) == Some(updater::Offer::Automatic)
+                                {
+                                    actions::download_update(s);
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            s.updater.check_error = None;
+                            if manual {
+                                s.status = tr!(
+                                    "Você já está na versão mais recente (v{}).",
+                                    "You're already on the latest version (v{}).",
+                                    updater::VERSION
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            openexplorer_gdrive::log(&format!("erro verificar atualizações: {e}"));
+                            s.updater.check_error = Some(e.clone());
+                            if manual {
+                                fail(s, e);
+                            }
+                        }
+                    }
+                }
+                updater::Answer::Progress { received, total } => {
+                    s.updater.download = updater::DownloadState::Downloading { received, total };
+                }
+                updater::Answer::Downloaded(result) => match result {
+                    Ok(staged) => {
+                        openexplorer_gdrive::log(&format!("atualização baixada e verificada: v{}", staged.version));
+                        s.updater.download = updater::DownloadState::Ready(staged);
+                    }
+                    Err(e) => {
+                        openexplorer_gdrive::log(&format!("erro baixar atualização: {e}"));
+                        s.updater.download = updater::DownloadState::Failed(e);
+                    }
+                },
+            },
         }
     }
     // Accounts on screen are asked what changed elsewhere, every few seconds; after the
@@ -1452,7 +1750,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     if let Some(at) = accounts::next_ask(s) {
         tx.wake_at(at);
     }
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         // The address field closes when the keyboard leaves it (a click elsewhere).
         if s.address[p].as_ref().is_some_and(|a| !a.focused) {
             s.address[p] = None;
@@ -1461,12 +1759,12 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         // Mostrar na pasta: the item is selected and brought into view once its folder lists it.
         let pane = &mut s.panes[p];
         let Some((id, name)) = pane.reveal.clone() else { continue };
-        if pane.entry(&id).is_some() {
+        if let Some(i) = pane.index_of(&id) {
             pane.reveal = None;
             pane.selected = [id.clone()].into();
             pane.cursor = Some(id.clone());
             pane.anchor = Some(id.clone());
-            tx.scroll_into_view_in(pane_key(p), row_key(&id));
+            reveal(s, p, i, &id, tx);
             changed = true;
         } else if !pane.loading {
             pane.reveal = None;
@@ -1476,17 +1774,8 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             }
         }
     }
-    // A tree shows its keyboard row's ring while it has focus, however it got it (Tab from the
-    // search field, a click), and stops once focus left it.
-    for p in 0..2 {
-        let on = tx.focused() == Some(ui::tree_key(p).as_str());
-        if s.tree.focused[p] != on {
-            tree::focus(s, p, on);
-            changed = true;
-        }
-    }
     // Each tree brings the folder its pane shows into view, once that's in the tree.
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         if tree::following(s, p) {
             let lines = tree::lines(s, p);
             if let Some(key) = tree::to_reveal(s, p, &lines) {
@@ -1497,16 +1786,90 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     // A drag of files held near the edge of a list or tree scrolls it.
     autoscroll::tick(&mut s.autoscroll, &s.edges, |p| (ui::list_key(p), ui::tree_key(p)), ui::HEADER_H, now, tx);
-    // An upload's clash dialog waiting for another dialog to close.
-    if s.dialog.is_none() && !s.clash_waiting.is_empty() {
-        actions::next_clash(s);
+    // Dismiss a conflict dialog if its worker was cancelled externally.
+    if matches!(&s.dialog, Some(actions::Dialog::Conflict(p)) if p.is_stale()) {
+        s.dialog = None;
+        changed = true;
+    }
+    // A transfer conflict prompt waiting for another dialog to close.
+    if s.dialog.is_none() && !s.conflict_waiting.is_empty() {
+        actions::next_conflict(s);
         changed = true;
     }
     changed
 }
 
 fn entry_of(f: DriveFile) -> Entry {
-    Entry { id: f.id, name: f.name, is_dir: f.is_dir, size: f.size, modified: f.modified, target: f.target, mime: Some(f.mime), md5: f.md5, starred: f.starred }
+    Entry { id: f.id, name: f.name, is_dir: f.is_dir, size: f.size, modified: f.modified, target: f.target, mime: Some(f.mime), md5: f.md5, starred: f.starred, drive_origin: None }
+}
+
+/// Builds the column-4 origin metadata for a Google Drive search hit.
+pub(crate) fn make_drive_origin(email: &str, f: &DriveFile, sd_names: &HashMap<String, String>, include_account: bool) -> model::DriveOrigin {
+    let (shared_drive, place) = if let Some(sd_id) = &f.drive_id {
+        let raw_name = sd_names.get(sd_id).cloned().unwrap_or_else(|| t("Drive compartilhado", "Shared drive").into());
+        let shown_name = model::shown(&raw_name);
+        (Some((sd_id.clone(), raw_name)), shown_name)
+    } else if f.owned_by_me == Some(true) {
+        (None, t("Meu Drive", "My Drive").into())
+    } else {
+        (None, t("Compartilhados comigo", "Shared with me").into())
+    };
+    let label = if include_account { format!("{email} · {place}") } else { place };
+    model::DriveOrigin {
+        email: email.to_string(),
+        shared_drive,
+        owned_by_me: f.owned_by_me.unwrap_or(false),
+        label,
+    }
+}
+
+/// Lists `email`'s shared drives on a thread of their own and sends their names
+/// ([`Msg::SharedDrives`]), so a search's results don't wait for them: they show "Drive
+/// compartilhado" until the names come, then take them ([`name_shared_drives`]).
+fn learn_shared_drives(drive: &Arc<Drive>, email: &str, out: &Sender<Msg>, wake: &Option<Waker>) {
+    let (drive, email, out, wake) = (drive.clone(), email.to_string(), out.clone(), wake.clone());
+    std::thread::spawn(move || {
+        if let Ok(list) = drive.shared_drives() {
+            let names = list.into_iter().map(|d| (d.id, d.name)).collect();
+            let _ = out.send(Msg::SharedDrives { email, names });
+            if let Some(w) = wake {
+                w();
+            }
+        }
+    });
+}
+
+/// The results of Drive searches on screen take `email`'s shared drives' names, now known.
+fn name_shared_drives(s: &mut State, email: &str) {
+    let Some(names) = s.shared_drive_names.get(email) else { return };
+    for pane in &mut s.panes {
+        if !pane.loc.is_drive_search() {
+            continue;
+        }
+        let every_account = matches!(pane.loc, Location::DriveSearch(_));
+        let mut renamed = false;
+        for e in &mut pane.entries {
+            let Some(o) = e.drive_origin.as_deref_mut() else { continue };
+            let Some((id, name)) = o.shared_drive.as_mut() else { continue };
+            let Some(real) = names.get(id.as_str()) else { continue };
+            if o.email != email || name == real {
+                continue;
+            }
+            name.clone_from(real);
+            let place = model::shown(real);
+            o.label = if every_account { format!("{email} · {place}") } else { place };
+            renamed = true;
+        }
+        if renamed {
+            pane.sort_entries();
+            pane.version += 1;
+        }
+    }
+}
+
+fn entry_of_search(email: &str, f: DriveFile, sd_names: &HashMap<String, String>, include_account: bool) -> Entry {
+    let origin = make_drive_origin(email, &f, sd_names, include_account);
+    Entry { drive_origin: Some(Box::new(origin)), ..entry_of(f) }
 }
 
 fn pane_key(p: usize) -> String {
@@ -1529,7 +1892,8 @@ fn row_key(id: &str) -> String {
 /// Opens a stored account: reads the client file and the credential store, so it runs off the
 /// UI thread.
 fn open_drive(email: &str) -> Result<Arc<Drive>, String> {
-    let cfg = ClientConfig::load()?;
+    // The client it signed in with: its refresh token is that client's.
+    let cfg = ClientConfig::for_account(&store::client_of(email))?;
     let token = store::refresh_token(email)?;
     Ok(Arc::new(Drive::new(cfg, token)))
 }
@@ -1592,9 +1956,10 @@ pub(crate) fn connect_with(s: &mut State, p: usize, cfg: ClientConfig, tx: &mut 
     background(s, move |emit| {
         let result = catch_panic(t("conectar", "connect"), || {
             let tokens = pending.finish(&cfg)?;
+            let client_id = cfg.client_id.clone();
             let drive = Drive::from_login(cfg, &tokens)?;
             let who = drive.about()?;
-            let account = StoredAccount { email: who.email, name: who.name };
+            let account = StoredAccount { email: who.email, name: who.name, client_id };
             store::save(account.clone(), drive.refresh_token())?;
             Ok((account, Arc::new(drive)))
         });
@@ -1609,20 +1974,32 @@ fn disconnect(s: &mut State, email: &str) {
         return;
     }
     s.drives.remove(email);
+    s.shared_drive_names.remove(email);
     s.quotas.remove(email);
     s.cache.forget(email);
     s.tree.forget(email);
     s.watch.remove(email);
     s.accounts.retain(|a| a.email != email);
-    for p in 0..2 {
+    for p in 0..MAX_PANES {
         let gone = |l: &Location| matches!(l, Location::Drive { email: e, .. } if e == email);
         s.panes[p].back.retain(|l| !gone(l));
         s.panes[p].forward.retain(|l| !gone(l));
-        if !s.tabs[p].is_picker() && matches!(&s.panes[p].loc, Location::Drive { email: e, .. } if e == email) {
-            switch(s, p, Location::Mock(Vec::new()));
+        if !s.tabs[p].is_picker() {
+            if matches!(&s.panes[p].loc, Location::Drive { email: e, .. } if e == email) {
+                switch(s, p, Location::Mock(Vec::new()));
+            } else if matches!(&s.panes[p].loc, Location::DriveSearch(_)) {
+                if s.accounts.is_empty() {
+                    switch(s, p, Location::Mock(Vec::new()));
+                } else {
+                    load(s, p);
+                }
+            }
         }
     }
     tabs::purge_locations(s, |l| matches!(l, Location::Drive { email: e, .. } if e == email), &Location::Mock(Vec::new()));
+    if s.accounts.is_empty() {
+        tabs::purge_locations(s, |l| matches!(l, Location::DriveSearch(_)), &Location::Mock(Vec::new()));
+    }
     s.status = tr!("Conta desconectada: {email}", "Account disconnected: {email}");
 }
 
@@ -1663,9 +2040,58 @@ pub(crate) fn refresh_all_quotas(s: &mut State) {
 
 pub(crate) fn set_main_tab(s: &mut State, tab: MainTab) {
     s.main_tab = tab;
+    s.view_menu_open = false;
+    s.view_mode_menu = None;
+    s.search_scope_menu = None;
     if tab == MainTab::Accounts {
         ensure_all_quotas(s);
     }
+}
+
+/// Switches between 1, 2, and 4 visible panes in `Explorar`, persisting the choice.
+pub(crate) fn set_pane_layout(s: &mut State, layout: settings::PaneLayout) {
+    let before = s.settings.pane_layout.count();
+    s.settings.pane_layout = layout;
+    s.settings.save();
+    s.view_menu_open = false;
+    s.view_mode_menu = None;
+    s.search_scope_menu = None;
+    s.menu = None;
+    s.tree_menu = None;
+    s.address_menu = None;
+    let count = layout.count();
+    if s.active >= count {
+        s.active = 0;
+    }
+    // A pane shown again is read again: while hidden it wasn't watched (B2's polling skips it).
+    for p in before..count {
+        if !s.tabs[p].is_picker() {
+            load(s, p);
+        }
+    }
+    if s.renaming.as_ref().is_some_and(|(p, _)| *p >= count) {
+        s.renaming = None;
+    }
+    if s.lasso.as_ref().is_some_and(|l| l.pane >= count) {
+        s.lasso = None;
+    }
+    s.main_tab = MainTab::Explore;
+}
+
+/// Sets the file display mode (Extra large / Large / Medium icons, List, Details) for pane `p`.
+pub(crate) fn set_view_mode(s: &mut State, p: usize, mode: model::ViewMode) {
+    s.active = p;
+    s.panes[p].view_mode = mode;
+    s.view_mode_menu = None;
+    if s.lasso.as_ref().is_some_and(|l| l.pane == p) {
+        s.lasso = None;
+    }
+}
+
+/// Cycles pane `p` directly to the next file display mode.
+pub(crate) fn cycle_view_mode(s: &mut State, p: usize) {
+    let next = s.panes[p].view_mode.next();
+    set_view_mode(s, p, next);
 }
 
 /// Opens `loc` in pane `p` (0 = left, 1 = right) and switches to `Explorar`.
@@ -1686,9 +2112,34 @@ fn load(s: &mut State, p: usize) {
     list(s, p, true);
 }
 
+/// The disks or their names changed: the panes showing Este Computador list them again.
+pub(crate) fn computer_changed(s: &mut State) {
+    for p in 0..MAX_PANES {
+        if s.panes[p].loc == Location::Computer {
+            load(s, p);
+        }
+    }
+}
+
+/// Este Computador's rows: the disks the app keeps, by the names the system gave.
+fn computer_entries(s: &State) -> Vec<Entry> {
+    s.local_drives
+        .iter()
+        .map(|(root, kind)| {
+            let id = mounts::disk_id(root);
+            Entry { id, name: tree::disk_name(s, root, *kind), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }
+        })
+        .collect()
+}
+
 /// Atualizar: [`load`], with a Dropbox or OneDrive folder read whole rather than from its kept
 /// listing.
 fn refresh(s: &mut State, p: usize) {
+    // Este Computador: the disks read again, a `subst` the system didn't tell about too.
+    if s.panes[p].loc == Location::Computer {
+        tree::read_drives(s);
+        tree::read_drive_names(s);
+    }
     dropbox::forget_shown(s, p);
     onedrive::forget_shown(s, p);
     load(s, p);
@@ -1722,6 +2173,121 @@ fn list(s: &mut State, p: usize, fresh: bool) {
     // Every load gets a new number, so a Drive answer for a folder left since is dropped,
     // whatever the pane shows now.
     let request = s.live[p].fetch_add(1, Ordering::Relaxed) + 1;
+    s.drive_search_warnings[p].clear();
+    if s.panes[p].loc == Location::Computer {
+        let entries = computer_entries(s);
+        let pane = &mut s.panes[p];
+        pane.free = None;
+        pane.set_entries(Ok(entries));
+        return;
+    }
+    // Multi-account Google Drive search across every connected account.
+    if let Location::DriveSearch(q) = &s.panes[p].loc {
+        let text = q.text.clone();
+        if s.accounts.is_empty() {
+            let pane = &mut s.panes[p];
+            pane.loading = false;
+            pane.error = Some(t("Conecte pelo menos uma conta do Google Drive para pesquisar.", "Connect at least one Google Drive account to search.").into());
+            pane.entries.clear();
+            pane.version += 1;
+            return;
+        }
+        let targets: Vec<(AccountRef, Option<HashMap<String, String>>)> = s
+            .accounts
+            .iter()
+            .map(|a| (AccountRef::of(s, &a.email), s.shared_drive_names.get(&a.email).cloned()))
+            .collect();
+        let pane = &mut s.panes[p];
+        pane.loading = true;
+        pane.error = None;
+        pane.free = None;
+        let live = s.live[p].clone();
+        let (out, wake) = (s.outbox.clone(), s.waker.clone());
+        let per_account_workers = 16usize.div_ceil(targets.len().max(1)).clamp(4, 16);
+        std::thread::spawn(move || {
+            let send = |out: &Sender<Msg>, wake: &Option<Waker>, msg: Msg| {
+                let _ = out.send(msg);
+                if let Some(w) = wake {
+                    w();
+                }
+            };
+            let seen = std::sync::Mutex::new(std::collections::HashSet::<String>::new());
+            let sent_first = std::sync::Mutex::new(false);
+            let warnings = std::sync::Mutex::new(Vec::<(String, String)>::new());
+            let succeeded = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|scope| {
+                for (account, cached_sd) in targets {
+                    let email = account.email.clone();
+                    let text = text.as_str();
+                    let (out, wake) = (out.clone(), wake.clone());
+                    let (live, seen, sent_first, warnings, succeeded) = (&live, &seen, &sent_first, &warnings, &succeeded);
+                    scope.spawn(move || {
+                        let emit = |msg: Msg| send(&out, &wake, msg);
+                        let drive = match catch_panic(t("abrir conta", "open account"), || account.open(&emit)) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                warnings.lock().unwrap().push((email, e));
+                                return;
+                            }
+                        };
+                        // The shared drives' names come alongside, not ahead of the search;
+                        // asked again once a result names a drive not known yet.
+                        let mut asked = cached_sd.is_none();
+                        if asked {
+                            learn_shared_drives(&drive, &email, &out, &wake);
+                        }
+                        let sd_names = cached_sd.unwrap_or_default();
+                        let res = catch_panic(t("pesquisar", "search"), || {
+                            drive.search_with_workers(text, &openexplorer_gdrive::search::Within::Everything, per_account_workers, |files, _more| {
+                                if !asked && files.iter().any(|f| f.drive_id.as_ref().is_some_and(|id| !sd_names.contains_key(id))) {
+                                    asked = true;
+                                    learn_shared_drives(&drive, &email, &out, &wake);
+                                }
+                                let entries: Vec<Entry> = {
+                                    let mut guard = seen.lock().unwrap();
+                                    files
+                                        .into_iter()
+                                        .filter(|f| guard.insert(f.id.clone()))
+                                        .map(|f| entry_of_search(&email, f, &sd_names, true))
+                                        .collect()
+                                };
+                                if !entries.is_empty() {
+                                    // Hold `sent_first` across `emit` so the `first: true` page strictly precedes any `first: false` page.
+                                    let mut first_guard = sent_first.lock().unwrap();
+                                    let first = !*first_guard;
+                                    *first_guard = true;
+                                    emit(Msg::Listed { pane: p, request, part: Part::Page { first, more: true }, result: Ok(entries), at: None });
+                                }
+                                live.load(Ordering::Relaxed) == request
+                            })
+                        });
+                        match res {
+                            Ok(()) => {
+                                succeeded.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(e) => warnings.lock().unwrap().push((email, e)),
+                        }
+                    });
+                }
+            });
+            if live.load(Ordering::Relaxed) != request {
+                return;
+            }
+            let warns = warnings.into_inner().unwrap();
+            let ok_count = succeeded.into_inner();
+            let first = !*sent_first.lock().unwrap();
+            if ok_count == 0 && !warns.is_empty() {
+                let combined = warns.iter().map(|(e, msg)| format!("{e}: {msg}")).collect::<Vec<_>>().join(" · ");
+                send(&out, &wake, Msg::Listed { pane: p, request, part: Part::Page { first, more: false }, result: Err(combined), at: None });
+            } else {
+                if !warns.is_empty() {
+                    send(&out, &wake, Msg::DriveSearchWarnings { pane: p, request, warnings: warns });
+                }
+                send(&out, &wake, Msg::Listed { pane: p, request, part: Part::Page { first, more: false }, result: Ok(Vec::new()), at: None });
+            }
+        });
+        return;
+    }
     // A search of the computer asks the index service, on a thread: milliseconds.
     if let Location::Found(f) = &s.panes[p].loc {
         let (f, show_hidden) = ((**f).clone(), s.settings.show_hidden);
@@ -1793,6 +2359,8 @@ fn list(s: &mut State, p: usize, fresh: bool) {
         ask_quota(s, &email);
     }
     let account = AccountRef::of(s, &email);
+    let cached_sd = s.shared_drive_names.get(&email).cloned();
+    let (names_out, names_wake) = (s.outbox.clone(), s.waker.clone());
     let key = cache::key(&s.panes[p].loc);
     // A folder seen this session shows at once; the fresh listing then replaces it whole.
     let in_memory = key.as_ref().and_then(|k| s.cache.get(k)).cloned();
@@ -1871,13 +2439,35 @@ fn list(s: &mut State, p: usize, fresh: bool) {
             // A folder opened from Compartilhados comigo, Com estrela or Recentes lists as any
             // folder, in whichever drive it sits.
             (Space::SharedWithMe | Space::Starred | Space::Recent | Space::Search(_), Some(f)) => drive.list(f, None, &mut page),
-            (Space::Search(q), None) => drive.search(&q.text, &q.within, &mut page),
+            (Space::Search(q), None) => {
+                // The shared drives' names come alongside, not ahead of the search; asked again
+                // once a result names a drive not known yet.
+                let mut asked = cached_sd.is_none();
+                if asked {
+                    learn_shared_drives(&drive, &email, &names_out, &names_wake);
+                }
+                let sd_names = cached_sd.unwrap_or_default();
+                let mut first_search = true;
+                let mut search_page = |files: Vec<DriveFile>, more: bool| {
+                    if !asked && files.iter().any(|f| f.drive_id.as_ref().is_some_and(|id| !sd_names.contains_key(id))) {
+                        asked = true;
+                        learn_shared_drives(&drive, &email, &names_out, &names_wake);
+                    }
+                    let entries: Vec<Entry> = files.into_iter().map(|f| entry_of_search(&email, f, &sd_names, false)).collect();
+                    emit(Msg::Listed { pane: p, request, part: Part::Page { first: first_search, more }, result: Ok(entries), at: None });
+                    first_search = false;
+                    live.load(Ordering::Relaxed) == request
+                };
+                drive.search(&q.text, &q.within, &mut search_page)
+            }
             (Space::SharedWithMe | Space::Starred | Space::Recent | Space::Trash, None) => match space.view() {
                 Some(v) => drive.view(v, &mut page),
                 None => Ok(()),
             },
             // The shared drives show as folders.
             (Space::SharedDrives, _) => drive.shared_drives().map(|list| {
+                let map: HashMap<String, String> = list.iter().map(|d| (d.id.clone(), d.name.clone())).collect();
+                emit(Msg::SharedDrives { email: email.clone(), names: map });
                 list.into_iter()
                     .map(|d| Entry {
                         name: if d.hidden { tr!("{} (oculto)", "{} (hidden)", d.name) } else { d.name },
@@ -1889,6 +2479,7 @@ fn list(s: &mut State, p: usize, fresh: bool) {
                         mime: None,
                         md5: None,
                         starred: false,
+                        drive_origin: None,
                     })
                     .collect::<Vec<_>>()
             }).map(|entries| emit(listed(Part::WHOLE, Ok(entries)))),
@@ -1902,6 +2493,18 @@ fn list(s: &mut State, p: usize, fresh: bool) {
 
 fn switch(s: &mut State, p: usize, loc: Location) {
     s.active = p;
+    s.search_scope_menu = None;
+    s.search_scope[p] = match &loc {
+        Location::DriveSearch(_) => model::DriveSearchScope::AllAccounts,
+        Location::Drive { space: Space::Search(q), path, .. } if path.is_empty() => {
+            if q.within == openexplorer_gdrive::search::Within::Everything {
+                model::DriveSearchScope::Account
+            } else {
+                model::DriveSearchScope::Here
+            }
+        }
+        _ => model::DriveSearchScope::Here,
+    };
     if s.renaming.as_ref().is_some_and(|(rp, _)| *rp == p) {
         s.renaming = None;
     }
@@ -1979,6 +2582,9 @@ fn open(s: &mut State, p: usize, id: &str) {
     if !e.is_dir {
         return actions::open_file(s, p, &e);
     }
+    if actions::found_folder(&pane.loc, &e).is_some() {
+        return actions::open_found_folder(s, p, &e);
+    }
     let loc = folder_in(&pane.loc, &e);
     navigate(s, p, loc);
 }
@@ -1989,10 +2595,23 @@ pub(crate) fn folder_in(at: &Location, e: &Entry) -> Location {
     match &mut loc {
         // A folder found opens where it is.
         Location::Found(_) => loc = Location::Local(PathBuf::from(&e.id)),
+        // A disk opens at its root.
+        Location::Computer => loc = Location::Local(PathBuf::from(&e.id)),
         Location::Local(dir) => dir.push(&e.name),
         Location::Mock(segs) => segs.push(e.name.clone()),
         Location::Drive { space: space @ Space::SharedDrives, .. } => *space = Space::Shared { id: e.id.clone(), name: e.name.clone() },
         Location::Drive { path, .. } => path.push((e.target.clone().unwrap_or_else(|| e.id.clone()), e.name.clone())),
+        // A folder found in every account opens where it sits (`actions::open_found_folder`).
+        // Here is where it opens when that can't be found: as one found in its own account
+        // does, under that account's search for the same words, so the address says where it
+        // came from and Up goes back to the results.
+        Location::DriveSearch(q) => {
+            if let Some(o) = e.drive_origin.as_deref() {
+                let target_id = e.target.clone().unwrap_or_else(|| e.id.clone());
+                let search = model::Search { text: q.text.clone(), within: openexplorer_gdrive::search::Within::Everything, place: actions::all_of_drive() };
+                loc = Location::Drive { email: o.email.clone(), space: Space::Search(Box::new(search)), path: vec![(target_id, e.name.clone())] };
+            }
+        }
         // A folder found opens where it is.
         Location::Server { server, .. } => {
             let segs = servers::segs_of(at, e);
@@ -2004,6 +2623,18 @@ pub(crate) fn folder_in(at: &Location, e: &Entry) -> Location {
 
 fn go_up(s: &mut State, p: usize) {
     let mut loc = s.panes[p].loc.clone();
+    // From a disk's top up to Este Computador, landing on the disk.
+    if let Location::Local(dir) = &loc
+        && mounts::is_disk_root(dir, &s.local_drives)
+    {
+        let id = mounts::disk_id(dir);
+        navigate(s, p, Location::Computer);
+        let pane = &mut s.panes[p];
+        pane.selected = [id.clone()].into();
+        pane.cursor = Some(id.clone());
+        pane.anchor = Some(id);
+        return;
+    }
     // The folder we come out of, to land on it.
     let from = match &mut loc {
         Location::Local(dir) => {
@@ -2014,7 +2645,7 @@ fn go_up(s: &mut State, p: usize) {
             name
         }
         Location::Mock(segs) => segs.pop(),
-        Location::Found(_) => None,
+        Location::Computer | Location::Found(_) | Location::DriveSearch(_) => None,
         // From a search's results back to the folder searched.
         Location::Server { find: find @ Some(_), .. } => {
             *find = None;
@@ -2057,6 +2688,7 @@ fn click(s: &mut State, p: usize, id: &str, mods: Mods) {
         }
     }
     s.active = p;
+    s.kbd_sel[p].stop();
     let pane = &mut s.panes[p];
     if mods.cmd {
         if !pane.selected.remove(id) {
@@ -2121,6 +2753,8 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         })
     };
     let page = keyboard::page(s.page_rows[p]) as isize;
+    let flow = s.views[p].flow.get();
+    let (across, down) = flow.steps();
     let owns = keyboard::list_has_keys(s, p, tx.focused());
     // Any other key ends a name being typed: Enter into a folder and a letter starts anew.
     let plain = !(ev.mods.cmd || ev.mods.ctrl || ev.mods.alt);
@@ -2202,13 +2836,36 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             if let Some(i) = keyboard::find(&s.panes[p].entries, at, query) {
                 let id = s.panes[p].entries[i].id.clone();
                 click(s, p, &id, Mods::default());
-                tx.scroll_into_view_in(pane_key(p), row_key(&id));
+                reveal(s, p, i, &id, tx);
             }
             return true;
         }
-        // Esc lets go of the selection; the cursor stays.
+        // Ctrl+0 resets list zoom; Ctrl+= / Ctrl++ zooms in; Ctrl+- zooms out.
+        _ if ev.is_command('0') => {
+            if s.zoom[p].reset(s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+            return true;
+        }
+        _ if ev.is_command('=') || ev.is_command('+') => {
+            if s.zoom[p].step_by(1.0, s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+            return true;
+        }
+        _ if ev.is_command('-') => {
+            if s.zoom[p].step_by(-1.0, s.now, s.settings.zoom_animated()) && s.zoom[p].is_animating() {
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
+            return true;
+        }
+        // Esc lets go of the selection (the cursor stays), or clears a pending copy/cut.
         Key::Escape if owns && !s.panes[p].selected.is_empty() => {
             s.panes[p].selected.clear();
+            return true;
+        }
+        Key::Escape if owns && s.clip.is_some() => {
+            s.clip = None;
             return true;
         }
         Key::Enter if ev.mods.alt => {
@@ -2223,8 +2880,12 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             go_forward(s, p);
             return true;
         }
-        Key::Up => step(-1),
-        Key::Down => step(1),
+        // The arrows follow the items as the view laid them out: tiles in rows, List's
+        // columns, Details' rows (where Left and Right don't move).
+        Key::Left if flow.sideways() => step(-across),
+        Key::Right if flow.sideways() => step(across),
+        Key::Up => step(-down),
+        Key::Down => step(down),
         Key::PageUp => step(-page),
         Key::PageDown => step(page),
         Key::Home => step(-(n as isize)),
@@ -2237,15 +2898,19 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
             go_up(s, p);
             return true;
         }
-        // Back to the tree beside the files, as in Explorer.
+        // Back to the tree beside the files, as in Explorer. Its ring comes on once focus lands
+        // there (`on_focus_change`), so a hidden tree shows none.
         Key::Tab if ev.mods.shift => {
-            tree::focus(s, p, true);
             tx.focus(ui::tree_key(p), true);
             return true;
         }
         Key::Tab => {
-            s.active = 1 - p;
-            tx.focus(pane_key(1 - p), true);
+            let count = s.settings.pane_layout.count();
+            if count > 1 {
+                let next = (p + 1) % count;
+                s.active = next;
+                tx.focus(pane_key(next), true);
+            }
             return true;
         }
         _ if ev.is_command('a') => {
@@ -2264,17 +2929,40 @@ fn key(s: &mut State, p: usize, ev: &KeyEvent, tx: &mut Tx) -> bool {
         _ => return false,
     };
     if let Some(i) = to {
+        let prev_single = (!ev.mods.cmd && !ev.mods.shift && s.panes[p].selected.len() == 1)
+            .then_some(at)
+            .flatten();
         let id = s.panes[p].entries[i].id.clone();
         // With Ctrl the cursor moves alone and the selection stays, as in Explorer.
         if ev.mods.cmd && !ev.mods.shift {
             s.active = p;
+            s.kbd_sel[p].stop();
             s.panes[p].cursor = Some(id.clone());
         } else {
             click(s, p, &id, Mods { shift: ev.mods.shift, ..Mods::default() });
+            if let Some(from_i) = prev_single
+                && from_i != i
+                && s.settings.selection_animated()
+            {
+                s.kbd_sel[p].start(from_i, i, s.now);
+                tx.wake_at(s.now + 1.0 / 60.0);
+            }
         }
-        tx.scroll_into_view_in(pane_key(p), row_key(&id));
+        reveal(s, p, i, &id, tx);
     }
     true
+}
+
+/// Brings item `i` (id `id`) of pane `p` into view. List builds only the columns in sight, so its
+/// items are reached by scrolling to where they sit; the other views reveal the row (or the
+/// virtual line) that holds them.
+fn reveal(s: &State, p: usize, i: usize, id: &str, tx: &mut Tx) {
+    let flow = s.views[p].flow.get();
+    if flow.rows {
+        tx.scroll_into_view_in(pane_key(p), flow.reveal_key(i, row_key(id)));
+    } else if let (_, Some([x, y])) = lasso::menu_point(&s.views[p], Some(i)) {
+        tx.scroll_to_instant(ui::list_key(p), x, y);
+    }
 }
 
 /// The Menu key, or Shift+F10, with nothing else held: the context menu from the keyboard.
@@ -2298,16 +2986,50 @@ fn menu_from_keys(s: &mut State, p: usize, tx: &mut Tx) {
         cursor.or_else(|| pane.entries.iter().position(|e| pane.selected.contains(&e.id)))
     };
     let (at, scroll) = lasso::menu_point(&s.views[p], row);
-    if let Some(y) = scroll {
-        tx.scroll_to_instant(ui::list_key(p), s.views[p].scroll.get().x, y);
+    if let Some([x, y]) = scroll {
+        tx.scroll_to_instant(ui::list_key(p), x, y);
     }
     s.menu = Some((p, at));
 }
 
 fn set_sort(s: &mut State, p: usize, col: SortCol) {
+    s.kbd_sel[p].stop();
+    let animate = s.settings.selection_animated() && !s.panes[p].entries.is_empty();
+    let (old_indices, vis_start, vis_end) = if animate {
+        let scroll = s.views[p].scroll.get();
+        let row_h = s.zoom[p].row_height().max(1.0);
+        let first = (scroll.y / row_h).floor().max(0.0) as usize;
+        let vis_count = ((scroll.h / row_h).ceil().max(24.0) as usize).min(120);
+        let len = s.panes[p].entries.len();
+        let win_start = first.saturating_sub(40);
+        let win_end = (first + vis_count + 40).min(len);
+        let mut map = HashMap::with_capacity(win_end.saturating_sub(win_start));
+        for (i, e) in s.panes[p].entries[win_start..win_end].iter().enumerate() {
+            map.insert(e.id.clone(), win_start + i);
+        }
+        (map, win_start, win_end)
+    } else {
+        (HashMap::new(), 0, 0)
+    };
     let pane = &mut s.panes[p];
     pane.sort = if pane.sort.0 == col { (col, !pane.sort.1) } else { (col, true) };
     pane.sort_entries();
+    if animate && !old_indices.is_empty() {
+        let end = vis_end.min(pane.entries.len());
+        let mut deltas = HashMap::new();
+        for (offset, e) in pane.entries[vis_start..end].iter().enumerate() {
+            let new_i = vis_start + offset;
+            if let Some(&old_i) = old_indices.get(&e.id)
+                && old_i != new_i
+            {
+                let d = (old_i as f32 - new_i as f32).clamp(-24.0, 24.0);
+                deltas.insert(e.id.clone(), d);
+            }
+        }
+        s.row_reorder[p].start(deltas, s.now);
+    } else {
+        s.row_reorder[p].clear();
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2344,7 +3066,8 @@ fn paths_for(s: &State, p: usize, ids: &[String], materialize: bool) -> Vec<Path
     let pane = &s.panes[p];
     match &pane.loc {
         Location::Local(_) | Location::Found(_) => ids.iter().filter_map(|id| pane.entry(id)).filter_map(|e| pane.loc.local_path(e)).collect(),
-        Location::Drive { .. } | Location::Server { .. } => Vec::new(),
+        // The disks themselves don't drag.
+        Location::Computer | Location::Drive { .. } | Location::DriveSearch(_) | Location::Server { .. } => Vec::new(),
         Location::Mock(segs) => {
             let dir = s.temp.join(if segs.is_empty() { "Meu Drive".to_string() } else { segs.join("_") });
             if materialize && std::fs::create_dir_all(&dir).is_err() {
@@ -2381,6 +3104,14 @@ fn start_drive_drag(s: &State, p: usize, ids: Vec<String>) {
     let source: Arc<dyn dragout::Files> = match &pane.loc {
         Location::Drive { email, .. } => {
             let Some(drive) = s.drives.get(email).cloned() else { return };
+            Arc::new(dragout::DriveSource { drive, files: items.iter().map(|e| actions::drive_file(e)).collect() })
+        }
+        Location::DriveSearch(_) => {
+            let Some(first_email) = items.first().and_then(|e| actions::item_account(&pane.loc, e)) else { return };
+            if !items.iter().all(|e| actions::item_account(&pane.loc, e) == Some(first_email)) {
+                return;
+            }
+            let Some(drive) = s.drives.get(first_email).cloned() else { return };
             Arc::new(dragout::DriveSource { drive, files: items.iter().map(|e| actions::drive_file(e)).collect() })
         }
         Location::Server { server, .. } => {
@@ -2456,12 +3187,16 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
     let loc = s.panes[p].loc.clone();
     let (mut done, mut skipped) = (0, 0);
     match &loc {
-        Location::Found(_) | Location::Server { find: Some(_), .. } => {
+        Location::Found(_) | Location::DriveSearch(_) | Location::Server { find: Some(_), .. } => {
             s.status = t("Os resultados da pesquisa não são uma pasta: solte os arquivos numa pasta.", "Search results aren't a folder: drop the files in a folder.").into();
             return;
         }
         Location::Local(dir) if network::is_server(dir) => {
             s.status = t("Aqui estão as pastas compartilhadas do computador: solte os arquivos numa delas.", "These are the computer's shared folders: drop the files in one of them.").into();
+            return;
+        }
+        Location::Computer => {
+            s.status = t("Aqui estão os discos do computador: solte os arquivos numa pasta de um deles.", "These are the computer's disks: drop the files in a folder on one of them.").into();
             return;
         }
         Location::Server { .. } => {
@@ -2489,15 +3224,11 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
             return;
         }
         Location::Local(dir) => {
-            // Files and folders from Explorer copy in the background with a bar; ones already
-            // here are left alone.
-            let fresh: Vec<PathBuf> = files.iter().filter(|f| f.parent() != Some(dir.as_path()) && f.file_name().is_some_and(|n| !dir.join(n).exists())).cloned().collect();
-            let skipped = files.len() - fresh.len();
-            if !fresh.is_empty() {
-                actions::local_transfer(s, transfers::Op::Copy, fresh, dir.clone(), vec![loc.clone()]);
-            }
-            if skipped > 0 {
-                s.status = tr!("Ignorados (já estão aqui): {skipped}.", "Skipped (already here): {skipped}.");
+            // Files and folders from Explorer (or the other pane) copy in the background with a
+            // bar; collisions prompt the user just like Copiar + Colar.
+            let sources: Vec<PathBuf> = files.iter().filter(|f| f.parent() != Some(dir.as_path())).cloned().collect();
+            if !sources.is_empty() {
+                actions::local_transfer(s, transfers::Op::Copy, sources, dir.clone(), vec![loc.clone()]);
             }
             return;
         }
@@ -2517,6 +3248,7 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
                     mime: None,
                     md5: None,
                     starred: false,
+                    drive_origin: None,
                 };
                 if s.mock.add(segs, entry) { done += 1 } else { skipped += 1 }
             }
@@ -2531,34 +3263,50 @@ fn nothing_to_upload() -> String {
     t("Nada para enviar: arraste arquivos ou pastas do computador.", "Nothing to upload: drag files or folders from the computer.").into()
 }
 
-/// The clash dialog over a fake account's Drive folder, for sample files in %TEMP%.
-fn clash_scene(s: &mut State, all: bool) {
+/// The conflict dialog over a Drive-to-local download of a video file, matching the Air Explorer layout.
+fn clash_scene(s: &mut State, many: bool) {
     let dir = std::env::temp_dir().join("openexplorer-clash-scene");
-    let _ = std::fs::create_dir_all(dir.join("Projetos"));
-    for name in ["Relatório.pdf", "foto.jpg", "notas.txt"] {
-        let _ = std::fs::write(dir.join(name), name);
-    }
-    let to = Location::Drive { email: "voce@gmail.com".into(), space: Space::MyDrive, path: vec![("x".into(), "Trabalho".into())] };
-    s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
-    switch(s, 0, Location::Local(dir.clone()));
-    s.panes[1].go(to.clone());
-    let e = |id: &str, name: &str, mime: &str| Entry {
-        id: id.into(),
-        name: name.into(),
-        is_dir: mime == openexplorer_gdrive::api::FOLDER_MIME,
-        size: Some(120_000),
-        modified: Some(SystemTime::now()),
-        target: None,
-        mime: Some(mime.into()),
-        md5: None,
-        starred: false,
+    let _ = std::fs::create_dir_all(&dir);
+    let local_file = dir.join("100.Code.S01E12.1080p.AMZN.WEB-DL.DD2.0.H.264.DUAL-alfaHD-Dinho.mp4");
+    let _ = std::fs::write(&local_file, "video");
+    let to = Location::Drive {
+        email: "voce@gmail.com".into(),
+        space: Space::MyDrive,
+        path: vec![("x".into(), "SERIES 0-G".into()), ("y".into(), "S01".into())],
     };
-    let existing = vec![e("a", "Relatório.pdf", "application/pdf"), e("b", "foto.jpg", "image/jpeg"), e("c", "Projetos", openexplorer_gdrive::api::FOLDER_MIME)];
-    s.panes[1].set_entries(Ok(existing.clone()));
-    let sources = ["Projetos", "Relatório.pdf", "foto.jpg", "notas.txt"].map(|n| dir.join(n)).to_vec();
-    let up = actions::Upload { email: "voce@gmail.com".into(), parent: "x".into(), to: to.clone(), sources, remove: false, reload: vec![to] };
-    let chosen = if all { Vec::new() } else { vec![uploads::Clash::KeepBoth] };
-    s.dialog = Some(actions::Dialog::Clash(Box::new(actions::ClashAsk { up, existing, clashes: vec![0, 1, 2], chosen, all })));
+    s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
+    switch(s, 0, Location::Local(dir.clone()));
+    s.panes[1].go(to);
+    let now = SystemTime::now();
+    let older = now - std::time::Duration::from_secs(3 * 3600);
+    let name = "100.Code.S01E12.1080p.AMZN.WEB-DL.DD2.0.H.264.DUAL-alfaHD-Dinho.mp4";
+    let bytes = 846_544_896; // 807,33 MB
+    let src = conflict::FileInfo {
+        name: name.into(),
+        place: "Drive [SERIES 0-G]\\SERIES\\0-9\\100 Code (2015)\\S01".into(),
+        is_dir: false,
+        size: Some(bytes),
+        modified: Some(now),
+        kind: model::Kind::Video,
+    };
+    let dst = conflict::FileInfo {
+        name: name.into(),
+        place: dir.display().to_string(),
+        is_dir: false,
+        size: Some(bytes),
+        modified: Some(older),
+        kind: model::Kind::Video,
+    };
+    s.dialog = Some(actions::Dialog::Conflict(Box::new(conflict::Prompt {
+        op: transfers::Op::Download,
+        src,
+        dst,
+        renamed: "100.Code.S01E12.1080p.AMZN.WEB-DL.DD2.0.H.264.DUAL-alfaHD-Dinho (2).mp4".into(),
+        may_have_more: many,
+        apply_all: false,
+        reply: None,
+        live: None,
+    })));
 }
 
 /// Opções open on Cache, its sizes fixed, then `then` applied to the page.
@@ -2609,6 +3357,7 @@ fn view_sample() -> Vec<Entry> {
         mime: mime.map(str::to_string),
         md5: None,
         starred: false,
+        drive_origin: None,
     };
     vec![
         e("f1", "Projetos antigos", true, None, 40, None),
@@ -2616,6 +3365,56 @@ fn view_sample() -> Vec<Entry> {
         e("f3", "Orçamento", false, None, 3, Some("application/vnd.google-apps.spreadsheet")),
         e("f4", "foto_praia.jpg", false, Some(3_480_112), 90, None),
     ]
+}
+
+/// Rune's own labels in Portuguese while the interface is; English keeps Rune's. macOS writes
+/// its menu items in title case ("Selecionar Tudo", "Ocultar Outros"), Windows and Linux in
+/// sentence case ("Selecionar tudo"): each gets its system's.
+fn rune_labels(label: rune::Label<'_>) -> Option<String> {
+    rune_labels_on(label, cfg!(target_os = "macos"))
+}
+
+fn rune_labels_on(label: rune::Label<'_>, mac: bool) -> Option<String> {
+    use rune::Label as L;
+    if openexplorer_i18n::english() {
+        return None;
+    }
+    let pick = |sentence: &str, title: &str| if mac { title.to_string() } else { sentence.to_string() };
+    Some(match label {
+        L::Cut => "Recortar".into(),
+        L::Copy => "Copiar".into(),
+        L::Paste => "Colar".into(),
+        L::SelectAll => pick("Selecionar tudo", "Selecionar Tudo"),
+        L::Undo => "Desfazer".into(),
+        L::Redo => "Refazer".into(),
+        L::LearnSpelling => pick("Aprender ortografia", "Aprender Ortografia"),
+        L::NoGuesses => pick("Nenhuma sugestão", "Nenhuma Sugestão"),
+        L::Spellcheck => pick("Verificação ortográfica", "Verificação Ortográfica"),
+        L::SpellcheckLanguages => pick("Idiomas da verificação ortográfica", "Idiomas da Verificação Ortográfica"),
+        L::Minimize => "Minimizar".into(),
+        L::Maximize => "Maximizar".into(),
+        L::Restore => "Restaurar".into(),
+        L::Zoom => "Zoom".into(),
+        L::Close => "Fechar".into(),
+        L::BringAllToFront => pick("Trazer todas para a frente", "Trazer Todas para a Frente"),
+        L::StartDictation => pick("Iniciar ditado…", "Iniciar Ditado…"),
+        L::EmojiAndSymbols => pick("Emoji e símbolos", "Emoji e Símbolos"),
+        L::About(app) => format!("Sobre o {app}"),
+        L::Services => "Serviços".into(),
+        L::Hide(app) => format!("Ocultar {app}"),
+        L::HideOthers => pick("Ocultar outros", "Ocultar Outros"),
+        L::ShowAll => pick("Mostrar tudo", "Mostrar Tudo"),
+        L::Quit(app) => format!("Encerrar {app}"),
+        L::MoreNestedLines(1) => "mais 1 linha aninhada".into(),
+        L::MoreNestedLines(n) => format!("mais {n} linhas aninhadas"),
+        L::OpenLink => pick("Abrir link", "Abrir Link"),
+        L::CopyLink => pick("Copiar link", "Copiar Link"),
+        L::SaveImageAs => pick("Salvar imagem como…", "Salvar Imagem Como…"),
+        L::CopyImage => pick("Copiar imagem", "Copiar Imagem"),
+        L::CopyImageAddress => pick("Copiar endereço da imagem", "Copiar Endereço da Imagem"),
+        // A dictionary's or a menu's own name, and labels Rune adds later: as Rune has them.
+        _ => return None,
+    })
 }
 
 fn main() {
@@ -2637,7 +3436,32 @@ fn main() {
             }
         });
     }
+    let cli = updater::intercept_cli(args);
+    if let Some(notice) = cli.notice {
+        *STARTUP_UPDATE_NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(notice);
+    }
     let initial = settings::Settings::load();
+    // Rune's own words (a text field's menu, the window buttons' names for screen readers) in
+    // the app's language.
+    rune::set_labels(rune_labels);
+    if !rune::is_headless() {
+        #[cfg(target_os = "windows")]
+        rune::set_app_icon_resource(1);
+        // macOS: the Dock and the app switcher. Linux: each window's icon (X11, and Wayland where
+        // the compositor takes one), for title bars and switchers when no desktop entry matches.
+        #[cfg(not(target_os = "windows"))]
+        let _ = rune::set_app_icon(include_bytes!("../assets/icon.png").as_slice());
+    }
+    // Apply an update downloaded in an earlier run before opening the window. Not when this start
+    // is the helper reporting that installing it failed: trying again at once would bring the
+    // same refusal (a declined UAC prompt, a locked file) back at every start, the window never
+    // opening. That update goes; the dialog can fetch and install it again.
+    let install_failed = matches!(STARTUP_UPDATE_NOTICE.lock().unwrap_or_else(|e| e.into_inner()).as_ref(), Some(Err(_)));
+    if install_failed {
+        updater::clear_staged();
+    } else if !rune::is_headless() && updater::install_kept(initial.auto_update) {
+        std::process::exit(0);
+    }
     accounts::start();
     let main_spec = AppSpec::<State> {
         min_size: Some((900.0, 420.0)),
@@ -2648,7 +3472,7 @@ fn main() {
             ("stress", |s| switch(s, 1, Location::Mock(vec!["Teste 50.000 arquivos".into()]))),
             // How a connected account looks, without a network: a fake account and a listing.
             ("account", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::Drive { email: "voce@gmail.com".into(), space: Space::MyDrive, path: vec![("x".into(), "Projetos".into())] });
                 s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
                 s.status = "Conta conectada: voce@gmail.com".into();
@@ -2726,7 +3550,7 @@ fn main() {
             // Drive names holding `/`, shown with `／` in the path bar, the list and the rename
             // field, without a network.
             ("slash", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::Drive { email: "voce@gmail.com".into(), space: Space::MyDrive, path: vec![("x".into(), "Séries/Filmes".into())] });
                 let mut entries = view_sample();
                 entries[0].name = "tes/test".into();
@@ -2741,7 +3565,7 @@ fn main() {
             // The path bar's menu over a Drive folder (with Copiar link do Drive), without a
             // network.
             ("address-menu", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::Drive { email: "voce@gmail.com".into(), space: Space::MyDrive, path: vec![("x".into(), "Projetos".into())] });
                 s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
                 s.address_menu = Some((1, rune::PointerPress { x: 820.0, y: 92.0 }));
@@ -2755,6 +3579,9 @@ fn main() {
                 found_scene(s, true);
             }),
             ("found-missing", |s| found_scene(s, false)),
+            // The Acrylic background where the system draws none (a headless run): Rune's
+            // near-opaque neutral tint shows around the panes and through the folder trees.
+            ("acrylic", |s| s.acrylic = true),
             // An upload whose names are taken in the Drive folder: all at once, or the second
             // of three asked on its own.
             ("clash", |s| clash_scene(s, true)),
@@ -2794,7 +3621,7 @@ fn main() {
             }),
             // Lixeira of an account with its menu open on an item, without a network.
             ("trash", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::Trash));
                 s.panes[1].set_entries(Ok(view_sample()));
                 s.panes[1].selected = ["f2".to_string()].into();
@@ -2802,7 +3629,7 @@ fn main() {
             }),
             // Excluir permanentemente asking to confirm.
             ("purge", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::Trash));
                 s.panes[1].set_entries(Ok(view_sample()));
                 s.panes[1].selected = ["f2".to_string(), "f3".to_string()].into();
@@ -2810,14 +3637,14 @@ fn main() {
             }),
             // Esvaziar lixeira asking to confirm.
             ("empty-trash", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::Trash));
                 s.panes[1].set_entries(Ok(view_sample()));
                 actions::ask_empty_trash(s, 1);
             }),
             // Com estrela with the menu on a starred file, and the views in the tree.
             ("starred", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::Starred));
                 s.panes[1].set_entries(Ok(view_sample().into_iter().map(|e| Entry { starred: true, ..e }).collect()));
                 s.panes[1].selected = ["f3".to_string()].into();
@@ -2825,7 +3652,7 @@ fn main() {
             }),
             // An account's storage in its status bar, without a network.
             ("quota", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.quotas.insert("voce@gmail.com".into(), Some(Quota { limit: Some(16_106_127_360), usage: 2_898_000_000, in_drive: 2_100_000_000, in_trash: 12_000_000 }));
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::MyDrive));
                 s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
@@ -2905,7 +3732,7 @@ fn main() {
             }),
             // Compartilhar on a file shared with a few people and the link, without a network.
             ("share", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.quotas.insert("voce@gmail.com".into(), Some(Quota { limit: None, usage: 734_003_200, in_drive: 600_000_000, in_trash: 0 }));
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::MyDrive));
                 s.panes[1].set_entries(Ok(MockDrive::new().list(&["Documentos".into()])));
@@ -2938,12 +3765,16 @@ fn main() {
             }),
             // The shared drives list of an account, without a network.
             ("shared", |s| {
-                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into() });
+                s.accounts.push(StoredAccount { email: "voce@gmail.com".into(), name: "Você".into(), client_id: String::new() });
                 s.panes[1].go(Location::drive("voce@gmail.com", Space::SharedDrives));
-                let d = |id: &str, name: &str| Entry { id: id.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+                let d = |id: &str, name: &str| Entry { id: id.into(), name: name.into(), is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
                 s.panes[1].set_entries(Ok(vec![d("0AAa", "Equipe de design"), d("0AAb", "Financeiro"), d("0AAc", "Projetos 2026")]));
             }),
             ("accounts-hub", accounts_hub_scene),
+            // The README's screenshots (`showcase`).
+            ("readme-main", showcase::main_scene),
+            ("readme-conflict", showcase::conflict_scene),
+            ("readme-search", showcase::search_scene),
             ("accounts-hub-empty", |s| {
                 s.accounts.clear();
                 s.servers.list.clear();
@@ -2952,6 +3783,58 @@ fn main() {
             ("accounts-hub-light", |s| {
                 accounts_hub_scene(s);
                 s.settings.theme = settings::Theme::Light;
+            }),
+            ("update-available", |s| {
+                s.updater.support = Ok(updater::InstallKind::WindowsInstalled { install_dir: PathBuf::from(r"C:\Program Files\OpenExplorer") });
+                s.updater.release = Some(updater::Release {
+                    version: "0.5.0".into(),
+                    url: "https://github.com/orezraey/OpenExplorer/releases/tag/v0.5.0".into(),
+                    notes: "- Atualização integrada no aplicativo\n- Melhorias de desempenho na listagem".into(),
+                    asset_name: "OpenExplorer-0.5.0-windows-x64-setup.exe".into(),
+                    download_url: "https://example.invalid/setup.exe".into(),
+                    size: 18_400_000,
+                    sha256: None,
+                    signed: None,
+                });
+                s.updater.download = updater::DownloadState::Idle;
+                s.dialog = Some(actions::Dialog::Update);
+            }),
+            ("update-downloading", |s| {
+                s.updater.support = Ok(updater::InstallKind::WindowsInstalled { install_dir: PathBuf::from(r"C:\Program Files\OpenExplorer") });
+                s.updater.release = Some(updater::Release {
+                    version: "0.5.0".into(),
+                    url: "https://github.com/orezraey/OpenExplorer/releases/tag/v0.5.0".into(),
+                    notes: String::new(),
+                    asset_name: "OpenExplorer-0.5.0-windows-x64-setup.exe".into(),
+                    download_url: "https://example.invalid/setup.exe".into(),
+                    size: 18_400_000,
+                    sha256: None,
+                    signed: None,
+                });
+                s.updater.download = updater::DownloadState::Downloading { received: 11_200_000, total: 18_400_000 };
+                s.dialog = Some(actions::Dialog::Update);
+            }),
+            ("update-ready", |s| {
+                s.updater.support = Ok(updater::InstallKind::WindowsInstalled { install_dir: PathBuf::from(r"C:\Program Files\OpenExplorer") });
+                s.updater.release = Some(updater::Release {
+                    version: "0.5.0".into(),
+                    url: "https://github.com/orezraey/OpenExplorer/releases/tag/v0.5.0".into(),
+                    notes: "- Atualização integrada no aplicativo\n- Melhorias de desempenho na listagem".into(),
+                    asset_name: "OpenExplorer-0.5.0-windows-x64-setup.exe".into(),
+                    download_url: "https://example.invalid/setup.exe".into(),
+                    size: 18_400_000,
+                    sha256: None,
+                    signed: None,
+                });
+                s.updater.download = updater::DownloadState::Ready(updater::Staged {
+                    version: "0.5.0".into(),
+                    file_path: PathBuf::from("staged.exe"),
+                    sha256: "0".repeat(64),
+                    install_kind: updater::InstallKind::WindowsInstalled { install_dir: PathBuf::from(r"C:\Program Files\OpenExplorer") },
+                    release_url: "https://github.com/orezraey/OpenExplorer/releases/tag/v0.5.0".into(),
+                    signed: Default::default(),
+                });
+                s.dialog = Some(actions::Dialog::Update);
             }),
         ],
         ..AppSpec::new("Open Explorer", (1280.0, 760.0), init, ui::view)
@@ -3080,8 +3963,23 @@ fn main() {
     .titlebar(rune::Titlebar::new(36.0))
     .font_smoothing(initial.text_render.smoothing())
     .turn_scope(enter_turn, leave_turn)
+    // Linux has no system pop-up menu: the fields' menu is drawn in the window, as in the main
+    // one. Rune dismisses it when the window loses focus: it goes.
+    .on_popup_menu(|s, request, tx| {
+        if s.is_placeholder {
+            tx.resolve_popup_menu(None);
+        } else {
+            s.account_popup = Some(request);
+        }
+    })
+    .on_focus(|s, focused, _| {
+        if !focused && !s.is_placeholder {
+            s.account_popup = None;
+        }
+    })
     .on_close(|s, _| {
         if !s.is_placeholder {
+            s.account_popup = None;
             s.account_window_closed();
         }
     });
@@ -3089,7 +3987,7 @@ fn main() {
     let mut main_app = rune::App::new(main_spec)
         .titlebar(rune::Titlebar::new(34.0))
         .font_smoothing(initial.text_render.smoothing())
-        .args(rune_args(std::env::args().skip(1)))
+        .args(rune_args(cli.args.into_iter()))
         .turn_scope(enter_turn, leave_turn)
         // B2 folders and Telegram accounts on screen look for changes only while the window is in
         // front.
@@ -3097,18 +3995,26 @@ fn main() {
             if s.is_placeholder {
                 PENDING_MAIN_FOCUS.with(|c| c.set(Some(focused)));
             } else {
-                accounts::window_focus(s, focused, tx);
+                // Rune dismisses a Linux in-window menu when the window loses focus: it goes.
+                if !focused {
+                    s.popup = None;
+                }
+                main_focus(s, focused, tx);
             }
         })
         // The app ends without returning from `run`: what the cloud accounts changed since their
         // trees and listings were last kept is kept here, so the next start has less to catch up on.
         .on_quit(|_, _| {
             accounts::save_caches();
-            if RESTART.load(Ordering::Relaxed) {
+            if !updater::run_pending_handoff() && RESTART.load(Ordering::Relaxed) {
                 relaunch();
             }
         })
         .on_close_request(|s, _| actions::close_requested(s))
+        // macOS: ⌘Q, Encerrar in the Dock, logging out. Elsewhere Rune never calls it.
+        .on_quit_request(actions::quit_requested)
+        // Linux has no system pop-up menu: a text field's is drawn in the window.
+        .on_popup_menu(|s, request, _| s.popup = Some(request))
         // It opens where it was closed, as Explorer's does.
         .on_window(window_place::created)
         .on_window_geometry(|_, _, _| {
@@ -3121,12 +4027,24 @@ fn main() {
     let mica = initial.mica && cfg!(windows);
     STARTED_WITH_MICA.store(mica, Ordering::Relaxed);
     MICA_ASKED.with(|a| a.set(mica.then_some(initial.material)));
-    if place.is_some() || mica {
+    // Experimental too, off Windows: the system's material behind the page and the folder
+    // trees, which also needs a transparent window.
+    let acrylic = initial.acrylic_window();
+    if place.is_some() || mica || acrylic {
         let maximized = place.is_some() && initial.window.is_some_and(|w| w.maximized);
-        main_app = main_app.window_options(rune::WindowOptions { transparent: mica, ..place.unwrap_or_default() }).maximized(maximized);
+        main_app = main_app.window_options(rune::WindowOptions { transparent: mica || acrylic, ..place.unwrap_or_default() }).maximized(maximized);
     }
     if mica {
-        main_app = main_app.window_backdrop(initial.material.backdrop()).color_scheme(initial.theme.color_scheme());
+        main_app = main_app.window_backdrop(initial.material.backdrop());
+    }
+    // The material's tint follows the app's theme, not the system's.
+    if mica || acrylic {
+        main_app = main_app.color_scheme(initial.theme.color_scheme());
+    }
+    // Experimental: content that keeps up with a drag of the left or top edge. Rune ignores it
+    // in a transparent window, so not with Mica or Acrylic.
+    if initial.resize_sync && cfg!(windows) {
+        main_app = main_app.resize_sync(rune::ResizeSync::On);
     }
 
     let batch_rename_app = rune::App::new(AppSpec::<State> {
@@ -3183,7 +4101,8 @@ fn main() {
             s.account_win = Some(account_handle);
             s.batch_rename_win = Some(batch_rename_handle);
             s.rule_editor_win = Some(rule_editor_handle);
-            s.main_win = Some(main_handle);
+            s.main_win = Some(main_handle.clone());
+            s.tray = tray::start(main_handle);
             s
         })
         .run();
@@ -3192,7 +4111,7 @@ fn main() {
 /// Central de Contas with connected cloud accounts and servers, without a network.
 fn accounts_hub_scene(s: &mut State) {
     s.accounts = vec![
-        StoredAccount { email: "caua@gmail.com".into(), name: "Cauã Silva".into() },
+        StoredAccount { email: "caua@gmail.com".into(), name: "Cauã Silva".into(), client_id: String::new() },
     ];
     s.quotas.insert(
         "caua@gmail.com".into(),
@@ -3256,6 +4175,13 @@ fn rune_args(given: impl Iterator<Item = String>) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// The tests that read or write `RESTART`, shared by the whole process, run one at a time.
+    static RESTART_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn restart_tests() -> std::sync::MutexGuard<'static, ()> {
+        RESTART_TESTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A close the app asked for, whose `on_close` comes after Adicionar conta opened a new
     /// form, keeps that form; the window's own close button drops it.
     #[test]
@@ -3269,11 +4195,95 @@ mod tests {
         assert!(s.account_form.is_none());
     }
 
+    /// Este Computador lists the disks by letter, by the names the system gave once they come;
+    /// a disk opens at its root, Up from it lands back on it, and a disk mounted shows there.
+    /// The disks themselves can't be deleted, renamed or pasted into.
+    #[test]
+    fn this_pc_lists_the_disks() {
+        let mut s = init();
+        let disk = |l: &str| PathBuf::from(format!("{l}:\\"));
+        s.local_drives = vec![(disk("C"), model::DriveKind::Fixed), (disk("W"), model::DriveKind::Fixed), (disk("X"), model::DriveKind::Network)];
+        let alt = r"AltMount (\\server) (X:)";
+        s.drive_names = [(disk("X"), alt.to_string())].into();
+        navigate(&mut s, 0, Location::Computer);
+        let rows = |s: &State| s.panes[0].entries.iter().map(|e| (e.id.clone(), e.name.clone())).collect::<Vec<_>>();
+        let c = model::DriveKind::Fixed.label("C:");
+        assert_eq!(rows(&s), [("C:\\".into(), c), ("W:\\".into(), model::DriveKind::Fixed.label("W:")), ("X:\\".into(), alt.into())]);
+        // The names come: the rows take them, still by letter.
+        tree::drive_names(&mut s, vec![(disk("C"), "Disco Local (C:)".into()), (disk("W"), "Zeta (W:)".into()), (disk("X"), alt.into())]);
+        assert_eq!(rows(&s).into_iter().map(|(_, n)| n).collect::<Vec<_>>(), ["Disco Local (C:)", "Zeta (W:)", alt]);
+        // Nothing to change on the disks themselves.
+        assert!(!actions::editable(&Location::Computer) && !actions::items_editable(&Location::Computer));
+        s.panes[0].selected = ["C:\\".to_string()].into();
+        actions::ask_delete(&mut s, 0);
+        assert!(s.dialog.is_none());
+        // A disk mounted joins the list.
+        tree::drives_changed(&mut s, vec![(disk("C"), model::DriveKind::Fixed), (disk("E"), model::DriveKind::Removable), (disk("W"), model::DriveKind::Fixed), (disk("X"), model::DriveKind::Network)]);
+        assert_eq!(rows(&s).into_iter().map(|(id, _)| id).collect::<Vec<_>>(), ["C:\\", "E:\\", "W:\\", "X:\\"]);
+        // One names job at a time: asked while one runs, it runs again after.
+        assert!(s.names_asking);
+        tree::read_drive_names(&mut s);
+        assert!(s.names_again);
+        // Names read before E: came are left for the newer reading, which starts now.
+        tree::drive_names(&mut s, vec![(disk("C"), "Antigo (C:)".into()), (disk("W"), "Zeta (W:)".into()), (disk("X"), alt.into())]);
+        assert_eq!(rows(&s)[0].1, "Disco Local (C:)");
+        assert!(s.names_asking && !s.names_again);
+        // A letter taken by another disk loses the old disk's name.
+        tree::drives_changed(&mut s, vec![(disk("C"), model::DriveKind::Fixed), (disk("E"), model::DriveKind::Removable), (disk("W"), model::DriveKind::Fixed), (disk("X"), model::DriveKind::Removable)]);
+        assert_eq!(rows(&s)[3].1, model::DriveKind::Removable.label("X:"));
+        // A tab left on Este Computador lists the disks as they are when it comes back.
+        tabs::open_new_tab(&mut s, 0, Location::Mock(Vec::new()));
+        tree::drives_changed(&mut s, vec![(disk("C"), model::DriveKind::Fixed), (disk("W"), model::DriveKind::Fixed)]);
+        tabs::select_tab(&mut s, 0, 0);
+        assert_eq!(s.panes[0].loc, Location::Computer);
+        assert_eq!(rows(&s).into_iter().map(|(id, _)| id).collect::<Vec<_>>(), ["C:\\", "W:\\"]);
+        // A disk opens at its root; Up comes back to it.
+        let w = s.panes[0].entries.iter().find(|e| e.id == "W:\\").cloned().unwrap();
+        assert_eq!(folder_in(&Location::Computer, &w), Location::Local(disk("W")));
+        navigate(&mut s, 0, Location::Local(disk("W")));
+        go_up(&mut s, 0);
+        assert_eq!(s.panes[0].loc, Location::Computer);
+        assert_eq!(s.panes[0].cursor.as_deref(), Some("W:\\"));
+        assert!(s.panes[0].selected.contains("W:\\"));
+        // A search from here looks through the whole computer.
+        s.search[0] = rune::TextEdit::new("notas");
+        actions::search_computer(&mut s, 0);
+        assert!(matches!(&s.panes[0].loc, Location::Found(f) if f.within.is_none() && f.text == "notas"));
+        // Emptied, the field takes the pane back to Este Computador.
+        s.search[0] = rune::TextEdit::new("");
+        actions::search_computer(&mut s, 0);
+        assert_eq!(s.panes[0].loc, Location::Computer);
+        // A volume mounted in a folder (/media/ana/PEN) goes up to Este Computador too.
+        let pen = disk("C").join("media").join("PEN");
+        tree::drives_changed(&mut s, vec![(disk("C"), model::DriveKind::Fixed), (pen.clone(), model::DriveKind::Removable)]);
+        navigate(&mut s, 0, Location::Local(pen.clone()));
+        go_up(&mut s, 0);
+        assert_eq!(s.panes[0].loc, Location::Computer);
+        assert_eq!(s.panes[0].cursor.as_deref(), Some(mounts::disk_id(&pen).as_str()));
+        // A folder in it goes up as any folder does.
+        navigate(&mut s, 0, Location::Local(pen.join("Fotos")));
+        go_up(&mut s, 0);
+        assert_eq!(s.panes[0].loc, Location::Local(pen));
+    }
+
+    /// A disk the system didn't tell about shows once the window gets the focus back.
+    #[test]
+    fn the_disks_are_read_again_when_the_window_gets_the_focus() {
+        let mut s = init();
+        s.local_drives.clear();
+        main_focus(&mut s, false, &mut Tx::default());
+        assert!(s.local_drives.is_empty());
+        main_focus(&mut s, true, &mut Tx::default());
+        assert_eq!(s.local_drives, mounts::list());
+        assert!(s.main_dirty);
+    }
+
     /// Closing the window asks only while a transfer runs, over the dialog open, which stays;
     /// a second close goes through and stops the transfers, and the question goes away by
     /// itself once they end.
     #[test]
     fn closing_asks_only_while_transfers_run() {
+        let _one_at_a_time = restart_tests();
         let mut s = init();
         assert_eq!(actions::close_requested(&mut s), rune::CloseResponse::Close);
         let end = || transfers::End::local(std::path::Path::new(r"C:\x"));
@@ -3303,6 +4313,60 @@ mod tests {
         assert!(s.quit_asked && actions::restarting());
         drop(last);
         assert!(actions::quit_question_done(&mut s) && !actions::restarting());
+    }
+
+    #[test]
+    fn quitting_the_app_asks_like_closing() {
+        let _one_at_a_time = restart_tests();
+        let mut s = init();
+        let mut tx = Tx::default();
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Quit);
+        let end = || transfers::End::local(std::path::Path::new(r"C:\x"));
+        let batch = transfers::queue(&mut s.transfers, None, transfers::Op::Copy, [(end(), end())]);
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Defer);
+        assert!(s.quit_asked && s.quit_app);
+        actions::keep_running(&mut s);
+        assert!(!s.quit_asked && !s.quit_app);
+
+        // Asked by a quit, answered with Fechar mesmo assim: the transfers stop.
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Defer);
+        actions::quit_anyway(&mut s, &mut tx);
+        assert!(!s.quit_asked && !s.quit_app && !actions::transfers_running(&s));
+        drop(batch);
+
+        // A quit asked again while the question shows quits; a window's close asking after a
+        // quit did is a close again.
+        let other = transfers::queue(&mut s.transfers, None, transfers::Op::Copy, [(end(), end())]);
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Defer);
+        assert_eq!(actions::close_requested(&mut s), rune::CloseResponse::Close);
+        assert!(!s.quit_app);
+        drop(other);
+        let last = transfers::queue(&mut s.transfers, None, transfers::Op::Copy, [(end(), end())]);
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Defer);
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Quit);
+        assert!(!s.quit_asked && !s.quit_app && !actions::transfers_running(&s));
+        drop(last);
+
+        // ⌘Q while Reiniciar asks quits, and the app doesn't open again.
+        let again = transfers::queue(&mut s.transfers, None, transfers::Op::Copy, [(end(), end())]);
+        actions::restart(&mut s, &mut tx);
+        assert!(s.quit_asked && actions::restarting());
+        assert_eq!(actions::quit_requested(&mut s, &mut tx), rune::QuitResponse::Quit);
+        assert!(!s.quit_asked && !actions::restarting());
+        drop(again);
+    }
+
+    #[test]
+    fn runes_words_in_portuguese() {
+        // Tests run in Portuguese (`openexplorer_i18n`); English keeps Rune's own words.
+        assert_eq!(rune_labels(rune::Label::Cut).as_deref(), Some("Recortar"));
+        assert_eq!(rune_labels_on(rune::Label::SelectAll, false).as_deref(), Some("Selecionar tudo"));
+        // macOS writes its menu items in title case.
+        assert_eq!(rune_labels_on(rune::Label::SelectAll, true).as_deref(), Some("Selecionar Tudo"));
+        assert_eq!(rune_labels_on(rune::Label::HideOthers, true).as_deref(), Some("Ocultar Outros"));
+        assert_eq!(rune_labels(rune::Label::Quit("Open Explorer")).as_deref(), Some("Encerrar Open Explorer"));
+        assert_eq!(rune_labels(rune::Label::MoreNestedLines(3)).as_deref(), Some("mais 3 linhas aninhadas"));
+        assert_eq!(rune_labels(rune::Label::Language("pt-BR")), None);
     }
 
     /// What a running transfer queue costs the window: 40 downloads advancing, each tick
@@ -3372,7 +4436,7 @@ mod tests {
     #[test]
     fn accounts_hub_lists_filters_opens_panes_and_removes() {
         let mut s = init();
-        s.accounts = vec![StoredAccount { email: "ana@gmail.com".into(), name: "Ana Souza".into() }];
+        s.accounts = vec![StoredAccount { email: "ana@gmail.com".into(), name: "Ana Souza".into(), client_id: String::new() }];
         s.quotas.insert(
             "ana@gmail.com".into(),
             Some(Quota { limit: Some(15_000_000_000), usage: 5_000_000_000, in_drive: 4_000_000_000, in_trash: 0 }),
@@ -3472,35 +4536,242 @@ mod tests {
     }
 
     fn entries(from: usize, n: usize) -> Vec<Entry> {
-        (from..from + n).map(|i| Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false }).collect()
+        (from..from + n).map(|i| Entry { id: format!("f{i}"), name: format!("arquivo {i}"), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }).collect()
     }
 
-    /// Dropping items whose names the Drive folder already has asks first, one by one once
-    /// Aplicar a todos is off; Cancelar drops the upload, and skipping everything sends nothing.
+    /// The median of 9 runs of `per_run` calls to `step`, in µs per call, and the best.
+    fn bench_runs(per_run: usize, mut step: impl FnMut()) -> (f64, f64) {
+        for _ in 0..per_run / 4 {
+            step();
+        }
+        let mut runs = Vec::new();
+        for _ in 0..9 {
+            let started = std::time::Instant::now();
+            for _ in 0..per_run {
+                step();
+            }
+            runs.push(started.elapsed().as_secs_f64() * 1e6 / per_run as f64);
+        }
+        runs.sort_by(f64::total_cmp);
+        (runs[0], runs[4])
+    }
+
+    /// What List view costs the window while transfers run: both panes in List on a folder of
+    /// 1 999 items (just under the count past which List goes virtual), 40 downloads advancing,
+    /// each tick through `poll`, the view and a frame (no GPU). Run it with
+    /// `cargo test --release -p openexplorer -- --ignored --nocapture list_view_progress_cost`.
     #[test]
-    fn an_upload_into_taken_names_asks_before_starting() {
+    #[ignore = "benchmark"]
+    fn list_view_progress_cost() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut s = init();
+        for p in 0..2 {
+            s.panes[p].set_entries(Ok(entries(0, 1999)));
+            s.panes[p].view_mode = model::ViewMode::List;
+        }
+        let end = |i: usize| transfers::End::local(std::path::Path::new(&format!(r"C:\Dados\Arquivo {i}.bin")));
+        let batch = transfers::queue(&mut s.transfers, None, transfers::Op::Download, (0..40).map(|i| (end(i), end(i))));
+        for t in &s.transfers {
+            t.progress.size(1 << 34);
+            t.progress.begin();
+        }
+        let rows: Vec<_> = s.transfers.iter().map(|t| t.progress.clone()).collect();
+        let mut rt = rune::Runtime::new(s, ui::view, (1600.0, 1000.0), rune::Env::new(false, 1.0));
+        let mut now = 0.0;
+        let (best, median) = bench_runs(100, || {
+            for p in &rows {
+                p.bytes.fetch_add(3 << 20, Relaxed);
+            }
+            now += 0.1;
+            rt.update_if(|s, tx| poll(s, now, tx));
+            rt.frame(0.1);
+        });
+        println!("List view tick: {best:.0} µs best, {median:.0} µs median of 9 runs of 100");
+        drop(batch);
+    }
+
+    /// A tree's keyboard ring comes on when the tree takes focus, stays while another window is in
+    /// front, and goes when focus moves on inside the window.
+    #[test]
+    fn the_tree_ring_follows_focus_not_the_window() {
+        let mut rt = rune::Runtime::new(init(), ui::view, (1600.0, 1000.0), rune::Env::new(false, 1.0));
+        let frames = |rt: &mut rune::Runtime<State>| {
+            for _ in 0..3 {
+                rt.frame(1.0 / 60.0);
+            }
+        };
+        frames(&mut rt);
+        let ring = |rt: &mut rune::Runtime<State>| {
+            let mut on = false;
+            rt.update(|s, _| on = s.tree.focused[0]);
+            on
+        };
+        assert!(!ring(&mut rt));
+        rt.update(|_, tx| tx.focus(ui::tree_key(0), true));
+        frames(&mut rt);
+        assert!(ring(&mut rt), "focus came to the tree");
+        rt.window_focus(false);
+        frames(&mut rt);
+        assert!(ring(&mut rt), "another window in front keeps it");
+        rt.window_focus(true);
+        frames(&mut rt);
+        assert!(ring(&mut rt), "back to the front, still on");
+        rt.update(|_, tx| tx.focus(pane_key(0), true));
+        frames(&mut rt);
+        assert!(!ring(&mut rt), "focus moved on to the list");
+        // Shift+Tab from the list with the tree hidden: focus can't go there, so no ring.
+        rt.update(|s, _| s.show_tree[0] = false);
+        frames(&mut rt);
+        let shift_tab = KeyEvent { key: Key::Tab, mods: Mods { shift: true, ..Mods::default() } };
+        rt.update(|s, tx| {
+            key(s, 0, &shift_tab, tx);
+        });
+        frames(&mut rt);
+        assert!(!ring(&mut rt), "the hidden tree never took focus");
+    }
+
+    /// The hover highlight follows the pointer to the row under it and fades when it leaves the
+    /// rows, without the view running for it.
+    #[test]
+    fn the_hover_highlight_follows_the_pointer() {
+        let mut s = init();
+        s.panes[0].set_entries(Ok(entries(0, 200)));
+        let mut rt = rune::Runtime::new(s, ui::view, (1600.0, 1000.0), rune::Env::new(false, 1.0));
+        for _ in 0..3 {
+            rt.frame(1.0 / 60.0);
+        }
+        let mut rect = [0.0; 4];
+        rt.update(|s, _| rect = s.views[0].rect);
+        let pill = |rt: &rune::Runtime<State>| rt.elements().into_iter().find(|e| e.key.as_deref() == Some("hover-pill")).map(|e| (e.rect, e.opacity));
+        rt.pointer_move(rect[0] + 60.0, rect[1] + lasso::HEADER_H + 5.5 * ROW_H);
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        let (at, shown) = pill(&rt).expect("the hover highlight is there");
+        assert!((at[1] - (rect[1] + lasso::HEADER_H + 5.0 * ROW_H)).abs() < 1.0, "on row 5: {at:?} in {rect:?}");
+        assert!(shown > 0.99, "{shown}");
+        rt.pointer_leave();
+        for _ in 0..30 {
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(pill(&rt).expect("still there").1 < 0.01);
+    }
+
+    /// List builds the columns in sight; scrolled sideways, the view builds the ones it reaches.
+    #[test]
+    fn list_builds_the_columns_it_scrolls_to() {
+        let mut s = init();
+        s.panes[0].set_entries(Ok(entries(0, 1999)));
+        s.panes[0].view_mode = model::ViewMode::List;
+        let mut rt = rune::Runtime::new(s, ui::view, (1600.0, 1000.0), rune::Env::new(false, 1.0));
+        for _ in 0..3 {
+            rt.frame(1.0 / 60.0);
+        }
+        let has = |rt: &rune::Runtime<State>, key: &str| rt.elements().iter().any(|e| e.key.as_deref() == Some(key));
+        assert!(has(&rt, "lcol-0") && !has(&rt, "lcol-40"));
+        rt.update(|_, tx| tx.scroll_to_instant(ui::list_key(0), 40.0 * 238.0, 0.0));
+        for i in 0..6 {
+            rt.update_if(|s, tx| poll(s, 1.0 + f64::from(i), tx));
+            rt.frame(1.0 / 60.0);
+        }
+        assert!(has(&rt, "lcol-40") && !has(&rt, "lcol-0"));
+    }
+
+    /// What the pointer costs moving down a Details list with the hover animation on (the
+    /// default): one row further each frame, as a quick sweep crosses them. Run it with
+    /// `cargo test --release -p openexplorer -- --ignored --nocapture hover_sweep_cost`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn hover_sweep_cost() {
+        let mut s = init();
+        for p in 0..2 {
+            s.panes[p].set_entries(Ok(entries(0, 2000)));
+        }
+        let mut rt = rune::Runtime::new(s, ui::view, (1600.0, 1000.0), rune::Env::new(false, 1.0));
+        for _ in 0..3 {
+            rt.frame(1.0 / 60.0);
+        }
+        let mut rect = [0.0; 4];
+        rt.update(|s, _| rect = s.views[0].rect);
+        assert!(rect[3] > 200.0, "the list was laid out: {rect:?}");
+        let rows = ((rect[3] - lasso::HEADER_H) / ROW_H) as usize - 1;
+        let mut i = 0;
+        let (best, median) = bench_runs(300, || {
+            i += 1;
+            let y = rect[1] + lasso::HEADER_H + (i % rows) as f32 * ROW_H + ROW_H / 2.0;
+            rt.pointer_move(rect[0] + 60.0, y);
+            rt.frame(1.0 / 60.0);
+        });
+        println!("hover, one row a frame: {best:.0} µs best, {median:.0} µs median of 9 runs of 300");
+    }
+
+    /// Transferring local files into a folder with collisions prompts via Dialog::Conflict,
+    /// supports Replace, Skip, KeepBoth, ReplaceNewer, Apply-to-all, and Cancel.
+    #[test]
+    fn a_transfer_into_existing_files_prompts_and_honours_choices() {
         let mut s = init();
         s.cache = cache::Cache::memory_only();
+        let root = std::env::temp_dir().join(format!("oe-conflict-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src_dir = root.join("src");
+        let dst_dir = root.join("dst");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dst_dir).unwrap();
+        std::fs::write(src_dir.join("a.txt"), "new-a").unwrap();
+        std::fs::write(src_dir.join("b.txt"), "new-b").unwrap();
+        std::fs::write(dst_dir.join("a.txt"), "old-a").unwrap();
+        std::fs::write(dst_dir.join("b.txt"), "old-b").unwrap();
+
+        let sources = vec![src_dir.join("a.txt"), src_dir.join("b.txt")];
+        actions::local_transfer(&mut s, transfers::Op::Copy, sources, dst_dir.clone(), vec![]);
+
+        let start = std::time::Instant::now();
+        let mut prompts = 0usize;
+        while start.elapsed() < std::time::Duration::from_secs(10) {
+            poll(&mut s, 0.0, &mut Tx::default());
+            if matches!(&s.dialog, Some(actions::Dialog::Conflict(_))) {
+                prompts += 1;
+                if prompts == 1 {
+                    actions::answer_conflict(&mut s, Some(conflict::Choice::Skip));
+                } else {
+                    actions::answer_conflict(&mut s, Some(conflict::Choice::KeepBoth));
+                }
+            }
+            if !actions::transfers_running(&s) && s.dialog.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(prompts, 2);
+        assert_eq!(std::fs::read_to_string(dst_dir.join("a.txt")).unwrap(), "old-a");
+        assert_eq!(std::fs::read_to_string(dst_dir.join("b.txt")).unwrap(), "old-b");
+        assert_eq!(std::fs::read_to_string(dst_dir.join("b (2).txt")).unwrap(), "new-b");
+
+        // Cancel from the conflict dialog aborts remaining items cleanly.
         clash_scene(&mut s, true);
-        let Some(actions::Dialog::Clash(ask)) = s.dialog.take() else { panic!("no clash dialog") };
-        let (to, sources) = (ask.up.to.clone(), ask.up.sources.clone());
-        // The same upload as a drop on the Drive pane: checked against its listing.
-        dropped(&mut s, 1, &sources);
-        let Some(actions::Dialog::Clash(ask)) = &s.dialog else { panic!("no clash dialog") };
-        assert_eq!(ask.clashes, [0, 1, 2]);
-        assert!(ask.all);
-        actions::toggle_clash_all(&mut s);
-        actions::answer_clash(&mut s, Some(uploads::Clash::Skip));
-        let Some(actions::Dialog::Clash(ask)) = &s.dialog else { panic!("the dialog should ask about the next one") };
-        assert_eq!(ask.up.sources[ask.current()].file_name().unwrap(), "Relatório.pdf");
-        actions::answer_clash(&mut s, None);
-        assert!(s.dialog.is_none() && s.transfers.is_empty());
-        // Every name taken, and all skipped: nothing is queued.
-        let only_taken: Vec<PathBuf> = sources.iter().filter(|p| !p.ends_with("notas.txt") && !p.is_dir()).cloned().collect();
-        actions::upload(&mut s, only_taken, &to, false, vec![]);
-        actions::answer_clash(&mut s, Some(uploads::Clash::Skip));
-        assert!(s.dialog.is_none() && s.transfers.is_empty());
-        assert!(s.status.starts_with("Nada enviado"), "{}", s.status);
+        assert!(matches!(&s.dialog, Some(actions::Dialog::Conflict(p)) if p.may_have_more && !p.apply_all));
+        actions::toggle_conflict_all(&mut s);
+        assert!(matches!(&s.dialog, Some(actions::Dialog::Conflict(p)) if p.apply_all));
+        actions::answer_conflict(&mut s, None);
+        assert!(s.dialog.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn conflict_dialog_lays_out_in_light_and_dark_themes() {
+        for dark in [false, true] {
+            let mut s = init();
+            s.settings.theme = if dark { settings::Theme::Dark } else { settings::Theme::Light };
+            clash_scene(&mut s, true);
+            let mut rt = rune::Runtime::new(s, ui::view, (1400.0, 900.0), rune::Env::new(dark, 1.0));
+            for _ in 0..3 {
+                rt.frame(1.0 / 60.0);
+            }
+            for key in ["conflict-replace", "conflict-skip", "conflict-keep-both", "conflict-replace-newer", "conflict-cancel"] {
+                let found = rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key)).unwrap_or_else(|| panic!("missing {key} (dark={dark})"));
+                assert!(found.rect[2] > 0.0 && found.rect[3] > 0.0, "{key} has empty rect: {:?}", found.rect);
+            }
+        }
     }
 
     #[test]
@@ -3612,7 +4883,7 @@ mod tests {
         s.panes[1].selected.clear();
         let h = lasso::HEADER_H + 10.0 * ROW_H;
         s.views[1].rect = [400.0, 100.0, 600.0, h];
-        s.views[1].scroll.set(lasso::Scroll { x: 0.0, y: 0.0, max_y: 40.0 * ROW_H + 2.0 * ROW_H, h });
+        s.views[1].scroll.set(lasso::Scroll { x: 0.0, y: 0.0, max_x: 0.0, max_y: 40.0 * ROW_H + 2.0 * ROW_H, h });
         let mut tx = Tx::default();
         let ev = |key, mods| KeyEvent { key, mods };
         let shift = Mods { shift: true, ..Mods::default() };
@@ -3633,5 +4904,178 @@ mod tests {
         s.panes[1].cursor = Some("f9".into());
         assert!(key(&mut s, 1, &ev(Key::ContextMenu, Mods::default()), &mut tx));
         assert_eq!(s.menu, Some((1, rune::PointerPress { x: 424.0, y: top + 3.0 * ROW_H })));
+    }
+
+    #[test]
+    fn finished_downloads_stay_until_cleared_unless_auto_clear_is_on() {
+        let mut s = init();
+        s.settings = settings::Settings::default();
+        assert!(!s.settings.clear_completed);
+
+        let end = |name: &str| transfers::End::local(std::path::Path::new(name));
+        let batch = transfers::queue(
+            &mut s.transfers,
+            None,
+            transfers::Op::Download,
+            [(end(r"C:\a.zip"), end(r"D:\a.zip")), (end(r"C:\b.zip"), end(r"D:\b.zip"))],
+        );
+        s.transfers[0].progress.begin();
+        s.transfers[0].progress.end(Ok(()));
+        s.transfers[1].progress.begin();
+        s.transfers[1].progress.end(Err("falha".into()));
+
+        // By default, completed transfers stay in the queue across `poll` and show the clear button.
+        let mut tx = Tx::default();
+        poll(&mut s, 0.1, &mut tx);
+        assert_eq!(s.transfers.len(), 2);
+
+        let mut rt = rune::Runtime::new(s, ui::view, (1280.0, 800.0), rune::Env::new(false, 1.0));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.elements().into_iter().any(|e| e.key.as_deref() == Some("queue-clear")));
+
+        // Manual clear removes finished rows from the queue.
+        rt.update(|s, _| {
+            actions::clear_transfers(s);
+            assert!(s.transfers.is_empty());
+
+            // With `clear_completed` enabled, `poll` removes Done rows and keeps Failed ones.
+            let batch2 = transfers::queue(
+                &mut s.transfers,
+                None,
+                transfers::Op::Download,
+                [(end(r"C:\c.zip"), end(r"D:\c.zip")), (end(r"C:\d.zip"), end(r"D:\d.zip"))],
+            );
+            s.transfers[0].progress.begin();
+            s.transfers[0].progress.end(Ok(()));
+            s.transfers[1].progress.begin();
+            s.transfers[1].progress.end(Err("falha".into()));
+            s.settings.clear_completed = true;
+            poll(s, 0.2, &mut Tx::default());
+            assert_eq!(s.transfers.len(), 1);
+            assert_eq!(s.transfers[0].progress.stage(), ops::Stage::Failed);
+            drop(batch2);
+        });
+
+        // The auto-clear option lives in Options -> Transfers, not General.
+        rt.update(|s, _| {
+            s.dialog = Some(actions::Dialog::Options(Box::new(settings::OptionsView::open(settings::OptionsTab::General))));
+        });
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.elements().into_iter().any(|e| e.key.as_deref() == Some("opt-clear-done")));
+
+        rt.update(|s, _| {
+            s.dialog = Some(actions::Dialog::Options(Box::new(settings::OptionsView::open(settings::OptionsTab::Transfers))));
+        });
+        rt.frame(1.0 / 60.0);
+        assert!(rt.elements().into_iter().any(|e| e.key.as_deref() == Some("opt-clear-done")));
+
+        drop(batch);
+    }
+
+    fn f_my_template() -> DriveFile {
+        DriveFile { id: "f2".into(), name: "Filme.mkv".into(), is_dir: false, size: Some(1), modified: None, mime: "video/x-matroska".into(), target: None, starred: false, md5: None, drive_id: None, owned_by_me: Some(true) }
+    }
+
+    #[test]
+    fn drive_origin_and_folder_in_for_global_drive_search() {
+        let sd = HashMap::from([("0AA".into(), "Séries／HD".into())]);
+        let f_sd = DriveFile {
+            id: "f1".into(),
+            name: "Lost".into(),
+            is_dir: true,
+            size: None,
+            modified: None,
+            mime: openexplorer_gdrive::api::FOLDER_MIME.into(),
+            target: None,
+            starred: false,
+            md5: None,
+            drive_id: Some("0AA".into()),
+            owned_by_me: Some(false),
+        };
+        let o_single = make_drive_origin("a@b", &f_sd, &sd, false);
+        assert_eq!(o_single.label, "Séries／HD");
+        let o_multi = make_drive_origin("a@b", &f_sd, &sd, true);
+        assert_eq!(o_multi.label, "a@b · Séries／HD");
+
+        let f_my = DriveFile { drive_id: None, owned_by_me: Some(true), ..f_sd.clone() };
+        assert_eq!(make_drive_origin("a@b", &f_my, &sd, false).label, "Meu Drive");
+        let f_swm = DriveFile { drive_id: None, owned_by_me: Some(false), ..f_sd.clone() };
+        assert_eq!(make_drive_origin("a@b", &f_swm, &sd, true).label, "a@b · Compartilhados comigo");
+
+        // A folder found in every account opens under that account's search for the same words,
+        // wherever it sits (a shared drive, My Drive, shared with the account).
+        let global = Location::DriveSearch(Box::new(model::DriveSearch { text: "lost".into() }));
+        let under_search = |email: &str, id: &str, name: &str| Location::Drive {
+            email: email.into(),
+            space: Space::Search(Box::new(model::Search { text: "lost".into(), within: openexplorer_gdrive::search::Within::Everything, place: actions::all_of_drive() })),
+            path: vec![(id.into(), name.into())],
+        };
+        assert_eq!(folder_in(&global, &entry_of_search("a@b", f_sd, &sd, true)), under_search("a@b", "f1", "Lost"));
+        assert_eq!(folder_in(&global, &entry_of_search("c@d", f_my, &sd, true)), under_search("c@d", "f1", "Lost"));
+        assert_eq!(folder_in(&global, &entry_of_search("a@b", f_swm, &sd, true)), under_search("a@b", "f1", "Lost"));
+        // Up from it goes back to that account's results.
+        let mut opened = under_search("a@b", "f1", "Lost");
+        if let Location::Drive { path, .. } = &mut opened {
+            path.pop();
+        }
+        assert!(opened.is_drive_search());
+
+        // A shared drive's name not known when the results came is taken once it arrives.
+        let mut s = init();
+        s.accounts.push(openexplorer_gdrive::store::StoredAccount { email: "a@b".into(), name: "A".into(), client_id: String::new() });
+        let unknown = DriveFile { drive_id: Some("0BB".into()), owned_by_me: Some(false), ..f_my_template() };
+        s.panes[1].go(global.clone());
+        s.panes[1].set_entries(Ok(vec![entry_of_search("a@b", unknown, &HashMap::new(), true)]));
+        assert_eq!(s.panes[1].entries[0].drive_origin.as_ref().unwrap().label, "a@b · Drive compartilhado");
+        s.shared_drive_names.insert("a@b".into(), HashMap::from([("0BB".into(), "Filmes".into())]));
+        name_shared_drives(&mut s, "a@b");
+        assert_eq!(s.panes[1].entries[0].drive_origin.as_ref().unwrap().label, "a@b · Filmes");
+    }
+
+    /// A folder of a Drive search's results (one account's or every account's) opens where it
+    /// really sits, so the tree opens down to it and Up goes to its real parent; folders
+    /// anywhere else open at once.
+    #[test]
+    fn a_folder_found_on_drive_opens_where_it_sits() {
+        use openexplorer_gdrive::api::{Place, Top};
+        let sd = HashMap::new();
+        let folder = DriveFile { id: "f1".into(), name: "Temp 3".into(), is_dir: true, drive_id: None, owned_by_me: Some(true), ..f_my_template() };
+        let global = Location::DriveSearch(Box::new(model::DriveSearch { text: "temp".into() }));
+        let found = entry_of_search("a@b", folder.clone(), &sd, true);
+        assert_eq!(actions::found_folder(&global, &found), Some(("a@b".into(), "f1".into())));
+        // One account's search, whose entries may carry no origin.
+        let search = model::Search { text: "temp".into(), within: openexplorer_gdrive::search::Within::Everything, place: actions::all_of_drive() };
+        let one = Location::Drive { email: "c@d".into(), space: Space::Search(Box::new(search)), path: Vec::new() };
+        assert!(one.is_drive_search());
+        let plain = entry_of(folder.clone());
+        assert_eq!(actions::found_folder(&one, &plain), Some(("c@d".into(), "f1".into())));
+        // A shortcut opens its target.
+        let shortcut = Entry { target: Some("t9".into()), ..plain.clone() };
+        assert_eq!(actions::found_folder(&one, &shortcut), Some(("c@d".into(), "t9".into())));
+        // Files, and folders already inside a folder, open as before.
+        assert_eq!(actions::found_folder(&one, &Entry { is_dir: false, ..plain.clone() }), None);
+        let inside = folder_in(&one, &plain);
+        assert!(!inside.is_drive_search());
+        assert_eq!(actions::found_folder(&inside, &plain), None);
+        assert_eq!(actions::found_folder(&Location::drive("c@d", Space::MyDrive), &plain), None);
+
+        // Where it opens, from where Drive says it sits.
+        let place = |top, folders: &[(&str, &str)]| Place { top, folders: folders.iter().map(|(i, n)| (i.to_string(), n.to_string())).collect(), name: "Temp 3".into(), is_folder: true };
+        let streaming = [("s1", "Séries"), ("s2", "Streaming")];
+        assert_eq!(
+            address::folder_location("a@b".into(), "f1", place(Top::MyDrive, &streaming)),
+            Location::Drive { email: "a@b".into(), space: Space::MyDrive, path: vec![("s1".into(), "Séries".into()), ("s2".into(), "Streaming".into()), ("f1".into(), "Temp 3".into())] }
+        );
+        let shared = Top::SharedDrive { id: "0AA".into(), name: "Filmes".into() };
+        assert_eq!(
+            address::folder_location("a@b".into(), "f1", place(shared.clone(), &[("s2", "Streaming")])),
+            Location::Drive { email: "a@b".into(), space: Space::Shared { id: "0AA".into(), name: "Filmes".into() }, path: vec![("s2".into(), "Streaming".into()), ("f1".into(), "Temp 3".into())] }
+        );
+        // A shared drive found is the drive itself.
+        assert_eq!(address::folder_location("a@b".into(), "0AA", place(shared, &[])), Location::Drive { email: "a@b".into(), space: Space::Shared { id: "0AA".into(), name: "Filmes".into() }, path: Vec::new() });
+        assert_eq!(
+            address::folder_location("a@b".into(), "f1", place(Top::SharedWithMe, &[("s2", "Streaming")])),
+            Location::Drive { email: "a@b".into(), space: Space::SharedWithMe, path: vec![("s2".into(), "Streaming".into()), ("f1".into(), "Temp 3".into())] }
+        );
     }
 }
