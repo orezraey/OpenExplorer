@@ -159,8 +159,9 @@ impl SysIcons {
         true
     }
 
-    /// Whether some pane shows Large or Extra large icons. Turned on, the icons known without
-    /// the 256 px one are asked for again with it; they keep showing meanwhile.
+    /// Whether some pane draws its icons past 64 pt (`get_sized` then takes the 256 px one).
+    /// Turned on, the icons known without the 256 px one are asked for again with it; they keep
+    /// showing meanwhile.
     pub fn set_big(&mut self, big: bool) {
         if big == self.big {
             return;
@@ -215,17 +216,37 @@ impl SysIcons {
         self.decoding.len() != before
     }
 
-    /// The best-resolution Windows shell icon for a display `size` in points: `SHIL_JUMBO`
-    /// (256 px) above 64 pt, `SHIL_EXTRALARGE` (48 px) above 24 pt, and `SHIL_SMALL` otherwise.
-    pub fn get_sized(&self, key: &IconKey, size: f32) -> Option<&Image> {
+    /// The best-resolution Windows shell icon for a display `size` in points, in a window
+    /// zoomed by `zoom` (the system's text size, `ui::text_zoom`): `SHIL_JUMBO` (256 px) above
+    /// 64 pt as drawn, `SHIL_EXTRALARGE` (48 px) above 24 pt, and `SHIL_SMALL` otherwise. Zoomed,
+    /// anything drawn past `SHIL_SMALL`'s own 16 pt takes the 48 px one, which shrinks sharp
+    /// where the small one would be stretched.
+    pub fn get_sized(&self, key: &IconKey, size: f32, zoom: f32) -> Option<&Image> {
         let pair = self.known.get(key)?.as_ref()?;
-        if size > 64.0 {
-            pair.jumbo.as_ref().or(pair.large.as_ref()).or(Some(&pair.small))
-        } else if size > 24.0 {
-            pair.large.as_ref().or(Some(&pair.small))
-        } else {
-            Some(&pair.small)
-        }
+        Some(match resolution(size, zoom) {
+            Resolution::Jumbo => pair.jumbo.as_ref().or(pair.large.as_ref()).unwrap_or(&pair.small),
+            Resolution::Large => pair.large.as_ref().unwrap_or(&pair.small),
+            Resolution::Small => &pair.small,
+        })
+    }
+}
+
+/// Which of the shell's icons `SysIcons::get_sized` takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Resolution {
+    Small,
+    Large,
+    Jumbo,
+}
+
+fn resolution(size: f32, zoom: f32) -> Resolution {
+    let drawn = size * zoom;
+    if drawn > 64.0 {
+        Resolution::Jumbo
+    } else if drawn > 24.0 || (zoom > 1.0 && drawn > 16.0) {
+        Resolution::Large
+    } else {
+        Resolution::Small
     }
 }
 
@@ -492,6 +513,19 @@ mod tests {
 
     fn file(name: &str) -> Entry {
         Entry { id: name.into(), name: name.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }
+    }
+
+    /// Unzoomed, the sizes keep their icons. Zoomed by the text size, a 16 pt icon drawn bigger
+    /// takes the 48 px one instead of a stretched small one, and Medium icons the 256 px one.
+    #[test]
+    fn a_zoomed_icon_takes_a_bigger_bitmap() {
+        assert_eq!(resolution(16.0, 1.0), Resolution::Small);
+        assert_eq!(resolution(20.0, 1.0), Resolution::Small);
+        assert_eq!(resolution(48.0, 1.0), Resolution::Large);
+        assert_eq!(resolution(96.0, 1.0), Resolution::Jumbo);
+        assert_eq!(resolution(16.0, 1.25), Resolution::Large);
+        assert_eq!(resolution(16.0, 2.25), Resolution::Large);
+        assert_eq!(resolution(48.0, 1.5), Resolution::Jumbo);
     }
 
     #[test]

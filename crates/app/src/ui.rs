@@ -47,10 +47,23 @@ pub(crate) fn kit(dark: bool) -> Kit {
 /// dialogs, which a window's `hover_motion_within` doesn't reach: the app's 80 ms glide, or at
 /// once. Its `Button` and `Menu` take none.
 pub(crate) fn window_kit(s: &State, cx: &mut Cx<State>, hover: Anim) -> Kit {
-    cx.zoom(cx.system_text_scale());
+    let zoom = cx.system_text_scale();
+    cx.zoom(zoom);
+    TEXT_ZOOM.with(|z| z.set(zoom));
     let mut k = kit(s.settings.theme.dark(cx.system_dark()));
     k.motion = k.motion.hover_motion(hover, hover);
     k
+}
+
+thread_local! {
+    /// The zoom the last view ran with (`window_kit`), for the parts of it that pick a bitmap
+    /// by size. The system has one text size, so every window has the same.
+    static TEXT_ZOOM: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+
+/// The zoom the views run with: the system's text size, 1 at 100 %.
+pub(crate) fn text_zoom() -> f32 {
+    TEXT_ZOOM.with(std::cell::Cell::get)
 }
 
 /// The hover the main and account windows glide with: the app's 80 ms curve while Opções keeps
@@ -3845,7 +3858,7 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
 
 /// Windows' icon for `key` once it has loaded, else the app's own `fallback`.
 fn shell_icon(s: &State, key: Option<&IconKey>, fallback: &'static Icon, size: f32) -> El {
-    match key.and_then(|k| s.icons.get_sized(k, size)).filter(|i| i.is_ready() && i.error().is_none()) {
+    match key.and_then(|k| s.icons.get_sized(k, size, text_zoom())).filter(|i| i.is_ready() && i.error().is_none()) {
         Some(image) => el().size(size, size).pixels(image.pixels()),
         None => icon(fallback, size),
     }
@@ -3869,7 +3882,7 @@ pub(crate) fn entry_icon(s: &State, loc: &Location, e: &crate::model::Entry, siz
         && let Some(path) = loc.local_path(e)
     {
         let key = IconKey::Dir(path);
-        if let Some(image) = s.icons.get_sized(&key, size).filter(|i| i.is_ready() && i.error().is_none()) {
+        if let Some(image) = s.icons.get_sized(&key, size, text_zoom()).filter(|i| i.is_ready() && i.error().is_none()) {
             return el().size(size, size).pixels(image.pixels());
         }
     }

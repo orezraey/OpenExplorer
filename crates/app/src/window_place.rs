@@ -64,6 +64,12 @@ pub fn placed(s: &mut State, p: rune::WindowPlacement, tx: &mut Tx) -> bool {
     false
 }
 
+/// Drops a write `placed` armed, so a test never writes the real settings file.
+#[cfg(test)]
+pub fn forget_unwritten() {
+    WRITE_AT.with(|w| w.set(None));
+}
+
 /// From the main window's `poll`: writes the place it moved to, once it rested `WRITE_AFTER`.
 /// Woken a little early, it asks to be woken again when that time comes.
 pub fn write_when_rested(s: &State, tx: &mut Tx) {

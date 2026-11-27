@@ -1354,8 +1354,9 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             tree::learn(s, p);
         }
     }
-    // The 256 px icons only while a pane in view shows Large or Extra large icons.
-    let big = s.panes[..s.settings.pane_layout.count()].iter().any(|p| matches!(p.view_mode, model::ViewMode::LargeIcons | model::ViewMode::ExtraLargeIcons));
+    // The 256 px icons only while a pane in view draws its icons past 64 pt: Large or Extra
+    // large icons, or Medium ones zoomed by the system's text size.
+    let big = s.panes[..s.settings.pane_layout.count()].iter().any(|p| p.view_mode.tile_metrics().2 * ui::text_zoom() > 64.0);
     s.icons.set_big(big);
     let mut changed = std::mem::take(&mut s.main_dirty) | s.icons.settle();
     // List scrolled sideways to columns its view didn't build.
@@ -4671,6 +4672,7 @@ mod tests {
             window_place::placed(s, maximized, tx);
             assert_eq!(s.settings.window, Some(window_place::Saved { maximized: true, ..kept }));
         });
+        window_place::forget_unwritten();
     }
 
     /// Screen readers hear which folder is the current one: the path's last step and the tree's
