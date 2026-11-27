@@ -17,7 +17,9 @@ use crate::model::{Entry, Location, shown};
 use crate::{Msg, State, background, catch_panic, ops};
 
 // ---------------------------------------------------------------------------------------------
-// Persisted API Keys
+// API keys, kept in the system's credential store like the accounts' credentials
+
+const KEY_SERVICE: &str = "OpenExplorer Media";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -26,33 +28,63 @@ pub struct MediaKeys {
     pub tvdb: String,
 }
 
+/// The two keys: their name in the credential store and the environment variable that can give
+/// one instead.
+const KEY_SLOTS: [(&str, &str); 2] = [("tmdb", "TMDB_API_KEY"), ("tvdb", "TVDB_API_KEY")];
+
+fn key_entry(name: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(KEY_SERVICE, name).map_err(|e| tr!("Cofre de credenciais indisponível: {e}", "Credential store unavailable: {e}"))
+}
+
+fn env_key(var: &str) -> String {
+    std::env::var(var).map(|v| v.trim().to_string()).unwrap_or_default()
+}
+
+/// What to keep in the store for a key typed as `typed`: nothing when it is empty or is the
+/// key the environment already gives, so a key from the environment is never written down.
+fn key_to_store<'a>(typed: &'a str, from_env: &str) -> Option<&'a str> {
+    let typed = typed.trim();
+    (!typed.is_empty() && typed != from_env).then_some(typed)
+}
+
 impl MediaKeys {
-    fn path() -> PathBuf {
+    /// The file older versions kept the keys in, as plain text.
+    fn old_path() -> PathBuf {
         openexplorer_gdrive::config_dir().join("media-apis.json")
     }
 
     pub fn load() -> Self {
-        let mut keys: Self = std::fs::read_to_string(Self::path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        if keys.tmdb.trim().is_empty()
-            && let Ok(v) = std::env::var("TMDB_API_KEY")
-        {
-            keys.tmdb = v.trim().to_string();
-        }
-        if keys.tvdb.trim().is_empty()
-            && let Ok(v) = std::env::var("TVDB_API_KEY")
-        {
-            keys.tvdb = v.trim().to_string();
-        }
-        keys
+        Self::move_old_file();
+        let read = |(name, var): (&str, &str)| {
+            let stored = key_entry(name).and_then(|e| e.get_password().map_err(|e| e.to_string())).unwrap_or_default();
+            if stored.trim().is_empty() { env_key(var) } else { stored.trim().to_string() }
+        };
+        Self { tmdb: read(KEY_SLOTS[0]), tvdb: read(KEY_SLOTS[1]) }
     }
 
-    pub fn save(&self) {
-        let Ok(bytes) = serde_json::to_vec_pretty(self) else { return };
-        let _ = std::fs::create_dir_all(openexplorer_gdrive::config_dir());
-        let _ = std::fs::write(Self::path(), bytes);
+    /// Moves the keys of the old plain-text file into the credential store, and deletes the file
+    /// once both are kept there.
+    fn move_old_file() {
+        let Ok(text) = std::fs::read_to_string(Self::old_path()) else { return };
+        let old: Self = serde_json::from_str(&text).unwrap_or_default();
+        if old.save().is_ok() {
+            let _ = std::fs::remove_file(Self::old_path());
+        }
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        for ((name, var), typed) in KEY_SLOTS.into_iter().zip([&self.tmdb, &self.tvdb]) {
+            let entry = key_entry(name)?;
+            match key_to_store(typed, &env_key(var)) {
+                Some(key) => entry
+                    .set_password(key)
+                    .map_err(|e| tr!("Não consegui guardar a chave no cofre do sistema: {e}", "Couldn't keep the key in the system's credential store: {e}"))?,
+                None => {
+                    let _ = entry.delete_credential();
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn for_source(&self, source: DataSource) -> &str {
@@ -1031,9 +1063,8 @@ pub fn save_keys(s: &mut State) {
     let m = &mut br.media;
     m.keys.tmdb = m.tmdb_key_edit.text.trim().to_string();
     m.keys.tvdb = m.tvdb_key_edit.text.trim().to_string();
-    m.keys.save();
     m.popup = None;
-    m.error = None;
+    m.error = m.keys.save().err();
 }
 
 pub fn match_with(s: &mut State, source: DataSource, kind: MediaKind) {
@@ -1605,6 +1636,14 @@ fn format_http_err(provider: &str, err: ureq::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_from_the_environment_is_never_stored() {
+        assert_eq!(key_to_store("  abc  ", ""), Some("abc"));
+        assert_eq!(key_to_store("abc", "abc"), None);
+        assert_eq!(key_to_store("xyz", "abc"), Some("xyz"));
+        assert_eq!(key_to_store("   ", "abc"), None);
+    }
 
     #[test]
     fn parses_standard_tv_scene_filenames() {

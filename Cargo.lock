@@ -3320,6 +3320,7 @@ dependencies = [
  "crc32fast",
  "hex",
  "imagesize",
+ "keyring",
  "libc",
  "md-5",
  "openexplorer-b2",

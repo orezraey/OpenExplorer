@@ -1228,6 +1228,8 @@ fn rule_editor_window_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
     }
     false
 }
+
+/// Runs `f`, turning a panic into an error that names it (and logging it), so background work
 /// that hits a bug still ends with a message instead of never answering. `doing` says what it
 /// was ("listar", "conectar").
 fn catch_panic<T>(doing: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {

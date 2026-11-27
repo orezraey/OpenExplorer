@@ -36,6 +36,8 @@ ring = "0.17"
 # The resvg Rune draws colour icons with, the version it uses, made to draw raster images inside
 # an SVG too: Koofr's logo comes only as a PNG, which its brand terms say not to redraw.
 resvg = { version = "0.45", default-features = false, features = ["raster-images"] }
+# The TMDB and TVDB keys, kept like the accounts' credentials.
+keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
 
 [dev-dependencies]
 # The Dropbox crate's stand-in for the API, for the tests of the panes' batches.
