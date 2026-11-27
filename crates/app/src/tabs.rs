@@ -107,6 +107,7 @@ pub fn tab_header(s: &State, loc: &Location) -> (Option<IconKey>, &'static Icon,
             Some(node) => (node.icon, node.fallback, node.label),
             None => (Some(IconKey::Computer), &icons::COMPUTER, t("Este Computador", "This PC").into()),
         },
+        Location::Computer => (Some(IconKey::Computer), &icons::COMPUTER, t("Este Computador", "This PC").into()),
         Location::Mock(_) => (None, &icons::LAB, t("Drive simulado", "Simulated drive").into()),
         Location::Drive { email, .. } => {
             let label = s
@@ -223,7 +224,8 @@ fn bring_in(s: &mut State, p: usize, idx: usize) {
     s.tabs[p].last_active = Some(idx);
     s.icons_for[p] = u64::MAX;
     // If the tab was still loading when left, kick off a fresh listing.
-    if s.panes[p].loading {
+    // Este Computador lists the disks as they are now: some may have come or gone meanwhile.
+    if s.panes[p].loading || s.panes[p].loc == Location::Computer {
         crate::list(s, p, false);
     }
     crate::tree::follow(s, p);

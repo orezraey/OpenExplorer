@@ -39,6 +39,8 @@ const SPACES: &[(&str, &str, Root)] = &[
 /// The simulated drive's name in the path bar.
 const MOCK: &str = "Drive simulado";
 const MOCK_EN: &str = "Simulated drive";
+const COMPUTER: &str = "Este Computador";
+const COMPUTER_EN: &str = "This PC";
 
 /// Where a pane goes, and the entry (id, name) to select there once it's listed.
 #[derive(Clone, Debug, PartialEq)]
@@ -51,6 +53,8 @@ pub struct Reached {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Target {
     Local(PathBuf),
+    /// Este Computador.
+    Computer,
     Mock(Vec<String>),
     /// In `email`'s Drive.
     Drive { email: String, way: Way },
@@ -96,6 +100,7 @@ impl Root {
 pub fn text(loc: &Location) -> String {
     match loc {
         Location::Local(dir) => dir.display().to_string(),
+        Location::Computer => t(COMPUTER, COMPUTER_EN).into(),
         Location::Found(f) => f.within.as_ref().map(|w| w.display().to_string()).unwrap_or_default(),
         Location::Mock(segs) => std::iter::once(t(MOCK, MOCK_EN)).chain(segs.iter().map(String::as_str)).collect::<Vec<_>>().join("/"),
         Location::Drive { email, space, path } => {
@@ -164,6 +169,9 @@ pub fn parse(typed: &str, here: &Location, accounts: &[String]) -> Result<Target
     if let Some(email) = accounts.iter().find(|a| a.eq_ignore_ascii_case(first)) {
         let rest: Vec<String> = parts.map(str::to_string).collect();
         return Ok(Target::Drive { email: email.clone(), way: drive_path(rest) });
+    }
+    if typed.eq_ignore_ascii_case(COMPUTER) || typed.eq_ignore_ascii_case(COMPUTER_EN) {
+        return Ok(Target::Computer);
     }
     if first.eq_ignore_ascii_case(MOCK) || first.eq_ignore_ascii_case(MOCK_EN) {
         return Ok(Target::Mock(parts.map(str::to_string).collect()));
@@ -580,6 +588,8 @@ mod tests {
         assert_eq!(text(&drive(Space::Starred, &[])), "ana@gmail.com/Com estrela");
         assert_eq!(text(&Location::Mock(vec!["Fotos".into()])), "Drive simulado/Fotos");
         assert_eq!(parse("Drive simulado/Fotos", &here, &accounts()), Ok(Target::Mock(vec!["Fotos".into()])));
+        assert_eq!(parse("este computador", &here, &accounts()), Ok(Target::Computer));
+        assert_eq!(parse("This PC", &here, &accounts()), Ok(Target::Computer));
     }
 
     /// A `/` in a Drive name shows as `／` and reads back as one step that stands for the `/`

@@ -33,6 +33,10 @@ const OWN_ICON: &[&str] = &["exe", "lnk", "ico", "url", "msc", "cpl", "scr"];
 
 /// The key for an entry of `loc`, or `None` for Google's own formats, which have no Windows icon.
 pub fn key_for(e: &Entry, loc: &Location) -> Option<IconKey> {
+    // A disk of Este Computador, by its root (the key the tree keeps for it).
+    if *loc == Location::Computer {
+        return Some(IconKey::Path(std::path::PathBuf::from(&e.id)));
+    }
     if e.is_dir {
         return Some(IconKey::Folder);
     }
@@ -117,6 +121,18 @@ impl SysIcons {
         self.fixed = fixed.into_iter().collect();
         let fixed: Vec<IconKey> = self.fixed.iter().cloned().collect();
         self.want(fixed.into_iter().chain([IconKey::Folder, IconKey::Computer]));
+    }
+
+    /// The icons the tree always shows are now `fixed` (a drive mounted or removed): those of
+    /// `stale` are looked up again, as another drive may now hold their letter.
+    pub fn refix(&mut self, fixed: impl IntoIterator<Item = IconKey>, stale: impl IntoIterator<Item = IconKey>) {
+        for k in stale {
+            self.known.remove(&k);
+            self.asked_big.remove(&k);
+        }
+        self.fixed = fixed.into_iter().collect();
+        let fixed: Vec<IconKey> = self.fixed.iter().cloned().collect();
+        self.want(fixed);
     }
 
     /// Asks for the icons of `keys` not seen yet.

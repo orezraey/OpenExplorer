@@ -3826,6 +3826,10 @@ fn entry_icon(s: &State, loc: &Location, e: &crate::model::Entry, size: f32) -> 
     if kind == Kind::FolderLink {
         return icon(fallback, size);
     }
+    // A disk in Este Computador: its own icon, as the tree shows it.
+    if *loc == Location::Computer {
+        return shell_icon(s, sysicons::key_for(e, loc).as_ref(), &icons::DISK, size);
+    }
     if e.is_dir
         && let Some(path) = loc.local_path(e)
     {
@@ -5904,6 +5908,7 @@ fn search_box(s: &State, k: &Kit, p: usize, layer: &mut Vec<El>) -> El {
     let (here_scope, place) = match loc {
         Location::Local(dir) => (None, crate::finder::place_of(dir)),
         Location::Found(f) => (None, f.place.clone()),
+        Location::Computer => (None, t("todo o computador", "This PC").to_string()),
         Location::Server { server, path, .. } => (None, path.last().unwrap_or(&server.name).clone()),
         Location::DriveSearch(_) => (None, t("todas as contas", "all accounts").to_string()),
         _ => match actions::search_scope(loc) {
@@ -6293,8 +6298,9 @@ fn search_bar(s: &State, k: &Kit, p: usize) -> El {
 
 fn can_go_up(loc: &Location) -> bool {
     match loc {
-        Location::Local(dir) => crate::network::parent(dir).is_some(),
-        Location::Found(_) | Location::DriveSearch(_) => false,
+        // A disk's top goes up to Este Computador.
+        Location::Local(dir) => crate::network::parent(dir).is_some() || crate::mounts::is_disk_root(dir),
+        Location::Computer | Location::Found(_) | Location::DriveSearch(_) => false,
         Location::Mock(segs) => !segs.is_empty(),
         Location::Drive { space, path, .. } => !path.is_empty() || matches!(space, Space::Shared { .. }),
         Location::Server { path, find, .. } => !path.is_empty() || find.is_some(),
