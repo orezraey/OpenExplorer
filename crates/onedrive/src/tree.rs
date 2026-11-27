@@ -50,7 +50,8 @@ pub struct Seen {
     pub id: String,
     pub parent: Option<String>,
     pub name: Option<String>,
-    pub size: u64,
+    /// In bytes; a folder's counts everything under it. `None` when Graph didn't say.
+    pub size: Option<u64>,
     pub modified: i64,
     pub is_dir: bool,
     pub deleted: bool,
@@ -96,7 +97,7 @@ impl Seen {
             id,
             parent: v.pointer("/parentReference/id").and_then(Value::as_str).map(str::to_string),
             name: v.get("name").and_then(Value::as_str).map(str::to_string),
-            size: v.get("size").and_then(Value::as_u64).unwrap_or(0),
+            size: v.get("size").and_then(Value::as_u64),
             modified: time(v.get("lastModifiedDateTime")),
             is_dir,
             deleted: v.get("deleted").is_some(),
@@ -307,7 +308,9 @@ impl Tree {
                 if let Some(name) = &s.name {
                     n.name = name.as_str().into();
                 }
-                n.size = s.size;
+                if let Some(size) = s.size {
+                    n.size = size;
+                }
                 n.modified = s.modified;
                 n.kids = s.kids;
                 if n.is_dir != s.is_dir || n.remote.as_deref() != s.remote.as_ref() {
@@ -329,7 +332,7 @@ impl Tree {
                     id: s.id.as_str().into(),
                     parent: Some(p),
                     name: name.as_str().into(),
-                    size: s.size,
+                    size: s.size.unwrap_or(0),
                     modified: s.modified,
                     is_dir: s.is_dir,
                     children: None,
@@ -463,11 +466,11 @@ pub(crate) mod tests {
     use serde_json::json;
 
     pub fn file(id: &str, parent: &str, name: &str) -> Seen {
-        Seen { id: id.into(), parent: Some(parent.into()), name: Some(name.into()), size: 10, modified: 1, is_dir: false, deleted: false, root: false, remote: None, kids: 0 }
+        Seen { id: id.into(), parent: Some(parent.into()), name: Some(name.into()), size: Some(10), modified: 1, is_dir: false, deleted: false, root: false, remote: None, kids: 0 }
     }
 
     pub fn dir(id: &str, parent: &str, name: &str) -> Seen {
-        Seen { is_dir: true, size: 0, ..file(id, parent, name) }
+        Seen { is_dir: true, size: Some(0), ..file(id, parent, name) }
     }
 
     fn gone(id: &str) -> Seen {
@@ -493,7 +496,7 @@ pub(crate) mod tests {
     #[test]
     fn graph_items_read_with_their_facets() {
         let f = Seen::of(&json!({"id":"1","name":"a.txt","size":5,"lastModifiedDateTime":"2024-03-01T10:00:00Z","parentReference":{"id":"R","driveId":"d"},"file":{}})).unwrap();
-        assert_eq!((f.is_dir, f.size, f.modified, f.parent.as_deref()), (false, 5, 1709287200, Some("R")));
+        assert_eq!((f.is_dir, f.size, f.modified, f.parent.as_deref()), (false, Some(5), 1709287200, Some("R")));
         let d = Seen::of(&json!({"id":"2","name":"x","folder":{"childCount":3}})).unwrap();
         assert!(d.is_dir);
         let s = Seen::of(&json!({"id":"3","name":"Deles","remoteItem":{"id":"r!9","folder":{},"parentReference":{"driveId":"other"}}})).unwrap();
@@ -503,6 +506,16 @@ pub(crate) mod tests {
         // A business delete has no name.
         let g = Seen::of(&json!({"id":"5","deleted":{"state":"deleted"},"parentReference":{"id":"R"}})).unwrap();
         assert!(g.deleted && g.name.is_none());
+    }
+
+    #[test]
+    fn a_folder_keeps_its_size_when_graph_leaves_it_out() {
+        let mut t = tree();
+        let mut touched = HashSet::new();
+        t.apply(&Seen { size: Some(1300), ..dir("D", "R", "Docs") }, &mut touched);
+        t.apply(&Seen { size: None, ..dir("D", "R", "Docs") }, &mut touched);
+        assert_eq!(t.get(t.find("D").unwrap()).size, 1300);
+        assert_eq!(Seen::of(&json!({"id":"2","name":"x","folder":{}})).unwrap().size, None);
     }
 
     #[test]

@@ -149,20 +149,42 @@ impl State {
         let id = format!("I{}", self.next);
         let version = self.bump();
         self.items.insert(id.clone(), FItem { id: id.clone(), parent: Some(parent.into()), name: name.into(), is_dir, data: data.to_vec(), version, deleted: false });
+        self.mark_up(Some(parent.to_string()), version);
         id
     }
 
     pub fn touch(&mut self, id: &str, f: impl FnOnce(&mut FItem)) {
         let v = self.bump();
         let it = self.items.get_mut(id).expect("an item");
+        let was = it.parent.clone();
         f(it);
         it.version = v;
+        let now = it.parent.clone();
+        if now != was {
+            self.mark_up(was, v);
+        }
+        self.mark_up(now, v);
+    }
+
+    /// Folder `from` and those above it changed at `version` too: Graph's delta feed brings the
+    /// folders above a changed item, with their sizes as they are now.
+    fn mark_up(&mut self, mut from: Option<String>, version: u64) {
+        while let Some(id) = from {
+            let Some(it) = self.items.get_mut(&id) else { return };
+            it.version = version;
+            from = it.parent.clone();
+        }
     }
 
     fn kids(&self, id: &str) -> Vec<&FItem> {
         let mut v: Vec<&FItem> = self.items.values().filter(|i| !i.deleted && i.parent.as_deref() == Some(id)).collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
+    }
+
+    /// What an item takes, a folder everything under it, as Graph counts it.
+    fn bytes(&self, it: &FItem) -> usize {
+        if it.is_dir { self.kids(&it.id).iter().map(|k| self.bytes(k)).sum() } else { it.data.len() }
     }
 
     fn child(&self, id: &str, name: &str) -> Option<&FItem> {
@@ -173,7 +195,7 @@ impl State {
         let mut v = json!({
             "id": it.id,
             "name": it.name,
-            "size": if it.is_dir { self.kids(&it.id).iter().map(|k| k.data.len()).sum::<usize>() } else { it.data.len() },
+            "size": self.bytes(it),
             "lastModifiedDateTime": "2024-05-06T07:08:09Z",
         });
         if it.deleted {
