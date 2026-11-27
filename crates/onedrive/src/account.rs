@@ -206,8 +206,22 @@ fn parts(path: &str) -> Vec<String> {
     path.split('/').filter(|s| !s.is_empty()).map(str::to_string).collect()
 }
 
+/// The size shown for an item: a folder's counts everything under it; a shortcut to another
+/// drive's folder has none (the Personal Vault's says 0 whatever it holds).
+///
+/// A personal account works the totals out late: after a change they stayed as they were (0
+/// for a new folder) from none to over 20 minutes, and the delta feed doesn't bring the folders
+/// again once they're right. Taken as it is: the size comes right when the folder above is
+/// read again (Atualizar). See `folder_sizes` in `tests/real_account.rs`.
+fn shown_size(is_dir: bool, shortcut: bool, size: Option<u64>) -> Option<u64> {
+    match is_dir {
+        true => size.filter(|_| !shortcut),
+        false => Some(size.unwrap_or(0)),
+    }
+}
+
 fn item_of(s: &Seen) -> Item {
-    Item { name: s.name.clone().unwrap_or_default(), is_dir: s.is_dir, size: (!s.is_dir).then_some(s.size), modified: (s.modified > 0).then_some(s.modified), id: Some(s.id.clone()) }
+    Item { name: s.name.clone().unwrap_or_default(), is_dir: s.is_dir, size: shown_size(s.is_dir, s.remote.is_some(), s.size), modified: (s.modified > 0).then_some(s.modified), id: Some(s.id.clone()) }
 }
 
 fn area_item(a: Area) -> Item {
@@ -640,7 +654,7 @@ impl Account {
 
     fn own_loc(&self, tree: &Tree, ix: Ix) -> Loc {
         let n = tree.get(ix);
-        let item = Item { name: n.name.to_string(), is_dir: n.is_dir, size: (!n.is_dir).then_some(n.size), modified: (n.modified > 0).then_some(n.modified), id: Some(n.id.to_string()) };
+        let item = Item { name: n.name.to_string(), is_dir: n.is_dir, size: shown_size(n.is_dir, n.remote.is_some(), Some(n.size)), modified: (n.modified > 0).then_some(n.modified), id: Some(n.id.to_string()) };
         let addr = match &n.remote {
             Some(r) => Addr { drive: r.drive.clone(), id: r.id.clone(), rest: Vec::new() },
             None => Addr { drive: self.meta.id.clone(), id: n.id.to_string(), rest: Vec::new() },

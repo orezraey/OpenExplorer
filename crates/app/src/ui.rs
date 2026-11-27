@@ -3673,7 +3673,8 @@ fn props_dialog(s: &State, k: &Kit, p: &actions::Props, layer: &mut Vec<El>) {
             body = body.child(prop_text(k, t("Caminho", "Path"), place_of(p)));
             let size = match (p.single(), &p.totals) {
                 (_, Some(t)) => format_bytes(t.bytes),
-                (Some(e), None) if !e.is_dir => e.size.map(format_bytes).unwrap_or_else(|| "—".into()),
+                // A server folder whose size came with the listing (OneDrive's).
+                (Some(e), None) if !e.is_dir || e.size.is_some() => e.size.map(format_bytes).unwrap_or_else(|| "—".into()),
                 (_, None) if loc.is_local() => t("Calculando…", "Calculating…").into(),
                 (None, None) => format_bytes(p.listed_bytes),
                 _ => "—".into(),
