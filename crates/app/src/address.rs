@@ -485,7 +485,7 @@ pub fn place_location(email: String, place: Place) -> Location {
 }
 
 /// Folder `id` itself, where `place` says it sits.
-fn folder_location(email: String, id: &str, place: Place) -> Location {
+pub(crate) fn folder_location(email: String, id: &str, place: Place) -> Location {
     // A shared drive's root is the drive, not a folder in it.
     if matches!(&place.top, Top::SharedDrive { id: drive, .. } if drive == id) {
         return place_location(email, place);

@@ -538,6 +538,36 @@ pub fn show_in_folder(s: &mut State, p: usize, _: &mut Tx) {
     }
 }
 
+/// The account and folder id a folder of a Drive search's results is looked up by before it
+/// opens (a shortcut's target, else itself); `None` where folders open at once.
+pub(crate) fn found_folder(loc: &Location, e: &Entry) -> Option<(String, String)> {
+    if !e.is_dir || !loc.is_drive_search() {
+        return None;
+    }
+    let email = item_account(loc, e)?.to_string();
+    Some((email, e.target.clone().unwrap_or_else(|| e.id.clone())))
+}
+
+/// Opens folder `e` of a Drive search's results where it really sits, as Explorer does: the
+/// tree opens down to it, the folders beside it show there, and Up goes to its real parent.
+/// Drive's search doesn't say where an item is, so its parents are looked up first. If that
+/// fails, it opens under the search, as before.
+pub fn open_found_folder(s: &mut State, p: usize, e: &Entry) {
+    let loc = s.panes[p].loc.clone();
+    let Some((email, id)) = found_folder(&loc, e) else { return };
+    let under_search = crate::folder_in(&loc, e);
+    s.status = tr!("Abrindo “{}”…", "Opening “{}”…", shown(&e.name));
+    let account = email.clone();
+    let find = move |d: &Drive| match d.place(&id) {
+        Ok(place) => Ok(Reached { loc: address::folder_location(account, &id, place), reveal: None }),
+        Err(err) => {
+            openexplorer_gdrive::log(&format!("pasta da pesquisa {id}: lugar não achado: {err}"));
+            Ok(Reached { loc: under_search, reveal: None })
+        }
+    };
+    reach(s, p, &email, t("abrir a pasta", "open the folder"), find);
+}
+
 /// Takes pane `p` to `to` as a step Voltar undoes, selecting what `to` reveals once it's
 /// listed.
 pub fn arrive(s: &mut State, p: usize, to: Reached) {

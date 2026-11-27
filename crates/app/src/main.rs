@@ -2132,6 +2132,9 @@ fn open(s: &mut State, p: usize, id: &str) {
     if !e.is_dir {
         return actions::open_file(s, p, &e);
     }
+    if actions::found_folder(&pane.loc, &e).is_some() {
+        return actions::open_found_folder(s, p, &e);
+    }
     let loc = folder_in(&pane.loc, &e);
     navigate(s, p, loc);
 }
@@ -2146,9 +2149,10 @@ pub(crate) fn folder_in(at: &Location, e: &Entry) -> Location {
         Location::Mock(segs) => segs.push(e.name.clone()),
         Location::Drive { space: space @ Space::SharedDrives, .. } => *space = Space::Shared { id: e.id.clone(), name: e.name.clone() },
         Location::Drive { path, .. } => path.push((e.target.clone().unwrap_or_else(|| e.id.clone()), e.name.clone())),
-        // A folder found in every account opens as one found in its own account does: under
-        // that account's search for the same words, so the address says where it came from and
-        // Up goes back to the results (its real parents aren't known from the search).
+        // A folder found in every account opens where it sits (`actions::open_found_folder`).
+        // Here is where it opens when that can't be found: as one found in its own account
+        // does, under that account's search for the same words, so the address says where it
+        // came from and Up goes back to the results.
         Location::DriveSearch(q) => {
             if let Some(o) = e.drive_origin.as_deref() {
                 let target_id = e.target.clone().unwrap_or_else(|| e.id.clone());
@@ -4386,5 +4390,52 @@ mod tests {
         s.shared_drive_names.insert("a@b".into(), HashMap::from([("0BB".into(), "Filmes".into())]));
         name_shared_drives(&mut s, "a@b");
         assert_eq!(s.panes[1].entries[0].drive_origin.as_ref().unwrap().label, "a@b · Filmes");
+    }
+
+    /// A folder of a Drive search's results (one account's or every account's) opens where it
+    /// really sits, so the tree opens down to it and Up goes to its real parent; folders
+    /// anywhere else open at once.
+    #[test]
+    fn a_folder_found_on_drive_opens_where_it_sits() {
+        use openexplorer_gdrive::api::{Place, Top};
+        let sd = HashMap::new();
+        let folder = DriveFile { id: "f1".into(), name: "Temp 3".into(), is_dir: true, drive_id: None, owned_by_me: Some(true), ..f_my_template() };
+        let global = Location::DriveSearch(Box::new(model::DriveSearch { text: "temp".into() }));
+        let found = entry_of_search("a@b", folder.clone(), &sd, true);
+        assert_eq!(actions::found_folder(&global, &found), Some(("a@b".into(), "f1".into())));
+        // One account's search, whose entries may carry no origin.
+        let search = model::Search { text: "temp".into(), within: openexplorer_gdrive::search::Within::Everything, place: actions::all_of_drive() };
+        let one = Location::Drive { email: "c@d".into(), space: Space::Search(Box::new(search)), path: Vec::new() };
+        assert!(one.is_drive_search());
+        let plain = entry_of(folder.clone());
+        assert_eq!(actions::found_folder(&one, &plain), Some(("c@d".into(), "f1".into())));
+        // A shortcut opens its target.
+        let shortcut = Entry { target: Some("t9".into()), ..plain.clone() };
+        assert_eq!(actions::found_folder(&one, &shortcut), Some(("c@d".into(), "t9".into())));
+        // Files, and folders already inside a folder, open as before.
+        assert_eq!(actions::found_folder(&one, &Entry { is_dir: false, ..plain.clone() }), None);
+        let inside = folder_in(&one, &plain);
+        assert!(!inside.is_drive_search());
+        assert_eq!(actions::found_folder(&inside, &plain), None);
+        assert_eq!(actions::found_folder(&Location::drive("c@d", Space::MyDrive), &plain), None);
+
+        // Where it opens, from where Drive says it sits.
+        let place = |top, folders: &[(&str, &str)]| Place { top, folders: folders.iter().map(|(i, n)| (i.to_string(), n.to_string())).collect(), name: "Temp 3".into(), is_folder: true };
+        let streaming = [("s1", "Séries"), ("s2", "Streaming")];
+        assert_eq!(
+            address::folder_location("a@b".into(), "f1", place(Top::MyDrive, &streaming)),
+            Location::Drive { email: "a@b".into(), space: Space::MyDrive, path: vec![("s1".into(), "Séries".into()), ("s2".into(), "Streaming".into()), ("f1".into(), "Temp 3".into())] }
+        );
+        let shared = Top::SharedDrive { id: "0AA".into(), name: "Filmes".into() };
+        assert_eq!(
+            address::folder_location("a@b".into(), "f1", place(shared.clone(), &[("s2", "Streaming")])),
+            Location::Drive { email: "a@b".into(), space: Space::Shared { id: "0AA".into(), name: "Filmes".into() }, path: vec![("s2".into(), "Streaming".into()), ("f1".into(), "Temp 3".into())] }
+        );
+        // A shared drive found is the drive itself.
+        assert_eq!(address::folder_location("a@b".into(), "0AA", place(shared, &[])), Location::Drive { email: "a@b".into(), space: Space::Shared { id: "0AA".into(), name: "Filmes".into() }, path: Vec::new() });
+        assert_eq!(
+            address::folder_location("a@b".into(), "f1", place(Top::SharedWithMe, &[("s2", "Streaming")])),
+            Location::Drive { email: "a@b".into(), space: Space::SharedWithMe, path: vec![("s2".into(), "Streaming".into()), ("f1".into(), "Temp 3".into())] }
+        );
     }
 }
