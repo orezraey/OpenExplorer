@@ -74,9 +74,10 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
     let mut i = 0usize;
     let mut out = Vec::new();
     while i < bytes.len() {
-        let c = bytes[i] as char;
+        // The character, not its first byte: an accent is two bytes, and the error names it.
+        let c = src[i..].chars().next().unwrap();
         if c.is_whitespace() {
-            i += 1;
+            i += c.len_utf8();
             continue;
         }
         // Comments: // ... or { ... } or (* ... *)
@@ -481,7 +482,14 @@ impl<'a> Parser<'a> {
     }
 }
 
-pub fn run(compiled: &CompiledScript, current_name: &str, idx: usize, entry: &Entry, loc: &Location) -> Result<String, String> {
+/// Why a script stopped on an item.
+pub struct Failed {
+    pub why: String,
+    /// It ran to its step limit: a loop that never ends, which no other item would end either.
+    pub endless: bool,
+}
+
+pub fn run(compiled: &CompiledScript, current_name: &str, idx: usize, entry: &Entry, loc: &Location) -> Result<String, Failed> {
     let mut env = Env {
         vars: HashMap::new(),
         entry,
@@ -494,9 +502,14 @@ pub fn run(compiled: &CompiledScript, current_name: &str, idx: usize, entry: &En
     env.vars.insert("filepath".into(), Val::Str(path_str));
     env.vars.insert("fileindex".into(), Val::Int(idx as i64 + 1));
 
-    env.exec(&compiled.body)?;
+    if let Err(why) = env.exec(&compiled.body) {
+        return Err(Failed { why, endless: env.steps > STEP_LIMIT });
+    }
     Ok(env.vars.get("filename").map(Val::as_str).unwrap_or_else(|| current_name.to_string()))
 }
+
+/// The statements a script may run on one item.
+const STEP_LIMIT: usize = 50_000;
 
 struct Env<'a> {
     vars: HashMap<String, Val>,
@@ -508,7 +521,7 @@ struct Env<'a> {
 impl<'a> Env<'a> {
     fn tick(&mut self) -> Result<(), String> {
         self.steps += 1;
-        if self.steps > 50_000 {
+        if self.steps > STEP_LIMIT {
             Err(t("Script excedeu o limite de iterações.", "Script exceeded iteration limit.").into())
         } else {
             Ok(())
@@ -555,14 +568,17 @@ impl<'a> Env<'a> {
                     while i >= end {
                         self.vars.insert(key.clone(), Val::Int(i));
                         self.exec(body)?;
-                        i -= 1;
+                        // The last number there is ends the loop.
+                        let Some(next) = i.checked_sub(1) else { break };
+                        i = next;
                     }
                 } else {
                     let mut i = start;
                     while i <= end {
                         self.vars.insert(key.clone(), Val::Int(i));
                         self.exec(body)?;
-                        i += 1;
+                        let Some(next) = i.checked_add(1) else { break };
+                        i = next;
                     }
                 }
             }
@@ -577,20 +593,21 @@ impl<'a> Env<'a> {
             Expr::Call(n, args) => self.call_fn(n, args),
             Expr::UnOp(is_not, sub) => {
                 let v = self.eval(sub)?;
-                if *is_not { Ok(Val::Bool(!v.as_bool())) } else { Ok(Val::Int(-v.as_int())) }
+                if *is_not { Ok(Val::Bool(!v.as_bool())) } else { Ok(Val::Int(v.as_int().wrapping_neg())) }
             }
             Expr::BinOp(op, l, r) => {
                 let lv = self.eval(l)?;
                 let rv = self.eval(r)?;
                 Ok(match op {
                     BinOp::Add => match (&lv, &rv) {
-                        (Val::Int(a), Val::Int(b)) => Val::Int(a + b),
+                        // Numbers wrap at the ends of their range rather than stop the program.
+                        (Val::Int(a), Val::Int(b)) => Val::Int(a.wrapping_add(*b)),
                         _ => Val::Str(format!("{}{}", lv.as_str(), rv.as_str())),
                     },
-                    BinOp::Sub => Val::Int(lv.as_int() - rv.as_int()),
-                    BinOp::Mul => Val::Int(lv.as_int() * rv.as_int()),
-                    BinOp::Div => Val::Int(if rv.as_int() == 0 { 0 } else { lv.as_int() / rv.as_int() }),
-                    BinOp::Mod => Val::Int(if rv.as_int() == 0 { 0 } else { lv.as_int() % rv.as_int() }),
+                    BinOp::Sub => Val::Int(lv.as_int().wrapping_sub(rv.as_int())),
+                    BinOp::Mul => Val::Int(lv.as_int().wrapping_mul(rv.as_int())),
+                    BinOp::Div => Val::Int(if rv.as_int() == 0 { 0 } else { lv.as_int().wrapping_div(rv.as_int()) }),
+                    BinOp::Mod => Val::Int(if rv.as_int() == 0 { 0 } else { lv.as_int().wrapping_rem(rv.as_int()) }),
                     BinOp::Eq => Val::Bool(lv.as_str() == rv.as_str()),
                     BinOp::Ne => Val::Bool(lv.as_str() != rv.as_str()),
                     BinOp::Lt => Val::Bool(lv.as_int() < rv.as_int()),
@@ -610,7 +627,7 @@ impl<'a> Env<'a> {
             "widedelete" | "delete" if args.len() == 3 => {
                 if let Expr::Var(vname) = &args[0] {
                     let s = self.vars.get(&vname.to_ascii_lowercase()).map(Val::as_str).unwrap_or_default();
-                    let idx = (self.eval(&args[1])?.as_int() - 1).max(0) as usize;
+                    let idx = self.eval(&args[1])?.as_int().saturating_sub(1).max(0) as usize;
                     let cnt = self.eval(&args[2])?.as_int().max(0) as usize;
                     let mut chars: Vec<char> = s.chars().collect();
                     let end = (idx + cnt).min(chars.len());
@@ -625,7 +642,7 @@ impl<'a> Env<'a> {
                 let ins = self.eval(&args[0])?.as_str();
                 if let Expr::Var(vname) = &args[1] {
                     let s = self.vars.get(&vname.to_ascii_lowercase()).map(Val::as_str).unwrap_or_default();
-                    let idx = (self.eval(&args[2])?.as_int() - 1).max(0) as usize;
+                    let idx = self.eval(&args[2])?.as_int().saturating_sub(1).max(0) as usize;
                     let mut chars: Vec<char> = s.chars().collect();
                     let at = idx.min(chars.len());
                     for (off, c) in ins.chars().enumerate() {
@@ -687,7 +704,7 @@ impl<'a> Env<'a> {
             }
             "widecopy" | "copy" => {
                 let hay = s(0);
-                let start = (n(1) - 1).max(0) as usize;
+                let start = n(1).saturating_sub(1).max(0) as usize;
                 let cnt = n(2).max(0) as usize;
                 Val::Str(hay.chars().skip(start).take(cnt).collect())
             }

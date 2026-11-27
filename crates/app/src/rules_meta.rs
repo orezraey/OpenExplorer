@@ -1348,7 +1348,7 @@ fn torrent_tag(tag: &str, path: &Path) -> Option<String> {
     let f = File::open(path).ok()?;
     let mut data = Vec::new();
     f.take(2 * 1024 * 1024).read_to_end(&mut data).ok()?;
-    let (val, _, info_slice) = bencode_parse(&data, 0)?;
+    let (val, _, info_slice) = bencode_parse(&data, 0, 0)?;
     let BVal::Dict(root) = val else { return None };
 
     let info = root.iter().find(|(k, _)| k == b"info").map(|(_, v)| v);
@@ -1418,7 +1418,15 @@ enum BVal {
     Dict(Vec<(Vec<u8>, BVal)>),
 }
 
-fn bencode_parse<'a>(data: &'a [u8], pos: usize) -> Option<(BVal, usize, Option<&'a [u8]>)> {
+/// The lists and dictionaries a torrent may hold one inside another. A real one goes a few
+/// deep; each level is a call, and a file of a million `l` (any file can be asked for a
+/// `Torrent_` tag) overflowed the stack.
+const BENCODE_DEPTH: usize = 64;
+
+fn bencode_parse<'a>(data: &'a [u8], pos: usize, depth: usize) -> Option<(BVal, usize, Option<&'a [u8]>)> {
+    if depth > BENCODE_DEPTH {
+        return None;
+    }
     let b = *data.get(pos)?;
     match b {
         b'i' => {
@@ -1430,7 +1438,7 @@ fn bencode_parse<'a>(data: &'a [u8], pos: usize) -> Option<(BVal, usize, Option<
             let mut p = pos + 1;
             let mut list = Vec::new();
             while *data.get(p)? != b'e' {
-                let (v, np, _) = bencode_parse(data, p)?;
+                let (v, np, _) = bencode_parse(data, p, depth + 1)?;
                 list.push(v);
                 p = np;
             }
@@ -1441,9 +1449,9 @@ fn bencode_parse<'a>(data: &'a [u8], pos: usize) -> Option<(BVal, usize, Option<
             let mut dict = Vec::new();
             let mut info_slice = None;
             while *data.get(p)? != b'e' {
-                let (BVal::Bytes(k), np, _) = bencode_parse(data, p)? else { return None };
+                let (BVal::Bytes(k), np, _) = bencode_parse(data, p, depth + 1)? else { return None };
                 let val_start = np;
-                let (v, vp, sub_info) = bencode_parse(data, np)?;
+                let (v, vp, sub_info) = bencode_parse(data, np, depth + 1)?;
                 if k == b"info" {
                     info_slice = Some(&data[val_start..vp]);
                 } else if info_slice.is_none() {
@@ -1458,7 +1466,8 @@ fn bencode_parse<'a>(data: &'a [u8], pos: usize) -> Option<(BVal, usize, Option<
             let colon = data[pos..].iter().position(|&c| c == b':')? + pos;
             let len = std::str::from_utf8(&data[pos..colon]).ok()?.parse::<usize>().ok()?;
             let start = colon + 1;
-            let end = start + len;
+            // `len` comes from the file: a damaged one could overflow the addition.
+            let end = start.checked_add(len)?;
             let slice = data.get(start..end)?;
             Some((BVal::Bytes(slice.to_vec()), end, None))
         }
@@ -1499,4 +1508,21 @@ fn version_info_tag(tag: &str, path: &Path) -> Option<String> {
 #[allow(dead_code)]
 fn _epoch_unused() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_of_lists_inside_lists_is_no_torrent() {
+        assert!(bencode_parse(&vec![b'l'; 1_000_000], 0, 0).is_none());
+        // A length past the end of the numbers, where adding it to the position overflowed.
+        assert!(bencode_parse(b"18446744073709551615:x", 0, 0).is_none());
+        // A real one still reads, with the bytes of its `info` for the hash.
+        let (val, end, info) = bencode_parse(b"d8:announce3:url4:infod6:lengthi5e4:name1:xee", 0, 0).unwrap();
+        assert!(matches!(val, BVal::Dict(ref d) if d.len() == 2));
+        assert_eq!(end, 45);
+        assert_eq!(info, Some(&b"d6:lengthi5e4:name1:xe"[..]));
+    }
 }

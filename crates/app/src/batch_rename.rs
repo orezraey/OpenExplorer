@@ -57,6 +57,8 @@ pub struct RowPreview {
     pub next: String,
     pub changed: bool,
     pub error: Option<String>,
+    /// Why a checked item is left as it is, when that isn't plain: it doesn't stop the batch.
+    pub note: Option<String>,
 }
 
 /// Computed preview for the entire batch rename window.
@@ -187,7 +189,7 @@ impl BatchRename {
                                 .iter()
                                 .map(|item| {
                                     let current = shown(&item.name);
-                                    RowPreview { next: current.clone(), current, changed: false, error: None }
+                                    RowPreview { next: current.clone(), current, changed: false, error: None, note: None }
                                 })
                                 .collect();
                             return Preview { regex_error: Some(format_regex_error(&e)), rows, changed_count: 0, error_count: 0, waiting: false };
@@ -209,11 +211,11 @@ impl BatchRename {
                         let current = shown(&item.name);
                         let included = self.checked.get(i).copied().unwrap_or(false);
                         if !included || search.is_empty() {
-                            return RowPreview { next: current.clone(), current, changed: false, error: None };
+                            return RowPreview { next: current.clone(), current, changed: false, error: None, note: None };
                         }
                         let next = apply_replace(&current, search, replace, self.replace_all, &matcher);
                         let changed = next != current;
-                        RowPreview { current, next, changed, error: None }
+                        RowPreview { current, next, changed, error: None, note: None }
                     })
                     .collect()
             }
@@ -225,14 +227,14 @@ impl BatchRename {
                     let current = shown(&item.name);
                     let included = self.checked.get(i).copied().unwrap_or(false);
                     if !included {
-                        return RowPreview { next: current.clone(), current, changed: false, error: None };
+                        return RowPreview { next: current.clone(), current, changed: false, error: None, note: None };
                     }
                     match self.media.format_item(i, &self.loc) {
                         Some(next) => {
                             let changed = next != current;
-                            RowPreview { current, next, changed, error: None }
+                            RowPreview { current, next, changed, error: None, note: None }
                         }
-                        None => RowPreview { next: current.clone(), current, changed: false, error: None },
+                        None => RowPreview { next: current.clone(), current, changed: false, error: None, note: self.media.skipped_note(i) },
                     }
                 })
                 .collect(),
@@ -242,10 +244,20 @@ impl BatchRename {
                 .map(|(i, (next, error))| {
                     let current = shown(&self.items[i].name);
                     let changed = next != current;
-                    RowPreview { current, next, changed, error }
+                    RowPreview { current, next, changed, error, note: None }
                 })
                 .collect(),
         };
+
+        // Windows drops the dots and spaces a name ends with: the preview shows the name the
+        // item will really have, and it's that name the checks below judge.
+        if cfg!(windows) && matches!(self.loc, Location::Local(_) | Location::Found(_)) {
+            for row in rows.iter_mut().filter(|row| row.changed) {
+                let kept = row.next.trim_end_matches(['.', ' ']).len();
+                row.next.truncate(kept);
+                row.changed = row.next != row.current;
+            }
+        }
 
         // Hashes still on their way: the names will change, so no conflict is judged yet.
         if crate::rules_meta::waited() {
@@ -313,6 +325,22 @@ impl BatchRename {
             HashSet::new()
         };
 
+        // The folders the batch renames, where items come from many folders (a search's
+        // results): an item inside one of them would have its path change under it, and
+        // neither the batch nor its undo would find it.
+        let renamed_folders: HashSet<String> = if matches!(self.loc, Location::Found(_)) {
+            self.items
+                .iter()
+                .enumerate()
+                .filter(|(i, item)| item.is_dir && self.checked.get(*i).copied().unwrap_or(false) && rows[*i].changed)
+                .filter_map(|(_, item)| self.loc.local_path(item))
+                .map(|path| ops::path_key(&path))
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let in_renamed_folder = |item: &Entry| !renamed_folders.is_empty() && self.loc.local_path(item).is_some_and(|path| path.ancestors().skip(1).any(|dir| renamed_folders.contains(&ops::path_key(dir))));
+
         let mut changed_count = 0;
         let mut error_count = 0;
         for (i, item) in self.items.iter().enumerate() {
@@ -328,6 +356,8 @@ impl BatchRename {
             let trimmed = rows[i].next.trim();
             let err = if let Some(why) = actions::name_problem(&self.loc, trimmed) {
                 Some(why)
+            } else if in_renamed_folder(item) {
+                Some(t("Está numa pasta renomeada neste lote: faça em duas etapas", "It's in a folder this batch renames: do it in two steps").into())
             } else {
                 let key = (group_of(item), norm(trimmed));
                 if target_counts.get(&key).copied().unwrap_or(0) > 1 {
@@ -565,6 +595,15 @@ fn run_local_batch(jobs: Vec<(PathBuf, String)>, rec: &undo::Rec) -> Result<Stri
         let to_key = ops::path_key(&from.with_file_name(name.trim()));
         ops::path_key(from) != to_key && source_keys.contains(&to_key)
     });
+    // The preview refuses a folder together with an item inside it; nothing is touched if one
+    // comes all the same: renaming the folder would leave the rest of the batch half done.
+    if let Some((inside, _)) = jobs.iter().find(|(from, _)| from.ancestors().skip(1).any(|dir| source_keys.contains(&ops::path_key(dir)))) {
+        return Err(tr!(
+            "\"{}\" está numa pasta que este lote também renomeia: faça em duas etapas. Nada foi renomeado.",
+            "\"{}\" is in a folder this batch renames too: do it in two steps. Nothing was renamed.",
+            inside.display()
+        ));
+    }
 
     if !needs_staging {
         let mut done = 0usize;
@@ -2298,5 +2337,79 @@ mod tests {
         br.media.clear_match();
         assert!(br.media.error.is_none());
         assert!(br.media.selected.is_none());
+    }
+
+    #[test]
+    fn two_shows_in_one_batch_never_take_one_name() {
+        use crate::media_rename::{Candidate, DataSource, EpisodeInfo, MediaKind};
+        let items = vec![file("Alpha.S01E01.mkv"), file("Alpha.S01E02.mkv"), file("Beta.S01E02.mkv")];
+        let mut br = BatchRename::new(Location::Local(PathBuf::from("C:/tmp")), items, vec![]);
+        br.mode = Mode::Media;
+        br.media.candidates = vec![Candidate { id: "1".into(), source: DataSource::Tmdb, kind: MediaKind::Series, title: "Alpha".into(), original_title: None, year: None, overview: String::new(), poster_url: None }];
+        br.media.selected = Some(0);
+        br.media.episodes = vec![
+            EpisodeInfo { season: 1, episode: 1, absolute: Some(1), title: "Pilot".into() },
+            EpisodeInfo { season: 1, episode: 2, absolute: Some(2), title: "Two".into() },
+        ];
+        br.media.episodes_for = Some("1".into());
+        let p = br.preview();
+        assert_eq!(p.rows[0].next, "Alpha - S01E01 - Pilot.mkv");
+        assert_eq!(p.rows[1].next, "Alpha - S01E02 - Two.mkv");
+        // The other show's file is left alone, and its row says why.
+        assert!(!p.rows[2].changed && p.rows[2].error.is_none(), "{:?}", p.rows[2]);
+        assert!(p.rows[2].note.is_some());
+        assert!(p.rows[0].note.is_none());
+        assert!(p.can_submit());
+    }
+
+    #[test]
+    fn a_folder_and_a_file_in_it_are_not_renamed_together() {
+        // A search's results can list a folder and a file inside it. Renamed together, the
+        // file's path changes under it, and neither the batch nor its undo could find it.
+        let loc = Location::Found(Box::new(crate::model::Found { text: "x".into(), within: None, place: String::new() }));
+        let item = |path: &str, is_dir: bool| Entry { id: path.into(), is_dir, ..file(path.rsplit('/').next().unwrap()) };
+        let items = vec![item("C:/tmp/x-pasta", true), item("C:/tmp/x-pasta/x-nota.txt", false), item("C:/tmp/x-solto.txt", false)];
+        let mut br = BatchRename::new(loc, items, vec![]);
+        br.search = TextEdit::new("x-");
+        br.replace = TextEdit::new("y-");
+        let p = br.preview();
+        assert!(p.rows[0].error.is_none() && p.rows[2].error.is_none(), "{p:?}");
+        assert!(p.rows[1].error.is_some());
+        assert!(!p.can_submit());
+        // Without the folder, the file can go.
+        br.checked[0] = false;
+        assert!(br.preview().can_submit());
+    }
+
+    #[test]
+    fn a_batch_with_a_folder_and_a_file_in_it_renames_nothing() {
+        let dir = std::env::temp_dir().join(format!("oe-batch-rename-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("X")).unwrap();
+        std::fs::write(dir.join("X").join("f.txt"), "f").unwrap();
+        let rec = undo::Rec::default();
+        let res = run_local_batch(vec![(dir.join("X"), "Y".into()), (dir.join("X").join("f.txt"), "g.txt".into())], &rec);
+        assert!(res.is_err());
+        assert!(dir.join("X").join("f.txt").exists() && !dir.join("Y").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_name_ending_in_a_dot_shows_as_windows_keeps_it() {
+        // Windows drops the dots and spaces a name ends with: the preview shows the name the
+        // file will really have, and sees that it's taken.
+        let mut br = local_br(&["a.txt", "c.txt"], &["b"]);
+        br.search = TextEdit::new(".txt");
+        br.replace = TextEdit::new(".");
+        br.checked[1] = false;
+        let p = br.preview();
+        assert_eq!(p.rows[0].next, "a");
+        assert!(p.rows[0].error.is_none());
+        br.search = TextEdit::new("a.txt");
+        br.replace = TextEdit::new("b. .");
+        let p = br.preview();
+        assert_eq!(p.rows[0].next, "b");
+        assert!(p.rows[0].error.is_some());
     }
 }

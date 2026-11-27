@@ -1688,7 +1688,8 @@ fn apply_rule_batch(
                     } else if *case_sensitive {
                         (stem == src).then(|| dst.to_string())
                     } else {
-                        stem.eq_ignore_ascii_case(src).then(|| dst.to_string())
+                        // Every letter's case, not only the ASCII ones: `ÉCOLE` is `école`.
+                        (stem.to_lowercase() == src.to_lowercase()).then(|| dst.to_string())
                     };
                     if let Some(next_base) = matched {
                         used.insert(row_idx);
@@ -1700,11 +1701,24 @@ fn apply_rule_batch(
         }
         RuleConfig::PascalScript { code } => match rules_script::compile(code) {
             Ok(compiled) => {
+                // A script that ran to its step limit on an item would on the next ones too,
+                // each taking milliseconds: 1,000 items froze the window for seconds. The rest
+                // of the batch takes the same error without running.
+                let mut endless: Option<String> = None;
                 for (i, item) in items.iter().enumerate() {
                     if !checked.get(i).copied().unwrap_or(true) {
                         continue;
                     }
-                    match rules_script::run(&compiled, &names[i], i, item, loc) {
+                    let result = match &endless {
+                        Some(why) => Err(why.clone()),
+                        None => rules_script::run(&compiled, &names[i], i, item, loc).map_err(|failed| {
+                            if failed.endless {
+                                endless = Some(failed.why.clone());
+                            }
+                            failed.why
+                        }),
+                    };
+                    match result {
                         Ok(next) => names[i] = next,
                         Err(e) => {
                             if errors[i].is_none() {
@@ -1908,6 +1922,10 @@ fn apply_single_rule(cfg: &RuleConfig, prepared: &Prepared, current: &str, item:
             Ok(format!("{next_base}{ext}"))
         }
         RuleConfig::Extension { set_new, new_ext, append_original, detect_binary, remove_duplicates, dup_case_sensitive } => {
+            // A folder has no extension, as for every other rule: a dot is part of its name.
+            if item.is_dir {
+                return Ok(current.to_string());
+            }
             let mut out = current.to_string();
             if *remove_duplicates {
                 out = strip_duplicate_extensions(&out, *dup_case_sensitive);
@@ -2015,10 +2033,12 @@ fn apply_single_rule(cfg: &RuleConfig, prepared: &Prepared, current: &str, item:
                     next_base = re.replace_all(&next_base, NoExpand(frag)).into_owned();
                 }
             }
-            if *ext_lower {
-                ext = ext.to_lowercase();
-            } else if *ext_upper {
-                ext = ext.to_uppercase();
+            if *ext_lower || *ext_upper {
+                // The extension's own case holds whether or not the rest of the rule skips it.
+                if ext.is_empty() {
+                    (next_base, ext) = split_stem_ext(&next_base, item.is_dir, true);
+                }
+                ext = if *ext_lower { ext.to_lowercase() } else { ext.to_uppercase() };
             }
             Ok(format!("{next_base}{ext}"))
         }
@@ -2075,8 +2095,7 @@ fn apply_single_rule(cfg: &RuleConfig, prepared: &Prepared, current: &str, item:
             prepare_sharepoint,
             skip_ext,
         } => {
-            let effective_skip = *skip_ext && !*prepare_sharepoint;
-            let (mut s, ext) = split_stem_ext(current, item.is_dir, effective_skip);
+            let (mut s, ext) = split_stem_ext(current, item.is_dir, *skip_ext);
             if *strip_parens {
                 s = RE_IN_PARENS.replace_all(&s, " ").into_owned();
             }
@@ -3247,5 +3266,99 @@ mod tests {
         rs.remove_selected();
         assert!(rs.rules.is_empty());
         assert!(!rs.all_selected);
+    }
+
+    fn folder(name: &str) -> Entry {
+        Entry { is_dir: true, ..file(name) }
+    }
+
+    /// The new name and the error one rule gives one item.
+    fn one(config: RuleConfig, item: Entry) -> (String, Option<String>) {
+        evaluate_rules(&[rule(config)], &[item], &[true], &Location::Local(PathBuf::from("C:/tmp"))).remove(0)
+    }
+
+    #[test]
+    fn sharepoint_clean_up_keeps_the_extension() {
+        let mut cfg = RuleConfig::default_for(RuleKind::CleanUp);
+        if let RuleConfig::CleanUp { replace_dot, prepare_sharepoint, .. } = &mut cfg {
+            *replace_dot = true;
+            *prepare_sharepoint = true;
+        }
+        assert_eq!(one(cfg, file("relatorio.final#v2.txt")).0, "relatorio final_v2.txt");
+    }
+
+    #[test]
+    fn the_extension_case_needs_no_skip_extension() {
+        let case = |mode, ext_lower, ext_upper| RuleConfig::Case { mode, preserve_case: false, skip_ext: false, force_fragments: false, fragments: String::new(), ext_lower, ext_upper };
+        assert_eq!(one(case(CaseMode::Upper, true, false), file("Foto.Jpg")).0, "FOTO.jpg");
+        assert_eq!(one(case(CaseMode::None, false, true), file("foto.jpg")).0, "foto.JPG");
+        // A folder has no extension: its dot is part of its name.
+        assert_eq!(one(case(CaseMode::None, false, true), folder("pasta.abc")).0, "pasta.abc");
+    }
+
+    #[test]
+    fn the_extension_rule_leaves_folders_alone() {
+        let mut cfg = RuleConfig::default_for(RuleKind::Extension);
+        if let RuleConfig::Extension { new_ext, .. } = &mut cfg {
+            *new_ext = "txt".into();
+        }
+        assert_eq!(one(cfg.clone(), file("notas.md")).0, "notas.txt");
+        assert_eq!(one(cfg.clone(), folder("Fotos.2024")).0, "Fotos.2024");
+        assert_eq!(one(cfg, folder("Fotos")).0, "Fotos");
+    }
+
+    #[test]
+    fn mapping_ignores_the_case_of_accented_letters() {
+        let cfg = RuleConfig::Mapping { entries: vec![("école".into(), "school".into())], allow_reuse: true, partial_match: false, inverse: false, case_sensitive: false, skip_ext: true };
+        assert_eq!(one(cfg, file("ÉCOLE.txt")).0, "school.txt");
+    }
+
+    #[test]
+    fn a_search_that_is_no_regex_marks_every_checked_item() {
+        // `[z-a]` is a wildcard class that no regex takes.
+        let cfg = RuleConfig::Replace { find: "[z-a]".into(), replace: "x".into(), occurrences: Occurrences::All, case_sensitive: false, whole_words: false, skip_ext: true, wildcards: true };
+        let items = [file("a.txt"), file("b.txt"), file("c.txt")];
+        let out = evaluate_rules(&[rule(cfg)], &items, &[true, false, true], &Location::Local(PathBuf::from("C:/tmp")));
+        assert_eq!(out.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["a.txt", "b.txt", "c.txt"]);
+        assert_eq!(out.iter().map(|(_, error)| error.is_some()).collect::<Vec<_>>(), [true, false, true]);
+    }
+
+    #[test]
+    fn a_regex_with_a_meta_tag_reads_each_item() {
+        let cfg = RuleConfig::Regex { pattern: "_:File_Extension:$".into(), replace: String::new(), case_sensitive: false, skip_ext: true };
+        let items = [file("a_txt.txt"), file("b_pdf.pdf"), file("c_txt.pdf")];
+        let out = evaluate_rules(&[rule(cfg)], &items, &[true; 3], &Location::Local(PathBuf::from("C:/tmp")));
+        assert_eq!(out.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["a.txt", "b.pdf", "c_txt.pdf"]);
+    }
+
+    #[test]
+    fn a_script_that_never_ends_stops_the_whole_batch() {
+        let cfg = RuleConfig::PascalScript { code: "begin while true do FileName := FileName; end.".into() };
+        let items: Vec<Entry> = (0..2_000).map(|i| file(&format!("f{i}.txt"))).collect();
+        let started = std::time::Instant::now();
+        let out = evaluate_rules(&[rule(cfg)], &items, &vec![true; items.len()], &Location::Local(PathBuf::from("C:/tmp")));
+        assert!(out.iter().all(|(_, error)| error.is_some()));
+        // One item runs to the limit, not each of them (minutes, unoptimized).
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn script_arithmetic_never_panics() {
+        for code in [
+            "begin FileName := IntToStr((0 - 9223372036854775807 - 1) div (0 - 1)); end.",
+            "begin FileName := IntToStr((0 - 9223372036854775807 - 1) mod (0 - 1)); end.",
+            "begin FileName := IntToStr(9223372036854775807 + 1); end.",
+            "begin FileName := IntToStr(9223372036854775807 * 2); end.",
+            "begin FileName := IntToStr(-(0 - 9223372036854775807 - 1)); end.",
+        ] {
+            let (name, error) = one(RuleConfig::PascalScript { code: code.into() }, file("a.txt"));
+            assert!(error.is_none() && !name.is_empty(), "{code}: {name:?} {error:?}");
+        }
+    }
+
+    #[test]
+    fn a_script_error_names_the_accented_character() {
+        let (_, error) = one(RuleConfig::PascalScript { code: "begin é end.".into() }, file("a.txt"));
+        assert!(error.as_deref().is_some_and(|e| e.contains('é')), "{error:?}");
     }
 }
