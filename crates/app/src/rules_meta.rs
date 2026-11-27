@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -301,6 +303,76 @@ pub const META_TAGS: &[MetaTagDef] = &[
 static TAG_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r":([A-Za-z0-9_]+):").unwrap());
 static TAG_CACHE: LazyLock<Mutex<HashMap<(String, String), String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Hashes read whole files, minutes for big videos or a network drive: they run on one
+/// background thread, so the window never waits on them. The jobs asked for, by cache key.
+static HASH_PENDING: LazyLock<Mutex<std::collections::HashSet<(String, String)>>> = LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+/// A file tag to compute: the file's path as the cache keys it, the tag, the path, the item.
+type HashJob = (String, String, std::path::PathBuf, Entry);
+static HASH_QUEUE: LazyLock<Mutex<Option<Sender<HashJob>>>> = LazyLock::new(|| Mutex::new(None));
+/// Set when a background hash lands, for the batch window's poll to draw again.
+static CHANGED: AtomicBool = AtomicBool::new(false);
+static WAKER: LazyLock<Mutex<Option<rune::Waker>>> = LazyLock::new(|| Mutex::new(None));
+
+thread_local! {
+    /// Whether the current preview pass met a tag still being computed.
+    static WAITED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What a tag still being computed shows meanwhile.
+pub const PENDING: &str = "…";
+
+/// The batch window's waker, called when a background hash lands.
+pub fn set_waker(waker: rune::Waker) {
+    *WAKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker);
+}
+
+/// Starts a preview pass: [`waited`] then says whether it met a tag still being computed.
+pub fn begin_pass() {
+    WAITED.with(|w| w.set(false));
+}
+
+pub fn waited() -> bool {
+    WAITED.with(std::cell::Cell::get)
+}
+
+/// Whether a background hash landed since the last call.
+pub fn take_changed() -> bool {
+    CHANGED.swap(false, Ordering::AcqRel)
+}
+
+/// Queues `tag` of the file at `path` for the background thread, once.
+fn compute_later(key: (String, String), path: std::path::PathBuf, entry: &Entry) {
+    if !HASH_PENDING.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone()) {
+        return;
+    }
+    let mut queue = HASH_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let tx = queue.get_or_insert_with(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<HashJob>();
+        std::thread::spawn(move || {
+            for (file, tag, path, entry) in rx {
+                let val = compute_file_tag(&tag, &path, &entry).unwrap_or_default();
+                let key = (file, tag);
+                if let Ok(mut g) = TAG_CACHE.lock() {
+                    g.insert(key.clone(), val);
+                }
+                HASH_PENDING.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+                CHANGED.store(true, Ordering::Release);
+                if let Some(wake) = WAKER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    wake();
+                }
+            }
+        });
+        tx
+    });
+    let (file, tag) = key;
+    if let Err(job) = tx.send((file, tag, path, entry.clone())) {
+        // The thread is gone: forget the job, so the next pass asks again.
+        *queue = None;
+        let (file, tag, ..) = job.0;
+        HASH_PENDING.lock().unwrap_or_else(|e| e.into_inner()).remove(&(file, tag));
+    }
+}
+
 pub fn clear_cache() {
     if let Ok(mut g) = TAG_CACHE.lock() {
         g.clear();
@@ -382,6 +454,11 @@ pub fn resolve_tag(tag: &str, entry: &Entry, loc: &Location) -> Option<String> {
         return Some(cached.clone());
     }
 
+    if tag.starts_with("Hash_") {
+        WAITED.with(|w| w.set(true));
+        compute_later(cache_key, path, entry);
+        return Some(PENDING.into());
+    }
     let val = compute_file_tag(tag, &path, entry).unwrap_or_default();
     if let Ok(mut g) = TAG_CACHE.lock() {
         if g.len() > 10_000 {
@@ -1059,10 +1136,9 @@ fn wma_tag(tag: &str, path: &Path) -> Option<String> {
     while p + 24 <= data.len() {
         let guid = &data[p..p + 16];
         let size = u64::from_le_bytes(data[p + 16..p + 24].try_into().ok()?) as usize;
-        if size < 24 || p + size > data.len() {
-            break;
-        }
-        let body = &data[p + 24..p + size];
+        // `size` comes from the file: a damaged one could overflow the addition.
+        let Some(end) = p.checked_add(size).filter(|&e| size >= 24 && e <= data.len()) else { break };
+        let body = &data[p + 24..end];
         if guid == FILE_PROPS && tag.starts_with("Audio_Duration") && body.len() >= 48 {
             let play_dur = u64::from_le_bytes(body[40..48].try_into().ok()?); // 100-ns units
             return Some(fmt_duration(tag, play_dur / 10_000_000));
@@ -1097,7 +1173,8 @@ fn avi_tag(tag: &str, path: &Path) -> Option<String> {
         return None;
     }
     let pos = data.windows(4).position(|w| w == b"avih")?;
-    if pos + 40 > data.len() {
+    // The 40 bytes read below start 8 bytes after the chunk id.
+    if pos + 48 > data.len() {
         return None;
     }
     let avih = &data[pos + 8..];

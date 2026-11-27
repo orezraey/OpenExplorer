@@ -95,11 +95,8 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             continue;
         }
         if src[i..].starts_with("(*") {
-            i += 2;
-            while i + 1 < bytes.len() && !src[i..].starts_with("*)") {
-                i += 1;
-            }
-            i += 2;
+            // Byte by byte would slice inside a multi-byte character (an accent).
+            i = src[i + 2..].find("*)").map_or(bytes.len(), |rel| i + 2 + rel + 2);
             continue;
         }
         if c == '\'' {
