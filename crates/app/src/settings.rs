@@ -266,6 +266,9 @@ pub struct Settings {
     pub skip_recycle_bin: bool,
     /// Where the main window was when it last closed, to open there again.
     pub window: Option<crate::window_place::Saved>,
+    /// Last logical size `(width, height)` of the independent Rule Editor window (always centered on open).
+    #[serde(default)]
+    pub rule_editor_size: Option<(u32, u32)>,
     /// Experimental: a Windows 11 material (`material`) behind the window. Turned on, it takes
     /// effect from the next start; turned off or changed, at once.
     pub mica: bool,
@@ -329,6 +332,7 @@ impl Default for Settings {
             clear_completed: false,
             skip_recycle_bin: false,
             window: None,
+            rule_editor_size: None,
             mica: false,
             material: Material::Mica,
             search_marker: false,

@@ -20,11 +20,31 @@ use crate::layout::{self, clamp_col, clamp_tree};
 
 const ROW_H: f32 = crate::ROW_H;
 
+/// Open Explorer's themed `Kit`: replaces `Kit::neutral`'s stark black `Submit` button with the
+/// app's accent blue and softens `Neutral` buttons in light mode across every window and dialog.
+pub(crate) fn kit(dark: bool) -> Kit {
+    let mut k = Kit::neutral(dark);
+    if dark {
+        k.c.bg_icon_button_contrast = rune::oklch(0.60, 0.15, 252.0);
+        k.c.submit_hover = k.alpha(Color::WHITE, 0.10);
+        k.c.contrast_pressed = k.alpha(Color::BLACK, 0.14);
+    } else {
+        k.c.bg_icon_button_contrast = rune::oklch(0.54, 0.165, 255.0);
+        k.c.submit_hover = k.alpha(Color::BLACK, 0.10);
+        k.c.contrast_pressed = k.alpha(Color::BLACK, 0.18);
+        k.c.bg_button_neutral = rune::oklch(0.965, 0.0, 0.0);
+    }
+    k.c.submit_highlight = k.alpha(Color::WHITE, 0.14);
+    k.c.submit_fg = Color::WHITE;
+    k.c.submit_icon = Color::WHITE;
+    k
+}
+
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if s.is_placeholder {
         return el();
     }
-    let k = Kit::neutral(s.settings.theme.dark(cx.system_dark()));
+    let k = kit(s.settings.theme.dark(cx.system_dark()));
     cx.caption_color(k.c.text_base);
     let title_leading = row()
         .gap(8.0)
@@ -1691,10 +1711,11 @@ fn context(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     }
     menu = menu.item(item(t("Colar", "Paste"), &icons::M_PASTE, "Ctrl+V", actions::can_paste(s, p), |s, p, _| actions::paste(s, p)));
     if n > 0 {
+        let rename_label = if n > 1 { t("Renomear em massa…", "Batch rename…") } else { t("Renomear", "Rename") };
         menu = menu
             .separator()
             .item(item(t("Excluir", "Delete"), &icons::M_DELETE, "Del", changeable, |s, p, _| actions::ask_delete(s, p)).danger(true))
-            .item(item(t("Renomear", "Rename"), &icons::M_RENAME, "F2", changeable && n == 1, actions::ask_rename));
+            .item(item(rename_label, &icons::M_RENAME, "F2", changeable, actions::ask_rename));
         if changeable && matches!(s.panes[p].loc, Location::Drive { .. } | Location::DriveSearch(_)) {
             let label = if actions::stars_to_add(s, p) { t("Adicionar estrela", "Add star") } else { t("Remover estrela", "Remove star") };
             menu = menu.item(item(label, &icons::M_STAR, "", true, |s, p, _| actions::star(s, p)));
@@ -2195,7 +2216,7 @@ pub fn account_window_view(s: &State, cx: &mut Cx<State>) -> El {
     if s.is_placeholder {
         return el();
     }
-    let k = Kit::neutral(s.settings.theme.dark(cx.system_dark()));
+    let k = kit(s.settings.theme.dark(cx.system_dark()));
     let default_form;
     let f = match &s.account_form {
         Some(f) => f.as_ref(),
@@ -3820,7 +3841,7 @@ fn shell_icon(s: &State, key: Option<&IconKey>, fallback: &'static Icon, size: f
 /// or a local folder's own Windows icon when it's a special/customized folder (Documentos,
 /// Downloads, Imagens, OneDrive…). A Drive shortcut to a folder keeps the app's linked-folder
 /// icon.
-fn entry_icon(s: &State, loc: &Location, e: &crate::model::Entry, size: f32) -> El {
+pub(crate) fn entry_icon(s: &State, loc: &Location, e: &crate::model::Entry, size: f32) -> El {
     let kind = e.kind();
     let fallback = kind_icon(kind);
     if kind == Kind::FolderLink {
@@ -4830,7 +4851,7 @@ fn accounts_hub(s: &State, k: &Kit) -> El {
 /// click, and on release when the size ended up different.
 /// `step` is how far the pointer moved along the size: `d.dx` for a width, `-d.dy` for a
 /// height grown upwards.
-fn resize(d: &mut Drag, step: f32, size: &mut f32, default: f32, clamp: impl Fn(f32) -> f32) -> bool {
+pub(crate) fn resize(d: &mut Drag, step: f32, size: &mut f32, default: f32, clamp: impl Fn(f32) -> f32) -> bool {
     match d.phase {
         Phase::Down if d.clicks >= 2 => {
             // The release of this click resizes from the default, so it doesn't undo it.
@@ -6500,6 +6521,10 @@ fn grip(k: &Kit, key: &str, edge: f32, height: f32, size: impl Fn(&mut State) ->
         })
 }
 
+/// The app's overlay scroll bar style used inside modals and auxiliary windows.
+pub(crate) fn bar_style(k: &Kit) -> rune_kit::ScrollBarStyle {
+    rune_kit::ScrollBarStyle::from_kit(k).thumb(k.alpha(k.c.text_base, 0.3)).thumb_hover(k.alpha(k.c.text_base, 0.5)).width(8.0).hover_width(10.0)
+}
 /// The scroll view of pane `p`'s file list.
 pub(crate) fn list_key(p: usize) -> String {
     format!("viewport-{p}")

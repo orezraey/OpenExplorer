@@ -14,6 +14,7 @@ mod address;
 mod anim;
 mod autoscroll;
 mod b2;
+mod batch_rename;
 mod cache;
 mod caches;
 mod conflict;
@@ -27,6 +28,7 @@ mod icons;
 mod keyboard;
 mod lasso;
 mod layout;
+mod media_rename;
 mod mega;
 mod model;
 mod mounts;
@@ -38,6 +40,10 @@ mod showcase;
 mod sharing;
 mod places;
 mod relay;
+mod rules_meta;
+mod rules_rename;
+mod rules_script;
+mod rules_ui;
 mod scrollbars;
 mod servers;
 mod services;
@@ -128,6 +134,8 @@ enum Msg {
     Telegram(telegram::Answer),
     /// What the caches take, measured or cleared for Opções › Cache.
     Caches(caches::Answer),
+    /// Background TMDB / TVDB search, episode list or poster cover for batch rename.
+    Media(media_rename::Answer),
     /// Installing the search service ended: search again in the panes `reload` shows.
     Installed { reload: Vec<Location>, result: Result<String, String> },
     /// A drag of Drive items `ids` out of pane `from` ended.
@@ -334,6 +342,8 @@ struct State {
     queue_totals: transfers::Totals,
     /// Windows' own icons, as Explorer shows them.
     icons: sysicons::SysIcons,
+    /// Remote TMDB / TVDB poster covers decoded asynchronously for batch rename.
+    posters: media_rename::PosterStore,
     /// The listing version each pane's icons were last asked for.
     icons_for: [u64; MAX_PANES],
     /// State of the independent "Registrar conta" window when open.
@@ -352,6 +362,21 @@ struct State {
     main_dirty: bool,
     account_synced_font: Option<settings::TextFont>,
     account_synced_render: Option<settings::TextRender>,
+    /// State of the independent "Renomear em massa" window when open.
+    batch_rename: Option<Box<batch_rename::BatchRename>>,
+    batch_rename_win: Option<rune::AppHandle<State>>,
+    batch_rename_dirty: bool,
+    batch_rename_shown: bool,
+    batch_rename_closes: u32,
+    batch_rename_synced_font: Option<settings::TextFont>,
+    batch_rename_synced_render: Option<settings::TextRender>,
+    rule_editor_win: Option<rune::AppHandle<State>>,
+    rule_editor_dirty: bool,
+    rule_editor_shown: bool,
+    rule_editor_place_on_open: bool,
+    rule_editor_closes: u32,
+    rule_editor_synced_font: Option<settings::TextFont>,
+    rule_editor_synced_render: Option<settings::TextRender>,
     is_placeholder: bool,
     /// Built-in updater state (latest release, download progress, staged file).
     updater: updater::UpdateState,
@@ -389,10 +414,40 @@ thread_local! {
     static MICA_ASKED: std::cell::Cell<Option<settings::Material>> = const { std::cell::Cell::new(None) };
 }
 static ACCOUNT_WAKER: std::sync::LazyLock<std::sync::Mutex<Option<Waker>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+static BATCH_RENAME_WAKER: std::sync::LazyLock<std::sync::Mutex<Option<Waker>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+static RULE_EDITOR_WAKER: std::sync::LazyLock<std::sync::Mutex<Option<Waker>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 thread_local! {
     static SHARED_STATE: std::cell::RefCell<Option<State>> = const { std::cell::RefCell::new(None) };
     static PENDING_MAIN_FOCUS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static RULE_EDITOR_NATIVE: std::cell::RefCell<Option<rune::WindowHandle>> = const { std::cell::RefCell::new(None) };
+    static RULE_EDITOR_LAST_SIZE: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
+}
+
+fn rule_editor_window_created(window: &rune::WindowHandle) {
+    RULE_EDITOR_NATIVE.with(|cell| *cell.borrow_mut() = Some(window.clone()));
+}
+
+fn rule_editor_geometry_changed() {
+    let Some(p) = RULE_EDITOR_NATIVE.with(|cell| cell.borrow().as_ref().and_then(rune::WindowHandle::placement)) else {
+        return;
+    };
+    let size = if p.maximized || p.minimized {
+        p.restore.map(|(_, s)| s)
+    } else if p.full_screen {
+        None
+    } else {
+        Some(p.content_size)
+    };
+    if let Some((pw, ph)) = size
+        && pw > 0
+        && ph > 0
+        && p.scale > 0.0
+    {
+        let lw = (pw as f32 / p.scale as f32).round().max(700.0) as u32;
+        let lh = (ph as f32 / p.scale as f32).round().max(440.0) as u32;
+        RULE_EDITOR_LAST_SIZE.with(|c| c.set(Some((lw, lh))));
+    }
 }
 
 impl State {
@@ -511,6 +566,7 @@ impl State {
             queue_looks: Vec::new(),
             queue_totals: Default::default(),
             icons: Default::default(),
+            posters: Default::default(),
             icons_for: [u64::MAX; MAX_PANES],
             account_form: None,
             account_win: None,
@@ -523,6 +579,20 @@ impl State {
             main_dirty: false,
             account_synced_font: None,
             account_synced_render: None,
+            batch_rename: None,
+            batch_rename_win: None,
+            batch_rename_dirty: false,
+            batch_rename_shown: false,
+            batch_rename_closes: 0,
+            batch_rename_synced_font: None,
+            batch_rename_synced_render: None,
+            rule_editor_win: None,
+            rule_editor_dirty: false,
+            rule_editor_shown: false,
+            rule_editor_place_on_open: false,
+            rule_editor_closes: 0,
+            rule_editor_synced_font: None,
+            rule_editor_synced_render: None,
             is_placeholder: true,
             updater: updater::UpdateState::idle(),
         }
@@ -584,6 +654,113 @@ impl State {
         self.account_dirty = true;
         if let Some(w) = &self.account_win {
             w.wake();
+        }
+    }
+
+    /// Shows `br` in the independent "Renomear em massa" window (movable and resizable).
+    pub fn open_batch_rename(&mut self, br: batch_rename::BatchRename) {
+        self.batch_rename = Some(Box::new(br));
+        self.batch_rename_dirty = true;
+        if let Some(w) = &self.batch_rename_win {
+            self.batch_rename_shown = true;
+            w.open();
+            w.wake();
+        }
+    }
+
+    /// Drops the batch rename state and closes its window (plus any open rule editor window).
+    pub fn close_batch_rename(&mut self) {
+        self.close_rule_editor();
+        self.batch_rename = None;
+        self.batch_rename_dirty = true;
+        if let Some(w) = &self.batch_rename_win
+            && std::mem::take(&mut self.batch_rename_shown)
+        {
+            self.batch_rename_closes += 1;
+            w.close();
+        }
+    }
+
+    pub fn notify_batch_rename(&mut self) {
+        self.batch_rename_dirty = true;
+        if let Some(w) = &self.batch_rename_win {
+            w.wake();
+        }
+    }
+
+    fn batch_rename_window_closed(&mut self) {
+        if self.batch_rename_closes > 0 {
+            self.batch_rename_closes -= 1;
+            return;
+        }
+        self.close_rule_editor();
+        self.batch_rename_shown = false;
+        self.batch_rename = None;
+    }
+
+    /// Opens the independent, resizable "Adicionar Regra" / "Editar Regra" window.
+    pub fn open_rule_editor(&mut self, edit_index: Option<usize>) {
+        self.open_rule_editor_at(edit_index, None);
+    }
+
+    /// Opens the independent Rule Editor window, optionally inserting a new rule at `insert_at`.
+    pub fn open_rule_editor_at(&mut self, edit_index: Option<usize>, insert_at: Option<usize>) {
+        if let Some(br) = &mut self.batch_rename {
+            match edit_index {
+                Some(i) => br.rules.open_edit(i),
+                None => br.rules.open_add_at(insert_at),
+            }
+        } else {
+            return;
+        }
+        self.rule_editor_dirty = true;
+        if let Some(w) = &self.rule_editor_win {
+            let was_shown = self.rule_editor_shown;
+            self.rule_editor_shown = true;
+            if !was_shown {
+                self.rule_editor_place_on_open = true;
+            }
+            w.open();
+            w.wake();
+        }
+    }
+
+    fn save_rule_editor_size(&mut self) {
+        rule_editor_geometry_changed();
+        if let Some(sz) = RULE_EDITOR_LAST_SIZE.with(std::cell::Cell::get)
+            && self.settings.rule_editor_size != Some(sz)
+        {
+            self.settings.rule_editor_size = Some(sz);
+            self.settings.save();
+        }
+    }
+
+    /// Closes the independent Rule Editor window without discarding `batch_rename`.
+    pub fn close_rule_editor(&mut self) {
+        self.save_rule_editor_size();
+        if let Some(br) = &mut self.batch_rename {
+            br.rules.editor.meta_target = None;
+            br.rules.tag_cat_open = false;
+        }
+        self.rule_editor_dirty = true;
+        if let Some(w) = &self.rule_editor_win
+            && std::mem::take(&mut self.rule_editor_shown)
+        {
+            self.rule_editor_closes += 1;
+            w.close();
+        }
+    }
+
+    fn rule_editor_window_closed(&mut self) {
+        self.save_rule_editor_size();
+        if self.rule_editor_closes > 0 {
+            self.rule_editor_closes -= 1;
+            return;
+        }
+        self.rule_editor_shown = false;
+        if let Some(br) = &mut self.batch_rename {
+            br.rules.editor.meta_target = None;
+            br.rules.tag_cat_open = false;
         }
     }
 }
@@ -724,6 +901,7 @@ fn init() -> State {
         queue_looks: Vec::new(),
         queue_totals: Default::default(),
         icons: Default::default(),
+        posters: Default::default(),
         icons_for: [u64::MAX; MAX_PANES],
         account_form: None,
         account_win: None,
@@ -736,6 +914,20 @@ fn init() -> State {
         main_dirty: false,
         account_synced_font: None,
         account_synced_render: None,
+        batch_rename: None,
+        batch_rename_win: None,
+        batch_rename_dirty: false,
+        batch_rename_shown: false,
+        batch_rename_closes: 0,
+        batch_rename_synced_font: None,
+        batch_rename_synced_render: None,
+        rule_editor_win: None,
+        rule_editor_dirty: false,
+        rule_editor_shown: false,
+        rule_editor_place_on_open: false,
+        rule_editor_closes: 0,
+        rule_editor_synced_font: None,
+        rule_editor_synced_render: None,
         is_placeholder: false,
         updater: updater::UpdateState::new(),
     };
@@ -763,7 +955,14 @@ fn setup(s: &mut State, waker: Waker) {
         if let Some(aw) = ACCOUNT_WAKER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             aw();
         }
+        if let Some(bw) = BATCH_RENAME_WAKER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            bw();
+        }
+        if let Some(rw) = RULE_EDITOR_WAKER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            rw();
+        }
     });
+    s.posters.start(rune::ImageCache::new(combined.clone()));
     s.waker = Some(combined);
     // Disks mounted or removed while the app runs show in Este Computador at once.
     if !rune::is_headless() {
@@ -845,7 +1044,190 @@ fn account_window_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
     false
 }
 
-/// Runs `f`, turning a panic into an error that names it (and logging it), so background work
+fn init_batch_rename_window() -> State {
+    State::placeholder()
+}
+
+fn setup_batch_rename_window(_: &mut State, waker: Waker) {
+    rules_meta::set_waker(waker.clone());
+    *BATCH_RENAME_WAKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker);
+}
+
+fn poll_batch_rename_window(s: &mut State, _now: f64, tx: &mut Tx) -> bool {
+    if s.is_placeholder {
+        return false;
+    }
+    if s.batch_rename_synced_font != Some(s.settings.font) {
+        s.batch_rename_synced_font = Some(s.settings.font);
+        let (sans, mono) = s.settings.font.families();
+        tx.set_font_families(sans, mono);
+    }
+    if s.batch_rename_synced_render != Some(s.settings.text_render) {
+        s.batch_rename_synced_render = Some(s.settings.text_render);
+        tx.set_font_smoothing(s.settings.text_render.smoothing());
+    }
+    // A meta tag computed in the background changes the preview.
+    let tags = rules_meta::take_changed();
+    std::mem::take(&mut s.batch_rename_dirty) || tags
+}
+
+fn batch_rename_window_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
+    if s.is_placeholder {
+        return false;
+    }
+    if ev.key == Key::Escape && ev.mods == Mods::default() {
+        if let Some(br) = &mut s.batch_rename {
+            if br.simple_analyze_open {
+                br.simple_analyze_open = false;
+                return true;
+            }
+            if br.media.open_dropdown.is_some() {
+                br.media.open_dropdown = None;
+                return true;
+            }
+            if br.media.popup.is_some() {
+                br.media.close_popup();
+                return true;
+            }
+            if br.rules.stack_menu.is_some() {
+                br.rules.stack_menu = None;
+                return true;
+            }
+            if br.rules.popup.is_some() {
+                br.rules.popup = None;
+                return true;
+            }
+        }
+        s.close_batch_rename();
+        return true;
+    }
+    if let Some(br) = &mut s.batch_rename
+        && br.mode == batch_rename::Mode::Rules
+        && br.rules.popup.is_none()
+        && br.rules.stack_menu.is_none()
+    {
+        let plain = ev.mods == Mods::default();
+        let shift_only = ev.mods.shift && !ev.mods.ctrl && !ev.mods.cmd && !ev.mods.alt;
+        let cmd_only = (ev.mods.ctrl || ev.mods.cmd) && !ev.mods.shift && !ev.mods.alt;
+        let sel = br.rules.selected.filter(|&i| i < br.rules.rules.len());
+        match &ev.key {
+            Key::Insert if plain => {
+                s.open_rule_editor(None);
+                return true;
+            }
+            Key::Insert if shift_only => {
+                br.rules.duplicate_selected();
+                return true;
+            }
+            Key::Enter if plain => {
+                if let Some(i) = sel {
+                    s.open_rule_editor(Some(i));
+                    return true;
+                }
+            }
+            Key::Enter if shift_only => {
+                if let Some(i) = sel {
+                    br.rules.open_comment(i);
+                    return true;
+                }
+            }
+            Key::Delete if plain => {
+                br.rules.remove_selected();
+                return true;
+            }
+            Key::Delete if shift_only => {
+                br.rules.clear_all();
+                return true;
+            }
+            Key::Up if cmd_only => {
+                br.rules.move_selected(-1);
+                return true;
+            }
+            Key::Down if cmd_only => {
+                br.rules.move_selected(1);
+                return true;
+            }
+            _ if ev.is_command('a') => {
+                br.rules.select_all();
+                return true;
+            }
+            Key::Text(ch) if shift_only && ch.eq_ignore_ascii_case("m") => {
+                br.rules.set_all_enabled(true);
+                return true;
+            }
+            Key::Text(ch) if shift_only && ch.eq_ignore_ascii_case("u") => {
+                br.rules.set_all_enabled(false);
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn init_rule_editor_window() -> State {
+    State::placeholder()
+}
+
+fn setup_rule_editor_window(_: &mut State, waker: Waker) {
+    *RULE_EDITOR_WAKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker);
+}
+
+fn poll_rule_editor_window(s: &mut State, _now: f64, tx: &mut Tx) -> bool {
+    if s.is_placeholder {
+        return false;
+    }
+    if std::mem::take(&mut s.rule_editor_place_on_open) {
+        if let Some((rw, rh)) = s.settings.rule_editor_size {
+            tx.resize_window_instant(((rw as f32).max(700.0), (rh as f32).max(440.0)));
+        }
+        tx.center_window();
+    }
+    if s.rule_editor_synced_font != Some(s.settings.font) {
+        s.rule_editor_synced_font = Some(s.settings.font);
+        let (sans, mono) = s.settings.font.families();
+        tx.set_font_families(sans, mono);
+    }
+    if s.rule_editor_synced_render != Some(s.settings.text_render) {
+        s.rule_editor_synced_render = Some(s.settings.text_render);
+        tx.set_font_smoothing(s.settings.text_render.smoothing());
+    }
+    std::mem::take(&mut s.rule_editor_dirty)
+}
+
+fn rule_editor_window_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
+    if s.is_placeholder {
+        return false;
+    }
+    if ev.key == Key::Escape && ev.mods == Mods::default() {
+        if let Some(br) = &mut s.batch_rename {
+            if br.rules.tag_cat_open {
+                br.rules.tag_cat_open = false;
+                return true;
+            }
+            if br.rules.editor.show_scripts_menu
+                || br.rules.editor.show_date_find_dd
+                || br.rules.editor.show_date_rep_dd
+                || br.rules.editor.show_num_sys_dd
+                || br.rules.editor.show_time_unit_dd
+            {
+                br.rules.editor.show_scripts_menu = false;
+                br.rules.editor.show_date_find_dd = false;
+                br.rules.editor.show_date_rep_dd = false;
+                br.rules.editor.show_num_sys_dd = false;
+                br.rules.editor.show_time_unit_dd = false;
+                return true;
+            }
+            if br.rules.editor.meta_target.is_some() {
+                br.rules.editor.meta_target = None;
+                return true;
+            }
+        }
+        s.close_rule_editor();
+        return true;
+    }
+    false
+}
 /// that hits a bug still ends with a message instead of never answering. `doing` says what it
 /// was ("listar", "conectar").
 fn catch_panic<T>(doing: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
@@ -1205,6 +1587,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             Msg::OneDrive(answer) => onedrive::arrived(s, answer, tx, now),
             Msg::Telegram(answer) => telegram::arrived(s, answer),
             Msg::Caches(answer) => caches::arrived(s, answer),
+            Msg::Media(answer) => media_rename::arrived(s, answer),
             Msg::Changes { email, result } => watch::arrived(s, email, result, now),
             Msg::Quota { email, result } => {
                 if s.accounts.iter().any(|a| a.email == email) {
@@ -3667,12 +4050,60 @@ fn main() {
         main_app = main_app.resize_sync(rune::ResizeSync::On);
     }
 
+    let batch_rename_app = rune::App::new(AppSpec::<State> {
+        min_size: Some((600.0, 440.0)),
+        families: initial.font.families(),
+        setup: Some(setup_batch_rename_window),
+        poll: Some(poll_batch_rename_window),
+        on_key: Some(batch_rename_window_key),
+        ..AppSpec::new(batch_rename::window_title(), (860.0, 620.0), init_batch_rename_window, batch_rename::batch_rename_window_view)
+    })
+    .windowless()
+    .titlebar(rune::Titlebar::new(36.0))
+    .font_smoothing(initial.text_render.smoothing())
+    .turn_scope(enter_turn, leave_turn)
+    .on_close(|s, _| {
+        if !s.is_placeholder {
+            s.batch_rename_window_closed();
+        }
+    });
+
     let (account_handle, _) = main_app.window(rune::windows::WindowSpec::from_app("add-account", account_app));
+    let (batch_rename_handle, _) = main_app.window(rune::windows::WindowSpec::from_app("batch-rename", batch_rename_app));
+    let ed_init_size = initial
+        .rule_editor_size
+        .map(|(w, h)| ((w as f32).max(700.0), (h as f32).max(440.0)))
+        .unwrap_or((840.0, 520.0));
+    let rule_editor_app = rune::App::new(AppSpec::<State> {
+        min_size: Some((700.0, 440.0)),
+        families: initial.font.families(),
+        setup: Some(setup_rule_editor_window),
+        poll: Some(poll_rule_editor_window),
+        on_key: Some(rule_editor_window_key),
+        ..AppSpec::new(rules_ui::editor_window_title(None), ed_init_size, init_rule_editor_window, rules_ui::rule_editor_window_view)
+    })
+    .windowless()
+    .titlebar(rune::Titlebar::new(36.0))
+    .font_smoothing(initial.text_render.smoothing())
+    .turn_scope(enter_turn, leave_turn)
+    .on_window(rule_editor_window_created)
+    .on_window_geometry(|_, _, _| {
+        rule_editor_geometry_changed();
+        false
+    })
+    .on_close(|s, _| {
+        if !s.is_placeholder {
+            s.rule_editor_window_closed();
+        }
+    });
+    let (rule_editor_handle, _) = main_app.window(rune::windows::WindowSpec::from_app("rule-editor", rule_editor_app));
     let main_handle = main_app.handle();
     main_app
         .init(move || {
             let mut s = init();
             s.account_win = Some(account_handle);
+            s.batch_rename_win = Some(batch_rename_handle);
+            s.rule_editor_win = Some(rule_editor_handle);
             s.main_win = Some(main_handle.clone());
             s.tray = tray::start(main_handle);
             s
