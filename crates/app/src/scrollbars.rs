@@ -174,12 +174,18 @@ impl Bars {
     }
 
     /// An arrow pressed, held or let go: it steps `dir` (-1 or 1 on an axis) at the press, then
-    /// again while held.
+    /// again while held, pausing while the pointer is off the arrow, as Windows' arrows do.
     fn arrow(&self, target: &str, dir: [f32; 2], d: &Drag, tx: &mut Tx) {
         tx.live_only();
         match d.phase {
             Phase::Down => tx.drag_repeat_after(REPEAT_DELAY),
-            Phase::Move if tx.drag_repeat() => tx.drag_repeat_after(REPEAT_EVERY),
+            Phase::Move if tx.drag_repeat() => {
+                tx.drag_repeat_after(REPEAT_EVERY);
+                let on = |v: f32| (0.0..=GUTTER).contains(&v);
+                if !(on(d.x) && on(d.y)) {
+                    return;
+                }
+            }
             _ => return,
         }
         let at = self.pos.get();
@@ -267,6 +273,22 @@ pub(crate) fn v_bar(k: &Kit, key: &str, viewport: El) -> El {
     build(k, key, viewport, 0.0, None)
 }
 
+/// How much taller the viewport keyed `key` will be after the view now running than it was laid
+/// out last: `-GUTTER` while its bottom gutter is coming, `GUTTER` while it's going, else 0. Call
+/// it before [`xy_bars`] builds the bars, to size content that fills the viewport's height from
+/// its last layout.
+pub(crate) fn height_change(key: &str) -> f32 {
+    let bars = kept(key);
+    if !bars.sideways.get() {
+        return 0.0;
+    }
+    match (bars.built_x.get(), h_shows(bars.pos.get())) {
+        (false, true) => -GUTTER,
+        (true, false) => GUTTER,
+        _ => 0.0,
+    }
+}
+
 /// A `scroll_xy()` viewport keyed `key` with a vertical bar on the right, starting `top` points
 /// down beside a header that tall, and a horizontal bar along the bottom while the content is
 /// wider than the viewport. `waker` runs the view again when that changes.
@@ -280,6 +302,11 @@ fn build(k: &Kit, key: &str, viewport: El, top: f32, sideways: Option<Option<Wak
     bars.sideways.set(sideways.is_some());
     let shows_x = sideways.is_some() && h_shows(bars.pos.get());
     bars.built_x.set(shows_x);
+    // A track taken away hears no hover leave or release: start the next one at rest.
+    if !shows_x {
+        bars.hover.set(false);
+        bars.drag.set(None);
+    }
     if let Some(waker) = sideways {
         *bars.waker.borrow_mut() = waker;
     }
@@ -376,5 +403,18 @@ mod tests {
         bars.built_x.set(true);
         bars.follow(at([0.0, 0.0], [10.0, 0.0], [300.0, 200.0]));
         assert!(!take_stale());
+    }
+
+    #[test]
+    fn the_height_change_follows_the_bottom_gutter_coming_and_going() {
+        let bars = kept("test-height");
+        bars.sideways.set(true);
+        bars.built_x.set(false);
+        bars.pos.set(at([0.0, 0.0], [10.0, 0.0], [300.0, 200.0]));
+        assert_eq!(height_change("test-height"), -GUTTER);
+        bars.built_x.set(true);
+        assert_eq!(height_change("test-height"), 0.0);
+        bars.pos.set(at([0.0, 0.0], [0.0, 0.0], [300.0, 200.0]));
+        assert_eq!(height_change("test-height"), GUTTER);
     }
 }

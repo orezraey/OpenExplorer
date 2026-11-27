@@ -6790,7 +6790,9 @@ fn list(s: &State, k: &Kit, p: usize) -> El {
             if n <= LIST_HORIZ_MAX {
                 // Windows Explorer List view: flows top-to-bottom per column and left-to-right
                 // across columns, scrolling horizontally when there are more columns than fit.
+                // The height left once the bottom scroll bar comes or goes in this view.
                 let vp_h = s.views[p].rect[3];
+                let vp_h = if vp_h > 0.0 { (vp_h + crate::scrollbars::height_change(&list_key(p))).max(1.0) } else { vp_h };
                 let rows_per_col = if vp_h > 0.0 { list_rows_for(vp_h) } else { s.list_rows[p].max(1) };
                 let num_cols = n.div_ceil(rows_per_col);
                 flow.set(crate::lasso::Flow {
