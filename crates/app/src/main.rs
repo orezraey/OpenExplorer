@@ -26,6 +26,7 @@ mod icons;
 mod keyboard;
 mod lasso;
 mod layout;
+mod media_rename;
 mod mega;
 mod model;
 mod network;
@@ -116,6 +117,8 @@ enum Msg {
     Telegram(telegram::Answer),
     /// What the caches take, measured or cleared for Opções › Cache.
     Caches(caches::Answer),
+    /// Background TMDB / TVDB search, episode list or poster cover for batch rename.
+    Media(media_rename::Answer),
     /// Installing the search service ended: search again in the panes `reload` shows.
     Installed { reload: Vec<Location>, result: Result<String, String> },
     /// A drag of Drive items `ids` out of pane `from` ended.
@@ -270,6 +273,8 @@ struct State {
     queue_totals: transfers::Totals,
     /// Windows' own icons, as Explorer shows them.
     icons: sysicons::SysIcons,
+    /// Remote TMDB / TVDB poster covers decoded asynchronously for batch rename.
+    posters: media_rename::PosterStore,
     /// The listing version each pane's icons were last asked for.
     icons_for: [u64; 2],
     /// State of the independent "Registrar conta" window when open.
@@ -428,6 +433,7 @@ impl State {
             queue_looks: Vec::new(),
             queue_totals: Default::default(),
             icons: Default::default(),
+            posters: Default::default(),
             icons_for: [u64::MAX; 2],
             account_form: None,
             account_win: None,
@@ -529,6 +535,13 @@ impl State {
         {
             self.batch_rename_closes += 1;
             w.close();
+        }
+    }
+
+    pub fn notify_batch_rename(&mut self) {
+        self.batch_rename_dirty = true;
+        if let Some(w) = &self.batch_rename_win {
+            w.wake();
         }
     }
 
@@ -650,6 +663,7 @@ fn init() -> State {
         queue_looks: Vec::new(),
         queue_totals: Default::default(),
         icons: Default::default(),
+        posters: Default::default(),
         icons_for: [u64::MAX; 2],
         account_form: None,
         account_win: None,
@@ -684,6 +698,7 @@ fn setup(s: &mut State, waker: Waker) {
             bw();
         }
     });
+    s.posters.start(rune::ImageCache::new(combined.clone()));
     s.waker = Some(combined);
     // Each tree opens down to the folder its pane starts in.
     for p in 0..2 {
@@ -778,6 +793,16 @@ fn batch_rename_window_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
         return false;
     }
     if ev.key == Key::Escape && ev.mods == Mods::default() {
+        if let Some(br) = &mut s.batch_rename {
+            if br.media.open_dropdown.is_some() {
+                br.media.open_dropdown = None;
+                return true;
+            }
+            if br.media.popup.is_some() {
+                br.media.popup = None;
+                return true;
+            }
+        }
         s.close_batch_rename();
         return true;
     }
@@ -1070,6 +1095,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             Msg::OneDrive(answer) => onedrive::arrived(s, answer, tx, now),
             Msg::Telegram(answer) => telegram::arrived(s, answer),
             Msg::Caches(answer) => caches::arrived(s, answer),
+            Msg::Media(answer) => media_rename::arrived(s, answer),
             Msg::Changes { email, result } => watch::arrived(s, email, result, now),
             Msg::Quota { email, result } => {
                 if s.accounts.iter().any(|a| a.email == email) {
@@ -2842,12 +2868,12 @@ fn main() {
     }
 
     let batch_rename_app = rune::App::new(AppSpec::<State> {
-        min_size: Some((540.0, 380.0)),
+        min_size: Some((600.0, 440.0)),
         families: initial.font.families(),
         setup: Some(setup_batch_rename_window),
         poll: Some(poll_batch_rename_window),
         on_key: Some(batch_rename_window_key),
-        ..AppSpec::new(batch_rename::window_title(), (740.0, 520.0), init_batch_rename_window, batch_rename::batch_rename_window_view)
+        ..AppSpec::new(batch_rename::window_title(), (860.0, 620.0), init_batch_rename_window, batch_rename::batch_rename_window_view)
     })
     .windowless()
     .titlebar(rune::Titlebar::new(36.0))

@@ -3306,6 +3306,7 @@ dependencies = [
  "serde",
  "serde_json",
  "trash",
+ "ureq",
  "windows",
  "windows-core",
  "windows-sys 0.61.2",
