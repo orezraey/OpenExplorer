@@ -248,7 +248,11 @@ fn disk_node(path: &Path, kind: DriveKind) -> Node {
         "" => shown.as_str(),
         l => l,
     };
-    let label = kind.label(letter);
+    // Off Windows a disk is a folder ("/media/ana/PEN"): it shows by its name, "/" by its kind.
+    let label = match path.file_name() {
+        Some(name) if !cfg!(windows) => name.to_string_lossy().into_owned(),
+        _ => kind.label(letter),
+    };
     Node { id: NodeId::Local(path.to_path_buf()), label, icon: Some(IconKey::Path(path.to_path_buf())), fallback: &icons::DISK, to: Some(Location::Local(path.to_path_buf())), opens: true }
 }
 
@@ -571,6 +575,33 @@ pub fn server_folders_changed(s: &mut State, id: &str, stale: &dyn Fn(&[String])
             load(s, &remote_node(&server, segs));
         }
     }
+}
+
+/// Reads the disks again and takes them in if they changed; true then.
+pub fn read_drives(s: &mut State) -> bool {
+    let drives = crate::mounts::list();
+    if drives == s.local_drives {
+        return false;
+    }
+    drives_changed(s, drives);
+    true
+}
+
+/// Takes in the disks as the system now lists them: one mounted joins Este Computador, one
+/// removed leaves it. The folders read under a disk that came, went or changed kind are
+/// dropped and closed, so one mounted again under the same letter is read anew when opened,
+/// its icon too.
+pub fn drives_changed(s: &mut State, drives: Vec<(PathBuf, DriveKind)>) {
+    let moved: Vec<PathBuf> = s.local_drives.iter().filter(|d| !drives.contains(d)).chain(drives.iter().filter(|d| !s.local_drives.contains(d))).map(|(d, _)| d.clone()).collect();
+    let under = |id: &NodeId| matches!(id, NodeId::Local(p) if moved.iter().any(|d| p.starts_with(d)));
+    s.tree.kids.retain(|id, _| !under(id));
+    for open in &mut s.tree.open {
+        open.retain(|id| !under(id));
+    }
+    s.local_drives = drives;
+    let fixed = fixed_icons(&s.places, &s.local_drives).into_iter().chain(crate::sysicons::home_key());
+    s.icons.refix(fixed, moved.into_iter().map(IconKey::Path));
+    s.tree.version += 1;
 }
 
 /// Re-reads open local and server nodes in the tree after `show_hidden` changes.
@@ -1255,6 +1286,39 @@ mod tests {
         learn(&mut s, 0);
         let Some(Kids::Ready(kids)) = s.tree.kids.get(&dados) else { panic!("not read") };
         assert_eq!(kids.iter().map(|k| k.label.as_str()).collect::<Vec<_>>(), ["2024", "2025"]);
+    }
+
+    /// A drive mounted while the app runs joins Este Computador; one removed leaves it, and the
+    /// folders read under it go, so it reads anew when mounted again.
+    #[test]
+    fn a_drive_mounted_or_removed_shows_at_once() {
+        let (mut s, root) = scene("mounts");
+        let computer = |s: &State| ids(&kids_or_empty(s, &computer_node()));
+        assert_eq!(computer(&s), [NodeId::Local(root.join("Disco"))]);
+        let x = root.join("Montado");
+        drives_changed(&mut s, vec![(root.join("Disco"), DriveKind::Fixed), (x.clone(), DriveKind::Network)]);
+        assert_eq!(computer(&s), [NodeId::Local(root.join("Disco")), NodeId::Local(x.clone())]);
+        s.tree.kids.insert(NodeId::Local(x.clone()), Kids::Ready(Vec::new()));
+        s.tree.kids.insert(NodeId::Local(x.join("Fotos")), Kids::Ready(Vec::new()));
+        s.tree.kids.insert(NodeId::Local(root.join("Disco/Dados")), Kids::Ready(Vec::new()));
+        s.tree.open[0].insert(NodeId::Local(x.clone()));
+        s.tree.open[0].insert(NodeId::Local(root.join("Disco")));
+        drives_changed(&mut s, vec![(root.join("Disco"), DriveKind::Fixed)]);
+        assert_eq!(computer(&s), [NodeId::Local(root.join("Disco"))]);
+        assert!(!s.tree.kids.contains_key(&NodeId::Local(x.join("Fotos"))));
+        assert!(s.tree.kids.contains_key(&NodeId::Local(root.join("Disco/Dados"))));
+        // Mounted again, it shows closed, so opening it reads its folders.
+        drives_changed(&mut s, vec![(root.join("Disco"), DriveKind::Fixed), (x.clone(), DriveKind::Network)]);
+        assert!(!s.tree.open[0].contains(&NodeId::Local(x.clone())));
+        assert!(!s.tree.kids.contains_key(&NodeId::Local(x.clone())));
+        assert!(s.tree.open[0].contains(&NodeId::Local(root.join("Disco"))));
+    }
+
+    fn kids_or_empty(s: &State, node: &Node) -> Vec<Node> {
+        match kids_of(s, node).into_owned() {
+            Kids::Ready(nodes) => nodes,
+            _ => Vec::new(),
+        }
     }
 
     /// Rows have keys of their own though a folder shows twice and two nodes load at once, and

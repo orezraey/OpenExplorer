@@ -972,28 +972,6 @@ pub fn drive_kind(dir: &Path) -> DriveKind {
     }
 }
 
-/// The disks Windows shows in "Este computador", by letter, with their kind.
-pub fn local_drives() -> Vec<(PathBuf, DriveKind)> {
-    #[cfg(windows)]
-    {
-        // A bit per letter that has a drive, without touching the drives themselves (an empty
-        // DVD drive would make `exists` wait).
-        let mask = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
-        (0..26u8)
-            .filter(|i| mask & (1 << i) != 0)
-            .map(|i| PathBuf::from(format!("{}:\\", (b'A' + i) as char)))
-            .map(|d| {
-                let kind = drive_kind(&d);
-                (d, kind)
-            })
-            .collect()
-    }
-    #[cfg(not(windows))]
-    {
-        vec![(PathBuf::from("/"), DriveKind::Fixed)]
-    }
-}
-
 /// Free bytes on the disk holding `dir`. Only asked of fixed disks: on a network share the
 /// call can block the window for as long as the server takes to answer.
 pub fn free_space(dir: &Path) -> Option<u64> {
@@ -1022,6 +1000,25 @@ mod tests {
 
     fn file(name: &str) -> Entry {
         Entry { id: name.into(), name: name.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }
+    }
+
+    /// A letter mounted while the app runs (here with `subst`) is in the next reading.
+    /// Ignored: it mounts a drive on the computer it runs on.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn a_drive_mounted_later_is_read() {
+        let before = crate::mounts::list();
+        let letter = (b'D'..=b'Z').rev().map(|c| c as char).find(|c| !before.iter().any(|(d, _)| d.to_string_lossy().starts_with(*c))).expect("no free letter");
+        let dir = std::env::temp_dir().join("openexplorer-subst-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = std::process::Command::new("subst").arg(format!("{letter}:")).arg(&dir).status().unwrap().success();
+        assert!(ok, "subst failed");
+        let root = PathBuf::from(format!("{letter}:\\"));
+        let after = crate::mounts::list();
+        let _ = std::process::Command::new("subst").arg(format!("{letter}:")).arg("/d").status();
+        assert!(after.iter().any(|(d, _)| *d == root), "{letter}: not in {after:?}");
+        assert!(!crate::mounts::list().iter().any(|(d, _)| *d == root));
     }
 
     /// Pages merged in one by one end in the order a full sort gives, for every column and

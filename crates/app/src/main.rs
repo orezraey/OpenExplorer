@@ -29,6 +29,7 @@ mod lasso;
 mod layout;
 mod mega;
 mod model;
+mod mounts;
 mod network;
 mod onedrive;
 mod ops;
@@ -88,6 +89,8 @@ enum Msg {
     ServerChecked { attempt: u64, result: Result<openexplorer_remote::Server, openexplorer_remote::Refusal>, secret: Option<String> },
     /// Computers for Rede; `done` once the network search ended.
     Servers { found: Vec<String>, done: bool },
+    /// The system says a disk was mounted or removed (see [`mounts::watch`]).
+    DrivesMoved,
     /// A file operation finished: reload the panes showing `reload`, and say how it went.
     Done { reload: Vec<Location>, result: Result<String, String> },
     /// Something Propriedades number `id` was waiting for.
@@ -251,7 +254,8 @@ struct State {
     undo: undo::History,
     /// Each pane's tree width, which its splitter changes.
     layout: layout::Layout,
-    /// The disks "Este Computador" lists, read at start.
+    /// The disks "Este Computador" lists, read at start and again when the system says one
+    /// was mounted or removed, or the window gets the focus back.
     local_drives: Vec<(PathBuf, model::DriveKind)>,
     /// The desktop and the user's folders, read at start.
     places: places::Places,
@@ -667,7 +671,7 @@ fn init() -> State {
         props_seq: 0,
         clip: None,
         undo: Default::default(),
-        local_drives: model::local_drives(),
+        local_drives: mounts::list(),
         places,
         tree,
         layout: layout::Layout::load(),
@@ -746,6 +750,17 @@ fn setup(s: &mut State, waker: Waker) {
         }
     });
     s.waker = Some(combined);
+    // Disks mounted or removed while the app runs show in Este Computador at once.
+    if !rune::is_headless() {
+        let (out, wake) = (s.outbox.clone(), s.waker.clone());
+        mounts::watch(move || {
+            if out.send(Msg::DrivesMoved).is_ok()
+                && let Some(wake) = &wake
+            {
+                wake();
+            }
+        });
+    }
     // Each tree opens down to the folder its pane starts in.
     for p in 0..MAX_PANES {
         tree::follow(s, p);
@@ -885,12 +900,21 @@ const TYPING_PAUSE: f64 = 0.12;
 /// How often a search is asked again while a disk is still being read, in seconds.
 const FOUND_AGAIN: f64 = 1.5;
 
+/// The main window got or lost the focus.
+fn main_focus(s: &mut State, focused: bool, tx: &mut Tx) {
+    accounts::window_focus(s, focused, tx);
+    // A mount the system doesn't tell about (`subst`) shows once the user is back.
+    if focused {
+        s.main_dirty |= tree::read_drives(s);
+    }
+}
+
 fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     if s.is_placeholder {
         return false;
     }
     if let Some(focused) = PENDING_MAIN_FOCUS.with(|c| c.take()) {
-        accounts::window_focus(s, focused, tx);
+        main_focus(s, focused, tx);
     }
     // Mica follows Opções while the window lives; turned on again, it comes back only in a window
     // made for it (only its creation makes a window transparent). Turned off, the view paints the
@@ -1046,6 +1070,7 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             Msg::Opened { email, drive } => keep_drive(s, email, drive),
             Msg::TreeKids { id, hidden, result } => tree::arrived(s, id, hidden, result),
             Msg::Servers { found, done } => tree::servers_found(s, found, done),
+            Msg::DrivesMoved => changed |= tree::read_drives(s),
             Msg::ServerChecked { attempt, result, secret } => servers::checked(s, attempt, result, secret),
             Msg::Listed { pane, request, part, result, at } => {
                 if s.live[pane].load(Ordering::Relaxed) != request {
@@ -3526,7 +3551,7 @@ fn main() {
                 if !focused {
                     s.popup = None;
                 }
-                accounts::window_focus(s, focused, tx);
+                main_focus(s, focused, tx);
             }
         })
         // The app ends without returning from `run`: what the cloud accounts changed since their
@@ -3672,6 +3697,18 @@ mod tests {
         assert!(s.account_form.is_some() && s.account_closes == 0);
         s.account_window_closed();
         assert!(s.account_form.is_none());
+    }
+
+    /// A disk the system didn't tell about shows once the window gets the focus back.
+    #[test]
+    fn the_disks_are_read_again_when_the_window_gets_the_focus() {
+        let mut s = init();
+        s.local_drives.clear();
+        main_focus(&mut s, false, &mut Tx::default());
+        assert!(s.local_drives.is_empty());
+        main_focus(&mut s, true, &mut Tx::default());
+        assert_eq!(s.local_drives, mounts::list());
+        assert!(s.main_dirty);
     }
 
     /// Closing the window asks only while a transfer runs, over the dialog open, which stays;

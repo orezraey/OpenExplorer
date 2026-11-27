@@ -366,7 +366,7 @@ mod tests {
     fn lists_this_computers_shares_and_distros() {
         println!("shares of localhost: {:?}", shares("localhost"));
         println!("distros: {:?}", distros());
-        println!("mapped: {:?}", mapped_servers(&crate::model::local_drives()));
+        println!("mapped: {:?}", mapped_servers(&crate::mounts::list()));
         let started = std::time::Instant::now();
         println!("computers: {:?} in {:?}", computers(), started.elapsed());
     }

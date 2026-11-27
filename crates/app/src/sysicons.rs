@@ -119,6 +119,18 @@ impl SysIcons {
         self.want(fixed.into_iter().chain([IconKey::Folder, IconKey::Computer]));
     }
 
+    /// The icons the tree always shows are now `fixed` (a drive mounted or removed): those of
+    /// `stale` are looked up again, as another drive may now hold their letter.
+    pub fn refix(&mut self, fixed: impl IntoIterator<Item = IconKey>, stale: impl IntoIterator<Item = IconKey>) {
+        for k in stale {
+            self.known.remove(&k);
+            self.asked_big.remove(&k);
+        }
+        self.fixed = fixed.into_iter().collect();
+        let fixed: Vec<IconKey> = self.fixed.iter().cloned().collect();
+        self.want(fixed);
+    }
+
     /// Asks for the icons of `keys` not seen yet.
     fn want(&mut self, keys: impl IntoIterator<Item = IconKey>) {
         for k in keys {
