@@ -13,10 +13,10 @@ use rune::{TextEdit, Tx};
 
 use crate::accounts;
 use crate::address::{self, Reached, Target};
-use crate::model::{Entry, Location, Space, shown, typed};
+use crate::conflict::{self, Choice, Prompt, Reply, Resolver};
+use crate::model::{DriveSearch, DriveSearchScope, Entry, Location, Space, shown, typed};
 use crate::transfers::{self, End, Op};
 use crate::undo::{self, Step};
-use crate::uploads::{Clash, Existing, Item, Put};
 use crate::{Msg, State, background, drive_task, open as open_entry, ops};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +30,8 @@ pub struct Clip {
     pub mode: ClipMode,
     pub from: Location,
     pub items: Vec<Entry>,
+    /// App clock (`State::now`) when picked up, driving the clipboard icon wiggle phase.
+    pub picked_at: f64,
 }
 
 /// Target of a connected account or server removal in the Central de Contas.
@@ -56,8 +58,8 @@ pub enum Dialog {
     Properties(Box<Props>),
     /// Opções: appearance, file behaviour, transfers and logs, applied as they change.
     Options(Box<crate::settings::OptionsView>),
-    /// Names an upload would repeat in its Drive folder: Substituir, Pular or Manter os dois.
-    Clash(Box<ClashAsk>),
+    /// File/folder destination conflict prompt during any transfer.
+    Conflict(Box<Prompt>),
     /// Compartilhar: who has access to a Drive item.
     Share(Box<crate::sharing::Share>),
     /// Copiar link on a private item: open it to anyone with the link first?
@@ -78,6 +80,8 @@ pub enum Dialog {
     SyncBrowse(Box<crate::sync::BrowseDialog>),
     /// Sincronizar - Salvar perfil de sincronização.
     SyncSave(Box<crate::sync::SaveDialog>),
+    /// Built-in update dialog (release info, download progress, restart to update).
+    Update,
 }
 
 /// The main window's close button, Alt+F4 or the taskbar's Fechar janela: with transfers still
@@ -88,6 +92,7 @@ pub fn close_requested(s: &mut State) -> rune::CloseResponse {
         return rune::CloseResponse::Close;
     }
     if std::mem::take(&mut s.quit_asked) {
+        s.quit_app = false;
         cancel_all_transfers(s);
         return rune::CloseResponse::Close;
     }
@@ -95,7 +100,33 @@ pub fn close_requested(s: &mut State) -> rune::CloseResponse {
         return rune::CloseResponse::Close;
     }
     s.quit_asked = true;
+    s.quit_app = false;
     rune::CloseResponse::Defer
+}
+
+/// macOS quitting the whole app (⌘Q, Encerrar in the Dock, logging out or shutting down): with
+/// transfers still running it asks first, as closing the window does, and the quit waits.
+/// Asked again while it asks, it quits as Fechar mesmo assim does, and a Reiniciar that asked
+/// is dropped: the app quits, it doesn't open again. A quit let through runs the window's
+/// `on_close` too; keeping the window's place here as well costs nothing.
+pub fn quit_requested(s: &mut State, _: &mut Tx) -> rune::QuitResponse {
+    if s.is_placeholder {
+        return rune::QuitResponse::Quit;
+    }
+    if std::mem::take(&mut s.quit_asked) {
+        s.quit_app = false;
+        crate::RESTART.store(false, Ordering::Relaxed);
+        cancel_all_transfers(s);
+        crate::window_place::remember(s);
+        return rune::QuitResponse::Quit;
+    }
+    if !transfers_running(s) {
+        crate::window_place::remember(s);
+        return rune::QuitResponse::Quit;
+    }
+    s.quit_asked = true;
+    s.quit_app = true;
+    rune::QuitResponse::Defer
 }
 
 /// Whether any row of the queue is still waiting or running.
@@ -113,6 +144,8 @@ pub fn quit_question_done(s: &mut State) -> bool {
     // A Reiniciar put off by the transfers goes with the question: else a later plain close
     // would open the app again.
     crate::RESTART.store(false, Ordering::Relaxed);
+    update_stays(s);
+    s.quit_app = false;
     true
 }
 
@@ -120,6 +153,59 @@ pub fn quit_question_done(s: &mut State) -> bool {
 pub fn keep_running(s: &mut State) {
     s.quit_asked = false;
     crate::RESTART.store(false, Ordering::Relaxed);
+    s.quit_app = false;
+    update_stays(s);
+}
+
+/// The app stays open after Reiniciar para atualizar asked to close: the update isn't handed
+/// off, and is ready to install again.
+fn update_stays(s: &mut State) {
+    if let Some(staged) = crate::updater::cancel_handoff() {
+        s.updater.download = crate::updater::DownloadState::Ready(staged);
+    }
+}
+
+/// Opens the built-in update modal.
+pub fn open_update_dialog(s: &mut State) {
+    s.dialog = Some(Dialog::Update);
+}
+
+/// Checks GitHub Releases for a newer version on a background thread.
+pub fn check_updates(s: &mut State, manual: bool) {
+    if s.updater.checking {
+        return;
+    }
+    s.updater.checking = true;
+    s.updater.check_error = None;
+    let kind = s.updater.support.as_ref().ok().cloned();
+    background(s, move |emit| {
+        let result = crate::updater::check_latest(kind.as_ref());
+        emit(Msg::Update(crate::updater::Answer::Checked { manual, result }));
+    });
+}
+
+/// Downloads the discovered update in the background, reporting progress back to the UI.
+pub fn download_update(s: &mut State) {
+    let Some(release) = s.updater.release.clone() else { return };
+    let Ok(kind) = s.updater.support.clone() else { return };
+    if matches!(s.updater.download, crate::updater::DownloadState::Downloading { .. } | crate::updater::DownloadState::Installing) {
+        return;
+    }
+    s.updater.download = crate::updater::DownloadState::Downloading { received: 0, total: release.size };
+    background(s, move |emit| {
+        let result = crate::updater::download_release(&release, &kind, |received, total| {
+            emit(Msg::Update(crate::updater::Answer::Progress { received, total }));
+        });
+        emit(Msg::Update(crate::updater::Answer::Downloaded(result)));
+    });
+}
+
+/// Hands off a downloaded update on quit and closes the window (respecting running transfers).
+pub fn install_update(s: &mut State, tx: &mut Tx) {
+    let crate::updater::DownloadState::Ready(staged) = s.updater.download.clone() else { return };
+    crate::updater::schedule_handoff(staged);
+    s.updater.download = crate::updater::DownloadState::Installing;
+    tx.close_window();
 }
 
 /// Reiniciar (Opções): the app closes as Fechar would, asking first while transfers run, and
@@ -138,12 +224,18 @@ pub fn restarting() -> bool {
     crate::RESTART.load(Ordering::Relaxed)
 }
 
-/// Fechar mesmo assim: the transfers are told to stop, and the window closes (a close the app
-/// asks for doesn't ask again).
+/// Fechar mesmo assim: the transfers are told to stop, and the window closes, or the whole app
+/// quits when quitting it asked (a close or quit the app asks for doesn't ask again).
 pub fn quit_anyway(s: &mut State, tx: &mut Tx) {
     cancel_all_transfers(s);
     s.quit_asked = false;
-    tx.close_window();
+    if std::mem::take(&mut s.quit_app) {
+        // A quit runs no window's `on_close`, where the window keeps its place.
+        crate::window_place::remember(s);
+        tx.quit();
+    } else {
+        tx.close_window();
+    }
 }
 
 pub fn selected(s: &State, p: usize) -> Vec<Entry> {
@@ -189,13 +281,33 @@ fn account(loc: &Location) -> Option<&str> {
     }
 }
 
+/// The Google Drive account owning `item` at `loc`: its per-item origin (multi-account search)
+/// or the location's account.
+pub(crate) fn item_account<'a>(loc: &'a Location, e: &'a Entry) -> Option<&'a str> {
+    e.drive_origin.as_deref().map(|o| o.email.as_str()).or_else(|| account(loc))
+}
+
+/// Groups `items` by their Google Drive account email, preserving first-seen account order.
+pub(crate) fn group_by_account(loc: &Location, items: Vec<Entry>) -> Vec<(String, Vec<Entry>)> {
+    let mut groups: Vec<(String, Vec<Entry>)> = Vec::new();
+    for item in items {
+        let Some(email) = item_account(loc, &item).map(str::to_string) else { continue };
+        if let Some((_, list)) = groups.iter_mut().find(|(e, _)| *e == email) {
+            list.push(item);
+        } else {
+            groups.push((email, vec![item]));
+        }
+    }
+    groups
+}
+
 /// Whether `loc` is a folder items can be put in (Colar, Nova pasta) and taken out of
 /// (Recortar): not the shared drives list, Drive's views or Lixeira, nor the simulated drive,
 /// nor a computer on the network (`\\servidor`, whose items are its shared folders).
 pub fn editable(loc: &Location) -> bool {
     match loc {
         Location::Local(dir) => !crate::network::is_server(dir),
-        Location::Mock(_) | Location::Found(_) => false,
+        Location::Computer | Location::Mock(_) | Location::Found(_) | Location::DriveSearch(_) => false,
         Location::Drive { .. } => drive_folder(loc).is_some(),
         Location::Server { find, .. } => find.is_none() && accounts::why_not(loc).is_none(),
     }
@@ -208,7 +320,7 @@ pub fn items_editable(loc: &Location) -> bool {
     match loc {
         Location::Drive { space: Space::SharedDrives | Space::Trash, .. } => false,
         Location::Server { .. } if accounts::items_fixed(loc) => false,
-        Location::Drive { .. } | Location::Found(_) | Location::Server { .. } => true,
+        Location::Drive { .. } | Location::DriveSearch(_) | Location::Found(_) | Location::Server { .. } => true,
         _ => editable(loc),
     }
 }
@@ -245,7 +357,8 @@ fn why_not(loc: &Location) -> String {
             "The simulated drive is only for testing the interface; open the local disk or Google Drive.",
         )
         .into(),
-        Location::Found(_) | Location::Server { find: Some(_), .. } => not_a_folder(),
+        Location::Found(_) | Location::DriveSearch(_) | Location::Server { find: Some(_), .. } => not_a_folder(),
+        Location::Computer => t("Aqui estão os discos do computador: abra um deles para mexer no que tem dentro.", "These are the computer's disks: open one of them to work with what's inside.").into(),
         Location::Local(dir) if crate::network::is_server(dir) => t(
             "Aqui estão as pastas compartilhadas do computador: abra uma delas para mexer no que tem dentro.",
             "These are the computer's shared folders: open one of them to work with what's inside.",
@@ -295,7 +408,7 @@ fn account_panes(s: &State, email: &str) -> Vec<Location> {
 
 /// [`account_panes`] and `loc`, the folder changed: the tree's menu works in folders no pane
 /// shows, and the tree reads those again.
-fn account_panes_and(s: &State, email: &str, loc: &Location) -> Vec<Location> {
+pub(crate) fn account_panes_and(s: &State, email: &str, loc: &Location) -> Vec<Location> {
     let mut out = account_panes(s, email);
     if !out.contains(loc) {
         out.push(loc.clone());
@@ -331,7 +444,7 @@ pub(crate) fn count(n: usize) -> String {
 /// A result of pane `p`'s search is being opened: the words found it, so ↑ in the search field
 /// brings them back, though the search ran as they were typed rather than with Enter.
 pub fn remember_search(s: &mut State, p: usize) {
-    let results = s.panes[p].loc.finds() || matches!(&s.panes[p].loc, Location::Drive { space: Space::Search(_), path, .. } if path.is_empty());
+    let results = s.panes[p].loc.finds() || s.panes[p].loc.is_drive_search();
     if results {
         let words = s.search[p].text.clone();
         s.history.add_search(&words);
@@ -366,13 +479,13 @@ pub fn open_file(s: &mut State, p: usize, item: &Entry) {
                 crate::fail(s, e);
             }
         }
-        Location::Drive { .. } if item.mime.as_deref().is_some_and(|m| m.starts_with("application/vnd.google-apps.")) => {
+        Location::Drive { .. } | Location::DriveSearch(_) if item.mime.as_deref().is_some_and(|m| m.starts_with("application/vnd.google-apps.")) => {
             // ShellExecute opens a URL in the default browser.
             if let Err(e) = ops::open(std::path::Path::new(&format!("https://drive.google.com/open?id={}", item.id))) {
                 crate::fail(s, tr!("Não consegui abrir o navegador: {e}", "Couldn't open the browser: {e}"));
             }
         }
-        Location::Drive { .. } => {
+        Location::Drive { .. } | Location::DriveSearch(_) => {
             // Each file in its own folder, so two files of the same name don't meet. A copy
             // already there from an earlier Abrir, as big as the file and as new, opens at once.
             let dir = std::env::temp_dir().join("OpenExplorer-abrir").join(ops::windows_name(&item.id));
@@ -393,13 +506,13 @@ pub fn open_file(s: &mut State, p: usize, item: &Entry) {
             download(s, &loc, vec![item.clone()], dir, Then::Open, Vec::new());
         }
         Location::Server { .. } => crate::servers::open_file(s, p, item),
-        Location::Mock(_) => not_here(s, p),
+        Location::Computer | Location::Mock(_) => not_here(s, p),
     }
 }
 
 /// Whether `loc` lists search results, whose items Mostrar na pasta takes to their folder.
 pub fn shows_results(loc: &Location) -> bool {
-    matches!(loc, Location::Found(_) | Location::Server { find: Some(_), .. }) || matches!(loc, Location::Drive { space: Space::Search(_), path, .. } if path.is_empty())
+    matches!(loc, Location::Found(_) | Location::Server { find: Some(_), .. }) || loc.is_drive_search()
 }
 
 /// Mostrar na pasta: goes from a search's results to the folder the selected item sits in, and
@@ -418,11 +531,12 @@ pub fn show_in_folder(s: &mut State, p: usize, _: &mut Tx) {
             let name = name.to_string_lossy().into_owned();
             arrive(s, p, Reached { loc: Location::Local(dir.to_path_buf()), reveal: Some((name.clone(), name)) });
         }
-        Location::Drive { email, .. } if shows_results(&loc) => {
+        Location::Drive { .. } | Location::DriveSearch(_) if shows_results(&loc) => {
+            let Some(email) = item_account(&loc, item).map(str::to_string) else { return };
             s.status = tr!("Procurando a pasta de “{}”…", "Looking for the folder of “{}”…", shown(&item.name));
             let (account, item) = (email.clone(), (item.id.clone(), item.name.clone()));
             let find = move |d: &Drive| d.place(&item.0).map(|place| Reached { loc: address::place_location(account, place), reveal: Some(item) });
-            reach(s, p, email, t("achar a pasta", "find the folder"), find);
+            reach(s, p, &email, t("achar a pasta", "find the folder"), find);
         }
         Location::Server { server, .. } => {
             let mut segs = crate::servers::segs_of(&loc, item);
@@ -431,6 +545,39 @@ pub fn show_in_folder(s: &mut State, p: usize, _: &mut Tx) {
         }
         _ => {}
     }
+}
+
+/// The account and folder id a folder of a Drive search's results is looked up by before it
+/// opens (a shortcut's target, else itself); `None` where folders open at once.
+pub(crate) fn found_folder(loc: &Location, e: &Entry) -> Option<(String, String)> {
+    if !e.is_dir || !loc.is_drive_search() {
+        return None;
+    }
+    let email = item_account(loc, e)?.to_string();
+    Some((email, e.target.clone().unwrap_or_else(|| e.id.clone())))
+}
+
+/// Opens folder `e` of a Drive search's results where it really sits, as Explorer does: the
+/// tree opens down to it, the folders beside it show there, and Up goes to its real parent.
+/// Drive's search doesn't say where an item is, so its parents are looked up first. If that
+/// fails, it opens under the search, as before.
+pub fn open_found_folder(s: &mut State, p: usize, e: &Entry) {
+    let loc = s.panes[p].loc.clone();
+    let Some((email, id)) = found_folder(&loc, e) else { return };
+    let under_search = crate::folder_in(&loc, e);
+    s.status = tr!("Abrindo “{}”…", "Opening “{}”…", shown(&e.name));
+    // The pane stays on the results meanwhile: a folder opened since, or still being looked
+    // up, gives way to this one, whichever answer comes first.
+    s.panes[p].moves += 1;
+    let account = email.clone();
+    let find = move |d: &Drive| match d.place(&id) {
+        Ok(place) => Ok(Reached { loc: address::folder_location(account, &id, place), reveal: None }),
+        Err(err) => {
+            openexplorer_gdrive::log(&format!("pasta da pesquisa {id}: lugar não achado: {err}"));
+            Ok(Reached { loc: under_search, reveal: None })
+        }
+    };
+    reach(s, p, &email, t("abrir a pasta", "open the folder"), find);
 }
 
 /// Takes pane `p` to `to` as a step Voltar undoes, selecting what `to` reveals once it's
@@ -505,6 +652,10 @@ pub fn go_to_address(s: &mut State, p: usize, typed: &str) -> bool {
             s.history.reached(p, s.panes[p].moves, true);
             crate::navigate(s, p, Location::Mock(segs));
         }
+        Target::Computer => {
+            s.history.reached(p, s.panes[p].moves, true);
+            crate::navigate(s, p, Location::Computer);
+        }
         Target::Local(path) => {
             let moves = s.panes[p].moves;
             background(s, move |emit| emit(Msg::Reached { pane: p, moves, result: crate::catch_panic(t("abrir o endereço", "open the address"), || address::reach_local(&path)) }));
@@ -566,7 +717,7 @@ pub fn pick_up(s: &mut State, p: usize, mode: ClipMode) {
     } else {
         tr!("Copiado: {n} — use Colar (Ctrl+V) na pasta de destino.", "Copied: {n} — use Paste (Ctrl+V) in the destination folder.")
     };
-    s.clip = Some(Clip { mode, from: loc, items });
+    s.clip = Some(Clip { mode, from: loc, items, picked_at: s.now });
 }
 
 /// Whether items of `from` can be copied or moved into `to` as it is: same disk, same Drive
@@ -577,21 +728,34 @@ fn fits(from: &Location, to: &Location) -> bool {
         (Location::Local(_) | Location::Found(_), Location::Drive { .. }) => drive_folder(to).is_some(),
         // Downloads only need the items, so any listing of them will do (Com estrela...),
         // except the shared drives list and Lixeira.
-        (Location::Drive { .. }, Location::Local(_)) => items_editable(from),
+        (Location::Drive { .. } | Location::DriveSearch(_), Location::Local(_)) => items_editable(from),
         (Location::Drive { email: a, .. }, Location::Drive { email: b, .. }) => a == b && drive_folder(to).is_some(),
+        (Location::DriveSearch(_), Location::Drive { .. }) => drive_folder(to).is_some(),
         (Location::Local(_) | Location::Found(_), Location::Server { .. }) => crate::servers::target(to).is_some(),
         (Location::Server { .. }, Location::Local(dst)) => !crate::network::is_server(dst),
         // Between servers, within one, and between a server and Drive: through the app.
         (Location::Server { .. }, Location::Server { .. }) => crate::servers::target(to).is_some(),
         (Location::Server { .. }, Location::Drive { .. }) => drive_folder(to).is_some(),
-        (Location::Drive { .. }, Location::Server { .. }) => items_editable(from) && crate::servers::target(to).is_some(),
+        (Location::Drive { .. } | Location::DriveSearch(_), Location::Server { .. }) => items_editable(from) && crate::servers::target(to).is_some(),
         _ => false,
     }
 }
 
+/// Whether `clip`'s picked-up items can paste into `to` (checks per-item account when coming
+/// from a multi-account Drive search).
+pub(crate) fn clip_fits(clip: &Clip, to: &Location) -> bool {
+    if !fits(&clip.from, to) {
+        return false;
+    }
+    if let (Location::DriveSearch(_), Location::Drive { email: dst_email, .. }) = (&clip.from, to) {
+        return !clip.items.is_empty() && clip.items.iter().all(|e| item_account(&clip.from, e) == Some(dst_email.as_str()));
+    }
+    true
+}
+
 /// Whether Colar can paste the clip into pane `p`.
 pub fn can_paste(s: &State, p: usize) -> bool {
-    s.clip.as_ref().is_some_and(|c| fits(&c.from, &s.panes[p].loc))
+    s.clip.as_ref().is_some_and(|c| clip_fits(c, &s.panes[p].loc))
 }
 
 /// The arrows between the panes: copies pane `from`'s selection into the folder pane `to`
@@ -620,16 +784,17 @@ pub fn paste(s: &mut State, p: usize) {
 /// Whether `s.clip` can be pasted directly into `to`.
 pub fn can_paste_to(s: &State, to: &Location) -> bool {
     let Some(clip) = &s.clip else { return false };
-    editable(to) && fits(&clip.from, to)
+    editable(to) && clip_fits(clip, to)
 }
 
 /// Pastes `s.clip` into `to` (used both by the file list and by right-clicking a folder in the
 /// navigation tree).
 pub fn paste_into(s: &mut State, p: usize, to: Location) {
     let Some(clip) = &s.clip else { return };
+    let can_clear = clip_fits(clip, &to);
     let (mode, from, items) = (clip.mode, clip.from.clone(), clip.items.clone());
     // A cut is used once; a copy can be pasted again.
-    if mode == ClipMode::Cut && fits(&from, &to) {
+    if mode == ClipMode::Cut && can_clear {
         s.clip = None;
     }
     transfer_to(s, mode, from, items, p, to);
@@ -646,10 +811,16 @@ fn transfer_to(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>,
     if (matches!(to, Location::Drive { .. }) && drive_folder(&to).is_none()) || (matches!(to, Location::Server { .. }) && !editable(&to)) {
         return not_here(s, p);
     }
-    if !fits(&from, &to) {
+    let same_drive_account = match (&from, &to) {
+        (Location::DriveSearch(_), Location::Drive { email: dst_email, .. }) => {
+            !items.is_empty() && items.iter().all(|e| item_account(&from, e) == Some(dst_email.as_str()))
+        }
+        _ => true,
+    };
+    if !fits(&from, &to) || !same_drive_account {
         s.status = match (&from, &to) {
             (Location::Local(_) | Location::Found(_), Location::Drive { .. }) => open_drive_folder(),
-            (Location::Drive { .. }, Location::Drive { .. }) if drive_folder(&to).is_some() => {
+            (Location::Drive { .. } | Location::DriveSearch(_), Location::Drive { .. }) if drive_folder(&to).is_some() => {
                 t("Colar entre contas diferentes do Google Drive ainda não é possível.", "Pasting between different Google Drive accounts isn't possible yet.").into()
             }
             _ => t("Não dá para colar aqui.", "Can't paste here.").into(),
@@ -667,7 +838,7 @@ fn transfer_to(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>,
             let sources = items.iter().filter_map(|e| from.local_path(e)).collect();
             upload(s, sources, &to, mode == ClipMode::Cut, reload);
         }
-        (Location::Drive { .. }, Location::Local(dst)) => {
+        (Location::Drive { .. } | Location::DriveSearch(_), Location::Local(dst)) => {
             let then = if mode == ClipMode::Cut { Then::Trash } else { Then::Nothing };
             download(s, &from, items, dst.clone(), then, reload);
         }
@@ -686,12 +857,12 @@ fn transfer_to(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>,
         }
         (Location::Server { .. }, Location::Server { .. }) => crate::relay::between_servers(s, &from, items, &to, mode == ClipMode::Cut, reload),
         (Location::Server { .. }, Location::Drive { .. }) => crate::relay::server_to_drive(s, &from, items, &to, mode == ClipMode::Cut, reload),
-        (Location::Drive { .. }, Location::Server { .. }) => crate::relay::drive_to_server(s, &from, items, &to, mode == ClipMode::Cut, reload),
+        (Location::Drive { .. } | Location::DriveSearch(_), Location::Server { .. }) => crate::relay::drive_to_server(s, &from, items, &to, mode == ClipMode::Cut, reload),
         _ => {
-            // Copied out of a view (Com estrela...), the items have no one folder they come from.
+            // Copied out of a view (Com estrela...) or search, the items have no one folder they come from.
             let src = drive_folder(&from).map(|(_, id)| id).unwrap_or_default();
-            let (Some(email), Some((_, dst))) = (account(&from).map(str::to_string), drive_folder(&to)) else { return };
-            let ends = items.iter().map(|e| (End::drive(&from, Some(&e.name)), End::drive(&to, None)));
+            let Some((email, dst)) = drive_folder(&to) else { return };
+            let ends = items.iter().map(|e| (End::drive_item(&from, e), End::drive(&to, None)));
             let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, ends);
             // Drive copies on its side: a file's bar fills when it's done; a folder's size isn't
             // known.
@@ -700,27 +871,114 @@ fn transfer_to(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>,
                     p.size(size);
                 }
             }
+            let may_have_more = items.len() > 1 || items.iter().any(|e| e.is_dir);
+            let resolver = (src != dst).then(|| make_resolver(s, op, may_have_more, &batch));
+            let src_place = End::drive(&from, None).text;
+            let dst_place = End::drive(&to, None).text;
             let who = email.clone();
             undo::drive_job(s, &email, reload, move |n| transfer_words(op, n), move |d, rec| {
-                batch.run(|i, _| {
+                let mut existing: std::collections::HashMap<String, DriveFile> = std::collections::HashMap::new();
+                let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+                if src != dst {
+                    d.list(&dst, None, |page, _| {
+                        for f in page {
+                            taken.insert(f.name.clone());
+                            existing.entry(f.name.clone()).or_insert(f);
+                        }
+                        true
+                    })?;
+                }
+                batch.run(|i, p| {
                     let e = &items[i];
                     // Shortcuts are copied as shortcuts, not followed into their target.
                     let file = DriveFile { is_dir: e.is_dir && e.target.is_none(), target: None, ..drive_file(e) };
-                    // Desfazer sends a copy to the trash, as Explorer sends one to the Recycle Bin.
                     let copy = |name: &str| {
                         let made = d.copy(&file, &dst, name)?;
                         rec.add([Step::DriveTrash { email: who.clone(), id: made.id, name: made.name, empty: false }]);
                         Ok(())
                     };
-                    match mode {
-                        ClipMode::Copy if src == dst => copy(&tr!("Cópia de {}", "Copy of {}", e.name)),
-                        ClipMode::Copy => copy(&e.name),
-                        ClipMode::Cut if src == dst => Ok(()),
-                        ClipMode::Cut if src.is_empty() => Err(t("Recortar precisa da pasta de origem.", "Cut needs the source folder.").into()),
-                        ClipMode::Cut => {
-                            d.move_to(&e.id, &src, &dst)?;
-                            rec.add([Step::DriveMove { email: who.clone(), id: e.id.clone(), name: e.name.clone(), from: dst.clone(), to: src.clone() }]);
+                    // Picked up from a view or a search (Com estrela, Recentes, the results of
+                    // one account or of all): the item's folder isn't known here, so Drive says
+                    // where it is now, and a cut moves it from there.
+                    let src = if mode == ClipMode::Cut && src.is_empty() {
+                        let Some(from) = d.status(&e.id)?.parents.into_iter().next() else {
+                            return Err(t(
+                                "Este item não está numa pasta desta conta (foi compartilhado com ela): use Copiar.",
+                                "This item isn't in a folder of this account (it was shared with it): use Copy.",
+                            )
+                            .into());
+                        };
+                        from
+                    } else {
+                        src.clone()
+                    };
+                    if src == dst {
+                        return match mode {
+                            ClipMode::Copy => copy(&tr!("Cópia de {}", "Copy of {}", e.name)),
+                            ClipMode::Cut => Ok(()),
+                        };
+                    }
+                    let Some(ex) = existing.get(&e.name).cloned() else {
+                        taken.insert(e.name.clone());
+                        return match mode {
+                            ClipMode::Copy => copy(&e.name),
+                            ClipMode::Cut => {
+                                d.move_to(&e.id, &src, &dst)?;
+                                rec.add([Step::DriveMove { email: who.clone(), id: e.id.clone(), name: e.name.clone(), from: dst.clone(), to: src.clone() }]);
+                                Ok(())
+                            }
+                        };
+                    };
+                    if file.is_dir && ex.is_dir {
+                        let res = resolver.as_ref().expect("resolver when src != dst");
+                        let mut kept = false;
+                        merge_drive_into(d, &who, &file.id, &ex.id, mode == ClipMode::Cut, &src_place, &dst_place, res, rec, &|| p.cancelled(), &mut kept)?;
+                        if mode == ClipMode::Cut && !kept {
+                            d.trash(&file.id)?;
+                            rec.add([Step::DriveRestore { email: who.clone(), id: file.id.clone(), name: file.name.clone(), empty: false }]);
+                        }
+                        return Ok(());
+                    }
+                    let res = resolver.as_ref().expect("resolver when src != dst");
+                    let free = conflict::numbered_name(&e.name, file.is_dir, |n| taken.contains(n));
+                    let decision = res.resolve(
+                        conflict::FileInfo::entry(e, src_place.clone()),
+                        conflict::FileInfo::drive(&ex, dst_place.clone()),
+                        free.clone(),
+                        || p.cancelled(),
+                    );
+                    match decision {
+                        conflict::Decision::Cancel => Err(ops::CANCELLED.into()),
+                        conflict::Decision::Skip => {
+                            p.skip();
                             Ok(())
+                        }
+                        conflict::Decision::Replace if !file.is_dir && !ex.is_dir => {
+                            match mode {
+                                ClipMode::Copy => {
+                                    copy(&e.name)?;
+                                }
+                                ClipMode::Cut => {
+                                    d.move_to(&e.id, &src, &dst)?;
+                                    rec.add([Step::DriveMove { email: who.clone(), id: e.id.clone(), name: e.name.clone(), from: dst.clone(), to: src.clone() }]);
+                                }
+                            }
+                            d.trash(&ex.id)?;
+                            rec.add([Step::DriveRestore { email: who.clone(), id: ex.id, name: ex.name, empty: false }]);
+                            Ok(())
+                        }
+                        conflict::Decision::KeepBoth | conflict::Decision::Replace => {
+                            let free = conflict::numbered_name(&e.name, file.is_dir, |n| taken.contains(n));
+                            taken.insert(free.clone());
+                            match mode {
+                                ClipMode::Copy => copy(&free),
+                                ClipMode::Cut => {
+                                    d.move_to(&e.id, &src, &dst)?;
+                                    d.rename(&e.id, &free)?;
+                                    rec.add([Step::DriveMove { email: who.clone(), id: e.id.clone(), name: free, from: dst.clone(), to: src.clone() }]);
+                                    Ok(())
+                                }
+                            }
                         }
                     }
                 })
@@ -734,6 +992,8 @@ fn transfer_to(s: &mut State, mode: ClipMode, from: Location, items: Vec<Entry>,
 pub fn local_transfer(s: &mut State, op: Op, sources: Vec<PathBuf>, dst: PathBuf, reload: Vec<Location>) {
     let to = End::local(&dst);
     let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, sources.iter().map(|p| (End::local(p), to.clone())));
+    let may_have_more = sources.len() > 1 || sources.iter().any(|p| p.is_dir());
+    let resolver = make_resolver(s, op, may_have_more, &batch);
     // Copies where there's no Recycle Bin (a shared folder, WSL, a USB stick) aren't kept for Desfazer,
     // which would have to delete them for good.
     let recyclable = undo::has_recycle_bin(&dst);
@@ -743,20 +1003,15 @@ pub fn local_transfer(s: &mut State, op: Op, sources: Vec<PathBuf>, dst: PathBuf
         }
         batch.run(|i, p| {
             let src = &sources[i];
-            match op {
-                Op::Copy | Op::Upload | Op::Download => {
-                    let made = ops::copy_into(src, &dst, p)?;
-                    if recyclable {
-                        rec.add([Step::Recycle { path: made }]);
-                    }
+            let move_item = op == Op::Move;
+            match ops::transfer_local(src, &dst, move_item, p, Some(&resolver))? {
+                ops::TransferOutcome::Copied { made, replaced: false } if recyclable => {
+                    rec.add([Step::Recycle { path: made }]);
                 }
-                Op::Move => {
-                    let to = ops::move_into(src, &dst, p)?;
-                    // Already there: nothing moved.
-                    if to != *src {
-                        rec.add([Step::Move { from: to, to: src.clone() }]);
-                    }
+                ops::TransferOutcome::Moved { from, to, replaced: false } if to != from => {
+                    rec.add([Step::Move { from: to, to: from }]);
                 }
+                _ => {}
             }
             Ok(())
         })
@@ -771,171 +1026,210 @@ fn transfer_words(op: Op, n: usize) -> String {
     }
 }
 
-/// An upload waiting for its names to be checked against the Drive folder it goes into.
-pub struct Upload {
-    pub email: String,
-    /// The Drive folder's id, and where it is.
-    pub parent: String,
-    pub to: Location,
-    pub sources: Vec<PathBuf>,
-    pub remove: bool,
-    pub reload: Vec<Location>,
+/// Builds a batch-scoped conflict [`Resolver`] that prompts via [`Msg::Conflict`] and cancels
+/// every row in `batch` if the user cancels the dialog.
+pub fn make_resolver(s: &State, op: Op, may_have_more: bool, batch: &transfers::Batch) -> Resolver {
+    let out = s.outbox.clone();
+    let wake = s.waker.clone();
+    let rows: Vec<Arc<ops::Progress>> = batch.rows().to_vec();
+    Resolver::new(
+        op,
+        may_have_more,
+        Arc::new(move |prompt| {
+            let _ = out.send(Msg::Conflict(Box::new(prompt)));
+            if let Some(w) = &wake {
+                w();
+            }
+        }),
+        Some(Arc::new(move || {
+            for r in &rows {
+                r.cancel();
+            }
+        })),
+    )
+}
+
+/// Shows a conflict prompt immediately if no dialog is open, else queues it.
+pub fn enqueue_conflict(s: &mut State, prompt: Prompt) {
+    if prompt.is_stale() {
+        return;
+    }
+    if s.dialog.is_none() {
+        s.dialog = Some(Dialog::Conflict(Box::new(prompt)));
+    } else {
+        s.conflict_waiting.push_back(prompt);
+    }
+}
+
+/// Toggles "Aplicar a todos os conflitos" on the open conflict dialog.
+pub fn toggle_conflict_all(s: &mut State) {
+    if let Some(Dialog::Conflict(prompt)) = &mut s.dialog {
+        prompt.apply_all = !prompt.apply_all;
+    }
+}
+
+/// Delivers the user's choice (or `None` to cancel the batch) to the waiting worker thread.
+pub fn answer_conflict(s: &mut State, choice: Option<Choice>) {
+    let Some(Dialog::Conflict(mut prompt)) = s.dialog.take() else { return };
+    if let Some(tx) = prompt.reply.take() {
+        let reply = match choice {
+            Some(c) => Reply::Choose { choice: c, apply_all: prompt.apply_all },
+            None => Reply::Cancel,
+        };
+        let _ = tx.send(reply);
+    }
+    next_conflict(s);
+}
+
+/// Opens the next queued conflict prompt once no dialog is open (skipping stale ones).
+pub fn next_conflict(s: &mut State) {
+    while s.dialog.is_none() {
+        let Some(prompt) = s.conflict_waiting.pop_front() else { break };
+        if !prompt.is_stale() {
+            s.dialog = Some(Dialog::Conflict(Box::new(prompt)));
+        }
+    }
 }
 
 /// Uploads `sources` (files and folders on the computer) into the Drive folder `to` shows, a
 /// row each in the queue. With `remove` (Recortar), each original goes to the Recycle Bin once
 /// all of it arrived.
-///
-/// Names are checked first against what the folder holds: the listing a pane shows of it
-/// when it's complete, else a fresh one. When any is taken, the clash dialog asks what to do
-/// before anything starts.
 pub fn upload(s: &mut State, sources: Vec<PathBuf>, to: &Location, remove: bool, reload: Vec<Location>) {
     let Some((email, parent)) = drive_folder(to) else {
         s.status = open_drive_folder();
         return;
     };
-    let up = Upload { email: email.clone(), parent: parent.clone(), to: to.clone(), sources, remove, reload };
-    if let Some(pane) = s.panes.iter().find(|p| p.loc == *to && !p.loading && p.error.is_none()) {
-        let existing = pane.entries.clone();
-        return ask_clashes(s, up, existing);
-    }
-    let list = move |d: &Drive| {
-        let mut out = Vec::new();
-        d.list(&parent, None, |page, _| {
-            out.extend(page.into_iter().map(crate::entry_of));
-            true
-        })?;
-        Ok(out)
-    };
-    drive_task(s, &email, t("listar a pasta", "list the folder"), list, move |result| Msg::Clashes { up, result });
-}
-
-/// The Drive folder's listing for an upload arrived.
-pub fn clashes_listed(s: &mut State, up: Upload, result: Result<Vec<Entry>, String>) {
-    match result {
-        Ok(existing) => ask_clashes(s, up, existing),
-        Err(e) => crate::fail(s, tr!("Não consegui ver o que já existe no destino: {e}", "Couldn't see what's already in the destination: {e}")),
-    }
-}
-
-/// An upload whose names are taken in its Drive folder, waiting for Substituir, Pular or
-/// Manter os dois.
-pub struct ClashAsk {
-    pub up: Upload,
-    /// What the folder holds.
-    pub existing: Vec<Entry>,
-    /// The sources whose names are taken, by position.
-    pub clashes: Vec<usize>,
-    /// The choices made so far, for the first of `clashes`.
-    pub chosen: Vec<Clash>,
-    /// Aplicar a todos: the next choice goes for every clash left.
-    pub all: bool,
-}
-
-impl ClashAsk {
-    /// The source the dialog asks about now, by position.
-    pub fn current(&self) -> usize {
-        self.clashes[self.chosen.len().min(self.clashes.len() - 1)]
-    }
-
-    /// What's already in the folder under `name`.
-    pub fn there(&self, name: &str) -> Option<&Entry> {
-        self.existing.iter().find(|e| e.name == name)
-    }
-}
-
-fn file_name(p: &std::path::Path) -> String {
-    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-}
-
-/// Starts `up` at once if none of its names is taken in `existing`, else asks: in the clash
-/// dialog, or after the one open now.
-fn ask_clashes(s: &mut State, up: Upload, existing: Vec<Entry>) {
-    let names: Vec<String> = up.sources.iter().map(|p| file_name(p)).collect();
-    let found: Vec<Existing> = existing.iter().map(Existing::of_entry).collect();
-    let clashes = crate::uploads::clashes(&names, &found);
-    if clashes.is_empty() {
-        return start_upload(s, up, &found, &[]);
-    }
-    let ask = ClashAsk { up, existing, clashes, chosen: Vec::new(), all: true };
-    if s.dialog.is_none() {
-        s.dialog = Some(Dialog::Clash(Box::new(ask)));
-    } else {
-        s.clash_waiting.push_back(ask);
-    }
-}
-
-/// Aplicar a todos, ticked or not.
-pub fn toggle_clash_all(s: &mut State) {
-    if let Some(Dialog::Clash(ask)) = &mut s.dialog {
-        ask.all = !ask.all;
-    }
-}
-
-/// An answer in the clash dialog: a choice for the item it asks about (for all left, with
-/// Aplicar a todos), or `None` for Cancelar, which drops the whole upload. Once every clash
-/// has its choice the upload starts.
-pub fn answer_clash(s: &mut State, choice: Option<Clash>) {
-    let Some(Dialog::Clash(mut ask)) = s.dialog.take() else { return };
-    let Some(c) = choice else {
-        s.status = t("Envio cancelado.", "Upload cancelled.").into();
-        return next_clash(s);
-    };
-    let n = if ask.all { ask.clashes.len() - ask.chosen.len() } else { 1 };
-    ask.chosen.extend(std::iter::repeat_n(c, n));
-    if ask.chosen.len() < ask.clashes.len() {
-        s.dialog = Some(Dialog::Clash(ask));
-        return;
-    }
-    let found: Vec<Existing> = ask.existing.iter().map(Existing::of_entry).collect();
-    let choices: Vec<(usize, Clash)> = ask.clashes.iter().copied().zip(ask.chosen.iter().copied()).collect();
-    start_upload(s, ask.up, &found, &choices);
-    next_clash(s);
-}
-
-/// Opens the clash dialog of the next upload waiting for one, if the window has no dialog.
-pub fn next_clash(s: &mut State) {
-    if s.dialog.is_none()
-        && let Some(ask) = s.clash_waiting.pop_front()
-    {
-        s.dialog = Some(Dialog::Clash(Box::new(ask)));
-    }
-}
-
-/// Queues `up`'s rows and starts it, each taken name settled by its entry in `choices`
-/// (source position, choice). Items skipped get no row.
-fn start_upload(s: &mut State, up: Upload, existing: &[Existing], choices: &[(usize, Clash)]) {
-    let choice = |i: usize| choices.iter().find(|(j, _)| *j == i).map_or(Clash::KeepBoth, |(_, c)| *c);
-    let local: Vec<(String, bool)> = up.sources.iter().map(|p| (file_name(p), p.is_dir())).collect();
-    let puts = crate::uploads::resolve(&local, existing, choice);
-    let mut items = Vec::new();
-    let mut skipped = 0;
-    for (i, (path, put)) in up.sources.into_iter().zip(puts).enumerate() {
-        if put == Put::Skip {
-            skipped += 1;
-        } else {
-            items.push(Item { path, put, clash: choice(i) });
-        }
-    }
-    if items.is_empty() {
-        s.status = if skipped == 1 {
-            t("Nada enviado: 1 item já existe no destino.", "Nothing uploaded: 1 item already exists in the destination.").into()
-        } else {
-            tr!("Nada enviado: {skipped} itens já existem no destino.", "Nothing uploaded: {skipped} items already exist in the destination.")
-        };
-        return;
-    }
-    let dest = End::drive(&up.to, None);
-    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Upload, items.iter().map(|it| (End::local(&it.path), dest.clone())));
+    let initial_existing = s
+        .panes
+        .iter()
+        .find(|p| p.loc == *to && !p.loading && p.error.is_none())
+        .map(|p| p.entries.iter().map(crate::uploads::Existing::of_entry).collect::<Vec<_>>());
+    let dest = End::drive(to, None);
+    let op = if remove { Op::Move } else { Op::Upload };
+    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, sources.iter().map(|p| (End::local(p), dest.clone())));
     let at_once = s.settings.uploads.into();
-    let (parent, remove) = (up.parent, up.remove);
-    drive_job(s, &up.email, up.reload, move |d| {
-        let summary = crate::uploads::run(d, &batch, &items, &parent, remove, at_once);
-        match summary {
-            Ok(line) if skipped > 0 => Ok(tr!("{line} Pulados (já existiam): {skipped}.", "{line} Skipped (already there): {skipped}.")),
-            other => other,
-        }
+    s.upload_slots.set_limit(at_once);
+    let slots = s.upload_slots.clone();
+    let may_have_more = sources.len() > 1 || sources.iter().any(|p| p.is_dir());
+    let resolver = make_resolver(s, op, may_have_more, &batch);
+    let dst_place = dest.text;
+    drive_job(s, &email, reload, move |d| {
+        crate::uploads::run_with_conflict(d, &batch, &sources, &parent, &dst_place, initial_existing, remove, at_once, &slots, Some(&resolver))
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_drive_into(
+    d: &Drive,
+    who: &str,
+    src_folder: &str,
+    dst_folder: &str,
+    move_item: bool,
+    src_place: &str,
+    dst_place: &str,
+    resolver: &Resolver,
+    rec: &undo::Rec,
+    cancelled: &dyn Fn() -> bool,
+    kept: &mut bool,
+) -> Result<(), String> {
+    let mut src_kids = Vec::new();
+    d.list(src_folder, None, |page, _| {
+        src_kids.extend(page);
+        true
+    })?;
+    let mut existing: std::collections::HashMap<String, DriveFile> = std::collections::HashMap::new();
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    d.list(dst_folder, None, |page, _| {
+        for f in page {
+            taken.insert(f.name.clone());
+            existing.entry(f.name.clone()).or_insert(f);
+        }
+        true
+    })?;
+    for child in src_kids {
+        if cancelled() {
+            return Err(ops::CANCELLED.into());
+        }
+        let Some(ex) = existing.get(&child.name).cloned() else {
+            taken.insert(child.name.clone());
+            if move_item {
+                d.move_to(&child.id, src_folder, dst_folder)?;
+                rec.add([Step::DriveMove {
+                    email: who.to_string(),
+                    id: child.id,
+                    name: child.name,
+                    from: dst_folder.to_string(),
+                    to: src_folder.to_string(),
+                }]);
+            } else {
+                let made = d.copy(&child, dst_folder, &child.name)?;
+                rec.add([Step::DriveTrash { email: who.to_string(), id: made.id, name: made.name, empty: false }]);
+            }
+            continue;
+        };
+        if child.is_dir && child.target.is_none() && ex.is_dir && ex.target.is_none() {
+            let child_src = if src_place.is_empty() { shown(&child.name) } else { format!("{src_place}\\{}", shown(&child.name)) };
+            let child_dst = if dst_place.is_empty() { shown(&ex.name) } else { format!("{dst_place}\\{}", shown(&ex.name)) };
+            let mut sub_kept = false;
+            merge_drive_into(d, who, &child.id, &ex.id, move_item, &child_src, &child_dst, resolver, rec, cancelled, &mut sub_kept)?;
+            if sub_kept {
+                *kept = true;
+            } else if move_item {
+                d.trash(&child.id)?;
+                rec.add([Step::DriveRestore { email: who.to_string(), id: child.id, name: child.name, empty: false }]);
+            }
+            continue;
+        }
+        let free = conflict::numbered_name(&child.name, child.is_dir, |n| taken.contains(n));
+        let decision = resolver.resolve(
+            conflict::FileInfo::drive(&child, src_place.to_string()),
+            conflict::FileInfo::drive(&ex, dst_place.to_string()),
+            free,
+            cancelled,
+        );
+        match decision {
+            conflict::Decision::Cancel => return Err(ops::CANCELLED.into()),
+            conflict::Decision::Skip => {
+                *kept = true;
+            }
+            conflict::Decision::Replace if !child.is_dir && !ex.is_dir => {
+                if move_item {
+                    d.move_to(&child.id, src_folder, dst_folder)?;
+                    rec.add([Step::DriveMove {
+                        email: who.to_string(),
+                        id: child.id,
+                        name: child.name,
+                        from: dst_folder.to_string(),
+                        to: src_folder.to_string(),
+                    }]);
+                } else {
+                    let made = d.copy(&child, dst_folder, &child.name)?;
+                    rec.add([Step::DriveTrash { email: who.to_string(), id: made.id, name: made.name, empty: false }]);
+                }
+                d.trash(&ex.id)?;
+                rec.add([Step::DriveRestore { email: who.to_string(), id: ex.id, name: ex.name, empty: false }]);
+            }
+            conflict::Decision::KeepBoth | conflict::Decision::Replace => {
+                let free = conflict::numbered_name(&child.name, child.is_dir, |n| taken.contains(n));
+                taken.insert(free.clone());
+                if move_item {
+                    d.move_to(&child.id, src_folder, dst_folder)?;
+                    d.rename(&child.id, &free)?;
+                    rec.add([Step::DriveMove {
+                        email: who.to_string(),
+                        id: child.id,
+                        name: free,
+                        from: dst_folder.to_string(),
+                        to: src_folder.to_string(),
+                    }]);
+                } else {
+                    let made = d.copy(&child, dst_folder, &free)?;
+                    rec.add([Step::DriveTrash { email: who.to_string(), id: made.id, name: made.name, empty: false }]);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A listed Drive item as the Drive client takes it.
@@ -950,6 +1244,8 @@ pub fn drive_file(e: &Entry) -> DriveFile {
         target: e.target.clone(),
         md5: e.md5.clone(),
         starred: e.starred,
+        drive_id: e.drive_origin.as_deref().and_then(|o| o.shared_drive.as_ref().map(|(id, _)| id.clone())),
+        owned_by_me: e.drive_origin.as_deref().map(|o| o.owned_by_me),
     }
 }
 
@@ -963,58 +1259,96 @@ pub enum Then {
     Open,
 }
 
-/// Downloads `items` of the Drive folder `from` into the folder `dst` on the computer, a row
+/// Downloads `items` of the Drive location `from` into the folder `dst` on the computer, a row
 /// each in the queue; then `then`.
 pub fn download(s: &mut State, from: &Location, items: Vec<Entry>, dst: PathBuf, then: Then, reload: Vec<Location>) {
-    let Some(email) = account(from).map(str::to_string) else {
+    let groups = group_by_account(from, items);
+    if groups.is_empty() {
         s.status = t("Não dá para baixar daqui.", "Can't download from here.").into();
         return;
-    };
+    }
     let to = End::local(&dst);
-    let batch = transfers::queue(&mut s.transfers, s.waker.clone(), Op::Download, items.iter().map(|e| (End::drive(from, Some(&e.name)), to.clone())));
-    let files: Vec<DriveFile> = items.iter().map(drive_file).collect();
     let (at_once, segmented) = (s.settings.downloads.into(), s.settings.segmented_downloads);
+    s.download_slots.set_limit(at_once);
+    let slots = s.download_slots.clone();
     // Desfazer sends what arrived to the Recycle Bin (not where there's none), and after
     // Recortar takes the originals out of the Drive trash. Abrir isn't kept.
     let recyclable = undo::has_recycle_bin(&dst);
     let op = if then == Then::Trash { Op::Move } else { Op::Copy };
-    let who = email.clone();
-    undo::drive_job(s, &email, reload, move |n| transfer_words(op, n), move |d, rec| {
-        let finish = |i: usize, path: &std::path::Path| {
-            let f = &files[i];
-            let arrived = recyclable.then(|| Step::Recycle { path: path.to_path_buf() });
-            match then {
-                Then::Nothing => {
-                    if let Some(step) = arrived {
-                        rec.add([step]);
+    let src_root = End::drive(from, None).text;
+    // Items of several accounts (a search of all of them): a batch each, every one asking
+    // about the names taken in the destination.
+    for (email, group) in groups {
+        let batch = transfers::queue(&mut s.transfers, s.waker.clone(), op, group.iter().map(|e| (End::drive_item(from, e), to.clone())));
+        let files: Vec<DriveFile> = group.iter().map(drive_file).collect();
+        let may_have_more = group.len() > 1 || group.iter().any(|e| e.is_dir);
+        let resolver = (then != Then::Open).then(|| make_resolver(s, Op::Download, may_have_more, &batch));
+        let who = email.clone();
+        let dst = dst.clone();
+        let reload = reload.clone();
+        let slots = slots.clone();
+        let src_root = src_root.clone();
+        undo::drive_job(s, &email, reload, move |n| transfer_words(op, n), move |d, rec| {
+            let finish = |i: usize, path: &std::path::Path, created: bool, kept: bool| {
+                let f = &files[i];
+                let arrived = (created && recyclable).then(|| Step::Recycle { path: path.to_path_buf() });
+                match then {
+                    Then::Nothing => {
+                        if let Some(step) = arrived {
+                            rec.add([step]);
+                        }
+                        Ok(())
                     }
-                    Ok(())
+                    Then::Trash => {
+                        if !kept {
+                            d.trash(&f.id)?;
+                            rec.add(arrived.into_iter().chain([Step::DriveRestore { email: who.clone(), id: f.id.clone(), name: f.name.clone(), empty: false }]));
+                        } else if let Some(step) = arrived {
+                            rec.add([step]);
+                        }
+                        Ok(())
+                    }
+                    Then::Open => ops::open(path),
                 }
-                Then::Trash => {
-                    d.trash(&f.id)?;
-                    rec.add(arrived.into_iter().chain([Step::DriveRestore { email: who.clone(), id: f.id.clone(), name: f.name.clone(), empty: false }]));
-                    Ok(())
-                }
-                Then::Open => ops::open(path),
-            }
-        };
-        crate::downloads::run(d, &batch, &files, &dst, at_once, segmented, &finish)
-    });
+            };
+            crate::downloads::run(d, &batch, &files, &dst, &src_root, at_once, segmented, &slots, resolver.as_ref(), &finish)
+        });
+    }
 }
 
 /// Pesquisar: the words in pane `p`'s search field, where the pane is: a folder with what's
-/// under it, a whole shared drive, My Drive; from Drive's views, everything. A search from a
-/// search's results looks where that one did.
+/// under it, a whole shared drive, My Drive; from Drive's views, everything; or the explicit
+/// scope chosen in `s.search_scope[p]`.
 pub fn search(s: &mut State, p: usize) {
     let words = s.search[p].text.clone();
     s.history.add_search(&words);
-    if s.panes[p].loc.is_local() {
+    if s.panes[p].loc.is_local() || s.panes[p].loc == Location::Computer {
         return search_computer(s, p);
     }
     if let Location::Server { .. } = s.panes[p].loc {
         return search_server(s, p);
     }
-    if let Some(to) = search_from(&s.panes[p].loc, &s.search[p].text) {
+    let text = words.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return;
+    }
+    let to = match (&s.panes[p].loc, s.search_scope[p]) {
+        (Location::Drive { .. } | Location::DriveSearch(_), DriveSearchScope::AllAccounts) if s.accounts.len() >= 2 => {
+            Some(Location::DriveSearch(Box::new(DriveSearch { text })))
+        }
+        (Location::Drive { email, .. }, DriveSearchScope::Account) => Some(Location::Drive {
+            email: email.clone(),
+            space: Space::Search(Box::new(crate::model::Search {
+                text,
+                within: openexplorer_gdrive::search::Within::Everything,
+                place: all_of_drive(),
+            })),
+            path: Vec::new(),
+        }),
+        (Location::DriveSearch(_), _) => Some(Location::DriveSearch(Box::new(DriveSearch { text }))),
+        (loc, _) => search_from(loc, &text),
+    };
+    if let Some(to) = to {
         crate::navigate(s, p, to);
     }
 }
@@ -1030,16 +1364,18 @@ pub fn search_computer(s: &mut State, p: usize) {
     let within = match &loc {
         Location::Local(dir) => Some(dir.clone()),
         Location::Found(f) => f.within.clone(),
+        // From Este Computador, the whole computer.
+        Location::Computer => None,
         _ => return,
     };
     if text.trim().is_empty() {
         if matches!(loc, Location::Found(_)) {
-            // Back to the folder the search started from: Voltar's last step, or the folder
-            // searched.
+            // Back to where the search started from: Voltar's last step (a folder, Este
+            // Computador), or the folder searched, or Este Computador for the whole computer.
             match (s.panes[p].back.last(), within) {
-                (Some(Location::Local(_)), _) => crate::go_back(s, p),
+                (Some(Location::Local(_) | Location::Computer), _) => crate::go_back(s, p),
                 (_, Some(dir)) => crate::switch(s, p, Location::Local(dir)),
-                _ => {}
+                (_, None) => crate::switch(s, p, Location::Computer),
             }
         }
         return;
@@ -1117,7 +1453,7 @@ pub(crate) fn search_scope(loc: &Location) -> Option<(openexplorer_gdrive::searc
 }
 
 /// A search of the whole account, as its place reads: "“praia” em todo o Drive".
-fn all_of_drive() -> String {
+pub(crate) fn all_of_drive() -> String {
     t("todo o Drive", "all of Drive").into()
 }
 
@@ -1128,8 +1464,96 @@ pub fn search_everywhere(s: &mut State, p: usize) {
         return crate::switch(s, p, to);
     }
     let Location::Drive { email, space: Space::Search(q), .. } = s.panes[p].loc.clone() else { return };
+    s.search_scope[p] = DriveSearchScope::Account;
     let q = crate::model::Search { within: openexplorer_gdrive::search::Within::Everything, place: all_of_drive(), ..*q };
     crate::navigate(s, p, Location::Drive { email, space: Space::Search(Box::new(q)), path: Vec::new() });
+}
+
+/// Searches the current query across every connected Google Drive account.
+pub fn search_all_accounts(s: &mut State, p: usize) {
+    if s.accounts.len() < 2 {
+        return;
+    }
+    let typed = s.search[p].text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = if !typed.is_empty() {
+        typed
+    } else if let Location::Drive { space: Space::Search(q), path, .. } = &s.panes[p].loc
+        && path.is_empty()
+    {
+        q.text.clone()
+    } else {
+        return;
+    };
+    s.search_scope[p] = DriveSearchScope::AllAccounts;
+    crate::navigate(s, p, Location::DriveSearch(Box::new(DriveSearch { text })));
+}
+
+/// Picks a Drive search scope in pane `p`'s dropdown; re-runs active search or focuses input.
+pub fn set_search_scope(s: &mut State, p: usize, scope: DriveSearchScope, tx: &mut Tx) {
+    s.search_scope_menu = None;
+    let scope = if scope == DriveSearchScope::AllAccounts && s.accounts.len() < 2 {
+        DriveSearchScope::Account
+    } else {
+        scope
+    };
+    s.search_scope[p] = scope;
+    let typed = s.search[p].text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let active_query = match &s.panes[p].loc {
+        Location::Drive { space: Space::Search(q), path, .. } if path.is_empty() => Some(q.text.clone()),
+        Location::DriveSearch(q) => Some(q.text.clone()),
+        _ => None,
+    };
+    if let Some(q_text) = active_query {
+        let text = if !typed.is_empty() { typed } else { q_text };
+        if !text.is_empty() {
+            if s.search[p].text.trim().is_empty() {
+                s.search[p] = TextEdit::new(text.clone());
+            }
+            if matches!(s.panes[p].loc, Location::Drive { .. }) {
+                search(s, p);
+                return;
+            }
+        }
+    } else if !typed.is_empty() {
+        search(s, p);
+        return;
+    }
+    tx.focus(crate::ui::search_key(p), false);
+}
+
+/// Narrows a multi-account search directly to `email`'s entire Google Drive account.
+pub fn search_in_account(s: &mut State, p: usize, email: String, tx: &mut Tx) {
+    s.search_scope_menu = None;
+    s.search_scope[p] = DriveSearchScope::Account;
+    let typed = s.search[p].text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = if !typed.is_empty() {
+        typed
+    } else if let Location::DriveSearch(q) = &s.panes[p].loc {
+        q.text.clone()
+    } else if let Location::Drive { space: Space::Search(q), path, .. } = &s.panes[p].loc
+        && path.is_empty()
+    {
+        q.text.clone()
+    } else {
+        String::new()
+    };
+    if text.is_empty() {
+        tx.focus(crate::ui::search_key(p), false);
+        return;
+    }
+    crate::navigate(
+        s,
+        p,
+        Location::Drive {
+            email,
+            space: Space::Search(Box::new(crate::model::Search {
+                text,
+                within: openexplorer_gdrive::search::Within::Everything,
+                place: all_of_drive(),
+            })),
+            path: Vec::new(),
+        },
+    );
 }
 
 /// Cancelar on a row of the queue.
@@ -1137,10 +1561,18 @@ pub fn cancel_transfer(row: &ops::Progress) {
     row.cancel();
 }
 
-/// Cancelar todas: every row not over yet.
+/// Cancelar todas: every row not over yet, plus any open/queued conflict prompts.
 pub fn cancel_all_transfers(s: &mut State) {
     for t in &s.transfers {
         t.progress.cancel();
+    }
+    if matches!(&s.dialog, Some(Dialog::Conflict(_)))
+        && let Some(Dialog::Conflict(p)) = s.dialog.take()
+    {
+        p.send_cancel();
+    }
+    while let Some(p) = s.conflict_waiting.pop_front() {
+        p.send_cancel();
     }
 }
 
@@ -1167,7 +1599,7 @@ pub fn parent_and_entry(loc: &Location) -> Option<(Location, Entry)> {
             let modified = std::fs::symlink_metadata(path).ok().and_then(|m| m.modified().ok());
             Some((
                 Location::Local(parent.to_path_buf()),
-                Entry { id: name.clone(), name, is_dir: true, size: None, modified, target: None, mime: None, md5: None, starred: false },
+                Entry { id: name.clone(), name, is_dir: true, size: None, modified, target: None, mime: None, md5: None, starred: false, drive_origin: None },
             ))
         }
         Location::Drive { email, space, path } if !path.is_empty() => {
@@ -1175,7 +1607,7 @@ pub fn parent_and_entry(loc: &Location) -> Option<(Location, Entry)> {
             let parent_path = path[..path.len() - 1].to_vec();
             Some((
                 Location::Drive { email: email.clone(), space: space.clone(), path: parent_path },
-                Entry { id, name, is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false },
+                Entry { id, name, is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None },
             ))
         }
         Location::Server { server, path, find: None } if !path.is_empty() => {
@@ -1183,7 +1615,7 @@ pub fn parent_and_entry(loc: &Location) -> Option<(Location, Entry)> {
             let parent_path = path[..path.len() - 1].to_vec();
             Some((
                 Location::Server { server: server.clone(), path: parent_path, find: None },
-                Entry { id: name.clone(), name, is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false },
+                Entry { id: name.clone(), name, is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None },
             ))
         }
         _ => None,
@@ -1199,7 +1631,7 @@ pub fn pick_up_item(s: &mut State, parent: Location, item: Entry, mode: ClipMode
         return;
     }
     let what = shown(&item.name);
-    s.clip = Some(Clip { mode, from: parent, items: vec![item] });
+    s.clip = Some(Clip { mode, from: parent, items: vec![item], picked_at: s.now });
     s.status = match mode {
         ClipMode::Copy => tr!("Copiado: {what}.", "Copied: {what}."),
         ClipMode::Cut => tr!("Recortado: {what}.", "Cut: {what}."),
@@ -1301,12 +1733,25 @@ pub fn delete(s: &mut State) {
                 Ok(tr!("Movido para a lixeira do Google Drive: {}.", "Moved to the Google Drive trash: {}.", count(n)))
             });
         }
+        Location::DriveSearch(_) => {
+            for (email, group) in group_by_account(&loc, items) {
+                let gn = group.len();
+                let who = email.clone();
+                undo::drive_job(s, &email, account_panes_and(s, &email, &loc), to_the_drive_trash, move |d, rec| {
+                    for e in group {
+                        d.trash(&e.id)?;
+                        rec.add([Step::DriveRestore { email: who.clone(), id: e.id, name: e.name, empty: false }]);
+                    }
+                    Ok(tr!("Movido para a lixeira do Google Drive: {}.", "Moved to the Google Drive trash: {}.", count(gn)))
+                });
+            }
+        }
         Location::Server { .. } => {
             if let Err(items) = accounts::delete(s, &loc, items) {
                 crate::servers::delete(s, &loc, items, vec![loc.clone()]);
             }
         }
-        Location::Mock(_) => return not_here(s, pane),
+        Location::Computer | Location::Mock(_) => return not_here(s, pane),
     }
     s.status = tr!("Excluindo {}…", "Deleting {}…", count(n));
 }
@@ -1412,16 +1857,24 @@ pub fn stars_to_add(s: &State, p: usize) -> bool {
 pub fn star(s: &mut State, p: usize) {
     let items = selected(s, p);
     let loc = s.panes[p].loc.clone();
-    let (false, true, Some(email)) = (items.is_empty(), items_editable(&loc), account(&loc)) else { return };
+    if items.is_empty() || !items_editable(&loc) {
+        return;
+    }
+    let groups = group_by_account(&loc, items);
+    if groups.is_empty() {
+        return;
+    }
     let on = stars_to_add(s, p);
-    let n = items.len();
-    drive_job(s, email, account_panes(s, email), move |d| {
-        for e in &items {
-            d.set_starred(&e.id, on)?;
-        }
-        let n = count(n);
-        Ok(if on { tr!("Estrela adicionada: {n}.", "Star added: {n}.") } else { tr!("Estrela removida: {n}.", "Star removed: {n}.") })
-    });
+    for (email, group) in groups {
+        let n = group.len();
+        drive_job(s, &email, account_panes(s, &email), move |d| {
+            for e in &group {
+                d.set_starred(&e.id, on)?;
+            }
+            let n = count(n);
+            Ok(if on { tr!("Estrela adicionada: {n}.", "Star added: {n}.") } else { tr!("Estrela removida: {n}.", "Star removed: {n}.") })
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1431,7 +1884,9 @@ pub fn star(s: &mut State, p: usize) {
 /// with the part before the extension selected. Enter or a click elsewhere renames, Esc cancels.
 pub fn ask_rename(s: &mut State, p: usize, tx: &mut Tx) {
     let items = selected(s, p);
-    let [item] = items.as_slice() else { return };
+    if items.is_empty() {
+        return;
+    }
     if !items_editable(&s.panes[p].loc) {
         return not_here(s, p);
     }
@@ -1439,9 +1894,13 @@ pub fn ask_rename(s: &mut State, p: usize, tx: &mut Tx) {
         s.status = share_stays().into();
         return;
     }
-    s.name_edit = name_field(item);
-    s.renaming = Some((p, item.clone()));
-    tx.scroll_into_view_in(crate::pane_key(p), crate::row_key(&item.id));
+    if let [item] = items.as_slice() {
+        s.name_edit = name_field(item);
+        s.renaming = Some((p, item.clone()));
+        tx.scroll_into_view_in(crate::pane_key(p), crate::row_key(&item.id));
+    } else {
+        crate::batch_rename::open(s, p, items);
+    }
 }
 
 /// The field Renomear (and Propriedades' name) starts with: the name as shown, its stem
@@ -1465,7 +1924,7 @@ fn stem_len(name: &str, is_dir: bool) -> usize {
 
 /// Why `name` can't name an item in `loc`, or `None`. Windows refuses characters such as `:`
 /// and `?` that Google Drive accepts, so its rules apply only on the local disk.
-fn name_problem(loc: &Location, name: &str) -> Option<String> {
+pub(crate) fn name_problem(loc: &Location, name: &str) -> Option<String> {
     match loc {
         Location::Local(_) | Location::Found(_) => ops::invalid_name(name),
         Location::Server { .. } if name.contains('/') => Some(t("O nome não pode ter /.", "The name can't have /.").into()),
@@ -1544,7 +2003,7 @@ pub fn apply_name(s: &mut State, pane: usize, item: Option<Entry>, name: String)
 
 pub fn apply_name_in(s: &mut State, pane: usize, loc: Location, item: Option<Entry>, name: String) {
     let shown_name = name.clone();
-    let name = if matches!(loc, Location::Drive { .. }) { typed(&name) } else { name };
+    let name = if matches!(loc, Location::Drive { .. } | Location::DriveSearch(_)) { typed(&name) } else { name };
     // Unchanged as shown (a real `／` kept), or the same name typed with `/`.
     if item.as_ref().is_some_and(|i| shown(&i.name) == shown_name || i.name == name) {
         return;
@@ -1585,6 +2044,16 @@ pub fn apply_name_in(s: &mut State, pane: usize, loc: Location, item: Option<Ent
                 Ok(tr!("Renomeado para \"{shown_name}\".", "Renamed to \"{shown_name}\"."))
             });
         }
+        (Location::DriveSearch(_), Some(item)) => {
+            let Some(email) = item_account(&loc, &item).map(str::to_string) else { return };
+            let what = tr!("renomear “{}” para “{shown_name}”", "rename “{}” to “{shown_name}”", shown(&item.name));
+            let who = email.clone();
+            undo::drive_job(s, &email, account_panes_and(s, &email, &loc), move |_| what, move |d, rec| {
+                let file = d.rename(&item.id, &name)?;
+                rec.add([Step::DriveRename { email: who, id: item.id, from: file.name, to: item.name }]);
+                Ok(tr!("Renomeado para \"{shown_name}\".", "Renamed to \"{shown_name}\"."))
+            });
+        }
         (Location::Drive { .. }, None) => {
             let Some((email, folder)) = drive_folder(&loc) else { return not_here(s, pane) };
             let what = tr!("criar a pasta “{shown_name}”", "create the folder “{shown_name}”");
@@ -1597,7 +2066,7 @@ pub fn apply_name_in(s: &mut State, pane: usize, loc: Location, item: Option<Ent
         }
         (Location::Server { find: None, .. }, None) => crate::servers::name(s, &loc, None, name),
         (Location::Server { .. }, Some(item)) => crate::servers::name(s, &loc, Some(item), name),
-        (Location::Mock(_) | Location::Found(_) | Location::Server { .. }, _) => not_here(s, pane),
+        (Location::Computer | Location::Mock(_) | Location::Found(_) | Location::DriveSearch(_) | Location::Server { .. }, _) => not_here(s, pane),
     }
 }
 
@@ -1646,7 +2115,8 @@ pub struct Props {
     pub md5_running: bool,
     /// The Tipo row: the items' shared type, or "Vários tipos".
     pub kind: String,
-    /// The listed sizes added up (files only, folders' contents not included).
+    /// The listed sizes added up: files, and folders whose listing gave a size (OneDrive's, which
+    /// can lag behind); other folders' contents not included.
     pub listed_bytes: u64,
     pub details: Option<Result<Details, String>>,
     pub revisions: Option<Result<Vec<Revision>, String>>,
@@ -1670,7 +2140,7 @@ impl Props {
 
     /// The Histórico de versões tab is for one Drive file (folders have no versions).
     pub fn has_versions(&self) -> bool {
-        matches!(self.loc, Location::Drive { .. }) && self.single().is_some_and(|e| !e.is_dir)
+        matches!(self.loc, Location::Drive { .. } | Location::DriveSearch(_)) && self.single().is_some_and(|e| !e.is_dir)
     }
 }
 
@@ -1730,7 +2200,9 @@ pub fn properties_of(s: &mut State, p: usize, loc: Location, items: Vec<Entry>) 
         }
     }
     // One Drive item: its owner, dates, description and checksum from Drive.
-    if let ([item], Some(email)) = (items.as_slice(), account(&loc)) {
+    if let [item] = items.as_slice()
+        && let Some(email) = item_account(&loc, item)
+    {
         let (details_id, sharing_id) = (item.id.clone(), item.id.clone());
         drive_task(s, email, t("ler as propriedades", "read the properties"), move |d| d.details(&details_id), move |r| Msg::Prop { id, update: PropUpdate::Details(r) });
         drive_task(s, email, t("ler as propriedades", "read the properties"), move |d| d.sharing(&sharing_id), move |r| Msg::Prop { id, update: PropUpdate::Sharing(r) });
@@ -1785,8 +2257,9 @@ pub fn props_tab(s: &mut State, tab: PropTab) {
     }
     p.revisions_asked = true;
     let id = p.id;
-    let Some(item_id) = p.single().map(|e| e.id.clone()) else { return };
-    let Some(email) = account(&p.loc).map(str::to_string) else { return };
+    let Some(item) = p.single() else { return };
+    let item_id = item.id.clone();
+    let Some(email) = item_account(&p.loc, item).map(str::to_string) else { return };
     let email = email.as_str();
     drive_task(s, email, t("ler as versões", "read the versions"), move |d| d.revisions(&item_id), move |r| Msg::Prop { id, update: PropUpdate::Revisions(r) });
 }
@@ -1835,7 +2308,7 @@ mod tests {
     /// what's typed goes back to `/` for Drive.
     #[test]
     fn a_slash_in_a_name_is_edited_as_shown() {
-        let e = Entry { id: "f1".into(), name: "a/b.txt".into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let e = Entry { id: "f1".into(), name: "a/b.txt".into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         let edit = name_field(&e);
         assert_eq!(edit.text, "a／b.txt");
         assert_eq!((edit.anchor.min(edit.focus), edit.anchor.max(edit.focus)), (0, "a／b".len()));
@@ -1978,7 +2451,7 @@ sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa 
         ask_new_folder(&mut s, 1, &mut Tx::default());
         assert!(s.dialog.is_none());
         assert!(s.status.starts_with("Com estrela é uma lista do Google Drive"), "{}", s.status);
-        s.clip = Some(Clip { mode: ClipMode::Copy, from: drive(Space::MyDrive, &[]), items: vec![] });
+        s.clip = Some(Clip { mode: ClipMode::Copy, from: drive(Space::MyDrive, &[]), items: vec![], picked_at: 0.0 });
         s.status.clear();
         paste(&mut s, 1);
         assert!(s.status.starts_with("Com estrela é uma lista"), "{}", s.status);
@@ -2001,7 +2474,7 @@ sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa 
         s.cache = crate::cache::Cache::memory_only();
         let sv = openexplorer_remote::Server::mega("ana@exemplo.com");
         let at = |path: &[&str]| crate::servers::folder(&sv, path.iter().map(|p| p.to_string()).collect());
-        let e = |id: &str| Entry { id: id.into(), name: id.into(), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false };
+        let e = |id: &str| Entry { id: id.into(), name: id.into(), is_dir: false, size: Some(1), modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         for (path, purge) in [(&["Drive na nuvem"][..], false), (&["Drive na nuvem", "Fotos"], false), (&["Lixeira"], true), (&["Lixeira", "Velha"], true), (&["Compartilhados comigo", "Deles"], true)] {
             s.dialog = None;
             s.panes[1].go(at(path));
@@ -2036,7 +2509,7 @@ sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa 
         assert!(in_trash(&at(&["Lixeira"])) && !in_trash(&at(&["Lixeira", "Velha"])) && !in_trash(&at(&["Meus arquivos"])));
         assert!(!editable(&at(&["Lixeira"])) && editable(&at(&["Meus arquivos"])));
         s.panes[1].go(at(&["Lixeira"]));
-        let e = Entry { id: "a.txt".into(), name: "a.txt".into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let e = Entry { id: "a.txt".into(), name: "a.txt".into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         s.panes[1].set_entries(Ok(vec![e]));
         s.panes[1].selected = ["a.txt".to_string()].into();
         ask_delete(&mut s, 1);
@@ -2051,7 +2524,7 @@ sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa 
         let mut s = crate::init();
         s.cache = crate::cache::Cache::memory_only();
         s.panes[1].go(drive(Space::Trash, &[]));
-        let e = |id: &str| Entry { id: id.into(), name: id.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let e = |id: &str| Entry { id: id.into(), name: id.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         s.panes[1].set_entries(Ok(vec![e("a"), e("b")]));
         s.panes[1].selected = ["a".to_string()].into();
         // Del in Lixeira opens Excluir permanentemente, not the move to the trash.
@@ -2138,7 +2611,7 @@ sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa 
     fn the_star_item_adds_unless_all_have_one() {
         let mut s = crate::init();
         s.panes[1].go(drive(Space::MyDrive, &[]));
-        let e = |id: &str, starred| Entry { id: id.into(), name: id.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred };
+        let e = |id: &str, starred| Entry { id: id.into(), name: id.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred, drive_origin: None };
         s.panes[1].set_entries(Ok(vec![e("a", true), e("b", false)]));
         s.panes[1].selected = ["a".to_string()].into();
         assert!(!stars_to_add(&s, 1));
@@ -2186,7 +2659,7 @@ sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa 
         for p in &mut s.panes {
             p.load_now(&s.mock, s.settings.show_hidden);
         }
-        s.clip = Some(Clip { mode: ClipMode::Cut, from: Location::Local(b.clone()), items: Vec::new() });
+        s.clip = Some(Clip { mode: ClipMode::Cut, from: Location::Local(b.clone()), items: Vec::new(), picked_at: 0.0 });
 
         copy_across(&mut s, 1, 0);
         assert!(s.status.contains("Selecione"), "nothing selected on the right: {}", s.status);
@@ -2208,5 +2681,100 @@ sftp ["x"] find=true: editable=0 items=1 trash=0 why="Os resultados da pesquisa 
         assert!(a.join("nota.txt").exists(), "a copy leaves the original");
         assert!(matches!(&s.clip, Some(Clip { mode: ClipMode::Cut, .. })), "what Recortar picked up stays");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_scopes_and_multi_account_search_operations() {
+        use crate::model::{DriveOrigin, DriveSearch, DriveSearchScope};
+        use openexplorer_gdrive::search::Within;
+        use openexplorer_gdrive::store::StoredAccount;
+
+        let mut s = crate::init();
+        s.cache = crate::cache::Cache::memory_only();
+        s.accounts = vec![
+            StoredAccount { email: "a@b".into(), name: "A".into(), client_id: String::new() },
+            StoredAccount { email: "c@d".into(), name: "C".into(), client_id: String::new() },
+        ];
+        s.panes[0].go(drive(Space::MyDrive, &[("f1")]));
+        s.search[0] = TextEdit::new("serie");
+
+        // Default scope searches only within current folder.
+        search(&mut s, 0);
+        assert!(matches!(
+            &s.panes[0].loc,
+            Location::Drive { email, space: Space::Search(q), path }
+                if email == "a@b" && path.is_empty() && q.text == "serie" && matches!(&q.within, Within::Folder { id, .. } if id == "f1")
+        ));
+
+        // Switching scope to Account searches whole current account (`Within::Everything`).
+        set_search_scope(&mut s, 0, DriveSearchScope::Account, &mut Tx::default());
+        assert!(matches!(
+            &s.panes[0].loc,
+            Location::Drive { email, space: Space::Search(q), path }
+                if email == "a@b" && path.is_empty() && q.text == "serie" && q.within == Within::Everything
+        ));
+
+        // Switching scope to AllAccounts navigates to Location::DriveSearch.
+        set_search_scope(&mut s, 0, DriveSearchScope::AllAccounts, &mut Tx::default());
+        assert_eq!(s.panes[0].loc, Location::DriveSearch(Box::new(DriveSearch { text: "serie".into() })));
+        assert!(!editable(&s.panes[0].loc));
+        assert!(items_editable(&s.panes[0].loc));
+        assert!(shows_results(&s.panes[0].loc));
+
+        // Narrowing from AllAccounts to one account switches to that account's general search.
+        search_in_account(&mut s, 0, "c@d".into(), &mut Tx::default());
+        assert!(matches!(
+            &s.panes[0].loc,
+            Location::Drive { email, space: Space::Search(q), .. }
+                if email == "c@d" && q.text == "serie" && q.within == Within::Everything
+        ));
+
+        // Multi-account item origin, account grouping, and paste compatibility.
+        let global = Location::DriveSearch(Box::new(DriveSearch { text: "serie".into() }));
+        let item_a = Entry {
+            id: "id1".into(),
+            name: "ep1.mkv".into(),
+            is_dir: false,
+            size: Some(10),
+            modified: None,
+            target: None,
+            mime: None,
+            md5: None,
+            starred: false,
+            drive_origin: Some(Box::new(DriveOrigin {
+                email: "a@b".into(),
+                shared_drive: Some(("0AA".into(), "Séries".into())),
+                owned_by_me: false,
+                label: "a@b · Séries".into(),
+            })),
+        };
+        let item_c = Entry {
+            id: "id2".into(),
+            name: "ep2.mkv".into(),
+            is_dir: false,
+            size: Some(10),
+            modified: None,
+            target: None,
+            mime: None,
+            md5: None,
+            starred: false,
+            drive_origin: Some(Box::new(DriveOrigin {
+                email: "c@d".into(),
+                shared_drive: None,
+                owned_by_me: true,
+                label: "c@d · Meu Drive".into(),
+            })),
+        };
+        assert_eq!(item_account(&global, &item_a), Some("a@b"));
+        assert_eq!(item_account(&global, &item_c), Some("c@d"));
+        let groups = group_by_account(&global, vec![item_a.clone(), item_c.clone()]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "a@b");
+        assert_eq!(groups[1].0, "c@d");
+
+        let clip_a = Clip { mode: ClipMode::Copy, from: global.clone(), items: vec![item_a], picked_at: 0.0 };
+        assert!(clip_fits(&clip_a, &Location::Local("C:\\".into())));
+        assert!(clip_fits(&clip_a, &Location::drive("a@b", Space::MyDrive)));
+        assert!(!clip_fits(&clip_a, &Location::drive("c@d", Space::MyDrive)));
     }
 }

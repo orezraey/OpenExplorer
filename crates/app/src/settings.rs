@@ -197,6 +197,45 @@ impl Language {
     }
 }
 
+/// How many file panes are shown in the Explore view: 1 (single pane with tree on the left and
+/// files on the right), 2 (side by side, default), or 4 (2×2 grid).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneLayout {
+    One,
+    Four,
+    #[default]
+    #[serde(other)]
+    Two,
+}
+
+impl PaneLayout {
+    pub const ALL: [PaneLayout; 3] = [PaneLayout::One, PaneLayout::Two, PaneLayout::Four];
+
+    pub fn count(self) -> usize {
+        match self {
+            PaneLayout::One => 1,
+            PaneLayout::Two => 2,
+            PaneLayout::Four => 4,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PaneLayout::One => t("Um painel", "One pane"),
+            PaneLayout::Two => t("Dois painéis", "Two panes"),
+            PaneLayout::Four => t("Quatro painéis", "Four panes"),
+        }
+    }
+
+    pub fn icon(self) -> &'static Icon {
+        match self {
+            PaneLayout::One => &crate::icons::VIEW_ONE_PANE,
+            PaneLayout::Two => &crate::icons::VIEW_TWO_PANES,
+            PaneLayout::Four => &crate::icons::VIEW_FOUR_PANES,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -204,6 +243,8 @@ pub struct Settings {
     pub theme: Theme,
     pub font: TextFont,
     pub text_render: TextRender,
+    /// Number of visible panes in Explore (1, 2, or 4).
+    pub pane_layout: PaneLayout,
     /// Files sent to the cloud or server at the same time.
     pub uploads: u8,
     /// Files fetched from the cloud or server at the same time.
@@ -216,12 +257,18 @@ pub struct Settings {
     pub segmented_downloads: bool,
     /// Show hidden files and `.` dotfiles in local folders, servers and the navigation tree.
     pub show_hidden: bool,
-    /// Remove finished transfers from the queue automatically once done.
+    /// Remove finished transfers from the queue automatically once done. Off by default; kept
+    /// under `auto_clear_completed` in JSON so older settings files with `clear_completed: true`
+    /// adopt the new default instead of keeping finished rows hidden.
+    #[serde(rename = "auto_clear_completed")]
     pub clear_completed: bool,
     /// Delete local files permanently (with confirmation) instead of sending them to Recycle Bin.
     pub skip_recycle_bin: bool,
     /// Where the main window was when it last closed, to open there again.
     pub window: Option<crate::window_place::Saved>,
+    /// Last logical size `(width, height)` of the independent Rule Editor window (always centered on open).
+    #[serde(default)]
+    pub rule_editor_size: Option<(u32, u32)>,
     /// Experimental: a Windows 11 material (`material`) behind the window. Turned on, it takes
     /// effect from the next start; turned off or changed, at once.
     pub mica: bool,
@@ -229,6 +276,43 @@ pub struct Settings {
     /// Experimental: a search's matches in names marked as with a highlighter, rather than
     /// only coloured.
     pub search_marker: bool,
+    /// Download newer stable releases on the same major version in the background and install
+    /// them on the next start (or when clicking "Restart to update").
+    pub auto_update: bool,
+    /// Master switch for native UI animations (all enabled by default).
+    pub animations: bool,
+    /// Fluid gliding hover highlight across rows, folders and controls.
+    pub animate_hover: bool,
+    /// Wiggle icons of files/folders picked up with Ctrl+C / Ctrl+X.
+    pub animate_clipboard: bool,
+    /// Smoothly animate list row/icon zoom on Ctrl+scroll and pinch gestures.
+    pub animate_zoom: bool,
+    /// Smooth selection highlights, keyboard glide, sort reorder and tree chevron rotation.
+    pub animate_selection: bool,
+    /// Subtle alternating row stripes (zebra stripes) in the file list.
+    pub zebra_stripes: bool,
+    /// Experimental (Windows): the window's content keeps up with a drag of its left or top
+    /// edge (Rune's `ResizeSync::On`), from the next start.
+    pub resize_sync: bool,
+    /// Experimental (macOS, Linux): the window's background and its folder trees show the
+    /// system's sidebar material (macOS) or blur (Wayland), from the next start. Windows has its
+    /// Acrylic through `mica` and `material`.
+    pub acrylic: bool,
+}
+
+impl Settings {
+    /// Whether the window opens with the acrylic background: asked for, off Windows (there the
+    /// translucent background's Acrylic effect is it).
+    pub fn acrylic_window(&self) -> bool {
+        self.acrylic && !cfg!(windows)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn the_acrylic_background_only_off_windows() {
+    assert_eq!(Settings { acrylic: true, ..Settings::default() }.acrylic_window(), !cfg!(windows));
+    assert!(!Settings::default().acrylic_window());
 }
 
 impl Default for Settings {
@@ -240,16 +324,27 @@ impl Default for Settings {
             theme: Theme::Auto,
             font: TextFont::System,
             text_render: TextRender::Smooth,
+            pane_layout: PaneLayout::Two,
             uploads: 4,
             downloads: 4,
             segmented_downloads: true,
             show_hidden: false,
-            clear_completed: true,
+            clear_completed: false,
             skip_recycle_bin: false,
             window: None,
+            rule_editor_size: None,
             mica: false,
             material: Material::Mica,
             search_marker: false,
+            auto_update: true,
+            animations: true,
+            animate_hover: true,
+            animate_clipboard: true,
+            animate_zoom: true,
+            animate_selection: true,
+            zebra_stripes: true,
+            resize_sync: false,
+            acrylic: false,
         }
     }
 }
@@ -285,6 +380,26 @@ impl Settings {
         let _ = std::fs::create_dir_all(openexplorer_gdrive::config_dir());
         let _ = std::fs::write(file(), text);
     }
+
+    #[inline]
+    pub fn hover_animated(self) -> bool {
+        self.animations && self.animate_hover
+    }
+
+    #[inline]
+    pub fn clipboard_animated(self) -> bool {
+        self.animations && self.animate_clipboard
+    }
+
+    #[inline]
+    pub fn zoom_animated(self) -> bool {
+        self.animations && self.animate_zoom
+    }
+
+    #[inline]
+    pub fn selection_animated(self) -> bool {
+        self.animations && self.animate_selection
+    }
 }
 
 /// Sidebar sections in the Opções dialog.
@@ -292,6 +407,7 @@ impl Settings {
 pub enum OptionsTab {
     #[default]
     General,
+    Animations,
     Transfers,
     Cache,
     Logs,
@@ -299,11 +415,19 @@ pub enum OptionsTab {
 }
 
 impl OptionsTab {
-    pub const ALL: [OptionsTab; 5] = [OptionsTab::General, OptionsTab::Transfers, OptionsTab::Cache, OptionsTab::Logs, OptionsTab::Experimental];
+    pub const ALL: [OptionsTab; 6] = [
+        OptionsTab::General,
+        OptionsTab::Animations,
+        OptionsTab::Transfers,
+        OptionsTab::Cache,
+        OptionsTab::Logs,
+        OptionsTab::Experimental,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             OptionsTab::General => t("Geral", "General"),
+            OptionsTab::Animations => t("Animações", "Animations"),
             OptionsTab::Transfers => t("Transferências", "Transfers"),
             OptionsTab::Cache => "Cache",
             OptionsTab::Logs => "Logs",
@@ -314,6 +438,7 @@ impl OptionsTab {
     pub fn icon(self) -> &'static Icon {
         match self {
             OptionsTab::General => &crate::icons::SETTINGS,
+            OptionsTab::Animations => &crate::icons::OPT_ANIMATIONS,
             OptionsTab::Transfers => &crate::icons::OPT_TRANSFERS,
             OptionsTab::Cache => &crate::icons::OPT_CACHE,
             OptionsTab::Logs => &crate::icons::OPT_LOGS,
@@ -381,9 +506,16 @@ mod tests {
 
     #[test]
     fn settings_read_back_and_stay_in_bounds() {
+        assert!(!Settings::default().clear_completed);
         assert_eq!(serde_json::from_str::<Settings>("{}").unwrap(), Settings::default());
-        let s: Settings = serde_json::from_str(r#"{"theme":"Dark","uploads":7,"show_hidden":true,"clear_completed":false}"#).unwrap();
-        assert_eq!((s.theme, s.uploads, s.downloads, s.show_hidden, s.clear_completed, s.skip_recycle_bin), (Theme::Dark, 7, 4, true, false, false));
+        // An older settings file with `clear_completed: true` adopts the new `false` default.
+        let legacy: Settings = serde_json::from_str(r#"{"theme":"Dark","uploads":7,"show_hidden":true,"clear_completed":true}"#).unwrap();
+        assert_eq!((legacy.theme, legacy.uploads, legacy.downloads, legacy.show_hidden, legacy.clear_completed, legacy.skip_recycle_bin), (Theme::Dark, 7, 4, true, false, false));
+        // Enabling auto-clear under the current key persists across save/load round-trips.
+        let auto_clear: Settings = serde_json::from_str(r#"{"auto_clear_completed":true}"#).unwrap();
+        assert!(auto_clear.clear_completed);
+        let round_trip: Settings = serde_json::from_str(&serde_json::to_string(&auto_clear).unwrap()).unwrap();
+        assert!(round_trip.clear_completed);
         let s: Settings = serde_json::from_str(r#"{"theme":"HighContrast","uploads":7}"#).unwrap();
         assert_eq!((s.theme, s.uploads), (Theme::Auto, 7));
         assert_eq!((at_once(0), at_once(50), at_once(3)), (1, MAX_AT_ONCE, 3));
@@ -395,6 +527,17 @@ mod tests {
         assert!(s.segmented_downloads);
         let off: Settings = serde_json::from_str(r#"{"big_files_in_segments":false}"#).unwrap();
         assert!(!off.segmented_downloads);
+        // Animations default to enabled even when reading an older settings file.
+        assert!(s.hover_animated() && s.clipboard_animated() && s.zoom_animated() && s.selection_animated());
+        let muted = Settings { animations: false, ..Settings::default() };
+        assert!(!muted.hover_animated() && !muted.clipboard_animated() && !muted.zoom_animated() && !muted.selection_animated());
+        assert_eq!(Settings::default().pane_layout, PaneLayout::Two);
+        let one: Settings = serde_json::from_str(r#"{"pane_layout":"One"}"#).unwrap();
+        assert_eq!((one.pane_layout, one.pane_layout.count()), (PaneLayout::One, 1));
+        let four: Settings = serde_json::from_str(r#"{"pane_layout":"Four"}"#).unwrap();
+        assert_eq!((four.pane_layout, four.pane_layout.count()), (PaneLayout::Four, 4));
+        let unknown: Settings = serde_json::from_str(r#"{"pane_layout":"Six"}"#).unwrap();
+        assert_eq!(unknown.pane_layout, PaneLayout::Two);
     }
 
     #[test]

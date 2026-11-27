@@ -12,6 +12,16 @@ const SERVICE: &str = "OpenExplorer Google Drive";
 pub struct StoredAccount {
     pub email: String,
     pub name: String,
+    /// The OAuth client the account signed in with: its refresh token works only with that
+    /// client, so the app's built-in one and a client of the user's own can both have accounts.
+    /// Empty for accounts saved before it was kept (they use [`crate::ClientConfig::load`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_id: String,
+}
+
+/// The client account `email` signed in with ([`crate::ClientConfig::for_account`]).
+pub fn client_of(email: &str) -> String {
+    accounts().into_iter().find(|a| a.email == email).map(|a| a.client_id).unwrap_or_default()
 }
 
 fn accounts_file() -> std::path::PathBuf {

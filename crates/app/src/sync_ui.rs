@@ -944,9 +944,8 @@ fn comparison_table(s: &State, k: &Kit) -> El {
 
     // One viewport scrolls both ways, as the file list's: sideways when the columns are wider
     // than the window, with the header stuck to the top and a bar along the bottom then. The
-    // bar at the side runs below the header, and the columns leave it its strip.
-    let bar = crate::ui::bar_style(k).track_offset(TABLE_HEADER_H, 0.0);
-    let content = col().key("sync-table-content").w_full().min_w(cols.total() + bar.strip()).child(table_header(s, k, cols, true)).child(list).child(rest);
+    // bars are in gutters of their own, as the file list's: the one at the side below the header.
+    let content = col().key("sync-table-content").w_full().min_w(cols.total()).child(table_header(s, k, cols, true)).child(list).child(rest);
     let viewport = col()
         .key(TABLE_VIEW)
         .scroll(ScrollSpec { stick_bottom: s.sync.auto_scroll && s.sync.phase == SyncPhase::Running })
@@ -954,7 +953,7 @@ fn comparison_table(s: &State, k: &Kit) -> El {
         .w_full()
         .h_full()
         .child(content);
-    table.child(col().w_full().grow(1.0).min_h(0.0).child(crate::ui::with_scroll_bars(k, TABLE_VIEW, viewport, bar, true)))
+    table.child(col().w_full().grow(1.0).min_h(0.0).child(crate::scrollbars::xy_bars(k, TABLE_VIEW, viewport, TABLE_HEADER_H, s.waker.clone()).w_full().h_full()))
 }
 
 /// The table's scroll view.
@@ -2380,8 +2379,16 @@ mod tests {
         assert_eq!(at_rest[0], (8.0, 1500.0));
         assert_eq!(at_rest.iter().map(|c| c.1).collect::<Vec<_>>(), [1500.0, 82.0, 124.0, 100.0, 300.0, 82.0, 124.0, 140.0]);
         assert!(at_rest[7].0 > table[0] + table[2], "the last column starts past the window's edge");
-        let bar = rect(&rt, &format!("h-bar-{}", super::TABLE_VIEW));
+        // The bar along the bottom comes in a gutter of its own once the view runs again, as
+        // the window has it run when the content turns out wider than the table.
+        assert!(crate::scrollbars::take_stale(), "the table asks for its bottom gutter");
+        rt.update(|_, _| {});
+        rt.frame(0.016);
+        let all = rt.elements();
+        let bars = all.iter().position(|e| !e.exiting && e.key.as_deref() == Some(&format!("bars-{}", super::TABLE_VIEW))).expect("the table's bars");
+        let bar = all.iter().find(|e| !e.exiting && e.parent == Some(bars) && e.key.as_deref() == Some("h-track")).map(|e| e.rect).expect("a bar along the bottom");
         assert!(bar[2] > 200.0 && bar[1] > table[1] + table[3] - 30.0, "the bar along the bottom: {bar:?} of {table:?}");
+        assert_eq!(columns(&rt), at_rest, "the gutter moves no column");
 
         // Sideways by the wheel: every column moves the same way, the header with the rows.
         let (x, y) = (table[0] + table[2] / 2.0, table[1] + table[3] / 2.0);

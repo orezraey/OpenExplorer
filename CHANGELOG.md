@@ -1,5 +1,110 @@
 # Changelog
 
+## 0.6.0 - 2026-11-26
+
+### Added
+
+* When a file with the same name is already where a copy, move, download or upload goes, a
+  window asks what to do: replace it, leave it, keep both (it shows the new name, as
+  `file (2).ext`), or copy only the files that are newer. It shows both files' size and date,
+  marks the newer one, and Apply to all conflicts answers once for the rest. Cancel stops the
+  items not yet started. It works between the computer, Google Drive, the other clouds and the
+  servers, in every direction. Rows left out show Skipped in the transfer queue.
+* A folder that already exists at the destination is merged with the one that arrives, instead
+  of a second copy beside it. On the computer and on servers, a replaced file is written in full
+  before the old one goes, so a cancel or a dropped connection leaves the old one.
+* Google Drive search can look in the current folder, in the whole account (My Drive, Shared
+  with me and every shared drive), or in all your Google accounts at once, from a menu in the
+  search bar. Results come in as each account answers, and an account that fails doesn't stop
+  the others. The Location column says where each item is, with its account when the search
+  covers several.
+* Open Explorer has its own icon in the window, the taskbar, the installer and the macOS app.
+  On Windows and Linux an icon in the notification area opens the window or quits; Quit asks
+  first while transfers run.
+* The transfer queue has Clear finished.
+
+### Changed
+
+* Finished transfers stay in the queue until you clear them. Clear finished automatically moved
+  from Options › General to Options › Transfers and is off unless you turn it on.
+
+### Fixed
+
+* Cut from Starred, Recent, Shared with me or a search, then paste, moves the items from their
+  own folder. Before, each row failed and the items stayed where they were. An item only shared
+  with the account, in none of its folders, can't be moved, and the row suggests Copy.
+* Restore defaults in Options also resets the limits of transfers already running.
+
+## 0.5.1 - 2026-11-26
+
+### Fixed
+
+* Uploads and downloads at the same time keep to the numbers set in Options › Transfers. Each
+  new copy started while another ran brought as many again, so two batches of 4 uploads sent 8
+  files at once. The limit now counts every batch together, on Google Drive and on the other
+  clouds and servers, and a change to it applies at once.
+* A transfer cancelled while it waits for another to finish ends at once.
+
+## 0.5.0 - 2026-11-26
+
+### Added
+
+* One, two or four panes, from View in the toolbar. Four show in a 2×2 grid, each with its own
+  tabs, tree and history.
+* Each pane shows its files as Explorer does: Extra large, Large or Medium icons, List or
+  Details, from the button at the right of the pane's bar. A click on the icon goes to the next
+  view, the arrow beside it picks one.
+* Open Explorer updates itself. Once a day it looks for a new release on GitHub, downloads it in
+  the background and installs it at the next start, or at once with Restart to update. Each
+  release is signed, and the signature is checked again just before installing. Options ›
+  General has Update automatically and Check for updates.
+* Google Drive works without a client of your own: Add account → Google Drive → Connect in
+  browser. Until Google verifies the app, it shows a warning (Advanced → Go to Open Explorer).
+  A client of your own still works, and each account keeps the one it signed in with.
+* Thirteen clouds that speak WebDAV are ready to add, with their logos: Koofr, InfiniCLOUD,
+  MagentaCLOUD, Mail.ru Cloud, Yandex Disk, Stack, Onlime limeDRIVE, HiDrive (STRATO and IONOS),
+  kDrive, pCloud US and EU, and Mail.com Cloud. You type only your login.
+* Animations, each with its own switch in Options › Animations: the hover highlight glides from
+  row to row, copied or cut items swing for a moment and cut ones fade, the keyboard's
+  selection glides, rows slide to their place when the list is sorted, and the tree's arrows
+  turn. Rows can have stripes.
+* Zoom in Details with Ctrl and the wheel, Ctrl+= and Ctrl+-, or a pinch; Ctrl+0 or the
+  percentage in the status bar goes back to 100%.
+* Details' columns can be put in another order by dragging their header.
+* macOS: Cmd+Q, Quit in the Dock and logging out ask first while transfers run, as closing the
+  window does.
+* Linux: a right click in a text field shows Cut, Copy and Paste, also in the add-account
+  window.
+* Options › Experimental: an acrylic background on macOS and Linux, and on Windows, content
+  that keeps up while the window's left or top edge is dragged.
+* `openexplorer --version` prints the version.
+
+### Changed
+
+* Open Explorer is faster than Air Explorer in all 37 measurements of an automated comparison,
+  with a median of 4.8 times less time. The README shows the figures.
+* Big Google Drive downloads come in 8 parallel parts. A part that ends takes over the rest of
+  a slow or stalled one.
+* A Drive folder being downloaded reads its subfolders many at a time.
+* Big OneDrive folders are read from both ends and show page by page. A OneDrive folder
+  download reads its folders ahead, and uploads go in 56.25 MiB parts.
+* MEGA uploads go in pieces, several at once: 100 MiB went from 27.9 s to 4.9 s.
+* Dropbox sends a file up to 150 MiB in one request: 100 MiB went from 9.8 s to 3.0 s.
+* Context menus are spaced as Windows 11's, with a thin border.
+* The field menus and the window buttons' names for screen readers are in Portuguese while the
+  interface is.
+* List and the hover highlight cost the window far less: a list of 2,000 items in List view
+  takes about 7 times less time per update while transfers run.
+
+### Fixed
+
+* A file downloaded twice into one folder at once failed with "The system cannot find the file
+  specified"; both copies finish now.
+* A download with a Drive folder and a shortcut to it saved the second one empty.
+* A typed Drive path could lead to a folder renamed, moved or deleted elsewhere.
+* Cancelling a Dropbox upload no longer waits for the whole file to be read.
+* macOS and Linux: a window closed on a display that is gone opens in the middle of the screen.
+
 ## 0.4.0 - 2026-11-25
 
 ### Added

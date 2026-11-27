@@ -39,6 +39,8 @@ const SPACES: &[(&str, &str, Root)] = &[
 /// The simulated drive's name in the path bar.
 const MOCK: &str = "Drive simulado";
 const MOCK_EN: &str = "Simulated drive";
+const COMPUTER: &str = "Este Computador";
+const COMPUTER_EN: &str = "This PC";
 
 /// Where a pane goes, and the entry (id, name) to select there once it's listed.
 #[derive(Clone, Debug, PartialEq)]
@@ -51,6 +53,8 @@ pub struct Reached {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Target {
     Local(PathBuf),
+    /// Este Computador.
+    Computer,
     Mock(Vec<String>),
     /// In `email`'s Drive.
     Drive { email: String, way: Way },
@@ -96,6 +100,7 @@ impl Root {
 pub fn text(loc: &Location) -> String {
     match loc {
         Location::Local(dir) => dir.display().to_string(),
+        Location::Computer => t(COMPUTER, COMPUTER_EN).into(),
         Location::Found(f) => f.within.as_ref().map(|w| w.display().to_string()).unwrap_or_default(),
         Location::Mock(segs) => std::iter::once(t(MOCK, MOCK_EN)).chain(segs.iter().map(String::as_str)).collect::<Vec<_>>().join("/"),
         Location::Drive { email, space, path } => {
@@ -113,6 +118,7 @@ pub fn text(loc: &Location) -> String {
             parts.extend(path.iter().map(|(_, name)| shown(name)));
             parts.join("/")
         }
+        Location::DriveSearch(_) => String::new(),
         Location::Server { .. } => crate::servers::address_text(loc),
     }
 }
@@ -163,6 +169,9 @@ pub fn parse(typed: &str, here: &Location, accounts: &[String]) -> Result<Target
     if let Some(email) = accounts.iter().find(|a| a.eq_ignore_ascii_case(first)) {
         let rest: Vec<String> = parts.map(str::to_string).collect();
         return Ok(Target::Drive { email: email.clone(), way: drive_path(rest) });
+    }
+    if typed.eq_ignore_ascii_case(COMPUTER) || typed.eq_ignore_ascii_case(COMPUTER_EN) {
+        return Ok(Target::Computer);
     }
     if first.eq_ignore_ascii_case(MOCK) || first.eq_ignore_ascii_case(MOCK_EN) {
         return Ok(Target::Mock(parts.map(str::to_string).collect()));
@@ -484,7 +493,7 @@ pub fn place_location(email: String, place: Place) -> Location {
 }
 
 /// Folder `id` itself, where `place` says it sits.
-fn folder_location(email: String, id: &str, place: Place) -> Location {
+pub(crate) fn folder_location(email: String, id: &str, place: Place) -> Location {
     // A shared drive's root is the drive, not a folder in it.
     if matches!(&place.top, Top::SharedDrive { id: drive, .. } if drive == id) {
         return place_location(email, place);
@@ -509,7 +518,7 @@ mod tests {
         use crate::cache::{Cache, Listing, key};
         use crate::model::Entry;
         use crate::watch::Watch;
-        let entry = |id: &str, name: &str, dir: bool| Entry { id: id.into(), name: name.into(), is_dir: dir, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let entry = |id: &str, name: &str, dir: bool| Entry { id: id.into(), name: name.into(), is_dir: dir, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         let at = |path: Vec<(String, String)>| Location::Drive { email: "ana@gmail.com".into(), space: Space::MyDrive, path };
         // The log, read since before the listings below: nothing changed.
         let log = Watch::reading("root-id", &[]);
@@ -579,6 +588,8 @@ mod tests {
         assert_eq!(text(&drive(Space::Starred, &[])), "ana@gmail.com/Com estrela");
         assert_eq!(text(&Location::Mock(vec!["Fotos".into()])), "Drive simulado/Fotos");
         assert_eq!(parse("Drive simulado/Fotos", &here, &accounts()), Ok(Target::Mock(vec!["Fotos".into()])));
+        assert_eq!(parse("este computador", &here, &accounts()), Ok(Target::Computer));
+        assert_eq!(parse("This PC", &here, &accounts()), Ok(Target::Computer));
     }
 
     /// A `/` in a Drive name shows as `／` and reads back as one step that stands for the `/`

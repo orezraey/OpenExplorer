@@ -85,11 +85,11 @@ pub struct History {
     /// Where it's saved; `None` (tests) saves nothing.
     file: Option<PathBuf>,
     /// Each pane's address field and search field.
-    pub address: [Recall; 2],
-    pub search: [Recall; 2],
+    pub address: [Recall; crate::layout::MAX_PANES],
+    pub search: [Recall; crate::layout::MAX_PANES],
     /// Per pane: an address typed whose place is being looked up, with the pane's `moves` then.
     /// It joins the list once the pane gets there.
-    pending: [Option<(u64, String)>; 2],
+    pending: [Option<(u64, String)>; crate::layout::MAX_PANES],
 }
 
 impl History {

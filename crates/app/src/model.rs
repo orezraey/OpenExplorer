@@ -30,6 +30,22 @@ pub struct Entry {
     /// Starred in Google Drive, for the menu to offer Adicionar or Remover estrela.
     #[serde(default)]
     pub starred: bool,
+    /// Where a Google Drive search result came from (not persisted in disk folder caches).
+    #[serde(skip)]
+    pub drive_origin: Option<Box<DriveOrigin>>,
+}
+
+/// Where a Google Drive search result comes from: its account, shared drive (if any),
+/// ownership flag, and formatted label for the 4th column ("Local").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriveOrigin {
+    pub email: String,
+    /// `(drive_id, drive_name)` when the item is in a shared drive.
+    pub shared_drive: Option<(String, String)>,
+    pub owned_by_me: bool,
+    /// Column text: e.g. "Séries HD", "Meu Drive", "Compartilhados comigo",
+    /// or in multi-account search: "conta@gmail.com · Séries HD".
+    pub label: String,
 }
 
 /// What a file is, for its icon and the Tipo column.
@@ -117,6 +133,8 @@ impl Entry {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Location {
     Local(PathBuf),
+    /// Este Computador: the disks, each entry's id its root (`C:\`, `/media/ana/PEN`).
+    Computer,
     /// What the search index found on the computer: files from many folders, each entry's id
     /// its full path (see [`crate::finder`]).
     Found(Box<Found>),
@@ -125,10 +143,30 @@ pub enum Location {
     /// A folder in a connected account: the (id, name) of each folder from the top of `space`
     /// down.
     Drive { email: String, space: Space, path: Vec<(String, String)> },
+    /// A search across all connected Google Drive accounts.
+    DriveSearch(Box<DriveSearch>),
     /// A folder on an FTP, SFTP or WebDAV server the user added: the server, and the folders
     /// from its root down. With `find`, the search for those words in that folder and below,
     /// each result's id its path from the folder searched (see [`crate::servers`]).
     Server { server: Box<openexplorer_remote::Server>, path: Vec<String>, find: Option<String> },
+}
+
+/// A search across all connected Google Drive accounts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DriveSearch {
+    pub text: String,
+}
+
+/// Explicit Google Drive search scope chosen in a pane's search bar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DriveSearchScope {
+    /// Scope to the pane's current Drive location (folder, shared drive, My Drive, or whole account for views).
+    #[default]
+    Here,
+    /// Whole current Google Drive account (`Within::Everything`: My Drive + Shared with me + all Shared Drives).
+    Account,
+    /// All connected Google Drive accounts (`Location::DriveSearch`).
+    AllAccounts,
 }
 
 /// A search of the computer: its words, the folder it looks under (everywhere when `None`), and
@@ -222,6 +260,13 @@ impl Location {
         matches!(self, Location::Found(_) | Location::Server { find: Some(_), .. })
     }
 
+    /// Whether this lists Google Drive search results (one account or all accounts),
+    /// where the 4th column shows the item's Drive/account location.
+    pub fn is_drive_search(&self) -> bool {
+        matches!(self, Location::DriveSearch(_))
+            || matches!(self, Location::Drive { space: Space::Search(_), path, .. } if path.is_empty())
+    }
+
     pub fn home() -> Location {
         let (var, fallback) = if cfg!(windows) { ("USERPROFILE", "C:\\") } else { ("HOME", "/") };
         Location::Local(std::env::var_os(var).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(fallback)))
@@ -236,6 +281,73 @@ pub enum SortCol {
     Kind,
 }
 
+/// How a pane displays its folder's entries, as in Windows Explorer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ViewMode {
+    ExtraLargeIcons,
+    LargeIcons,
+    MediumIcons,
+    List,
+    #[default]
+    #[serde(other)]
+    Details,
+}
+
+impl ViewMode {
+    pub const ALL: [ViewMode; 5] = [
+        ViewMode::ExtraLargeIcons,
+        ViewMode::LargeIcons,
+        ViewMode::MediumIcons,
+        ViewMode::List,
+        ViewMode::Details,
+    ];
+
+    /// Advances directly to the next view mode (clicking the main icon half of the split button).
+    pub fn next(self) -> ViewMode {
+        match self {
+            ViewMode::ExtraLargeIcons => ViewMode::LargeIcons,
+            ViewMode::LargeIcons => ViewMode::MediumIcons,
+            ViewMode::MediumIcons => ViewMode::List,
+            ViewMode::List => ViewMode::Details,
+            ViewMode::Details => ViewMode::ExtraLargeIcons,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewMode::ExtraLargeIcons => t("Ícones extra grandes", "Extra large icons"),
+            ViewMode::LargeIcons => t("Ícones grandes", "Large icons"),
+            ViewMode::MediumIcons => t("Ícones médios", "Medium icons"),
+            ViewMode::List => t("Lista", "List"),
+            ViewMode::Details => t("Detalhes", "Details"),
+        }
+    }
+
+    pub fn icon(self) -> &'static rune::Icon {
+        match self {
+            ViewMode::ExtraLargeIcons => &crate::icons::VM_EXTRA_LARGE,
+            ViewMode::LargeIcons => &crate::icons::VM_LARGE,
+            ViewMode::MediumIcons => &crate::icons::VM_MEDIUM,
+            ViewMode::List => &crate::icons::VM_LIST,
+            ViewMode::Details => &crate::icons::VM_DETAILS,
+        }
+    }
+
+    pub fn is_grid(self) -> bool {
+        matches!(self, ViewMode::ExtraLargeIcons | ViewMode::LargeIcons | ViewMode::MediumIcons)
+    }
+
+    /// `(tile_w, tile_h, icon_size)` for grid modes, sized to match Windows Explorer.
+    pub fn tile_metrics(self) -> (f32, f32, f32) {
+        match self {
+            ViewMode::ExtraLargeIcons => (236.0, 268.0, 200.0),
+            ViewMode::LargeIcons => (128.0, 152.0, 96.0),
+            ViewMode::MediumIcons => (96.0, 102.0, 48.0),
+            ViewMode::List | ViewMode::Details => (0.0, 0.0, 16.0),
+        }
+    }
+}
+
 pub struct Pane {
     pub loc: Location,
     pub entries: Vec<Entry>,
@@ -244,6 +356,7 @@ pub struct Pane {
     pub anchor: Option<String>,
     pub cursor: Option<String>,
     pub sort: (SortCol, bool),
+    pub view_mode: ViewMode,
     /// Bumped whenever `entries` change, so the virtual list skips re-reading 50,000 keys.
     pub version: u64,
     pub drop_over: bool,
@@ -277,10 +390,16 @@ fn order(asc: bool, a: &Entry, b: &Entry, by: Ordering) -> Ordering {
     })
 }
 
-/// What the fourth column sorts by: the type, or for a search's results the folder (the column
-/// shows Pasta there, as Everything's does).
+/// What the fourth column sorts by: the type, the folder (for computer/server searches),
+/// or the Drive origin label (for Google Drive search results).
 fn kind_key(found: bool, e: &Entry) -> String {
-    if found { crate::finder::folder_of(e) } else { e.kind_label() }
+    if found {
+        crate::finder::folder_of(e)
+    } else if let Some(origin) = &e.drive_origin {
+        origin.label.clone()
+    } else {
+        e.kind_label()
+    }
 }
 
 fn by_column(col: SortCol, a: &Entry, b: &Entry) -> Ordering {
@@ -301,6 +420,7 @@ impl Pane {
             anchor: None,
             cursor: None,
             sort: (SortCol::Name, true),
+            view_mode: ViewMode::Details,
             version: 0,
             drop_over: false,
             error: None,
@@ -345,7 +465,8 @@ impl Pane {
         let entries = match &self.loc {
             Location::Local(dir) => read_local(dir, show_hidden).map_err(|e| format!("{}: {e}", dir.display())),
             Location::Mock(segs) => Ok(mock.list(segs)),
-            Location::Drive { .. } | Location::Found(_) | Location::Server { .. } => return,
+            // Listed from the disks the app keeps (see `crate::list`).
+            Location::Computer | Location::Drive { .. } | Location::DriveSearch(_) | Location::Found(_) | Location::Server { .. } => return,
         };
         self.set_entries(entries);
     }
@@ -442,7 +563,11 @@ impl Pane {
 
     pub fn sort_entries(&mut self) {
         let (col, asc) = self.sort;
-        if col == SortCol::Kind {
+        if col == SortCol::Name && self.loc == Location::Computer {
+            // The disks by letter, as Explorer has them: "AltMount (\\server) (X:)" after
+            // "Disco Local (W:)".
+            self.entries.sort_by(|a, b| order(asc, a, b, rune_kit::natural_cmp(&a.id, &b.id)));
+        } else if col == SortCol::Kind {
             // The label is built once per entry rather than twice per comparison.
             let found = self.loc.finds();
             let mut keyed: Vec<(String, Entry)> = std::mem::take(&mut self.entries).into_iter().map(|e| (kind_key(found, &e), e)).collect();
@@ -457,6 +582,7 @@ impl Pane {
     pub fn title(&self) -> String {
         match &self.loc {
             Location::Local(p) => p.display().to_string(),
+            Location::Computer => t("Este Computador", "This PC").into(),
             Location::Found(f) => tr!("“{}” em {}", "“{}” in {}", f.text, f.place),
             Location::Mock(segs) => tr!("Meu Drive/{}", "My Drive/{}", segs.join("/")),
             Location::Drive { space, path, .. } => {
@@ -467,6 +593,7 @@ impl Pane {
                 parts.extend(path.iter().map(|(_, n)| n.as_str()));
                 parts.join("/")
             }
+            Location::DriveSearch(q) => tr!("“{}” em todas as contas", "“{}” in all accounts", q.text),
             Location::Server { server, path, find } => {
                 let place = std::iter::once(server.name.as_str()).chain(path.iter().map(String::as_str)).collect::<Vec<_>>().join("/");
                 match find {
@@ -500,7 +627,7 @@ pub fn is_hidden(name: &str, meta: Option<&std::fs::Metadata>) -> bool {
 /// shared folders.
 pub fn read_local(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>> {
     if let Some((server, _)) = crate::network::unc(dir).filter(|(_, share)| share.is_empty()) {
-        let folder = |name: String| Entry { id: name.clone(), name, is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false };
+        let folder = |name: String| Entry { id: name.clone(), name, is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
         return Ok(crate::network::shares(&server)?.into_iter().map(folder).collect());
     }
     let mut out = Vec::new();
@@ -522,6 +649,7 @@ pub fn read_local(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>> 
             mime: None,
             md5: None,
             starred: false,
+            drive_origin: None,
         });
     }
     Ok(out)
@@ -541,8 +669,8 @@ impl MockDrive {
     pub fn new() -> MockDrive {
         let now = SystemTime::now();
         let ago = |days: u64| now - Duration::from_secs(days * 86_400);
-        let dir = |name: &str, days| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: Some(ago(days)), target: None, mime: None, md5: None, starred: false };
-        let file = |name: String, size: u64, days| Entry { id: name.clone(), name, is_dir: false, size: Some(size), modified: Some(ago(days)), target: None, mime: None, md5: None, starred: false };
+        let dir = |name: &str, days| Entry { id: name.into(), name: name.into(), is_dir: true, size: None, modified: Some(ago(days)), target: None, mime: None, md5: None, starred: false, drive_origin: None };
+        let file = |name: String, size: u64, days| Entry { id: name.clone(), name, is_dir: false, size: Some(size), modified: Some(ago(days)), target: None, mime: None, md5: None, starred: false, drive_origin: None };
 
         let mut folders = HashMap::new();
         folders.insert(
@@ -651,6 +779,26 @@ pub fn format_time(t: SystemTime) -> String {
     chrono::DateTime::<chrono::Local>::from(t).format("%d/%m/%Y %H:%M").to_string()
 }
 
+/// A size with two decimal places ("807,33 MB"), or `"512 B"` below 1 KB.
+pub fn format_size_exact(b: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if b < 1024 {
+        return format!("{b} B");
+    }
+    let mut v = b as f64 / 1024.0;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    openexplorer_i18n::decimal(format!("{v:.2} {}", UNITS[u]))
+}
+
+/// Local date and time including seconds: `"17/08/2021 16:59:23"`.
+pub fn format_time_secs(t: SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(t).format("%d/%m/%Y %H:%M:%S").to_string()
+}
+
 /// `Option<SystemTime>` as signed milliseconds since 1970 for the disk cache: serde's own
 /// `SystemTime` format can't hold a time before 1970, and Drive has files dated far earlier.
 mod unix_ms {
@@ -702,6 +850,7 @@ pub struct Crumb {
 /// The clickable path of a location: `C:\ › Users › Ana`, `ana@gmail.com › Meu Drive › Fotos`.
 pub fn crumbs(loc: &Location) -> Vec<Crumb> {
     match loc {
+        Location::Computer => vec![Crumb { label: t("Este Computador", "This PC").into(), to: Location::Computer }],
         Location::Local(dir) if let Some((server, share)) = crate::network::unc(dir) => {
             use crate::network::{is_wsl, server_path, share_path};
             let label = if is_wsl(&server) { "Linux".to_string() } else { format!(r"\\{server}") };
@@ -764,6 +913,10 @@ pub fn crumbs(loc: &Location) -> Vec<Crumb> {
             }
             out
         }
+        Location::DriveSearch(q) => vec![Crumb {
+            label: tr!("“{}” em todas as contas", "“{}” in all accounts", q.text),
+            to: loc.clone(),
+        }],
         Location::Server { server, path, find } => {
             let at = |path: &[String]| Location::Server { server: server.clone(), path: path.to_vec(), find: None };
             let mut out = vec![Crumb { label: server.name.clone(), to: at(&[]) }];
@@ -828,28 +981,6 @@ pub fn drive_kind(dir: &Path) -> DriveKind {
     }
 }
 
-/// The disks Windows shows in "Este computador", by letter, with their kind.
-pub fn local_drives() -> Vec<(PathBuf, DriveKind)> {
-    #[cfg(windows)]
-    {
-        // A bit per letter that has a drive, without touching the drives themselves (an empty
-        // DVD drive would make `exists` wait).
-        let mask = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
-        (0..26u8)
-            .filter(|i| mask & (1 << i) != 0)
-            .map(|i| PathBuf::from(format!("{}:\\", (b'A' + i) as char)))
-            .map(|d| {
-                let kind = drive_kind(&d);
-                (d, kind)
-            })
-            .collect()
-    }
-    #[cfg(not(windows))]
-    {
-        vec![(PathBuf::from("/"), DriveKind::Fixed)]
-    }
-}
-
 /// Free bytes on the disk holding `dir`. Only asked of fixed disks: on a network share the
 /// call can block the window for as long as the server takes to answer.
 pub fn free_space(dir: &Path) -> Option<u64> {
@@ -877,7 +1008,26 @@ mod tests {
     use super::*;
 
     fn file(name: &str) -> Entry {
-        Entry { id: name.into(), name: name.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false }
+        Entry { id: name.into(), name: name.into(), is_dir: false, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None }
+    }
+
+    /// A letter mounted while the app runs (here with `subst`) is in the next reading.
+    /// Ignored: it mounts a drive on the computer it runs on.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn a_drive_mounted_later_is_read() {
+        let before = crate::mounts::list();
+        let letter = (b'D'..=b'Z').rev().map(|c| c as char).find(|c| !before.iter().any(|(d, _)| d.to_string_lossy().starts_with(*c))).expect("no free letter");
+        let dir = std::env::temp_dir().join("openexplorer-subst-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = std::process::Command::new("subst").arg(format!("{letter}:")).arg(&dir).status().unwrap().success();
+        assert!(ok, "subst failed");
+        let root = PathBuf::from(format!("{letter}:\\"));
+        let after = crate::mounts::list();
+        let _ = std::process::Command::new("subst").arg(format!("{letter}:")).arg("/d").status();
+        assert!(after.iter().any(|(d, _)| *d == root), "{letter}: not in {after:?}");
+        assert!(!crate::mounts::list().iter().any(|(d, _)| *d == root));
     }
 
     /// Pages merged in one by one end in the order a full sort gives, for every column and
@@ -1017,5 +1167,71 @@ mod tests {
         assert_eq!(names(false), ["visivel.txt"]);
         assert_eq!(names(true), [".oculto", ".segredo", "visivel.txt"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn view_mode_cycles_through_all_five_modes() {
+        let mut m = ViewMode::default();
+        assert_eq!(m, ViewMode::Details);
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            m = m.next();
+            seen.push(m);
+        }
+        assert_eq!(seen, ViewMode::ALL);
+        assert!(ViewMode::ExtraLargeIcons.is_grid());
+        assert!(ViewMode::LargeIcons.is_grid());
+        assert!(ViewMode::MediumIcons.is_grid());
+        assert!(!ViewMode::List.is_grid());
+        assert!(!ViewMode::Details.is_grid());
+    }
+
+    #[test]
+    fn drive_search_results_sort_by_location_and_show_title_and_crumbs() {
+        let loc = Location::DriveSearch(Box::new(DriveSearch { text: "batman".into() }));
+        assert!(loc.is_drive_search());
+        assert!(!Location::drive("a@b", Space::MyDrive).is_drive_search());
+        let search_one = Location::drive("a@b", Space::Search(Box::new(Search {
+            text: "batman".into(),
+            within: openexplorer_gdrive::search::Within::Everything,
+            place: "todo o Drive".into(),
+        })));
+        assert!(search_one.is_drive_search());
+
+        let with_origin = |id: &str, label: &str, is_dir: bool| Entry {
+            id: id.into(),
+            name: id.into(),
+            is_dir,
+            size: None,
+            modified: None,
+            target: None,
+            mime: None,
+            md5: None,
+            starred: false,
+            drive_origin: Some(Box::new(DriveOrigin {
+                email: "a@b".into(),
+                shared_drive: None,
+                owned_by_me: true,
+                label: label.into(),
+            })),
+        };
+
+        let mut p = Pane::new(loc.clone());
+        assert_eq!(p.title(), "“batman” em todas as contas");
+        assert_eq!(crumbs(&loc).len(), 1);
+        assert_eq!(crumbs(&loc)[0].label, "“batman” em todas as contas");
+
+        p.sort = (SortCol::Kind, true);
+        p.set_entries(Ok(vec![
+            with_origin("f1", "Zebra", false),
+            with_origin("f2", "Alfa", false),
+            with_origin("d1", "Zebra", true),
+        ]));
+        let ids: Vec<&str> = p.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["d1", "f2", "f1"]);
+
+        p.append_entries(vec![with_origin("f3", "Meio", false)]);
+        let ids: Vec<&str> = p.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["d1", "f2", "f3", "f1"]);
     }
 }

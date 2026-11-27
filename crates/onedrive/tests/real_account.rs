@@ -5,9 +5,12 @@
 //!   registration (see `openexplorer_onedrive::registration_help`).
 //! - `ONEDRIVE_TEST_REFRESH_TOKEN`: a refresh token for it. `sign_in_prints_a_refresh_token`
 //!   gets one: it prints the address to open in the browser, waits, and prints the token.
-//! - `ONEDRIVE_TEST_WRITE=1` lets `writing_round_trip` and `work_bin_round_trip` write, inside
-//!   a folder of their own at the drive's top that they delete at the end (and, on a work
-//!   account, delete for good from the recycle bin).
+//! - `ONEDRIVE_TEST_WRITE=1` lets `writing_round_trip`, `folder_sizes` and `work_bin_round_trip`
+//!   write, inside a folder of their own at the drive's top that they delete at the end (and,
+//!   on a work account, delete for good from the recycle bin). On a personal account
+//!   `folder_sizes` saw the totals right at once in 2 runs of 5, and 0 for 85 s, 10 min, 14 min
+//!   in the others (and over 20 min in a check outside the app's code); the delta feed never
+//!   brought the folders again once the totals were right.
 //!
 //! A work or school account's recycle bin needs SharePoint's permission (AllSites.Write) in the
 //! registration and granted: `work_bin_grant` opens the sign-in that grants it. Then
@@ -97,6 +100,105 @@ fn writing_round_trip() {
     // Seen from the delta feed as well.
     a.catch_up().unwrap();
     assert!(a.stat(&dir).unwrap().is_none());
+}
+
+/// What Graph says about folder sizes, printed: whether a folder's `size` counts everything
+/// under it, whether the delta feed brings the folders above a changed file with their new size,
+/// and where a shortcut to a shared folder keeps its size.
+#[test]
+#[ignore]
+fn folder_sizes() {
+    use serde_json::Value;
+    if std::env::var("ONEDRIVE_TEST_WRITE").as_deref() != Ok("1") {
+        eprintln!("ONEDRIVE_TEST_WRITE=1 para escrever");
+        return;
+    }
+    let a = open();
+    let refresh = std::env::var("ONEDRIVE_TEST_REFRESH_TOKEN").unwrap();
+    let g = graph::Graph::new(client(), graph::Endpoints::default(), refresh, Box::new(|_| {}));
+    println!("conta {:?}", a.meta.kind);
+    let size = |v: &Value| v.get("size").and_then(Value::as_u64);
+    let at = |path: &str| path.split('/').map(graph::segment).collect::<Vec<_>>().join("/");
+    let show = |what: &str| {
+        let top = g.get(&format!("/me/drive/root:/{}?$select=id,name,size,folder", at(what)), "ler").unwrap();
+        println!("  {what}: size {:?}, childCount {:?}", size(&top), top.pointer("/folder/childCount"));
+        size(&top)
+    };
+
+    // What an earlier run left behind (it stopped before cleaning up).
+    for it in a.list("/Meus arquivos").unwrap() {
+        if it.is_dir && it.name.strip_prefix("Open Explorer tamanho ").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+            println!("apagando o que sobrou: {}", it.name);
+            a.remove(&format!("/Meus arquivos/{}", it.name)).unwrap();
+        }
+    }
+
+    // Shortcuts to shared folders at the top: where their size is.
+    let top = g.get("/me/drive/root/children?$top=999", "listar").unwrap();
+    for it in top["value"].as_array().unwrap().iter().filter(|i| i.get("remoteItem").is_some()) {
+        println!("atalho {:?}: size {:?}, remoteItem.size {:?}, remoteItem.folder {:?}", it["name"], size(it), it.pointer("/remoteItem/size"), it.pointer("/remoteItem/folder"));
+    }
+
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let name = format!("Open Explorer tamanho {stamp}");
+    let dir = format!("/Meus arquivos/{name}");
+    a.mkdir(&dir).unwrap();
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        a.mkdir(&format!("{dir}/Sub")).unwrap();
+        a.mkdir(&format!("{dir}/Sub/Fundo")).unwrap();
+        a.upload(&format!("{dir}/raiz.bin"), &mut &[1u8; 300][..], 300, &mut |_| true).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        println!("antes (300 bytes na pasta, nada nas subpastas):");
+        show(&name);
+        show(&format!("{name}/Sub"));
+
+        // A delta position from now, then a file two folders down.
+        let v = g.get("/me/drive/root/delta?token=latest", "delta").unwrap();
+        let mut link = v["@odata.deltaLink"].as_str().unwrap().to_string();
+        a.upload(&format!("{dir}/Sub/Fundo/fundo.bin"), &mut &[2u8; 1000][..], 1000, &mut |_| true).unwrap();
+        let sent = std::time::Instant::now();
+
+        // Graph works the totals out later: the folders asked directly, and what each delta
+        // read brings since the one before (does the new total come as a change of its own?).
+        let (mut direct_ok, mut delta_ok) = (false, false);
+        while sent.elapsed() < std::time::Duration::from_secs(20 * 60) && !(direct_ok && delta_ok) {
+            let secs = sent.elapsed().as_secs();
+            let top = show(&name);
+            let sub = show(&format!("{name}/Sub"));
+            let root = g.get("/me/drive/root?$select=size", "ler").unwrap();
+            println!("+{secs} s: {name} {top:?}, Sub {sub:?}, raiz {:?}", root["size"]);
+            direct_ok |= top == Some(1300);
+            loop {
+                let d = g.get(&link, "delta").unwrap();
+                for it in d["value"].as_array().unwrap() {
+                    println!("  delta +{secs} s: {:?} size {:?} pasta {}", it["name"], size(it), it.get("folder").is_some());
+                    delta_ok |= it["name"].as_str() == Some(name.as_str()) && size(it) == Some(1300);
+                }
+                if let Some(n) = d.get("@odata.nextLink").and_then(Value::as_str) {
+                    link = n.to_string();
+                } else {
+                    link = d["@odata.deltaLink"].as_str().unwrap().to_string();
+                    break;
+                }
+            }
+            if !(direct_ok && delta_ok) {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+        }
+        println!("fim: direto {direct_ok}, delta {delta_ok}, {} s", sent.elapsed().as_secs());
+        // What the account makes of it: the delta feed taken in, the totals as listed.
+        a.catch_up().unwrap();
+        let listed = a.list("/Meus arquivos").unwrap().into_iter().find(|i| i.name == name).map(|i| i.size);
+        let stat = a.stat(&dir).unwrap().map(|i| i.size);
+        println!("conta: listada {listed:?}, stat {stat:?}");
+        if delta_ok {
+            assert_eq!((listed, stat), (Some(Some(1300)), Some(Some(1300))));
+        }
+    }));
+    a.remove(&dir).unwrap();
+    if let Err(e) = ran {
+        std::panic::resume_unwind(e);
+    }
 }
 
 /// A work account, or the test says why it doesn't run.

@@ -2081,6 +2081,7 @@ fn list_sync_location(
                     mime: Some(f.mime),
                     md5: f.md5,
                     starred: f.starred,
+                    drive_origin: None,
                 }));
                 true
             })?;

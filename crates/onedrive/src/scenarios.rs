@@ -68,11 +68,38 @@ fn changes_elsewhere_reach_kept_folders_without_listing_them_again() {
     });
     let before = fake.requests();
     let c = a.poll().unwrap();
-    assert!(c.touches(&docs) && c.touches(&fotos) && !c.touches(ROOT));
+    // The top too: Docs and Fotos came along with their new sizes.
+    assert!(c.touches(&docs) && c.touches(&fotos) && c.touches(ROOT));
     assert_eq!(names(&a, "/Meus arquivos/Docs"), ["novo.txt"]);
     assert_eq!(names(&a, "/Meus arquivos/Fotos"), ["a.txt"]);
+    assert_eq!(sizes(&a, TOP), [("Docs".into(), Some(1)), ("Fotos".into(), Some(4))]);
     assert_eq!(fake.requests() - before, 1);
     assert_eq!(a.folder_id("/Meus arquivos/Docs").as_deref(), Some(docs.as_str()));
+}
+
+fn sizes(a: &Account, path: &str) -> Vec<(String, Option<u64>)> {
+    let mut v: Vec<(String, Option<u64>)> = a.list(path).unwrap().into_iter().map(|i| (i.name, i.size)).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn folders_show_what_they_hold_and_keep_up_with_changes_below() {
+    let (fake, a, docs, _) = setup(Kind::Personal);
+    let fundo = fake.with(|st| {
+        let sub = st.add(&docs, "Sub", true, &[]);
+        st.add(&sub, "Fundo", true, &[])
+    });
+    // Everything under a folder counts, the folders under it too.
+    assert_eq!(sizes(&a, TOP), [("Docs".into(), Some(8)), ("Fotos".into(), Some(0))]);
+    assert_eq!(a.stat("/Meus arquivos/Docs").unwrap().unwrap().size, Some(8));
+    // A file two folders down: the delta feed brings the folders above it, so the top shows the
+    // new total without being listed again.
+    fake.with(|st| st.add(&fundo, "novo.bin", false, &[0; 100]));
+    let before = fake.requests();
+    assert!(a.poll().unwrap().touches(ROOT));
+    assert_eq!(sizes(&a, TOP), [("Docs".into(), Some(108)), ("Fotos".into(), Some(0))]);
+    assert_eq!(fake.requests() - before, 1);
 }
 
 #[test]

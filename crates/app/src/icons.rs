@@ -15,9 +15,18 @@ macro_rules! icon32 {
     };
 }
 
+// Application brand icon (rendered in full colour via resvg's raster-images).
+icon32!(APP_ICON, "app-icon", include_str!("../assets/app-icon.svgfrag"));
+
 // The copy arrows between the panes, in `currentColor`.
 icon!(COPY_RIGHT, "copy-right", r##"<path d="M4.5 1.5L11.5 8L4.5 14.5Z" fill="currentColor"/>"##);
 icon!(COPY_LEFT, "copy-left", r##"<path d="M11.5 1.5L4.5 8L11.5 14.5Z" fill="currentColor"/>"##);
+
+// The arrows at the ends of a scroll bar, in `currentColor`.
+icon!(SCROLL_UP, "scroll-up", r##"<path d="M8 4L13 11H3Z" fill="currentColor"/>"##);
+icon!(SCROLL_DOWN, "scroll-down", r##"<path d="M8 12L13 5H3Z" fill="currentColor"/>"##);
+icon!(SCROLL_LEFT, "scroll-left", r##"<path d="M4 8L11 3V13Z" fill="currentColor"/>"##);
+icon!(SCROLL_RIGHT, "scroll-right", r##"<path d="M12 8L5 3V13Z" fill="currentColor"/>"##);
 
 // The search field's magnifier, in `currentColor`.
 icon!(SEARCH, "search", r##"<circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10.4 10.4L14 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>"##);
@@ -25,6 +34,7 @@ icon!(SEARCH, "search", r##"<circle cx="7" cy="7" r="4.5" fill="none" stroke="cu
 // Opções, in the toolbar and sidebar: gear, transfers, logs and theme icons, in `currentColor`.
 icon!(SETTINGS, "settings", r##"<circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 1.5V3.2M8 12.8V14.5M1.5 8H3.2M12.8 8H14.5M3.4 3.4L4.6 4.6M11.4 11.4L12.6 12.6M3.4 12.6L4.6 11.4M11.4 4.6L12.6 3.4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="8" r="4.6" fill="none" stroke="currentColor" stroke-width="1.3"/>"##);
 icon!(OPT_TRANSFERS, "opt-transfers", r##"<path d="M5.2 13V3M2.8 5.4L5.2 3L7.6 5.4M10.8 3V13M8.4 10.6L10.8 13L13.2 10.6" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/>"##);
+icon!(OPT_ANIMATIONS, "opt-animations", r##"<path d="M8.5 2L9.7 5.3L13 6.5L9.7 7.7L8.5 11L7.3 7.7L4 6.5L7.3 5.3Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M3.5 10.5L4.1 12.1L5.7 12.7L4.1 13.3L3.5 14.9L2.9 13.3L1.3 12.7L2.9 12.1Z" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linejoin="round"/>"##);
 icon!(OPT_CACHE, "opt-cache", r##"<ellipse cx="8" cy="3.9" rx="5.3" ry="1.9" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M2.7 3.9V12.1C2.7 13.15 5.07 14 8 14C10.93 14 13.3 13.15 13.3 12.1V3.9M2.7 8C2.7 9.05 5.07 9.9 8 9.9C10.93 9.9 13.3 9.05 13.3 8" fill="none" stroke="currentColor" stroke-width="1.3"/>"##);
 icon!(OPT_LOGS, "opt-logs", r##"<rect x="2.5" y="1.8" width="11" height="12.4" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5.2 5.2H10.8M5.2 8H10.8M5.2 10.8H8.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>"##);
 icon!(OPT_EXPERIMENTAL, "opt-experimental", r##"<path d="M6 2.2H10M6.8 2.2V6L3.1 12.2C2.7 12.9 3.2 13.8 4 13.8H12C12.8 13.8 13.3 12.9 12.9 12.2L9.2 6V2.2" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><path d="M4.6 10.2H11.4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>"##);
@@ -94,6 +104,15 @@ icon!(CHEVRON_DOWN, "chevron-down", r#"<path d="M4 6L8 10L12 6" stroke="currentC
 icon!(CHEVRON, "chevron", r#"<path d="M6 4L10 8L6 12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
 icon!(PLUS, "plus", r#"<path d="M8 3.2V12.8M3.2 8H12.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>"#);
 icon!(TOGGLE_TREE, "toggle-tree", r#"<rect x="2" y="3" width="12" height="10" rx="1.8" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M6.2 3V13" stroke="currentColor" stroke-width="1.25"/>"#);
+icon!(VIEW_MONITOR, "view-monitor", r#"<rect x="1.8" y="2.6" width="12.4" height="8.4" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5.2 13.4H10.8M8 11V13.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>"#);
+icon!(VIEW_ONE_PANE, "view-one-pane", r#"<rect x="2" y="3" width="12" height="10" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/>"#);
+icon!(VIEW_TWO_PANES, "view-two-panes", r#"<rect x="2" y="3" width="12" height="10" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 3V13" stroke="currentColor" stroke-width="1.25"/>"#);
+icon!(VIEW_FOUR_PANES, "view-four-panes", r#"<rect x="2" y="3" width="12" height="10" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 3V13M2 8H14" stroke="currentColor" stroke-width="1.25"/>"#);
+icon!(VM_EXTRA_LARGE, "vm-extra-large", r#"<rect x="2" y="2.5" width="12" height="11" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="5.7" cy="6.1" r="1.1" fill="currentColor"/><path d="M2.6 11.4L6.1 8.1L8.8 10.6L10.9 8.7L13.4 11.4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>"#);
+icon!(VM_LARGE, "vm-large", r#"<rect x="2" y="2.5" width="5.2" height="5.2" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.3"/><rect x="8.8" y="2.5" width="5.2" height="5.2" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M2.6 10.4H6.6M2.6 12.6H5.6M9.4 10.4H13.4M9.4 12.6H12.4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>"#);
+icon!(VM_MEDIUM, "vm-medium", r#"<rect x="2.2" y="2.2" width="4.8" height="4.8" rx="1.1" fill="none" stroke="currentColor" stroke-width="1.3"/><rect x="9" y="2.2" width="4.8" height="4.8" rx="1.1" fill="none" stroke="currentColor" stroke-width="1.3"/><rect x="2.2" y="9" width="4.8" height="4.8" rx="1.1" fill="none" stroke="currentColor" stroke-width="1.3"/><rect x="9" y="9" width="4.8" height="4.8" rx="1.1" fill="none" stroke="currentColor" stroke-width="1.3"/>"#);
+icon!(VM_LIST, "vm-list", r#"<circle cx="3.2" cy="4.2" r="1" fill="currentColor"/><circle cx="3.2" cy="8" r="1" fill="currentColor"/><circle cx="3.2" cy="11.8" r="1" fill="currentColor"/><path d="M6.2 4.2H13.4M6.2 8H13.4M6.2 11.8H13.4" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/>"#);
+icon!(VM_DETAILS, "vm-details", r#"<path d="M2.4 4H13.6M2.4 8H13.6M2.4 12H13.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>"#);
 icon!(EXTERNAL_LINK, "external-link", r#"<path d="M9.5 2.5H13.5V6.5M13.2 2.8L7.5 8.5M6.5 4H3.5C2.95 4 2.5 4.45 2.5 5V12.5C2.5 13.05 2.95 13.5 3.5 13.5H11C11.55 13.5 12 13.05 12 12.5V9.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#);
 
 // Category tabs and titlebar in the "Registrar conta" window and Central de Contas, in `currentColor`.
@@ -221,7 +240,7 @@ mod tests {
     /// its 32 x 32 pixels come out coloured.
     #[test]
     fn brand_logos_draw() {
-        for icon in [&super::PROVIDER_B2, &super::PROVIDER_KOOFR, &super::PROVIDER_MAILRU, &super::PROVIDER_YANDEX, &super::PROVIDER_ONLIME] {
+        for icon in [&super::APP_ICON, &super::PROVIDER_B2, &super::PROVIDER_KOOFR, &super::PROVIDER_MAILRU, &super::PROVIDER_YANDEX, &super::PROVIDER_ONLIME] {
             let svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">{}</svg>"#, icon.body);
             let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default()).unwrap();
             let mut pixmap = resvg::tiny_skia::Pixmap::new(32, 32).unwrap();

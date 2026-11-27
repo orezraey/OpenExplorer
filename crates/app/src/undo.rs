@@ -28,6 +28,10 @@ pub enum Step {
     /// The item at `from` on the computer goes to `to`: a rename, or a move into another folder
     /// under the same name.
     Move { from: PathBuf, to: PathBuf },
+    /// Renames on the computer done as one, through temporary names, so they can swap or chain
+    /// (`a` → `b` and `b` → `a`): a batch rename's, which separate [`Step::Move`]s can't take back,
+    /// as each finds its name still taken by another item of the batch.
+    MoveMany { moves: Vec<(PathBuf, PathBuf)> },
     /// The item at `path` goes to the Recycle Bin.
     Recycle { path: PathBuf },
     /// What went to the Recycle Bin from `path` at `since` (seconds since 1970) or later comes
@@ -94,6 +98,13 @@ impl Rec {
         let mut rec = self.0.lock().unwrap_or_else(|e| e.into_inner());
         rec.0.extend(steps);
         rec.1 += 1;
+    }
+
+    /// [`Rec::add`] of steps that take back what was done to `items` items at once.
+    pub fn add_items(&self, steps: impl IntoIterator<Item = Step>, items: usize) {
+        let mut rec = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        rec.0.extend(steps);
+        rec.1 += items;
     }
 
     /// The record of what was done (`what` says it, given how many items), if anything was.
@@ -307,7 +318,7 @@ pub struct Replayed {
 pub fn replay(record: Record, reach: &mut dyn Reach, redo: bool) -> Replayed {
     let Record { what, steps, reload } = record;
     let mut bin = Bin::default();
-    if let Some(why) = steps.iter().find_map(|step| step.check(reach, &mut bin).err()) {
+    if let Some(why) = steps.iter().find_map(|step| step.check(&steps, reach, &mut bin).err()) {
         let result = if redo { tr!("Não dá para refazer “{what}”: {why}", "Can't redo “{what}”: {why}") } else { tr!("Não dá para desfazer “{what}”: {why}", "Can't undo “{what}”: {why}") };
         return Replayed { back: None, left: None, result: Err(result) };
     }
@@ -533,8 +544,9 @@ impl Step {
         }
     }
 
-    /// Whether the item the step changes is still as it expects, or what changed.
-    fn check(&self, reach: &mut dyn Reach, bin: &mut Bin) -> Result<(), String> {
+    /// Whether the item the step changes is still as it expects, or what changed. `batch` is the
+    /// whole record: a name one of its steps frees doesn't count as taken.
+    fn check(&self, batch: &[Step], reach: &mut dyn Reach, bin: &mut Bin) -> Result<(), String> {
         match self {
             Step::Move { from, to } => {
                 if !there(from) {
@@ -545,6 +557,21 @@ impl Step {
                 }
                 if !to.parent().is_some_and(Path::is_dir) {
                     return Err(tr!("a pasta {} não existe mais.", "the folder {} no longer exists.", dir_of(to)));
+                }
+                Ok(())
+            }
+            Step::MoveMany { moves } => {
+                for (from, to) in moves {
+                    if !there(from) {
+                        return Err(tr!("“{}” não está mais em {}.", "“{}” is no longer in {}.", name_of(from), dir_of(from)));
+                    }
+                    let freed = moves.iter().any(|(other, _)| same_path(other, to));
+                    if there(to) && !freed {
+                        return Err(tr!("já existe “{}” em {}.", "“{}” already exists in {}.", name_of(to), dir_of(to)));
+                    }
+                    if !to.parent().is_some_and(Path::is_dir) {
+                        return Err(tr!("a pasta {} não existe mais.", "the folder {} no longer exists.", dir_of(to)));
+                    }
                 }
                 Ok(())
             }
@@ -591,8 +618,11 @@ impl Step {
                 let d = reach.drive(email)?;
                 let st = d.status(id)?;
                 drive_alive(&st, from)?;
+                // Another rename of the same batch moving its item off `to` frees it (a swap).
+                let freed = batch.iter().any(|other| matches!(other, Step::DriveRename { email: e, id: other_id, from: other_from, .. } if e == email && other_id != id && other_from == to));
                 if let Some(parent) = st.parents.first()
                     && !from.eq(to)
+                    && !freed
                     && d.taken(parent, to)?
                 {
                     return Err(tr!("já existe “{to}” nessa pasta do Drive.", "“{to}” already exists in that Drive folder."));
@@ -686,6 +716,10 @@ impl Step {
                     std::fs::rename(from, to).map_err(|e| tr!("Não consegui mover “{}”: {e}", "Couldn't move “{}”: {e}", name_of(from)))?;
                 }
                 Step::Move { from: to.clone(), to: from.clone() }
+            }
+            Step::MoveMany { moves } => {
+                ops::rename_together(moves)?;
+                Step::MoveMany { moves: moves.iter().map(|(from, to)| (to.clone(), from.clone())).collect() }
             }
             Step::Recycle { path } => {
                 // The Recycle Bin dates items to the second.
@@ -1001,6 +1035,49 @@ mod tests {
         undo_then_redo(record("criar", vec![Step::RemoveDir { path: fresh.clone() }]), &mut reach, |_| assert!(!fresh.exists()));
         assert!(fresh.is_dir());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_swaps_and_chains_undo_and_redo_as_one() {
+        let dir = scratch("swap");
+        let mut reach = Fake::default();
+        let (a, b, c, d) = (dir.join("a.txt"), dir.join("b.txt"), dir.join("c.txt"), dir.join("d.txt"));
+        // The batch swapped a and b, and renamed c to d: the record takes it back.
+        std::fs::write(&a, "B").unwrap();
+        std::fs::write(&b, "A").unwrap();
+        std::fs::write(&d, "C").unwrap();
+        let steps = vec![Step::MoveMany { moves: vec![(a.clone(), b.clone()), (b.clone(), a.clone()), (d.clone(), c.clone())] }];
+        let r = replay(record("renomear em massa (3 itens)", steps), &mut reach, false);
+        assert!(r.result.is_ok(), "{:?}", r.result);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "A");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "B");
+        assert_eq!(std::fs::read_to_string(&c).unwrap(), "C");
+        assert!(!d.exists());
+        // And redone.
+        let r = replay(r.back.unwrap(), &mut reach, true);
+        assert!(r.result.is_ok(), "{:?}", r.result);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "B");
+        assert_eq!(std::fs::read_to_string(&d).unwrap(), "C");
+    }
+
+    #[test]
+    fn drive_swaps_undo() {
+        let mut reach = Fake::default();
+        // The batch swapped the names of 1 and 2.
+        reach.drive.put("1", "b.txt", "p");
+        reach.drive.put("2", "a.txt", "p");
+        let steps = vec![
+            Step::DriveRename { email: "e".into(), id: "1".into(), from: "b.txt".into(), to: "a.txt".into() },
+            Step::DriveRename { email: "e".into(), id: "2".into(), from: "a.txt".into(), to: "b.txt".into() },
+        ];
+        let r = replay(record("renomear em massa (2 itens)", steps), &mut reach, false);
+        assert!(r.result.is_ok(), "{:?}", r.result);
+        assert_eq!(reach.drive.get("1").name, "a.txt");
+        assert_eq!(reach.drive.get("2").name, "b.txt");
+        // A name taken by an item outside the batch still stops it.
+        reach.drive.put("3", "c.txt", "p");
+        let steps = vec![Step::DriveRename { email: "e".into(), id: "1".into(), from: "a.txt".into(), to: "c.txt".into() }];
+        assert!(replay(record("renomear", steps), &mut reach, false).result.is_err());
     }
 
     #[test]
