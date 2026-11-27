@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, NaiveDateTime, Timelike};
 use openexplorer_i18n::{t, tr};
 use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
@@ -2149,8 +2149,10 @@ fn apply_single_rule(cfg: &RuleConfig, current: &str, item: &Entry, loc: &Locati
             adjust_unit,
         } => {
             let (stem, ext) = split_stem_ext(current, item.is_dir, *skip_ext);
-            let _ = (custom_short_months, short_months, custom_long_months, long_months);
-            let next_base = reformat_date_in_str(&stem, find_fmt, replace_fmt, *whole_words, *adjust_on, *adjust_amount, *adjust_unit)?;
+            let short = month_names(*custom_short_months, short_months, EN_SHORT_MONTHS);
+            let long = month_names(*custom_long_months, long_months, EN_LONG_MONTHS);
+            let adjust = adjust_on.then_some((*adjust_amount, *adjust_unit));
+            let next_base = reformat_date_in_str(&stem, find_fmt, replace_fmt, *whole_words, (&short, &long), adjust)?;
             Ok(format!("{next_base}{ext}"))
         }
         RuleConfig::Regex { pattern, replace, case_sensitive, skip_ext } => {
@@ -2616,46 +2618,77 @@ pub const DATE_FORMATS: &[&str] = &[
     "dd-mm-yyyy hh-nn",
 ];
 
-fn date_fmt_to_chrono(fmt: &str) -> String {
-    // ReNamer format tokens -> chrono strftime
-    fmt.replace("yyyy", "%Y")
-        .replace("yy", "%y")
-        .replace("mmmm", "%B")
-        .replace("mmm", "%b")
-        .replace("mm", "%m")
-        .replace("dd", "%d")
-        .replace("hh", "%H")
-        .replace("nn", "%M")
-        .replace("ss", "%S")
+const EN_SHORT_MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const EN_LONG_MONTHS: [&str; 12] =
+    ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+/// A piece of a ReNamer date format: a field or literal text.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum DateTok<'a> {
+    Lit(&'a str),
+    Year4,
+    Year2,
+    MonthLong,
+    MonthShort,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
 }
 
-fn date_fmt_to_regex(fmt: &str) -> String {
-    let mut out = String::new();
+/// Splits a ReNamer date format (`yyyy`, `yy`, `mmmm`, `mmm`, `mm`, `dd`, `hh`, `nn`, `ss`) into
+/// its fields, longest token first, everything else as literal text.
+fn date_tokens(fmt: &str) -> Vec<DateTok<'_>> {
+    const FIELDS: [(&str, DateTok<'static>); 9] = [
+        ("yyyy", DateTok::Year4),
+        ("yy", DateTok::Year2),
+        ("mmmm", DateTok::MonthLong),
+        ("mmm", DateTok::MonthShort),
+        ("mm", DateTok::Month),
+        ("dd", DateTok::Day),
+        ("hh", DateTok::Hour),
+        ("nn", DateTok::Minute),
+        ("ss", DateTok::Second),
+    ];
+    let mut out = Vec::new();
     let mut rest = fmt;
-    while !rest.is_empty() {
-        let next = [
-            ("yyyy", r"\d{4}"),
-            ("yy", r"\d{2}"),
-            ("mmmm", r"[A-Za-zÀ-ÿ]+"),
-            ("mmm", r"[A-Za-zÀ-ÿ]{3}"),
-            ("mm", r"\d{1,2}"),
-            ("dd", r"\d{1,2}"),
-            ("hh", r"\d{1,2}"),
-            ("nn", r"\d{1,2}"),
-            ("ss", r"\d{1,2}"),
-        ]
-        .into_iter()
-        .find(|(tok, _)| rest.starts_with(tok));
-        if let Some((tok, pat)) = next {
-            out.push_str(pat);
+    while let Some(ch) = rest.chars().next() {
+        if let Some((tok, field)) = FIELDS.iter().find(|(tok, _)| rest.starts_with(tok)) {
+            out.push(*field);
             rest = &rest[tok.len()..];
         } else {
-            let ch = rest.chars().next().unwrap();
-            out.push_str(&regex::escape(&ch.to_string()));
+            out.push(DateTok::Lit(&rest[..ch.len_utf8()]));
             rest = &rest[ch.len_utf8()..];
         }
     }
     out
+}
+
+/// The 12 month names a rule reads and writes: the user's list when its box is on and the list
+/// has exactly 12 names, English otherwise.
+fn month_names(custom: bool, list: &str, english: [&str; 12]) -> [String; 12] {
+    if custom {
+        let names: Vec<String> = list.split(',').map(|n| n.trim().to_string()).collect();
+        if names.len() == 12 && names.iter().all(|n| !n.is_empty()) {
+            return names.try_into().unwrap_or_else(|_| english.map(String::from));
+        }
+    }
+    english.map(String::from)
+}
+
+/// One capture group that matches any of `names`, ignoring case, longest first so "Junho" is
+/// not cut at "Jun".
+fn names_group(names: &[String; 12]) -> String {
+    let mut sorted: Vec<&String> = names.iter().collect();
+    sorted.sort_by_key(|n| std::cmp::Reverse(n.chars().count()));
+    let alts: Vec<String> = sorted.iter().map(|n| regex::escape(n)).collect();
+    format!("((?i:{}))", alts.join("|"))
+}
+
+fn month_of(names: &[String; 12], text: &str) -> Option<u32> {
+    let text = text.to_lowercase();
+    names.iter().position(|n| n.to_lowercase() == text).map(|i| i as u32 + 1)
 }
 
 fn reformat_date_in_str(
@@ -2663,22 +2696,33 @@ fn reformat_date_in_str(
     find_fmt: &str,
     replace_fmt: &str,
     whole_words: bool,
-    adjust_on: bool,
-    adjust_amount: i64,
-    adjust_unit: TimeUnit,
+    months: (&[String; 12], &[String; 12]),
+    adjust: Option<(i64, TimeUnit)>,
 ) -> Result<String, String> {
     if find_fmt.trim().is_empty() || replace_fmt.trim().is_empty() {
         return Ok(input.to_string());
     }
-    let pat = date_fmt_to_regex(find_fmt);
+    let (short, long) = months;
+    let find = date_tokens(find_fmt);
+    let fields: Vec<DateTok> = find.iter().copied().filter(|t| !matches!(t, DateTok::Lit(_))).collect();
+    let pat: String = find
+        .iter()
+        .map(|t| match t {
+            DateTok::Lit(s) => regex::escape(s),
+            DateTok::Year4 => r"(\d{4})".into(),
+            DateTok::Year2 => r"(\d{2})".into(),
+            DateTok::MonthLong => names_group(long),
+            DateTok::MonthShort => names_group(short),
+            DateTok::Month | DateTok::Day | DateTok::Hour | DateTok::Minute | DateTok::Second => r"(\d{1,2})".into(),
+        })
+        .collect();
     let re = Regex::new(&pat).map_err(|e| e.to_string())?;
-    let c_in = date_fmt_to_chrono(find_fmt);
-    let c_out = date_fmt_to_chrono(replace_fmt);
-    let has_time = find_fmt.contains("hh") || find_fmt.contains("nn") || find_fmt.contains("ss");
+    let replace = date_tokens(replace_fmt);
 
     let mut out = String::with_capacity(input.len());
     let mut last = 0;
-    for m in re.find_iter(input) {
+    for caps in re.captures_iter(input) {
+        let m = caps.get(0).expect("group 0 always matches");
         if whole_words {
             let prev_alnum = input[..m.start()].chars().next_back().is_some_and(|c| c.is_alphanumeric());
             let next_alnum = input[m.end()..].chars().next().is_some_and(|c| c.is_alphanumeric());
@@ -2686,29 +2730,62 @@ fn reformat_date_in_str(
                 continue;
             }
         }
-        let matched = m.as_str();
-        let dt = if has_time {
-            NaiveDateTime::parse_from_str(matched, &c_in).ok()
-        } else {
-            NaiveDate::parse_from_str(matched, &c_in).ok().map(|d| d.and_time(NaiveTime::MIN))
-        };
-        let Some(mut dt) = dt else { continue };
+        let Some(mut dt) = read_date(&caps, &fields, short, long) else { continue };
         out.push_str(&input[last..m.start()]);
-        if adjust_on {
-            dt = match adjust_unit {
-                TimeUnit::Seconds => dt + ChronoDuration::seconds(adjust_amount),
-                TimeUnit::Minutes => dt + ChronoDuration::minutes(adjust_amount),
-                TimeUnit::Hours => dt + ChronoDuration::hours(adjust_amount),
-                TimeUnit::Days => dt + ChronoDuration::days(adjust_amount),
-                TimeUnit::Months => add_months(dt, adjust_amount),
-                TimeUnit::Years => add_months(dt, adjust_amount * 12),
+        if let Some((amount, unit)) = adjust {
+            dt = match unit {
+                TimeUnit::Seconds => dt + ChronoDuration::seconds(amount),
+                TimeUnit::Minutes => dt + ChronoDuration::minutes(amount),
+                TimeUnit::Hours => dt + ChronoDuration::hours(amount),
+                TimeUnit::Days => dt + ChronoDuration::days(amount),
+                TimeUnit::Months => add_months(dt, amount),
+                TimeUnit::Years => add_months(dt, amount * 12),
             };
         }
-        out.push_str(&dt.format(&c_out).to_string());
+        for t in &replace {
+            match t {
+                DateTok::Lit(s) => out.push_str(s),
+                DateTok::Year4 => out.push_str(&format!("{:04}", dt.year())),
+                DateTok::Year2 => out.push_str(&format!("{:02}", dt.year().rem_euclid(100))),
+                DateTok::MonthLong => out.push_str(&long[dt.month0() as usize]),
+                DateTok::MonthShort => out.push_str(&short[dt.month0() as usize]),
+                DateTok::Month => out.push_str(&format!("{:02}", dt.month())),
+                DateTok::Day => out.push_str(&format!("{:02}", dt.day())),
+                DateTok::Hour => out.push_str(&format!("{:02}", dt.hour())),
+                DateTok::Minute => out.push_str(&format!("{:02}", dt.minute())),
+                DateTok::Second => out.push_str(&format!("{:02}", dt.second())),
+            }
+        }
         last = m.end();
     }
     out.push_str(&input[last..]);
     Ok(out)
+}
+
+/// Builds the date a match names. It needs a year, a month and a day; a time field left out is
+/// 0. A two-digit year is 1969 to 2068, as chrono reads `%y`.
+fn read_date(caps: &regex::Captures, fields: &[DateTok], short: &[String; 12], long: &[String; 12]) -> Option<NaiveDateTime> {
+    let (mut y, mut mo, mut d, mut h, mut mi, mut s) = (None, None, None, 0, 0, 0);
+    for (i, field) in fields.iter().enumerate() {
+        let text = caps.get(i + 1)?.as_str();
+        let num = || text.parse::<u32>().ok();
+        match field {
+            DateTok::Year4 => y = Some(text.parse::<i32>().ok()?),
+            DateTok::Year2 => {
+                let v = text.parse::<i32>().ok()?;
+                y = Some(if v < 69 { 2000 + v } else { 1900 + v });
+            }
+            DateTok::MonthLong => mo = Some(month_of(long, text)?),
+            DateTok::MonthShort => mo = Some(month_of(short, text)?),
+            DateTok::Month => mo = Some(num()?),
+            DateTok::Day => d = Some(num()?),
+            DateTok::Hour => h = num()?,
+            DateTok::Minute => mi = num()?,
+            DateTok::Second => s = num()?,
+            DateTok::Lit(_) => {}
+        }
+    }
+    NaiveDate::from_ymd_opt(y?, mo?, d?)?.and_hms_opt(h, mi, s)
 }
 
 fn add_months(dt: NaiveDateTime, delta_months: i64) -> NaiveDateTime {
@@ -2854,6 +2931,54 @@ mod tests {
         let res = evaluate_rules(&rules, &items, &[true, true], &loc);
         assert_eq!(res[0].0, "01Track One - Artist.mp3");
         assert_eq!(res[1].0, "02Track Two - Artist.mp3");
+    }
+
+    #[test]
+    fn reformat_date_reads_and_writes_custom_month_names() {
+        let date = |find: &str, replace: &str, custom: bool, name: &str| {
+            let rules = vec![rule(RuleConfig::ReformatDate {
+                find_fmt: find.into(),
+                replace_fmt: replace.into(),
+                whole_words: false,
+                skip_ext: true,
+                custom_short_months: custom,
+                short_months: "jan,fev,mar,abr,mai,jun,jul,ago,set,out,nov,dez".into(),
+                custom_long_months: custom,
+                long_months: "janeiro,fevereiro,março,abril,maio,junho,julho,agosto,setembro,outubro,novembro,dezembro".into(),
+                adjust_on: false,
+                adjust_amount: 0,
+                adjust_unit: TimeUnit::Days,
+            })];
+            evaluate_rules(&rules, &[file(name)], &[true], &Location::Local(PathBuf::from("C:/tmp"))).remove(0).0
+        };
+        // Custom long and short names are read, ignoring case, and written.
+        assert_eq!(date("dd mmmm yyyy", "yyyy-mm-dd", true, "Foto 15 Março 2024.jpg"), "Foto 2024-03-15.jpg");
+        assert_eq!(date("yyyy-mm-dd", "dd mmm yyyy", true, "2024-02-05.txt"), "05 fev 2024.txt");
+        assert_eq!(date("yyyy-mm-dd", "mmmm", true, "x 2024-06-30.txt"), "x junho.txt");
+        // With the boxes off, the names stay English.
+        assert_eq!(date("dd mmm yyyy", "yyyy-mm-dd", false, "15 Mar 2024.txt"), "2024-03-15.txt");
+        assert_eq!(date("dd mmm yyyy", "yyyy-mm-dd", false, "15 mar 2024 a.txt"), "2024-03-15 a.txt");
+        assert_eq!(date("yyyy-mm-dd", "dd mmmm yy", false, "2024-12-01.txt"), "01 December 24.txt");
+        // A list without 12 names falls back to English; an impossible date is left alone.
+        let short_list = |n: &str| {
+            let rules = vec![rule(RuleConfig::ReformatDate {
+                find_fmt: "dd mmm yyyy".into(),
+                replace_fmt: "yyyy-mm-dd".into(),
+                whole_words: false,
+                skip_ext: true,
+                custom_short_months: true,
+                short_months: "a,b,c".into(),
+                custom_long_months: false,
+                long_months: String::new(),
+                adjust_on: false,
+                adjust_amount: 0,
+                adjust_unit: TimeUnit::Days,
+            })];
+            evaluate_rules(&rules, &[file(n)], &[true], &Location::Local(PathBuf::from("C:/tmp"))).remove(0).0
+        };
+        assert_eq!(short_list("15 Mar 2024.txt"), "2024-03-15.txt");
+        assert_eq!(date("yyyy-mm-dd", "dd.mm.yyyy", false, "2024-02-30.txt"), "2024-02-30.txt");
+        assert_eq!(date("yyyymmdd hh-nn", "dd/mm/yy hh:nn", false, "20240105 07-30.txt"), "05/01/24 07:30.txt");
     }
 
     #[test]
