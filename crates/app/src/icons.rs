@@ -22,6 +22,12 @@ icon32!(APP_ICON, "app-icon", include_str!("../assets/app-icon.svgfrag"));
 icon!(COPY_RIGHT, "copy-right", r##"<path d="M4.5 1.5L11.5 8L4.5 14.5Z" fill="currentColor"/>"##);
 icon!(COPY_LEFT, "copy-left", r##"<path d="M11.5 1.5L4.5 8L11.5 14.5Z" fill="currentColor"/>"##);
 
+// The arrows at the ends of a scroll bar, in `currentColor`.
+icon!(SCROLL_UP, "scroll-up", r##"<path d="M8 4L13 11H3Z" fill="currentColor"/>"##);
+icon!(SCROLL_DOWN, "scroll-down", r##"<path d="M8 12L13 5H3Z" fill="currentColor"/>"##);
+icon!(SCROLL_LEFT, "scroll-left", r##"<path d="M4 8L11 3V13Z" fill="currentColor"/>"##);
+icon!(SCROLL_RIGHT, "scroll-right", r##"<path d="M12 8L5 3V13Z" fill="currentColor"/>"##);
+
 // The search field's magnifier, in `currentColor`.
 icon!(SEARCH, "search", r##"<circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10.4 10.4L14 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>"##);
 
