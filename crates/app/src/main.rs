@@ -2254,7 +2254,7 @@ fn go_up(s: &mut State, p: usize) {
     let mut loc = s.panes[p].loc.clone();
     // From a disk's top up to Este Computador, landing on the disk.
     if let Location::Local(dir) = &loc
-        && mounts::is_disk_root(dir)
+        && mounts::is_disk_root(dir, &s.local_drives)
     {
         let id = mounts::disk_id(dir);
         navigate(s, p, Location::Computer);
@@ -3830,6 +3830,21 @@ mod tests {
         s.search[0] = rune::TextEdit::new("notas");
         actions::search_computer(&mut s, 0);
         assert!(matches!(&s.panes[0].loc, Location::Found(f) if f.within.is_none() && f.text == "notas"));
+        // Emptied, the field takes the pane back to Este Computador.
+        s.search[0] = rune::TextEdit::new("");
+        actions::search_computer(&mut s, 0);
+        assert_eq!(s.panes[0].loc, Location::Computer);
+        // A volume mounted in a folder (/media/ana/PEN) goes up to Este Computador too.
+        let pen = disk("C").join("media").join("PEN");
+        tree::drives_changed(&mut s, vec![(disk("C"), model::DriveKind::Fixed), (pen.clone(), model::DriveKind::Removable)]);
+        navigate(&mut s, 0, Location::Local(pen.clone()));
+        go_up(&mut s, 0);
+        assert_eq!(s.panes[0].loc, Location::Computer);
+        assert_eq!(s.panes[0].cursor.as_deref(), Some(mounts::disk_id(&pen).as_str()));
+        // A folder in it goes up as any folder does.
+        navigate(&mut s, 0, Location::Local(pen.join("Fotos")));
+        go_up(&mut s, 0);
+        assert_eq!(s.panes[0].loc, Location::Local(pen));
     }
 
     /// A disk the system didn't tell about shows once the window gets the focus back.

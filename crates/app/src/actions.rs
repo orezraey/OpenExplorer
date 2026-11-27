@@ -1362,12 +1362,12 @@ pub fn search_computer(s: &mut State, p: usize) {
     };
     if text.trim().is_empty() {
         if matches!(loc, Location::Found(_)) {
-            // Back to the folder the search started from: Voltar's last step, or the folder
-            // searched.
+            // Back to where the search started from: Voltar's last step (a folder, Este
+            // Computador), or the folder searched, or Este Computador for the whole computer.
             match (s.panes[p].back.last(), within) {
-                (Some(Location::Local(_)), _) => crate::go_back(s, p),
+                (Some(Location::Local(_) | Location::Computer), _) => crate::go_back(s, p),
                 (_, Some(dir)) => crate::switch(s, p, Location::Local(dir)),
-                _ => {}
+                (_, None) => crate::switch(s, p, Location::Computer),
             }
         }
         return;

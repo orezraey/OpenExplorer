@@ -5853,7 +5853,7 @@ fn navbar(s: &State, k: &Kit, p: usize, layer: &mut Vec<El>) -> El {
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
         .child(nav_button(k, "back", &icons::BACK, t("Voltar (Alt+←)", "Back (Alt+←)"), !pane.back.is_empty(), move |s: &mut State| go_back(s, p)))
         .child(nav_button(k, "forward", &icons::FORWARD, t("Avançar (Alt+→)", "Forward (Alt+→)"), !pane.forward.is_empty(), move |s: &mut State| go_forward(s, p)))
-        .child(nav_button(k, "up", &icons::UP, t("Acima (Backspace)", "Up (Backspace)"), can_go_up(&pane.loc), move |s: &mut State| go_up(s, p)))
+        .child(nav_button(k, "up", &icons::UP, t("Acima (Backspace)", "Up (Backspace)"), can_go_up(s, &pane.loc), move |s: &mut State| go_up(s, p)))
         .child(path_bar(s, k, p).mx(4.0))
         .child(search_box(s, k, p, layer))
         .child(nav_button(k, "reload", &icons::REFRESH, t("Atualizar (Ctrl+R)", "Refresh (Ctrl+R)"), true, move |s: &mut State| refresh(s, p)))
@@ -6296,10 +6296,10 @@ fn search_bar(s: &State, k: &Kit, p: usize) -> El {
     bar
 }
 
-fn can_go_up(loc: &Location) -> bool {
+fn can_go_up(s: &State, loc: &Location) -> bool {
     match loc {
         // A disk's top goes up to Este Computador.
-        Location::Local(dir) => crate::network::parent(dir).is_some() || crate::mounts::is_disk_root(dir),
+        Location::Local(dir) => crate::network::parent(dir).is_some() || crate::mounts::is_disk_root(dir, &s.local_drives),
         Location::Computer | Location::Found(_) | Location::DriveSearch(_) => false,
         Location::Mock(segs) => !segs.is_empty(),
         Location::Drive { space, path, .. } => !path.is_empty() || matches!(space, Space::Shared { .. }),
