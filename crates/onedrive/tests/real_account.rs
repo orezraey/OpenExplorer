@@ -181,7 +181,9 @@ fn folder_sizes() {
                     break;
                 }
             }
-            std::thread::sleep(std::time::Duration::from_secs(30));
+            if !(direct_ok && delta_ok) {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
         }
         println!("fim: direto {direct_ok}, delta {delta_ok}, {} s", sent.elapsed().as_secs());
         // What the account makes of it: the delta feed taken in, the totals as listed.
@@ -283,4 +285,3 @@ fn work_bin_round_trip() {
     let (purged, err) = a.bin_purge(&leftover);
     assert_eq!((purged.len(), err), (leftover.len(), None));
 }
-

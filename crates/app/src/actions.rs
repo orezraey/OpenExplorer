@@ -2061,7 +2061,8 @@ pub struct Props {
     pub md5_running: bool,
     /// The Tipo row: the items' shared type, or "Vários tipos".
     pub kind: String,
-    /// The listed sizes added up (files only, folders' contents not included).
+    /// The listed sizes added up: files, and folders whose listing gave a size (OneDrive's, which
+    /// can lag behind); other folders' contents not included.
     pub listed_bytes: u64,
     pub details: Option<Result<Details, String>>,
     pub revisions: Option<Result<Vec<Revision>, String>>,
