@@ -379,6 +379,11 @@ pub fn clear_cache() {
     }
 }
 
+/// Whether `input` holds a `:TagName:` placeholder, so it reads differently for each item.
+pub fn has_tags(input: &str) -> bool {
+    input.contains(':') && TAG_REGEX.is_match(input)
+}
+
 /// Expands all `:TagName:` placeholders inside `input` for `entry` at `loc`.
 pub fn expand_tags(input: &str, entry: &Entry, loc: &Location) -> String {
     if !input.contains(':') {
@@ -459,11 +464,10 @@ pub fn resolve_tag(tag: &str, entry: &Entry, loc: &Location) -> Option<String> {
         compute_later(cache_key, path, entry);
         return Some(PENDING.into());
     }
+    // Kept for as long as the batch window shows these items: emptying it when it grew past a
+    // size made a batch of more files than that read them all again at every preview.
     let val = compute_file_tag(tag, &path, entry).unwrap_or_default();
     if let Ok(mut g) = TAG_CACHE.lock() {
-        if g.len() > 10_000 {
-            g.clear();
-        }
         g.insert(cache_key, val.clone());
     }
     Some(val)

@@ -254,7 +254,7 @@ impl BatchRename {
         }
 
         // Collision & validity checks.
-        let case_insensitive_fs = matches!(self.loc, Location::Local(_) | Location::Found(_));
+        let case_insensitive_fs = ops::IGNORES_CASE && matches!(self.loc, Location::Local(_) | Location::Found(_));
         let norm = |name: &str| -> String {
             let trimmed = name.trim();
             if case_insensitive_fs {
@@ -560,12 +560,10 @@ pub fn submit(s: &mut State) {
 /// Executes local disk batch renames safely, using a two-phase temporary rename whenever a target
 /// path overlaps another source path in the same batch (e.g. `a -> b` and `b -> c`, or swaps).
 fn run_local_batch(jobs: Vec<(PathBuf, String)>, rec: &undo::Rec) -> Result<String, String> {
-    let source_keys: HashSet<String> = jobs.iter().map(|(from, _)| from.to_string_lossy().to_lowercase()).collect();
+    let source_keys: HashSet<String> = jobs.iter().map(|(from, _)| ops::path_key(from)).collect();
     let needs_staging = jobs.iter().any(|(from, name)| {
-        let to = from.with_file_name(name.trim());
-        let from_key = from.to_string_lossy().to_lowercase();
-        let to_key = to.to_string_lossy().to_lowercase();
-        from_key != to_key && source_keys.contains(&to_key)
+        let to_key = ops::path_key(&from.with_file_name(name.trim()));
+        ops::path_key(from) != to_key && source_keys.contains(&to_key)
     });
 
     if !needs_staging {
