@@ -114,6 +114,18 @@ fn radio_btn(k: &rune_kit::Kit, accent: Color, key: String, selected: bool, labe
     r
 }
 
+fn field_colors(k: &rune_kit::Kit, invalid: bool) -> (Color, Color) {
+    let fill = if k.dark { rune::oklch(0.155, 0.0, 0.0) } else { k.c.bg_base };
+    let border = if invalid {
+        k.c.danger.fg
+    } else if k.dark {
+        k.alpha(Color::WHITE, 0.22)
+    } else {
+        k.c.border_strong
+    };
+    (fill, border)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn num_stepper(
     k: &rune_kit::Kit,
@@ -129,6 +141,7 @@ fn num_stepper(
     let invalid = !trimmed.is_empty()
         && !(trimmed == "-" && min < 0)
         && trimmed.parse::<i64>().is_err();
+    let (fill, border) = field_colors(k, invalid);
     let btn = |suffix: &'static str, glyph: &'static str, delta: i64| {
         row()
             .key(format!("{key}-{suffix}"))
@@ -151,8 +164,8 @@ fn num_stepper(
         .key(key)
         .h(28.0)
         .radius(k.radius.sm)
-        .fill(k.c.bg_base)
-        .border(1.0, if invalid { k.c.danger.fg } else { k.c.border_base })
+        .fill(fill)
+        .border(1.0, border)
         .center_y()
         .child(
             row()
@@ -803,34 +816,47 @@ fn ed_mut(s: &mut State) -> &mut crate::rules_rename::RuleEditorState {
     }
 }
 
+fn text_box(
+    k: &rune_kit::Kit,
+    label: &str,
+    placeholder: &str,
+    edit: &TextEdit,
+    on_edit: impl for<'a> Fn(&'a mut State) -> &'a mut TextEdit + 'static,
+) -> El {
+    let (fill, border) = field_colors(k, false);
+    row()
+        .w_full()
+        .h(28.0)
+        .px(6.0)
+        .center_y()
+        .radius(k.radius.sm)
+        .fill(fill)
+        .border(1.0, border)
+        .child(
+            TextInput::new(edit)
+                .plain()
+                .width(None)
+                .height(26.0)
+                .label(label)
+                .placeholder(placeholder)
+                .on_edit(on_edit)
+                .build(k)
+                .grow(1.0)
+                .w(0.0)
+                .min_w(0.0),
+        )
+}
+
 fn input_a(k: &rune_kit::Kit, label: &str, placeholder: &str, edit: &TextEdit) -> El {
-    TextInput::new(edit)
-        .width(None)
-        .label(label)
-        .placeholder(placeholder)
-        .on_edit(|s: &mut State| {
-            let e = ed_mut(s);
-            &mut e.edit_a
-        })
-        .build(k)
+    text_box(k, label, placeholder, edit, |s| &mut ed_mut(s).edit_a)
 }
 
 fn input_b(k: &rune_kit::Kit, label: &str, placeholder: &str, edit: &TextEdit) -> El {
-    TextInput::new(edit)
-        .width(None)
-        .label(label)
-        .placeholder(placeholder)
-        .on_edit(|s: &mut State| &mut ed_mut(s).edit_b)
-        .build(k)
+    text_box(k, label, placeholder, edit, |s| &mut ed_mut(s).edit_b)
 }
 
 fn input_c(k: &rune_kit::Kit, label: &str, placeholder: &str, edit: &TextEdit) -> El {
-    TextInput::new(edit)
-        .width(None)
-        .label(label)
-        .placeholder(placeholder)
-        .on_edit(|s: &mut State| &mut ed_mut(s).edit_c)
-        .build(k)
+    text_box(k, label, placeholder, edit, |s| &mut ed_mut(s).edit_c)
 }
 
 fn render_rule_config_panel(k: &rune_kit::Kit, br: &BatchRename, accent: Color, panel_border: Color, layer: &mut Vec<El>) -> El {
@@ -846,13 +872,15 @@ fn render_rule_config_panel(k: &rune_kit::Kit, br: &BatchRename, accent: Color, 
 
 fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: Color, panel_border: Color, layer: &mut Vec<El>) -> El {
     let ed = &br.rules.editor;
+    let group_fill = if k.dark { rune::oklch(0.225, 0.0, 0.0) } else { k.c.surface_raised };
     let group_box = |title: &str, inner: El| {
         col()
             .w_full()
+            .items_start()
             .padding(10.0)
             .gap(6.0)
             .radius(k.radius.sm)
-            .fill(k.c.surface_raised)
+            .fill(group_fill)
             .border(1.0, panel_border)
             .child(text(title.to_string()).font(k.ty.caption()).color(k.c.text_muted))
             .child(inner)
@@ -883,6 +911,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                                 .grow(1.0)
                                 .w(0.0)
                                 .min_w(0.0)
+                                .items_start()
                                 .gap(6.0)
                                 .child(radio_btn(k, accent, "ins-pre".into(), wm == InsertWhere::Prefix, t("Prefixo", "Prefix"), |s| {
                                     if let RuleConfig::Insert { where_mode, .. } = &mut ed_mut(s).config {
@@ -921,11 +950,11 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                                         .w_full()
                                         .gap(8.0)
                                         .center_y()
-                                        .child(radio_btn(k, accent, "ins-after".into(), wm == InsertWhere::AfterText, t("Após texto:", "After text:"), |s| {
+                                        .child(row().w(116.0).center_y().child(radio_btn(k, accent, "ins-after".into(), wm == InsertWhere::AfterText, t("Após texto:", "After text:"), |s| {
                                             if let RuleConfig::Insert { where_mode, .. } = &mut ed_mut(s).config {
                                                 *where_mode = InsertWhere::AfterText;
                                             }
-                                        }).w(116.0))
+                                        })))
                                         .child(input_b(k, t("Após", "After"), "", &ed.edit_b).grow(1.0).w(0.0).min_w(0.0)),
                                 )
                                 .child(
@@ -933,11 +962,11 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                                         .w_full()
                                         .gap(8.0)
                                         .center_y()
-                                        .child(radio_btn(k, accent, "ins-before".into(), wm == InsertWhere::BeforeText, t("Antes do texto:", "Before text:"), |s| {
+                                        .child(row().w(116.0).center_y().child(radio_btn(k, accent, "ins-before".into(), wm == InsertWhere::BeforeText, t("Antes do texto:", "Before text:"), |s| {
                                             if let RuleConfig::Insert { where_mode, .. } = &mut ed_mut(s).config {
                                                 *where_mode = InsertWhere::BeforeText;
                                             }
-                                        }).w(116.0))
+                                        })))
                                         .child(input_c(k, t("Antes", "Before"), "", &ed.edit_c).grow(1.0).w(0.0).min_w(0.0)),
                                 )
                                 .child(radio_btn(k, accent, "ins-rep".into(), wm == InsertWhere::ReplaceCurrent, t("Substituir nome atual", "Replace current name"), |s| {
@@ -959,17 +988,18 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                 t("De:", "From:"),
                 col()
                     .w_full()
+                    .items_start()
                     .gap(6.0)
                     .child(
                         row()
                             .w_full()
                             .gap(8.0)
                             .center_y()
-                            .child(radio_btn(k, accent, "del-fpos".into(), fm == DeleteFrom::Position, t("Posição:", "Position:"), |s| {
+                            .child(row().w(92.0).center_y().child(radio_btn(k, accent, "del-fpos".into(), fm == DeleteFrom::Position, t("Posição:", "Position:"), |s| {
                                 if let RuleConfig::Delete { from_mode, .. } = &mut ed_mut(s).config {
                                     *from_mode = DeleteFrom::Position;
                                 }
-                            }).w(92.0))
+                            })))
                             .child(num_stepper(k, "del-fp-n", 0, fp as i64, 1, 999_999, &ed.nums[0], |s, v| {
                                 if let RuleConfig::Delete { from_mode, from_pos, .. } = &mut ed_mut(s).config {
                                     *from_mode = DeleteFrom::Position;
@@ -982,11 +1012,11 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                             .w_full()
                             .gap(8.0)
                             .center_y()
-                            .child(radio_btn(k, accent, "del-fdel".into(), fm == DeleteFrom::Delimiter, t("Delimitador:", "Delimiter:"), |s| {
+                            .child(row().w(92.0).center_y().child(radio_btn(k, accent, "del-fdel".into(), fm == DeleteFrom::Delimiter, t("Delimitador:", "Delimiter:"), |s| {
                                 if let RuleConfig::Delete { from_mode, .. } = &mut ed_mut(s).config {
                                     *from_mode = DeleteFrom::Delimiter;
                                 }
-                            }).w(92.0))
+                            })))
                             .child(input_a(k, t("Delimitador", "Delimiter"), "", &ed.edit_a).grow(1.0).w(0.0).min_w(0.0)),
                     ),
             );
@@ -994,17 +1024,18 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                 t("Até:", "Until:"),
                 col()
                     .w_full()
+                    .items_start()
                     .gap(6.0)
                     .child(
                         row()
                             .w_full()
                             .gap(8.0)
                             .center_y()
-                            .child(radio_btn(k, accent, "del-ucnt".into(), um == DeleteUntil::Count, t("Contagem:", "Count:"), |s| {
+                            .child(row().w(92.0).center_y().child(radio_btn(k, accent, "del-ucnt".into(), um == DeleteUntil::Count, t("Contagem:", "Count:"), |s| {
                                 if let RuleConfig::Delete { until_mode, .. } = &mut ed_mut(s).config {
                                     *until_mode = DeleteUntil::Count;
                                 }
-                            }).w(92.0))
+                            })))
                             .child(num_stepper(k, "del-uc-n", 1, uc as i64, 1, 999_999, &ed.nums[1], |s, v| {
                                 if let RuleConfig::Delete { until_mode, until_count, .. } = &mut ed_mut(s).config {
                                     *until_mode = DeleteUntil::Count;
@@ -1017,11 +1048,11 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                             .w_full()
                             .gap(8.0)
                             .center_y()
-                            .child(radio_btn(k, accent, "del-udel".into(), um == DeleteUntil::Delimiter, t("Delimitador:", "Delimiter:"), |s| {
+                            .child(row().w(92.0).center_y().child(radio_btn(k, accent, "del-udel".into(), um == DeleteUntil::Delimiter, t("Delimitador:", "Delimiter:"), |s| {
                                 if let RuleConfig::Delete { until_mode, .. } = &mut ed_mut(s).config {
                                     *until_mode = DeleteUntil::Delimiter;
                                 }
-                            }).w(92.0))
+                            })))
                             .child(input_b(k, t("Delimitador", "Delimiter"), "", &ed.edit_b).grow(1.0).w(0.0).min_w(0.0)),
                     )
                     .child(radio_btn(k, accent, "del-uend".into(), um == DeleteUntil::UntilEnd, t("Até o final", "Until the end"), |s| {
@@ -1032,6 +1063,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
             );
             col()
                 .w_full()
+                .items_start()
                 .gap(10.0)
                 .child(row().w_full().gap(10.0).child(from_box.grow(1.0).w(0.0)).child(until_box.grow(1.0).w(0.0)))
                 .child(
@@ -1042,6 +1074,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                             col()
                                 .grow(1.0)
                                 .w(0.0)
+                                .items_start()
                                 .gap(6.0)
                                 .child(instant_checkbox(k, accent, "del-cur".into(), dc, t("Excluir nome atual", "Delete current name"), |s| {
                                     if let RuleConfig::Delete { delete_current, .. } = &mut ed_mut(s).config {
@@ -1058,6 +1091,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                             col()
                                 .grow(1.0)
                                 .w(0.0)
+                                .items_start()
                                 .gap(6.0)
                                 .child(instant_checkbox(k, accent, "del-rtl".into(), rtl_v, t("Direita-para-esquerda", "Right-to-left"), |s| {
                                     if let RuleConfig::Delete { rtl, .. } = &mut ed_mut(s).config {
@@ -1076,6 +1110,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
             let (occ, cs, ww, se, wc) = (*occurrences, *case_sensitive, *whole_words, *skip_ext, *wildcards);
             col()
                 .w_full()
+                .items_start()
                 .gap(10.0)
                 .child(
                     row()
@@ -1093,6 +1128,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                         .child(
                             col()
                                 .w(140.0)
+                                .items_start()
                                 .gap(5.0)
                                 .child(text(t("Ocorrências:", "Occurrences:")).font(k.ty.caption()).color(k.c.text_muted))
                                 .child(radio_btn(k, accent, "rem-all".into(), occ == Occurrences::All, t("Tudo", "All"), |s| {
@@ -1115,6 +1151,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                             col()
                                 .grow(1.0)
                                 .w(0.0)
+                                .items_start()
                                 .gap(6.0)
                                 .pt(16.0)
                                 .child(instant_checkbox(k, accent, "rem-cs".into(), cs, t("Diferenciar maiúsculas de minúsculas", "Case sensitive"), |s| {
@@ -1151,6 +1188,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
             let (occ, cs, ww, se, wc) = (*occurrences, *case_sensitive, *whole_words, *skip_ext, *wildcards);
             col()
                 .w_full()
+                .items_start()
                 .gap(10.0)
                 .child(
                     row()
@@ -1176,6 +1214,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                         .child(
                             col()
                                 .w(140.0)
+                                .items_start()
                                 .gap(5.0)
                                 .child(text(t("Ocorrências:", "Occurrences:")).font(k.ty.caption()).color(k.c.text_muted))
                                 .child(radio_btn(k, accent, "rep-all".into(), occ == Occurrences::All, t("Tudo", "All"), |s| {
@@ -1198,6 +1237,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                             col()
                                 .grow(1.0)
                                 .w(0.0)
+                                .items_start()
                                 .gap(6.0)
                                 .pt(16.0)
                                 .child(instant_checkbox(k, accent, "rep-cs".into(), cs, t("Diferenciar maiúsculas de minúsculas", "Case sensitive"), |s| {
@@ -1234,8 +1274,8 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
             let (sm, se, rtl_v) = (*split_mode, *skip_ext, *rtl);
             col()
                 .w_full()
+                .items_start()
                 .gap(8.0)
-                .child(text(t("Dividir usando:", "Split using:")).font(k.ty.text_small).color(k.c.text_base))
                 .child(radio_btn(k, accent, "rear-del".into(), sm == RearrangeSplit::Delimiters, t("Delimitadores (separe múltiplos com |)", "Delimiters (separate multiple with |)"), |s| {
                     if let RuleConfig::Rearrange { split_mode, .. } = &mut ed_mut(s).config {
                         *split_mode = RearrangeSplit::Delimiters;
@@ -1291,6 +1331,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
             let (sn, ao, db, rd, dcs) = (*set_new, *append_original, *detect_binary, *remove_duplicates, *dup_case_sensitive);
             col()
                 .w_full()
+                .items_start()
                 .gap(8.0)
                 .child(instant_checkbox(k, accent, "ext-new".into(), sn, t("Nova Extensão (sem ponto):", "New Extension (without dot):"), |s| {
                     if let RuleConfig::Extension { set_new, .. } = &mut ed_mut(s).config {
@@ -1342,11 +1383,12 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                     .w_full()
                     .gap(8.0)
                     .center_y()
-                    .child(instant_checkbox(k, accent, chk_key.into(), on, label, toggle).w(150.0))
-                    .child(TextInput::new(edit).width(None).label(label).on_edit(move |s: &mut State| pick(ed_mut(s))).build(k).grow(1.0).w(0.0).min_w(0.0))
+                    .child(row().w(150.0).center_y().child(instant_checkbox(k, accent, chk_key.into(), on, label, toggle)))
+                    .child(text_box(k, label, "", edit, move |s| pick(ed_mut(s))).grow(1.0).w(0.0).min_w(0.0))
             };
             col()
                 .w_full()
+                .items_start()
                 .gap(6.0)
                 .child(line("stp-en", en, t("Inglês:", "English:"), &ed.edit_a, |s| {
                     if let RuleConfig::Strip { english, .. } = &mut ed_mut(s).config { *english = !*english; }
@@ -1374,6 +1416,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                         .child(
                             col()
                                 .w(130.0)
+                                .items_start()
                                 .gap(4.0)
                                 .child(radio_btn(k, accent, "stp-w-all".into(), wm == StripWhere::Everywhere, t("Em todo lugar", "Everywhere"), |s| {
                                     if let RuleConfig::Strip { where_mode, .. } = &mut ed_mut(s).config { *where_mode = StripWhere::Everywhere; }
@@ -1389,6 +1432,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                             col()
                                 .grow(1.0)
                                 .w(0.0)
+                                .items_start()
                                 .gap(4.0)
                                 .child(instant_checkbox(k, accent, "stp-inv".into(), inv, t("Retira todos, menos os selecionados", "Strip all except selected"), |s| {
                                     if let RuleConfig::Strip { invert, .. } = &mut ed_mut(s).config { *invert = !*invert; }
@@ -1408,6 +1452,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                 t("Alterar maiúsculo/minúsculo:", "Change case:"),
                 col()
                     .w_full()
+                    .items_start()
                     .gap(4.0)
                     .child(radio_btn(k, accent, "cs-title".into(), cm == CaseMode::TitleCase, t("Primeira Letra Da Palavra Em Maiúscula", "Capitalize Every Word"), |s| {
                         if let RuleConfig::Case { mode, .. } = &mut ed_mut(s).config { *mode = CaseMode::TitleCase; }
@@ -1442,6 +1487,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                 .grow(1.0)
                 .w(0.0)
                 .min_w(0.0)
+                .items_start()
                 .gap(8.0)
                 .child(instant_checkbox(k, accent, "cs-ff".into(), ff, t("Forçar maiúsculo/minúsculo para fragmentos:", "Force case for fragments:"), |s| {
                     if let RuleConfig::Case { force_fragments, .. } = &mut ed_mut(s).config { *force_fragments = !*force_fragments; }
@@ -1475,21 +1521,22 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
             let left = col()
                 .grow(1.0)
                 .w(0.0)
+                .items_start()
                 .gap(6.0)
-                .child(row().gap(8.0).center_y().child(text(t("Índice inicial:", "Index starts:")).font(k.ty.text_small).color(k.c.text_base).w(105.0)).child(num_stepper(k, "ser-st", 0, st, -999_999, 999_999, &ed.nums[0], |s, v| {
+                .child(row().gap(8.0).center_y().child(text(t("Índice inicial:", "Index starts:")).font(k.ty.text_small).color(k.c.text_base).w(134.0)).child(num_stepper(k, "ser-st", 0, st, -999_999, 999_999, &ed.nums[0], |s, v| {
                     if let RuleConfig::Serialize { start, .. } = &mut ed_mut(s).config { *start = v; }
                 })))
-                .child(row().gap(8.0).center_y().child(text(t("Repetir:", "Repeat:")).font(k.ty.text_small).color(k.c.text_base).w(105.0)).child(num_stepper(k, "ser-rep", 1, rep as i64, 1, 999_999, &ed.nums[1], |s, v| {
+                .child(row().gap(8.0).center_y().child(text(t("Repetir:", "Repeat:")).font(k.ty.text_small).color(k.c.text_base).w(134.0)).child(num_stepper(k, "ser-rep", 1, rep as i64, 1, 999_999, &ed.nums[1], |s, v| {
                     if let RuleConfig::Serialize { repeat, .. } = &mut ed_mut(s).config { *repeat = v as u32; }
                 })))
-                .child(row().gap(8.0).center_y().child(text(t("Passo:", "Step:")).font(k.ty.text_small).color(k.c.text_base).w(105.0)).child(num_stepper(k, "ser-stp", 2, stp, -999_999, 999_999, &ed.nums[2], |s, v| {
+                .child(row().gap(8.0).center_y().child(text(t("Passo:", "Step:")).font(k.ty.text_small).color(k.c.text_base).w(134.0)).child(num_stepper(k, "ser-stp", 2, stp, -999_999, 999_999, &ed.nums[2], |s, v| {
                     if let RuleConfig::Serialize { step, .. } = &mut ed_mut(s).config { *step = v; }
                 })))
                 .child(
-                    row().gap(6.0).center_y()
-                        .child(instant_checkbox(k, accent, "ser-re".into(), re_on, t("Redefinir a cada:", "Reset every:"), |s| {
+                    row().gap(8.0).center_y()
+                        .child(row().w(134.0).center_y().child(instant_checkbox(k, accent, "ser-re".into(), re_on, t("Redefinir a cada:", "Reset every:"), |s| {
                             if let RuleConfig::Serialize { reset_every_on, .. } = &mut ed_mut(s).config { *reset_every_on = !*reset_every_on; }
-                        }))
+                        })))
                         .child(num_stepper(k, "ser-ren", 3, re_n as i64, 1, 999_999, &ed.nums[3], |s, v| {
                             if let RuleConfig::Serialize { reset_every_on, reset_every, .. } = &mut ed_mut(s).config {
                                 *reset_every_on = true;
@@ -1570,6 +1617,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                 t("Onde inserir:", "Where to insert:"),
                 col()
                     .w_full()
+                    .items_start()
                     .gap(6.0)
                     .child(radio_btn(k, accent, "ser-pre".into(), wm == InsertWhere::Prefix, t("Prefixo", "Prefix"), |s| {
                         if let RuleConfig::Serialize { where_mode, .. } = &mut ed_mut(s).config { *where_mode = InsertWhere::Prefix; }
@@ -1604,6 +1652,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                 t("Caracteres para usar:", "Characters to use:"),
                 col()
                     .w_full()
+                    .items_start()
                     .gap(6.0)
                     .child(instant_checkbox(k, accent, "rnd-dg".into(), dg, t("Dígitos (0..9)", "Digits (0..9)"), |s| {
                         if let RuleConfig::Random { digits, .. } = &mut ed_mut(s).config { *digits = !*digits; }
@@ -1620,6 +1669,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                 t("Onde inserir:", "Where to insert:"),
                 col()
                     .w_full()
+                    .items_start()
                     .gap(6.0)
                     .child(radio_btn(k, accent, "rnd-pre".into(), wm == InsertWhere::Prefix, t("Prefixo", "Prefix"), |s| {
                         if let RuleConfig::Random { where_mode, .. } = &mut ed_mut(s).config { *where_mode = InsertWhere::Prefix; }
@@ -1648,6 +1698,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
             );
             col()
                 .w_full()
+                .items_start()
                 .gap(8.0)
                 .child(
                     row()
@@ -1668,11 +1719,13 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
             let (pn, pnl, sz, pt, ptl, pts, se) = (*pad_numbers, *pad_numbers_len, *strip_zeros, *pad_text, *pad_text_len, *pad_text_side, *skip_ext);
             col()
                 .w_full()
+                .items_start()
                 .gap(10.0)
                 .child(group_box(
                     t("Sequências de números", "Number sequences"),
                     col()
                         .w_full()
+                        .items_start()
                         .gap(6.0)
                         .child(
                             row().w_full().gap(8.0).center_y()
@@ -1694,6 +1747,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                     t("Preenchimento de texto", "Text padding"),
                     col()
                         .w_full()
+                        .items_start()
                         .gap(6.0)
                         .child(
                             row().w_full().gap(8.0).center_y()
@@ -1733,6 +1787,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
             );
             col()
                 .w_full()
+                .items_start()
                 .gap(6.0)
                 .child(group_box(
                     t("Retirar o conteúdo de colchetes:", "Strip contents of brackets:"),
@@ -1751,6 +1806,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                     t("Substituir estes caracteres por espaços:", "Replace these characters with spaces:"),
                     col()
                         .w_full()
+                        .items_start()
                         .gap(6.0)
                         .child(
                             row().w_full().gap(12.0)
@@ -1824,6 +1880,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
             let right = col()
                 .grow(1.0)
                 .w(0.0)
+                .items_start()
                 .gap(8.0)
                 .child(text(t("Direção:", "Direction:")).font(k.ty.text_small).color(k.c.text_base))
                 .child(radio_btn(k, accent, "tr-fwd".into(), dir == TranslitDir::Forward, t("Avançar", "Forward"), |s| {
@@ -1891,6 +1948,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
             }
             col()
                 .w_full()
+                .items_start()
                 .gap(8.0)
                 .child(text(t("Localizar formatos de data/hora:", "Find date/time formats:")).font(k.ty.text_small).color(k.c.text_base))
                 .child(
@@ -1912,17 +1970,17 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                 }))
                 .child(
                     row().w_full().gap(8.0).center_y()
-                        .child(instant_checkbox(k, accent, "dt-csm".into(), csm, t("Usar meses curtos:", "Short months:"), |s| {
+                        .child(row().w(165.0).center_y().child(instant_checkbox(k, accent, "dt-csm".into(), csm, t("Usar meses curtos:", "Short months:"), |s| {
                             if let RuleConfig::ReformatDate { custom_short_months, .. } = &mut ed_mut(s).config { *custom_short_months = !*custom_short_months; }
-                        }).w(165.0))
+                        })))
                         .child(input_c(k, t("Meses curtos", "Short months"), "", &ed.edit_c).grow(1.0).w(0.0).min_w(0.0)),
                 )
                 .child(
                     row().w_full().gap(8.0).center_y()
-                        .child(instant_checkbox(k, accent, "dt-clm".into(), clm, t("Usar meses longos:", "Long months:"), |s| {
+                        .child(row().w(165.0).center_y().child(instant_checkbox(k, accent, "dt-clm".into(), clm, t("Usar meses longos:", "Long months:"), |s| {
                             if let RuleConfig::ReformatDate { custom_long_months, .. } = &mut ed_mut(s).config { *custom_long_months = !*custom_long_months; }
-                        }).w(165.0))
-                        .child(TextInput::new(&ed.edit_d).width(None).label("Long months").on_edit(|s: &mut State| &mut ed_mut(s).edit_d).build(k).grow(1.0).w(0.0).min_w(0.0)),
+                        })))
+                        .child(text_box(k, "Long months", "", &ed.edit_d, |s| &mut ed_mut(s).edit_d).grow(1.0).w(0.0).min_w(0.0)),
                 )
                 .child(
                     row().w_full().gap(8.0).center_y()
@@ -1958,6 +2016,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
             let (cs, se) = (*case_sensitive, *skip_ext);
             col()
                 .w_full()
+                .items_start()
                 .gap(10.0)
                 .child(
                     row().w_full().gap(8.0).center_y()
@@ -2004,8 +2063,8 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                         .w_full()
                         .h(230.0)
                         .radius(k.radius.sm)
-                        .fill(k.c.surface_raised)
-                        .border(1.0, panel_border)
+                        .fill(field_colors(k, false).0)
+                        .border(1.0, field_colors(k, false).1)
                         .child(
                             col()
                                 .w(32.0)
@@ -2091,6 +2150,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                             col()
                                 .grow(1.0)
                                 .w(0.0)
+                                .items_start()
                                 .gap(4.0)
                                 .child(radio_btn(k, accent, "ui-bef".into(), um == UserInputMode::Before, t("Inserir na frente do nome atual", "Insert in front of current name"), |s| {
                                     if let RuleConfig::UserInput { mode, .. } = &mut ed_mut(s).config { *mode = UserInputMode::Before; }
@@ -2103,6 +2163,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                             col()
                                 .grow(1.0)
                                 .w(0.0)
+                                .items_start()
                                 .gap(4.0)
                                 .child(radio_btn(k, accent, "ui-rep".into(), um == UserInputMode::Replace, t("Substituir nome atual", "Replace current name"), |s| {
                                     if let RuleConfig::UserInput { mode, .. } = &mut ed_mut(s).config { *mode = UserInputMode::Replace; }
@@ -2162,6 +2223,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                             col()
                                 .grow(1.0)
                                 .w(0.0)
+                                .items_start()
                                 .gap(4.0)
                                 .child(instant_checkbox(k, accent, "map-ar".into(), ar, t("Permitir reutilização", "Allow reuse"), |s| {
                                     if let RuleConfig::Mapping { allow_reuse, .. } = &mut ed_mut(s).config { *allow_reuse = !*allow_reuse; }
@@ -2177,6 +2239,7 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                             col()
                                 .grow(1.0)
                                 .w(0.0)
+                                .items_start()
                                 .gap(4.0)
                                 .child(instant_checkbox(k, accent, "map-cs".into(), cs, t("Diferenciar maiúsculas de minúsculas", "Case sensitive"), |s| {
                                     if let RuleConfig::Mapping { case_sensitive, .. } = &mut ed_mut(s).config { *case_sensitive = !*case_sensitive; }
@@ -2191,8 +2254,8 @@ fn render_rule_config_panel_inner(k: &rune_kit::Kit, br: &BatchRename, accent: C
                         .w_full()
                         .gap(6.0)
                         .center_y()
-                        .child(TextInput::new(&ed.map_key).width(None).label("Corresponder").placeholder(t("Corresponder", "Match")).on_edit(|s: &mut State| &mut ed_mut(s).map_key).build(k).grow(1.0).w(0.0))
-                        .child(TextInput::new(&ed.map_val).width(None).label("Novo Nome").placeholder(t("Novo Nome", "New Name")).on_edit(|s: &mut State| &mut ed_mut(s).map_val).build(k).grow(1.0).w(0.0))
+                        .child(text_box(k, "Corresponder", t("Corresponder", "Match"), &ed.map_key, |s| &mut ed_mut(s).map_key).grow(1.0).w(0.0).min_w(0.0))
+                        .child(text_box(k, "Novo Nome", t("Novo Nome", "New Name"), &ed.map_val, |s| &mut ed_mut(s).map_val).grow(1.0).w(0.0).min_w(0.0))
                         .child(tool_btn(k, "map-add-row", "+", true, |s| {
                             let e = ed_mut(s);
                             let a = e.map_key.text.clone();
