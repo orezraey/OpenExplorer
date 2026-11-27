@@ -3289,7 +3289,10 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 name = "openexplorer"
 version = "0.4.0"
 dependencies = [
+ "arboard",
  "chrono",
+ "crc32fast",
+ "imagesize",
  "md-5",
  "openexplorer-b2",
  "openexplorer-dropbox",
@@ -3300,11 +3303,14 @@ dependencies = [
  "openexplorer-onedrive",
  "openexplorer-remote",
  "openexplorer-telegram",
+ "rand",
  "regex",
  "rune",
  "rune-kit",
  "serde",
  "serde_json",
+ "sha1",
+ "sha2 0.11.1",
  "trash",
  "ureq",
  "windows",

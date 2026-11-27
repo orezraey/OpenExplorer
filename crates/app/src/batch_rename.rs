@@ -24,6 +24,7 @@ pub enum Mode {
     #[default]
     Simple,
     Media,
+    Rules,
 }
 
 /// State of the independent "Renomear em massa" window.
@@ -43,6 +44,8 @@ pub struct BatchRename {
     pub use_regex: bool,
     /// State for the advanced "Mídia · TMDB / TVDB" tab.
     pub media: MediaState,
+    /// State for the composable ReNamer-style "Regras (Avançado)" tab.
+    pub rules: crate::rules_rename::RulesState,
 }
 
 /// Live preview of a single row in the batch rename table.
@@ -77,6 +80,7 @@ enum Matcher {
 
 impl BatchRename {
     pub fn new(loc: Location, items: Vec<Entry>, other_names: Vec<String>) -> Self {
+        crate::rules_meta::clear_cache();
         let n = items.len();
         let media = MediaState::new(&items);
         let mut search = TextEdit::new("");
@@ -93,6 +97,7 @@ impl BatchRename {
             case_insensitive: false,
             use_regex: false,
             media,
+            rules: crate::rules_rename::RulesState::new(),
         }
     }
 
@@ -163,6 +168,15 @@ impl BatchRename {
                     }
                 })
                 .collect(),
+            Mode::Rules => crate::rules_rename::evaluate_rules(&self.rules.rules, &self.items, &self.checked, &self.loc)
+                .into_iter()
+                .enumerate()
+                .map(|(i, (next, error))| {
+                    let current = shown(&self.items[i].name);
+                    let changed = next != current;
+                    RowPreview { current, next, changed, error }
+                })
+                .collect(),
         };
 
         // Collision & validity checks.
@@ -214,6 +228,10 @@ impl BatchRename {
         let mut error_count = 0;
         for (i, item) in self.items.iter().enumerate() {
             let included = self.checked.get(i).copied().unwrap_or(false);
+            if included && rows[i].error.is_some() {
+                error_count += 1;
+                continue;
+            }
             if !included || !rows[i].changed {
                 continue;
             }
@@ -632,7 +650,8 @@ pub fn batch_rename_window_view(s: &State, cx: &mut Cx<State>) -> El {
         .gap(6.0)
         .center_y()
         .child(tab_btn("tab-simple", t("Simples (Procurar e substituir)", "Simple (Search & replace)"), Mode::Simple))
-        .child(tab_btn("tab-media", t("Mídia · TMDB / TVDB", "Media · TMDB / TVDB"), Mode::Media));
+        .child(tab_btn("tab-media", t("Mídia · TMDB / TVDB", "Media · TMDB / TVDB"), Mode::Media))
+        .child(tab_btn("tab-rules", t("Regras (Avançado)", "Rules (Advanced)"), Mode::Rules));
 
     let mut layer: Vec<El> = Vec::new();
 
@@ -950,6 +969,7 @@ pub fn batch_rename_window_view(s: &State, cx: &mut Cx<State>) -> El {
                 .child(footer)
         }
         Mode::Media => media_workspace(s, &k, br, &preview, all_checked, panel_bg, panel_border, accent_bg, accent_hover, mode_tabs, &mut layer),
+        Mode::Rules => crate::rules_ui::rules_workspace(s, &k, br, &preview, all_checked, panel_bg, panel_border, accent_bg, mode_tabs, &mut layer),
     };
 
     let root = col()

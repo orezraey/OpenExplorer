@@ -36,6 +36,10 @@ mod settings;
 mod sharing;
 mod places;
 mod relay;
+mod rules_meta;
+mod rules_rename;
+mod rules_script;
+mod rules_ui;
 mod servers;
 mod sysicons;
 mod tabs;
@@ -300,6 +304,12 @@ struct State {
     batch_rename_closes: u32,
     batch_rename_synced_font: Option<settings::TextFont>,
     batch_rename_synced_render: Option<settings::TextRender>,
+    rule_editor_win: Option<rune::AppHandle<State>>,
+    rule_editor_dirty: bool,
+    rule_editor_shown: bool,
+    rule_editor_closes: u32,
+    rule_editor_synced_font: Option<settings::TextFont>,
+    rule_editor_synced_render: Option<settings::TextRender>,
     is_placeholder: bool,
 }
 
@@ -333,6 +343,7 @@ thread_local! {
 }
 static ACCOUNT_WAKER: std::sync::LazyLock<std::sync::Mutex<Option<Waker>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 static BATCH_RENAME_WAKER: std::sync::LazyLock<std::sync::Mutex<Option<Waker>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+static RULE_EDITOR_WAKER: std::sync::LazyLock<std::sync::Mutex<Option<Waker>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 thread_local! {
     static SHARED_STATE: std::cell::RefCell<Option<State>> = const { std::cell::RefCell::new(None) };
@@ -452,6 +463,12 @@ impl State {
             batch_rename_closes: 0,
             batch_rename_synced_font: None,
             batch_rename_synced_render: None,
+            rule_editor_win: None,
+            rule_editor_dirty: false,
+            rule_editor_shown: false,
+            rule_editor_closes: 0,
+            rule_editor_synced_font: None,
+            rule_editor_synced_render: None,
             is_placeholder: true,
         }
     }
@@ -526,8 +543,9 @@ impl State {
         }
     }
 
-    /// Drops the batch rename state and closes its window.
+    /// Drops the batch rename state and closes its window (plus any open rule editor window).
     pub fn close_batch_rename(&mut self) {
+        self.close_rule_editor();
         self.batch_rename = None;
         self.batch_rename_dirty = true;
         if let Some(w) = &self.batch_rename_win
@@ -550,8 +568,54 @@ impl State {
             self.batch_rename_closes -= 1;
             return;
         }
+        self.close_rule_editor();
         self.batch_rename_shown = false;
         self.batch_rename = None;
+    }
+
+    /// Opens the independent, resizable "Adicionar Regra" / "Editar Regra" window.
+    pub fn open_rule_editor(&mut self, edit_index: Option<usize>) {
+        if let Some(br) = &mut self.batch_rename {
+            match edit_index {
+                Some(i) => br.rules.open_edit(i),
+                None => br.rules.open_add(),
+            }
+        } else {
+            return;
+        }
+        self.rule_editor_dirty = true;
+        if let Some(w) = &self.rule_editor_win {
+            self.rule_editor_shown = true;
+            w.open();
+            w.wake();
+        }
+    }
+
+    /// Closes the independent Rule Editor window without discarding `batch_rename`.
+    pub fn close_rule_editor(&mut self) {
+        if let Some(br) = &mut self.batch_rename {
+            br.rules.editor.meta_target = None;
+            br.rules.tag_cat_open = false;
+        }
+        self.rule_editor_dirty = true;
+        if let Some(w) = &self.rule_editor_win
+            && std::mem::take(&mut self.rule_editor_shown)
+        {
+            self.rule_editor_closes += 1;
+            w.close();
+        }
+    }
+
+    fn rule_editor_window_closed(&mut self) {
+        if self.rule_editor_closes > 0 {
+            self.rule_editor_closes -= 1;
+            return;
+        }
+        self.rule_editor_shown = false;
+        if let Some(br) = &mut self.batch_rename {
+            br.rules.editor.meta_target = None;
+            br.rules.tag_cat_open = false;
+        }
     }
 }
 
@@ -682,6 +746,12 @@ fn init() -> State {
         batch_rename_closes: 0,
         batch_rename_synced_font: None,
         batch_rename_synced_render: None,
+        rule_editor_win: None,
+        rule_editor_dirty: false,
+        rule_editor_shown: false,
+        rule_editor_closes: 0,
+        rule_editor_synced_font: None,
+        rule_editor_synced_render: None,
         is_placeholder: false,
     }
 }
@@ -696,6 +766,9 @@ fn setup(s: &mut State, waker: Waker) {
         }
         if let Some(bw) = BATCH_RENAME_WAKER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             bw();
+        }
+        if let Some(rw) = RULE_EDITOR_WAKER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            rw();
         }
     });
     s.posters.start(rune::ImageCache::new(combined.clone()));
@@ -802,8 +875,70 @@ fn batch_rename_window_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
                 br.media.popup = None;
                 return true;
             }
+            if br.rules.popup.is_some() {
+                br.rules.popup = None;
+                return true;
+            }
         }
         s.close_batch_rename();
+        return true;
+    }
+    false
+}
+
+fn init_rule_editor_window() -> State {
+    State::placeholder()
+}
+
+fn setup_rule_editor_window(_: &mut State, waker: Waker) {
+    *RULE_EDITOR_WAKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker);
+}
+
+fn poll_rule_editor_window(s: &mut State, _now: f64, tx: &mut Tx) -> bool {
+    if s.is_placeholder {
+        return false;
+    }
+    if s.rule_editor_synced_font != Some(s.settings.font) {
+        s.rule_editor_synced_font = Some(s.settings.font);
+        let (sans, mono) = s.settings.font.families();
+        tx.set_font_families(sans, mono);
+    }
+    if s.rule_editor_synced_render != Some(s.settings.text_render) {
+        s.rule_editor_synced_render = Some(s.settings.text_render);
+        tx.set_font_smoothing(s.settings.text_render.smoothing());
+    }
+    std::mem::take(&mut s.rule_editor_dirty)
+}
+
+fn rule_editor_window_key(s: &mut State, ev: &KeyEvent, _: &mut Tx) -> bool {
+    if s.is_placeholder {
+        return false;
+    }
+    if ev.key == Key::Escape && ev.mods == Mods::default() {
+        if let Some(br) = &mut s.batch_rename {
+            if br.rules.tag_cat_open {
+                br.rules.tag_cat_open = false;
+                return true;
+            }
+            if br.rules.editor.show_scripts_menu
+                || br.rules.editor.show_date_find_dd
+                || br.rules.editor.show_date_rep_dd
+                || br.rules.editor.show_num_sys_dd
+                || br.rules.editor.show_time_unit_dd
+            {
+                br.rules.editor.show_scripts_menu = false;
+                br.rules.editor.show_date_find_dd = false;
+                br.rules.editor.show_date_rep_dd = false;
+                br.rules.editor.show_num_sys_dd = false;
+                br.rules.editor.show_time_unit_dd = false;
+                return true;
+            }
+            if br.rules.editor.meta_target.is_some() {
+                br.rules.editor.meta_target = None;
+                return true;
+            }
+        }
+        s.close_rule_editor();
         return true;
     }
     false
@@ -2887,12 +3022,31 @@ fn main() {
 
     let (account_handle, _) = main_app.window(rune::windows::WindowSpec::from_app("add-account", account_app));
     let (batch_rename_handle, _) = main_app.window(rune::windows::WindowSpec::from_app("batch-rename", batch_rename_app));
+    let rule_editor_app = rune::App::new(AppSpec::<State> {
+        min_size: Some((700.0, 440.0)),
+        families: initial.font.families(),
+        setup: Some(setup_rule_editor_window),
+        poll: Some(poll_rule_editor_window),
+        on_key: Some(rule_editor_window_key),
+        ..AppSpec::new(rules_ui::editor_window_title(None), (840.0, 520.0), init_rule_editor_window, rules_ui::rule_editor_window_view)
+    })
+    .windowless()
+    .titlebar(rune::Titlebar::new(36.0))
+    .font_smoothing(initial.text_render.smoothing())
+    .turn_scope(enter_turn, leave_turn)
+    .on_close(|s, _| {
+        if !s.is_placeholder {
+            s.rule_editor_window_closed();
+        }
+    });
+    let (rule_editor_handle, _) = main_app.window(rune::windows::WindowSpec::from_app("rule-editor", rule_editor_app));
     let main_handle = main_app.handle();
     main_app
         .init(move || {
             let mut s = init();
             s.account_win = Some(account_handle);
             s.batch_rename_win = Some(batch_rename_handle);
+            s.rule_editor_win = Some(rule_editor_handle);
             s.main_win = Some(main_handle);
             s
         })
