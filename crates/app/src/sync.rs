@@ -463,7 +463,13 @@ impl SyncFilter {
     }
 
     /// Returns true if a file with relative path `rel_path`, `size`, and `modified` passes all filters.
+    #[cfg(test)]
     pub fn allows_file(&self, rel_path: &str, size: Option<u64>, modified: Option<SystemTime>, now: SystemTime) -> bool {
+        self.allows_name(rel_path) && self.allows_date(modified, now) && self.allows_size(size)
+    }
+
+    /// Whether the names to leave out and to take let a file at `rel_path` through.
+    pub fn allows_name(&self, rel_path: &str) -> bool {
         let rel = rel_path.trim_matches('/');
 
         // 1. Exclude patterns
@@ -481,8 +487,11 @@ impl SyncFilter {
                 return false;
             }
         }
+        true
+    }
 
-        // 3. Date filters
+    /// Whether the dates to leave out let a file modified at `modified` through.
+    pub fn allows_date(&self, modified: Option<SystemTime>, now: SystemTime) -> bool {
         if self.exclude_older.enabled
             && let (Some(m), Some(cutoff)) = (modified, self.exclude_older.cutoff(now))
             && m < cutoff
@@ -495,8 +504,11 @@ impl SyncFilter {
         {
             return false;
         }
+        true
+    }
 
-        // 4. Size filters
+    /// Whether the sizes to leave out let a file of `size` bytes through.
+    pub fn allows_size(&self, size: Option<u64>) -> bool {
         if self.exclude_smaller.enabled
             && let Some(sz) = size
             && sz < self.exclude_smaller.bytes()
@@ -680,7 +692,53 @@ pub enum SyncLocation {
     },
 }
 
+/// The folder `path` is, whatever way it was written: links and `..` followed, and on Windows the
+/// letters as the disk has them. Of a folder that isn't there yet, the part that is there is
+/// read so and the rest is as written.
+fn real_path(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(at) {
+            return rest.iter().rev().fold(real, |path, name| path.join(name));
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                at = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 impl SyncLocation {
+    /// Whether the two are the same folder, or one is inside the other. A pair of such sides
+    /// reads its own tree twice under two paths: a mirror would copy `sub/file` into
+    /// `sub/sub/file` and then delete `sub/file`, moving what it was to keep. It asks the disk
+    /// for folders of the computer, so not from the window's thread.
+    ///
+    /// What it can't see: a server saved twice, or one folder reached by a server and by a
+    /// path of the computer.
+    fn overlaps(&self, other: &SyncLocation) -> bool {
+        fn starts<T: PartialEq>(a: &[T], b: &[T]) -> bool {
+            let n = a.len().min(b.len());
+            a[..n] == b[..n]
+        }
+        match (self, other) {
+            (SyncLocation::Local(a), SyncLocation::Local(b)) => {
+                let (a, b) = (real_path(a), real_path(b));
+                a.starts_with(&b) || b.starts_with(&a)
+            }
+            (SyncLocation::Drive { email: a, shared_drive_id: in_a, path: path_a, .. }, SyncLocation::Drive { email: b, shared_drive_id: in_b, path: path_b, .. }) => {
+                let ids = |path: &[(String, String)]| path.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+                a == b && in_a == in_b && starts(&ids(path_a), &ids(path_b))
+            }
+            (SyncLocation::Server { server_id: a, path: path_a, .. }, SyncLocation::Server { server_id: b, path: path_b, .. }) => a == b && starts(path_a, path_b),
+            _ => false,
+        }
+    }
+
     pub fn from_location(loc: &Location) -> Option<Self> {
         match loc {
             Location::Local(p) => Some(SyncLocation::Local(p.clone())),
@@ -2110,11 +2168,25 @@ fn list_sync_location(
 
 struct ScannedItem {
     is_dir: bool,
+    /// A link to a folder: a symbolic link or a junction on the computer, a symbolic link on a
+    /// server, a shortcut on Google Drive. It is a row, and what it points to is not read: that
+    /// is somewhere else, and a deletion that went through the link would take it from there.
+    link: bool,
     meta: SideMeta,
 }
 
 /// What one side of a pair holds, by path from its root.
 type Scanned = BTreeMap<String, ScannedItem>;
+
+/// What a comparison answers for a pair whose sides overlap (see [`SyncLocation::overlaps`]).
+fn overlap_refused(left: &SyncLocation, right: &SyncLocation) -> String {
+    tr!(
+        "As duas pastas de um par são a mesma, ou uma está dentro da outra: “{}” e “{}”. Escolha pastas separadas.",
+        "The two folders of a pair are the same, or one is inside the other: “{}” and “{}”. Choose separate folders.",
+        left.display_label(),
+        right.display_label()
+    )
+}
 
 pub fn start_compare(s: &mut State) {
     if s.sync.is_busy() {
@@ -2166,6 +2238,11 @@ pub fn start_compare(s: &mut State) {
             let now = SystemTime::now();
             let mut all_rows = Vec::new();
             let mut total_filtered_out = 0usize;
+
+            // Before any pair is read: asked here, off the window's thread, for it asks the disk.
+            if let Some((_, left_loc, right_loc)) = valid_pairs.iter().find(|(_, left_loc, right_loc)| left_loc.overlaps(right_loc)) {
+                return Err(overlap_refused(left_loc, right_loc));
+            }
 
             for (pair_index, left_loc, right_loc) in &valid_pairs {
                 if cancel.load(Ordering::Relaxed) {
@@ -2388,25 +2465,38 @@ const DRIVE_READERS: usize = 6;
 
 fn scan_local(root: &Path, filter: &SyncFilter, show_hidden: bool, cancel: &AtomicBool, seen: &AtomicUsize) -> Result<Scanned, String> {
     walk(root.to_path_buf(), local_readers(), cancel, |folder, items, inside| {
-        let entries = crate::model::read_local(&folder.at, show_hidden).map_err(|e| e.to_string())?;
+        let mut entries = Vec::new();
+        crate::model::read_local_each(&folder.at, show_hidden, |e, link| entries.push((e, link))).map_err(|e| e.to_string())?;
         seen.fetch_add(entries.len(), Ordering::Relaxed);
-        for e in entries {
+        for (e, link) in entries {
             let rel = join_rel(&folder.rel, &e.name);
             let meta = SideMeta { id: e.id, size: e.size, modified: e.modified, md5: None, drive_file: None };
-            if e.is_dir {
+            if link {
+                // Always a row where folders are rows, whatever the filter says of its name:
+                // it is what tells the comparison to leave that path alone on both sides.
+                if !filter.root_only {
+                    items.push((rel, ScannedItem { is_dir: true, link: true, meta: SideMeta { size: None, ..meta } }));
+                }
+            } else if e.is_dir {
                 let (listed, read) = folder_part(filter, &rel);
                 if read {
                     inside.push(Folder { at: folder.at.join(&e.name), rel: rel.clone(), depth: folder.depth + 1 });
                 }
                 if listed {
-                    items.push((rel, ScannedItem { is_dir: true, meta }));
+                    items.push((rel, ScannedItem { is_dir: true, link: false, meta }));
                 }
             } else {
-                items.push((rel, ScannedItem { is_dir: false, meta }));
+                items.push((rel, ScannedItem { is_dir: false, link: false, meta }));
             }
         }
         Ok(())
     })
+}
+
+/// Whether a Drive item is a shortcut to a folder: it lists as a folder, with the folder it
+/// opens as its target.
+fn drive_link(is_dir: bool, target: Option<&str>) -> bool {
+    is_dir && target.is_some()
 }
 
 fn scan_drive(drive: &Drive, root_id: &str, shared_drive: Option<&str>, filter: &SyncFilter, cancel: &AtomicBool, seen: &AtomicUsize) -> Result<Scanned, String> {
@@ -2419,19 +2509,25 @@ fn scan_drive(drive: &Drive, root_id: &str, shared_drive: Option<&str>, filter: 
         })?;
         for f in files {
             let rel = join_rel(&folder.rel, &f.name);
-            if f.is_dir {
+            if drive_link(f.is_dir, f.target.as_deref()) {
+                // A shortcut to a folder: a row by its own id, never the id of the folder it
+                // points to, which a deletion would then send to the trash with all it holds.
+                if !filter.root_only {
+                    let meta = SideMeta { id: f.id.clone(), size: None, modified: f.modified, md5: None, drive_file: Some(Box::new(f)) };
+                    items.push((rel, ScannedItem { is_dir: true, link: true, meta }));
+                }
+            } else if f.is_dir {
                 let (listed, read) = folder_part(filter, &rel);
-                let child_id = f.target.clone().unwrap_or_else(|| f.id.clone());
                 if read {
-                    inside.push(Folder { at: child_id.clone(), rel: rel.clone(), depth: folder.depth + 1 });
+                    inside.push(Folder { at: f.id.clone(), rel: rel.clone(), depth: folder.depth + 1 });
                 }
                 if listed {
-                    let meta = SideMeta { id: child_id, size: None, modified: f.modified, md5: None, drive_file: Some(Box::new(f)) };
-                    items.push((rel, ScannedItem { is_dir: true, meta }));
+                    let meta = SideMeta { id: f.id.clone(), size: None, modified: f.modified, md5: None, drive_file: Some(Box::new(f)) };
+                    items.push((rel, ScannedItem { is_dir: true, link: false, meta }));
                 }
             } else {
                 let meta = SideMeta { id: f.id.clone(), size: f.size, modified: f.modified, md5: f.md5.clone(), drive_file: Some(Box::new(f)) };
-                items.push((rel, ScannedItem { is_dir: false, meta }));
+                items.push((rel, ScannedItem { is_dir: false, link: false, meta }));
             }
         }
         Ok(())
@@ -2471,6 +2567,13 @@ fn scan_server_dir(
             if filter.root_only {
                 continue;
             }
+            // A link to a folder lists as the folder it points to. It is a row, whatever the
+            // filter says of its name, and is not gone through: as the app's other walks, which
+            // one back up would send round for ever, and for what is there to stay there.
+            if item.link {
+                out.insert(rel, ScannedItem { is_dir: true, link: true, meta: SideMeta { id: child_remote, size: None, modified: item.modified, md5: None, drive_file: None } });
+                continue;
+            }
             if filter.skip_filtered_dirs && filter.is_dir_excluded(&rel) {
                 continue;
             }
@@ -2479,6 +2582,7 @@ fn scan_server_dir(
                     rel.clone(),
                     ScannedItem {
                         is_dir: true,
+                        link: false,
                         meta: SideMeta { id: child_remote.clone(), size: None, modified: item.modified, md5: None, drive_file: None },
                     },
                 );
@@ -2489,6 +2593,7 @@ fn scan_server_dir(
                 rel,
                 ScannedItem {
                     is_dir: false,
+                    link: false,
                     meta: SideMeta { id: child_remote, size: item.size, modified: item.modified, md5: None, drive_file: None },
                 },
             );
@@ -2640,6 +2745,11 @@ fn compare_maps(
     let mut filtered_out = 0usize;
     // The rows of files with the same size on both sides, still to be told apart by content.
     let mut by_content = Vec::new();
+    // The paths that are a link to a folder on either side. Nothing at one or under it is
+    // copied or deleted on any side: the side with the link read nothing there, so what the
+    // other side holds would pass for missing from it, and a mirror would delete it.
+    let mut links: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let under_a_link = |links: &std::collections::HashSet<String>, path: &str| path.match_indices('/').any(|(at, _)| links.contains(&path[..at]));
 
     // Both sides come sorted by path: one pass takes the next path of either, or of both.
     let (mut left, mut right) = (left.into_iter().peekable(), right.into_iter().peekable());
@@ -2676,6 +2786,19 @@ fn compare_maps(
             status: RowStatus::Filtered,
         };
 
+        // A path comes after the folders above it, so a link above this one is noted already.
+        // A link on one side is enough, whatever the other has by that name: a file there
+        // would else be copied onto the link.
+        let link = l_opt.as_ref().is_some_and(|x| x.link) || r_opt.as_ref().is_some_and(|x| x.link);
+        if link || (!links.is_empty() && under_a_link(&links, &rel_path)) {
+            if link {
+                links.insert(rel_path.clone());
+            }
+            filtered_out += 1;
+            rows.push(filtered(rel_path, l_opt, r_opt));
+            continue;
+        }
+
         if is_dir {
             if options.filter.is_dir_excluded(&rel_path) {
                 filtered_out += 1;
@@ -2702,16 +2825,18 @@ fn compare_maps(
             continue;
         }
 
-        // File filtering: check filter against available side(s)
-        let allowed = match (&l_opt, &r_opt) {
-            (Some(l), None) => options.filter.allows_file(&rel_path, l.meta.size, l.meta.modified, now),
-            (None, Some(r)) => options.filter.allows_file(&rel_path, r.meta.size, r.meta.modified, now),
-            (Some(l), Some(r)) => {
-                options.filter.allows_file(&rel_path, l.meta.size, l.meta.modified, now)
-                    || options.filter.allows_file(&rel_path, r.meta.size, r.meta.modified, now)
-            }
-            (None, None) => false,
-        };
+        // The filter. A file on one side alone passes by its name, date and size. One on both
+        // sides is a row with something to do if either passes; what may then be copied is
+        // settled once the action is known.
+        let filter = &options.filter;
+        let passes = |x: &ScannedItem| filter.allows_date(x.meta.modified, now) && filter.allows_size(x.meta.size);
+        let allowed = filter.allows_name(&rel_path)
+            && match (&l_opt, &r_opt) {
+                (Some(l), None) => passes(l),
+                (None, Some(r)) => passes(r),
+                (Some(l), Some(r)) => passes(l) || passes(r),
+                (None, None) => false,
+            };
         if !allowed {
             filtered_out += 1;
             rows.push(filtered(rel_path, l_opt, r_opt));
@@ -2721,14 +2846,29 @@ fn compare_maps(
         let action = match (&l_opt, &r_opt) {
             (Some(_), None) => rules.left_only.to_sync_action(),
             (None, Some(_)) => rules.right_only.to_sync_action(),
-            (Some(l), Some(r)) => {
-                if options.compare_hash && l.meta.size == r.meta.size {
-                    by_content.push(rows.len());
-                }
-                decide_by_time(&l.meta, &r.meta, &rules)
-            }
+            (Some(l), Some(r)) => decide_by_time(&l.meta, &r.meta, &rules),
             (None, None) => SyncAction::None,
         };
+        // A copy over a file that is there takes one the filter lets through and replaces
+        // one it lets through. By size, neither may be left out: the one copied is what the
+        // filter said not to copy, and the one replaced is lost, as much as if it were
+        // deleted. By date, the one copied decides: an old copy replaced by a file changed
+        // since is what a filter of dates is for.
+        if let (Some(l), Some(r)) = (&l_opt, &r_opt) {
+            let copied = match action {
+                SyncAction::CopyRight => Some((l, r)),
+                SyncAction::CopyLeft => Some((r, l)),
+                _ => None,
+            };
+            if copied.is_some_and(|(from, to)| !(filter.allows_date(from.meta.modified, now) && filter.allows_size(from.meta.size) && filter.allows_size(to.meta.size))) {
+                filtered_out += 1;
+                rows.push(filtered(rel_path, l_opt, r_opt));
+                continue;
+            }
+            if options.compare_hash && l.meta.size == r.meta.size {
+                by_content.push(rows.len());
+            }
+        }
 
         rows.push(CompareRow {
             id: 0,
@@ -3494,7 +3634,8 @@ impl Known {
             let Some(pair) = pairs.get(row.pair_index) else { continue };
             for (loc, meta) in [(&pair.left, &row.left), (&pair.right, &row.right)] {
                 match (loc, meta) {
-                    (Some(loc @ SyncLocation::Drive { .. }), Some(meta)) => {
+                    // Not a shortcut: its id is no folder's, and nothing is sent through it.
+                    (Some(loc @ SyncLocation::Drive { .. }), Some(meta)) if !meta.drive_file.as_ref().is_some_and(|f| drive_link(f.is_dir, f.target.as_deref())) => {
                         if let Some((side, _)) = drive_side(loc) {
                             drive.insert((side, row.rel_path.clone()), meta.id.clone());
                         }
@@ -3843,6 +3984,7 @@ mod tests {
         let t2 = t1 - Duration::from_secs(60);
         let side = |name: &str, modified| ScannedItem {
             is_dir: false,
+            link: false,
             meta: SideMeta { id: name.into(), size: Some(17), modified: Some(modified), md5: None, drive_file: None },
         };
         let sides = |modified| BTreeMap::from([("other.txt".to_string(), side("other.txt", modified)), ("same.txt".to_string(), side("same.txt", modified))]);
@@ -4492,6 +4634,243 @@ mod tests {
         a_server_folder_with_something_left(openexplorer_remote::Protocol::Ftp, "ftp", 21330);
     }
 
+    /// A link from `link` to the folder `to`: a junction on Windows, which needs no privilege
+    /// (a symbolic link does), a symbolic link elsewhere.
+    fn link_folder(link: &Path, to: &Path) {
+        // Each part by the system's own separator, which `mklink` wants.
+        let to: PathBuf = to.components().collect();
+        #[cfg(windows)]
+        let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(link).arg(to).output().is_ok_and(|o| o.status.success());
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(to, link).is_ok();
+        assert!(made && std::fs::read_dir(link).is_ok(), "no link at {}", link.display());
+    }
+
+    /// A mirror onto a side with links to a folder that is somewhere else. Nothing goes
+    /// through a link, and nothing at or under its path is copied or deleted on either side:
+    /// - a link only on the right stays, and so does what it points to;
+    /// - a link on the left where the right has a folder of that name: the right's files are
+    ///   not taken for files missing from the left, and stay;
+    /// - a folder to delete that holds a link stays, with the link.
+    ///
+    /// Under `root`, with the Recycle Bin or without it.
+    fn links_left_alone(root: &Path, skip_recycle_bin: bool) {
+        let (left, right, outside) = (root.join("left"), root.join("right"), root.join("outside"));
+        let put = |path: PathBuf| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        };
+        for rel in ["outside/precious.txt", "outside/deep/more.txt", "left/same.txt", "right/same.txt", "right/gone.txt", "right/Docs/real.txt", "right/Docs/Sub/too.txt", "right/Old/old.txt", "left/Clash"] {
+            put(local_join_rel(root, rel));
+        }
+        // A plain file on the left by the name of a link on the right.
+        link_folder(&right.join("Clash"), &outside);
+        link_folder(&right.join("Link"), &outside);
+        link_folder(&left.join("Docs"), &outside);
+        link_folder(&right.join("Old").join("Kept"), &outside);
+
+        let (left_loc, right_loc) = (SyncLocation::Local(left), SyncLocation::Local(right.clone()));
+        let (pool, drives, cancel, opts) = (Pool::default(), HashMap::new(), AtomicBool::new(false), SyncOptions::default());
+        let (l, r) = scan_both(&left_loc, &right_loc, &opts.filter, true, &pool, &[], &drives, &cancel, &|_| {}).unwrap();
+        // What a link points to is not read.
+        assert!(l.keys().chain(r.keys()).all(|path| !path.contains("precious") && !path.contains("more.txt")), "{:?} {:?}", l.keys(), r.keys());
+        assert!(r["Link"].link && l["Docs"].link && r["Old/Kept"].link && !r["Docs"].link && !r["Old"].link);
+        let (mut rows, _) = compare_maps(0, &left_loc, &right_loc, l, r, &opts, SystemTime::now(), &cancel, &|_, _| {});
+        rows.iter_mut().enumerate().for_each(|(i, r)| r.id = i);
+        let action = |path: &str| rows.iter().find(|r| r.rel_path == path).map(|r| (r.action, r.status.clone())).unwrap_or_else(|| panic!("no row for {path}"));
+        for path in ["Link", "Docs", "Docs/real.txt", "Docs/Sub", "Docs/Sub/too.txt", "Old/Kept", "Clash"] {
+            assert_eq!(action(path), (SyncAction::None, RowStatus::Filtered), "{path}");
+        }
+        for path in ["gone.txt", "Old", "Old/old.txt"] {
+            assert_eq!(action(path).0, SyncAction::DeleteRight, "{path}");
+        }
+
+        let planned: Vec<CompareRow> = rows.iter().filter(|r| r.enabled && r.action != SyncAction::None).cloned().collect();
+        let pairs = [FolderPair { id: 1, left: Some(left_loc.clone()), right: Some(right_loc.clone()) }];
+        let known = Known::default();
+        let run = Run { pairs: &pairs, skip_recycle_bin, segmented: false, pool: &pool, servers: &[], drives: &drives, cancel: &cancel, known: &known, at_once: AtOnce { uploads: 1, downloads: 1, disk: 4, bin: BIN_AT_ONCE } };
+        let (ok, failed, _) = run_plan(&run, planned, &mut |_, _| {});
+        assert!(std::fs::metadata(local_join_rel(root, "left/Clash")).unwrap().is_file());
+        // gone.txt and Old/old.txt went; Old stayed, for the link in it.
+        assert_eq!((ok, failed, known.kept.load(Ordering::Relaxed)), (2, 0, 1));
+        for gone in ["gone.txt", "Old/old.txt"] {
+            assert!(!local_join_rel(&right, gone).exists(), "{gone} is still there");
+        }
+        for there in ["outside/precious.txt", "outside/deep/more.txt", "right/Docs/real.txt", "right/Docs/Sub/too.txt", "right/Link/precious.txt", "right/Old/Kept/precious.txt", "left/Docs/precious.txt", "right/Clash/precious.txt"] {
+            assert!(local_join_rel(root, there).exists(), "{there} is gone");
+        }
+    }
+
+    #[test]
+    fn a_link_to_a_folder_is_left_alone_with_what_it_points_to() {
+        let root = std::env::temp_dir().join(format!("oe-sync-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        links_left_alone(&root, true);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// And through the system's Recycle Bin, which would take a link's folder with it: only
+    /// the two files deleted are in it.
+    #[cfg(any(windows, all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
+    #[test]
+    fn a_link_to_a_folder_is_left_alone_by_the_recycle_bin_too() {
+        let bin = Binned::new("links");
+        links_left_alone(&bin.0, false);
+        assert_eq!(bin.in_the_bin(), ["gone.txt", "old.txt"]);
+    }
+
+    /// A server in memory: the folders and files at each path, and which folders are links.
+    struct Linked(BTreeMap<&'static str, Vec<(&'static str, bool, bool)>>);
+    impl openexplorer_remote::Conn for Linked {
+        fn list(&mut self, dir: &str) -> openexplorer_remote::Result<Vec<openexplorer_remote::Item>> {
+            let items = self.0.get(dir).ok_or_else(|| format!("{dir} was not to be read"))?;
+            Ok(items.iter().map(|&(name, is_dir, link)| openexplorer_remote::Item { name: name.into(), is_dir, size: Some(1), modified: None, link }).collect())
+        }
+        fn stat(&mut self, _: &str) -> openexplorer_remote::Result<Option<openexplorer_remote::Item>> {
+            Ok(None)
+        }
+        fn mkdir(&mut self, _: &str) -> openexplorer_remote::Result<()> {
+            Err("no".into())
+        }
+        fn rename(&mut self, _: &str, _: &str) -> openexplorer_remote::Result<()> {
+            Err("no".into())
+        }
+        fn remove_file(&mut self, _: &str) -> openexplorer_remote::Result<()> {
+            Err("no".into())
+        }
+        fn remove_dir(&mut self, _: &str) -> openexplorer_remote::Result<()> {
+            Err("no".into())
+        }
+        fn download(&mut self, _: &str, _: &mut dyn std::io::Write, _: openexplorer_remote::Progress) -> openexplorer_remote::Result<()> {
+            Err("no".into())
+        }
+        fn upload(&mut self, _: &str, _: &mut dyn std::io::Read, _: u64, _: openexplorer_remote::Progress) -> openexplorer_remote::Result<()> {
+            Err("no".into())
+        }
+        fn home(&mut self) -> openexplorer_remote::Result<String> {
+            Ok("/".into())
+        }
+        fn is_link(&mut self, _: &str) -> openexplorer_remote::Result<bool> {
+            Ok(false)
+        }
+        fn alive(&mut self) -> bool {
+            true
+        }
+    }
+
+    /// A link to a folder on a server lists as a folder. It is a row and is not gone through:
+    /// the fake fails a listing of it, or of what it points to.
+    #[test]
+    fn a_server_link_to_a_folder_is_not_gone_through() {
+        let mut conn = Linked(BTreeMap::from([
+            ("/", vec![("Docs", true, true), ("real", true, false), ("top.txt", false, false), ("file-link", false, true)]),
+            ("/real", vec![("a.txt", false, false), ("Up", true, true)]),
+        ]));
+        let (cancel, seen, mut out) = (AtomicBool::new(false), AtomicUsize::new(0), BTreeMap::new());
+        // Even with its name left out by the filter, and such folders not read.
+        let filter = SyncFilter { exclude_patterns: "Docs".into(), skip_filtered_dirs: true, ..SyncFilter::default() };
+        scan_server_dir(&mut conn, "/", "", 0, &filter, true, &cancel, &seen, &mut out).unwrap();
+        let found: Vec<(&str, bool, bool)> = out.iter().map(|(path, item)| (path.as_str(), item.is_dir, item.link)).collect();
+        assert_eq!(found, [("Docs", true, true), ("file-link", false, false), ("real", true, false), ("real/Up", true, true), ("real/a.txt", false, false), ("top.txt", false, false)]);
+        assert!(drive_link(true, Some("target")) && !drive_link(true, None) && !drive_link(false, Some("target")));
+    }
+
+    /// What a comparison makes of files on both sides, each with its size and how many days
+    /// ago it was changed, by the rules of `mode` and the filter.
+    fn compared(mode: SyncMode, filter: SyncFilter, left: &[(&str, u64, u64)], right: &[(&str, u64, u64)]) -> Vec<(String, SyncAction, RowStatus)> {
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let side = |files: &[(&str, u64, u64)]| -> Scanned {
+            files
+                .iter()
+                .map(|&(path, size, days)| {
+                    let meta = SideMeta { id: path.into(), size: Some(size), modified: Some(now - Duration::from_secs(days * 86_400)), md5: None, drive_file: None };
+                    (path.to_string(), ScannedItem { is_dir: false, link: false, meta })
+                })
+                .collect()
+        };
+        let loc = SyncLocation::Local(PathBuf::from("nowhere"));
+        let opts = SyncOptions { mode, filter, ..SyncOptions::default() };
+        let (rows, _) = compare_maps(0, &loc, &loc, side(left), side(right), &opts, now, &AtomicBool::new(false), &|_, _| {});
+        rows.into_iter().map(|r| (r.rel_path, r.action, r.status)).collect()
+    }
+
+    /// With files over a size left out, a file over it is neither copied nor replaced: a copy
+    /// over it would lose it as a deletion would. Whichever side it is on, and whichever is
+    /// the newer.
+    #[test]
+    fn a_file_the_size_filter_leaves_out_is_neither_copied_nor_replaced() {
+        const MB: u64 = 1024 * 1024;
+        let filter = || SyncFilter { exclude_larger: SizeRule { enabled: true, amount: 50, unit: SizeUnit::MB }, ..SyncFilter::default() };
+        let left_over = |row: &(String, SyncAction, RowStatus)| (row.1, row.2.clone()) == (SyncAction::None, RowStatus::Filtered);
+        for mode in [SyncMode::Bidirectional, SyncMode::Mirror] {
+            // The big one newer on the right, newer on the left, and the small one newer.
+            for (left, right) in [((MB, 9), (100 * MB, 1)), ((100 * MB, 1), (MB, 9)), ((MB, 1), (100 * MB, 9)), ((100 * MB, 9), (MB, 1))] {
+                let rows = compared(mode, filter(), &[("a.bin", left.0, left.1)], &[("a.bin", right.0, right.1)]);
+                assert!(left_over(&rows[0]), "{mode:?} {left:?} {right:?}: {rows:?}");
+            }
+            // Two files under the size still go the way the rules say; one over it on one
+            // side alone is left where it is.
+            let rows = compared(mode, filter(), &[("small.bin", MB, 1), ("big-left.bin", 100 * MB, 1)], &[("small.bin", 2 * MB, 9)]);
+            assert_eq!(rows.iter().find(|r| r.0 == "small.bin").unwrap().1, SyncAction::CopyRight, "{mode:?}");
+            assert!(left_over(rows.iter().find(|r| r.0 == "big-left.bin").unwrap()), "{mode:?}");
+        }
+    }
+
+    /// With files older than a week left out, the file that would be copied decides: one
+    /// changed since replaces an old copy, and an old file replaces nothing.
+    #[test]
+    fn the_date_filter_goes_by_the_file_that_is_copied() {
+        let filter = || SyncFilter { exclude_older: DateRule { enabled: true, mode: DateFilterMode::Period, amount: 7, unit: DateUnit::Days, date: String::new() }, ..SyncFilter::default() };
+        let one = |mode, left: (u64, u64), right: (u64, u64)| {
+            let rows = compared(mode, filter(), &[("a.txt", left.0, left.1)], &[("a.txt", right.0, right.1)]);
+            (rows[0].1, rows[0].2.clone())
+        };
+        // Both ways: the new one is copied over the old one, from either side.
+        assert_eq!(one(SyncMode::Bidirectional, (10, 1), (20, 30)).0, SyncAction::CopyRight);
+        assert_eq!(one(SyncMode::Bidirectional, (10, 30), (20, 1)).0, SyncAction::CopyLeft);
+        // A mirror sends the left over the right: not when the left is the old one.
+        assert_eq!(one(SyncMode::Mirror, (10, 1), (20, 30)).0, SyncAction::CopyRight);
+        assert_eq!(one(SyncMode::Mirror, (10, 30), (20, 1)), (SyncAction::None, RowStatus::Filtered));
+        // Both old: left out.
+        assert_eq!(one(SyncMode::Bidirectional, (10, 30), (20, 40)), (SyncAction::None, RowStatus::Filtered));
+    }
+
+    /// A pair whose sides are one folder, or one inside the other, is not compared.
+    #[test]
+    fn sides_that_are_one_folder_or_one_inside_the_other_overlap() {
+        let root = std::env::temp_dir().join(format!("oe-sync-overlap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("data/sub")).unwrap();
+        std::fs::create_dir_all(root.join("database")).unwrap();
+        let local = |rel: &str| SyncLocation::Local(root.join(rel));
+        assert!(local("data").overlaps(&local("data/sub")) && local("data/sub").overlaps(&local("data")) && local("data").overlaps(&local("data")));
+        // By another way of writing it, and by a link.
+        assert!(local("data").overlaps(&local("data/sub/../sub")));
+        link_folder(&root.join("alias"), &root.join("data/sub"));
+        assert!(local("data").overlaps(&local("alias")));
+        // A name that starts the same is another folder, and so is one beside it.
+        assert!(!local("data").overlaps(&local("database")) && !local("data/sub").overlaps(&local("database")));
+        // Folders that aren't there yet go by how they are written.
+        assert!(local("new").overlaps(&local("new/inside")) && !local("new").overlaps(&local("newer")));
+        // One that isn't there inside one that is, which is read by its real path.
+        assert!(local("data").overlaps(&local("data/new/deeper")) && local("alias/new").overlaps(&local("data")) && !local("database/new").overlaps(&local("data")));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let drive = |email: &str, shared: Option<&str>, ids: &[&str]| SyncLocation::Drive {
+            email: email.into(),
+            shared_drive_id: shared.map(str::to_string),
+            shared_drive_name: None,
+            path: ids.iter().map(|id| (id.to_string(), format!("name of {id}"))).collect(),
+        };
+        assert!(drive("a@b", None, &["x"]).overlaps(&drive("a@b", None, &["x", "y"])) && drive("a@b", None, &[]).overlaps(&drive("a@b", None, &["x"])));
+        assert!(!drive("a@b", None, &["x"]).overlaps(&drive("a@b", None, &["z", "y"])) && !drive("a@b", None, &["x"]).overlaps(&drive("c@d", None, &["x"])));
+        assert!(!drive("a@b", None, &["x"]).overlaps(&drive("a@b", Some("shared"), &["x"])));
+        let server = |id: &str, path: &[&str]| SyncLocation::Server { server_id: id.into(), server_name: id.into(), path: path.iter().map(|p| p.to_string()).collect() };
+        assert!(server("s", &["home"]).overlaps(&server("s", &["home", "docs"])) && server("s", &["home"]).overlaps(&server("s", &["home"])));
+        assert!(!server("s", &["home"]).overlaps(&server("t", &["home"])) && !server("s", &["home", "a"]).overlaps(&server("s", &["home", "b"])));
+        assert!(!server("s", &[]).overlaps(&drive("a@b", None, &[])) && !local("data").overlaps(&server("s", &[])));
+    }
+
     /// What sending files to the system's Recycle Bin costs one at a time and several in one
     /// request: 100 empty files each way. They are the test's own and leave the Recycle Bin at
     /// the end. Run it with `cargo test --release -p openexplorer -- --ignored --nocapture recycle_cost`.
@@ -4652,10 +5031,10 @@ mod tests {
                     return Err(format!("folder {}", folder.at));
                 }
                 let meta = || SideMeta { id: String::new(), size: Some(folder.at as u64), modified: None, md5: None, drive_file: None };
-                items.push((join_rel(&folder.rel, "file"), ScannedItem { is_dir: false, meta: meta() }));
+                items.push((join_rel(&folder.rel, "file"), ScannedItem { is_dir: false, link: false, meta: meta() }));
                 for n in [2 * folder.at + 1, 2 * folder.at + 2].into_iter().filter(|_| folder.at < 400) {
                     let rel = join_rel(&folder.rel, &n.to_string());
-                    items.push((rel.clone(), ScannedItem { is_dir: true, meta: meta() }));
+                    items.push((rel.clone(), ScannedItem { is_dir: true, link: false, meta: meta() }));
                     inside.push(Folder { at: n, rel, depth: folder.depth + 1 });
                 }
                 Ok(())
@@ -4680,7 +5059,7 @@ mod tests {
     #[test]
     fn sides_merge_in_path_order() {
         let now = SystemTime::now();
-        let file = || ScannedItem { is_dir: false, meta: SideMeta { id: String::new(), size: Some(1), modified: Some(now), md5: None, drive_file: None } };
+        let file = || ScannedItem { is_dir: false, link: false, meta: SideMeta { id: String::new(), size: Some(1), modified: Some(now), md5: None, drive_file: None } };
         let side = |names: &[&str]| names.iter().map(|n| (n.to_string(), file())).collect::<BTreeMap<_, _>>();
         let (loc, cancel) = (SyncLocation::Local(PathBuf::from("x")), AtomicBool::new(false));
         let (rows, _) = compare_maps(3, &loc, &loc, side(&["a", "b/1", "d"]), side(&["b/1", "c", "e"]), &SyncOptions::default(), now, &cancel, &|_, _| {});
