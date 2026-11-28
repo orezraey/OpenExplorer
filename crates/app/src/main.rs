@@ -406,6 +406,10 @@ fn relaunch() {
 /// How long the window's background takes to fade in over Mica before Mica goes, in seconds:
 /// longer than the colour spring takes to settle.
 const MICA_FADE: f64 = 0.4;
+
+/// The most frames a second the main window draws by itself while another app's window is in
+/// front of it (`App::unfocused_fps`).
+const UNFOCUSED_FPS: f32 = 30.0;
 thread_local! {
     /// When Mica, turned off in Opções, leaves the main window.
     static MICA_OFF_AT: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
@@ -3554,6 +3558,10 @@ fn main() {
     if let Some(notice) = cli.notice {
         *STARTUP_UPDATE_NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(notice);
     }
+    // Linux: the system's fallback fonts (emoji, Chinese or Japanese in a file name) are read on
+    // a thread of their own from now on, so the first such name doesn't hold the window up
+    // (240 to 400 ms, Rune measured). Nothing on Windows and macOS, which need no such build.
+    rune::text::prewarm_system_fonts();
     let initial = settings::Settings::load();
     // Rune's own words (a text field's menu, the window buttons' names for screen readers) in
     // the app's language.
@@ -4161,6 +4169,10 @@ fn main() {
     if initial.resize_sync && cfg!(windows) {
         main_app = main_app.resize_sync(rune::ResizeSync::On);
     }
+    // Behind another app's window but still in sight, what moves by itself (the transfers'
+    // bars, the spinners) draws at most 30 times a second; input over the window lifts it.
+    // Rune applies it on macOS only, so far.
+    main_app = main_app.unfocused_fps(UNFOCUSED_FPS);
 
     let batch_rename_app = rune::App::new(AppSpec::<State> {
         min_size: Some((600.0, 440.0)),
