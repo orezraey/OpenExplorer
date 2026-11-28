@@ -42,7 +42,7 @@ use crate::account::now;
 use crate::backend::{Backend, Changes, Paged, Progress, Small};
 use crate::chats::{self, ChatFile, ChatRef, Cursor, Kind, Month, Page};
 use crate::lanes::{self, Lanes, Link, Tuning};
-use crate::places::{self, Places};
+use crate::places::{self, Paging, Places};
 use crate::session::KeyringSession;
 use crate::tree::{Doc, Msg};
 use crate::{CANCELLED, Result};
@@ -74,8 +74,10 @@ const PLACE_FRESH: Duration = Duration::from_secs(10 * 60);
 const PLACES: usize = 20_000;
 /// What a part answers when Telegram no longer takes the file's place: never shown as it is.
 const STALE: &str = "FILE_REFERENCE";
-/// How long a connection being made has to answer the first request sent over it: connecting
-/// and that answer take half a second from far away, a part of 512 KiB on a slow line more.
+/// How long a connection has to answer its probe, a request of a few bytes sent when it's made
+/// and again when a request on it was cut: connecting and that answer take half a second from
+/// far away. An address that swallows the connection would else hold the parts sent there for
+/// minutes.
 const FIRST_ANSWER: Duration = Duration::from_secs(15);
 /// Waits longer than this fail rather than hold a transfer for so long.
 const LONGEST_WAIT: u64 = 15 * 60;
@@ -248,12 +250,10 @@ impl Drop for Busy<'_> {
 }
 
 /// An error after which an extra connection is no use: it ended, or its key isn't known there.
-/// One that never answered (`answered`: it did) is no use either when it can't be reached: the
-/// media address may be closed to a network that reaches the DC's own.
-fn broken(e: &InvocationError, answered: bool) -> bool {
+/// One whose request was only cut (`Io`) may come back: it leaves the round and is probed.
+fn broken(e: &InvocationError) -> bool {
     matches!(e, InvocationError::Dropped(_) | InvocationError::Transport(_) | InvocationError::Authentication(_) | InvocationError::Deserialize(_))
         || matches!(e, InvocationError::Rpc(r) if r.name == "AUTH_KEY_UNREGISTERED")
-        || (!answered && matches!(e, InvocationError::Io(_)))
 }
 
 /// How many waits Telegram asked for in this process, and their seconds: for logs and tests.
@@ -424,54 +424,77 @@ impl Shared {
     /// `lanes` says are missing, once the account's own holds a key there that's authorized (its
     /// own DC, or one it imported its authorization into): the copies then carry that key and
     /// need nothing of their own.
-    async fn grow(&self, dc: i32, down: bool) {
+    async fn grow(self: &Arc<Self>, dc: i32, down: bool) {
         let media = if down && self.lanes.takes_media(dc) { self.media_of(dc).await } else { None };
         let Some(kind) = self.lanes.to_open(dc, down, media.is_some()) else { return };
         if !self.session.has_key(dc) || (dc != self.session.home() && !self.authorized.lock().await.contains(&dc)) {
             return;
         }
         let address = media.filter(|_| kind == lanes::Kind::Media);
-        self.lanes.grow(dc, kind, || self.open(dc, address));
+        for lane in self.lanes.grow(dc, kind, || self.open(dc, address)) {
+            self.probe(dc, lane);
+        }
+    }
+
+    /// Asks `lane`, a connection to `dc` being made or one whose request was cut, something
+    /// small: once it answers, parts go over it; if it doesn't within [`FIRST_ANSWER`], it's
+    /// dropped. Any answer of Telegram's counts but that the key isn't known there.
+    fn probe(self: &Arc<Self>, dc: i32, lane: Arc<lanes::Lane<SenderPoolHandle>>) {
+        let s = self.clone();
+        tokio::spawn(async move {
+            let asked = lane.link.invoke_in_dc(dc, &tl::functions::help::GetNearestDc {});
+            let why = match tokio::time::timeout(FIRST_ANSWER, asked).await {
+                Ok(Ok(_)) => None,
+                Ok(Err(InvocationError::Rpc(e))) if e.name != "AUTH_KEY_UNREGISTERED" => None,
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(_) => Some("no answer".to_string()),
+            };
+            match why {
+                None => s.lanes.answered(dc, &lane),
+                Some(why) => s.dropped(dc, &lane, &why),
+            }
+        });
+    }
+
+    /// Drops `lane`, an extra connection to `dc` that broke, and notes it the first time.
+    fn dropped(&self, dc: i32, lane: &Arc<lanes::Lane<SenderPoolHandle>>, why: &str) {
+        let busy = lane.busy.load(Ordering::SeqCst);
+        if self.lanes.drop_lane(dc, lane) {
+            DROPPED_LANES.lock().unwrap_or_else(|e| e.into_inner()).push(format!("DC {dc}: {why}"));
+            note(format!("DC {dc}: connection dropped {:.1} s after it opened, {busy} requests on it: {why}", lane.age().as_secs_f64()));
+        }
     }
 
     /// Sends a file-part request to `dc` (a download's when `down`) over the connection `lanes`
-    /// picks; an extra connection that broke is dropped and the request goes over another.
-    async fn call_in<R: tl::RemoteCall>(&self, dc: i32, down: bool, request: &R) -> std::result::Result<R::Return, InvocationError> {
+    /// picks. An extra connection that broke is dropped, one whose request was cut leaves the
+    /// round until it answers a probe, and either way the request goes over another: in the
+    /// end the account's own, whose errors come back as they are.
+    async fn call_in<R: tl::RemoteCall>(self: &Arc<Self>, dc: i32, down: bool, request: &R) -> std::result::Result<R::Return, InvocationError> {
         loop {
             let lane = self.lanes.pick(dc, down);
-            let answered = lane.is_ready();
             let answer = {
                 let _busy = Busy::on(&lane.busy);
-                let asked = lane.link.invoke_in_dc(dc, request);
-                // A connection being made gets so long to answer its first request, and no
-                // longer: an address that swallows the connection would hold this part, and the
-                // download behind it, for minutes.
-                if answered || lane.main {
-                    asked.await
-                } else {
-                    tokio::time::timeout(FIRST_ANSWER, asked).await.unwrap_or(Err(InvocationError::Dropped("no answer from a new connection")))
-                }
+                lane.link.invoke_in_dc(dc, request).await
             };
-            if answer.is_ok() {
-                lane.answered();
-                // The account's key answered there: it's authorized, also when that was done in
-                // an earlier run, so the extra connections may go there too.
-                if lane.main && dc != self.session.home() {
-                    let mut done = self.authorized.lock().await;
-                    if !done.contains(&dc) {
-                        done.push(dc);
-                    }
+            // The account's key answered there: it's authorized, also when that was done in an
+            // earlier run, so the extra connections may go there too.
+            if answer.is_ok() && lane.main && dc != self.session.home() {
+                let mut done = self.authorized.lock().await;
+                if !done.contains(&dc) {
+                    done.push(dc);
                 }
             }
             match &answer {
-                Err(e) if !lane.main && broken(e, answered) => {
+                Err(e) if !lane.main && broken(e) => {
                     if too_many(e) {
                         REFUSALS.fetch_add(1, Ordering::Relaxed);
                     }
-                    let busy = lane.busy.load(Ordering::SeqCst) + 1;
-                    if self.lanes.drop_lane(dc, &lane) {
-                        DROPPED_LANES.lock().unwrap_or_else(|e| e.into_inner()).push(format!("DC {dc}: {e}"));
-                        note(format!("DC {dc}: connection dropped {:.1} s after it opened, {busy} requests on it: {e}", lane.age().as_secs_f64()));
+                    self.dropped(dc, &lane, &e.to_string());
+                }
+                Err(InvocationError::Io(e)) if !lane.main => {
+                    if self.lanes.falter(&lane) {
+                        note(format!("DC {dc}: a request on a connection was cut ({e}): asking whether it still answers"));
+                        self.probe(dc, lane.clone());
                     }
                 }
                 _ => return answer,
@@ -480,7 +503,7 @@ impl Shared {
     }
 
     /// One part of a file, from wherever Telegram keeps it.
-    async fn part(&self, location: &tl::enums::InputFileLocation, dc: &mut i32, offset: i64, cancel: &AtomicBool) -> Result<Vec<u8>> {
+    async fn part(self: &Arc<Self>, location: &tl::enums::InputFileLocation, dc: &mut i32, offset: i64, cancel: &AtomicBool) -> Result<Vec<u8>> {
         let budget = self.budget();
         loop {
             let _slot = budget.acquire().await.map_err(|e| e.to_string())?;
@@ -522,8 +545,11 @@ pub struct Real {
     premium: bool,
     /// The places of the files asked about lately, by chat and message.
     places: Places<(PeerId, i32), Place>,
-    /// One download asks about places at a time: those waiting find theirs came with its answer.
-    finding: AsyncMutex<()>,
+    /// Per channel, one download asks for a page at a time: those waiting find their file's
+    /// place came with its answer.
+    finding: std::sync::Mutex<HashMap<PeerId, Arc<AsyncMutex<()>>>>,
+    /// Whether a page pays in each chat.
+    paging: Paging<PeerId>,
     /// The account's own user, as Saved Messages' files are fetched by: asked once.
     me: std::sync::OnceLock<PeerRef>,
 }
@@ -724,7 +750,7 @@ impl Real {
             lanes: Lanes::new(conn.main.clone(), tuning, CEILING_FOR),
             media: AsyncMutex::default(),
         });
-        Real { conn, shared, premium, places: Places::new(PLACE_FRESH, PLACES), finding: AsyncMutex::new(()), me: std::sync::OnceLock::new() }
+        Real { conn, shared, premium, places: Places::new(PLACE_FRESH, PLACES), finding: std::sync::Mutex::default(), paging: Paging::default(), me: std::sync::OnceLock::new() }
     }
 
     pub fn session(&self) -> &Arc<KeyringSession> {
@@ -861,7 +887,7 @@ impl Backend for Real {
     }
 
     fn changes(&self, pts: i32) -> Result<Changes> {
-        self.block(async {
+        let changes = self.block(async {
             let s = &self.shared;
             let mut upserts: Vec<Msg> = Vec::new();
             let mut deleted: Vec<i32> = Vec::new();
@@ -898,7 +924,20 @@ impl Backend for Real {
                 }
             }
             Ok(Changes::TooLong)
-        })
+        });
+        // A message sent again, edited or deleted may hold another file now, or none: a place
+        // kept for it would bring the old one (see `places`).
+        match &changes {
+            Ok(Changes::Since { upserts, deleted, .. }) => {
+                let channel = self.shared.channel.id;
+                for id in upserts.iter().map(|m| m.id).chain(deleted.iter().copied()) {
+                    self.places.forget(&(channel, id));
+                }
+            }
+            Ok(Changes::TooLong) => self.places.clear(),
+            Err(_) => {}
+        }
+        changes
     }
 
     fn send_text(&self, text: &str) -> Result<Msg> {
@@ -1059,6 +1098,16 @@ impl Backend for Real {
             for f in &CHAT_FILTERS {
                 let raw = self.search(&peer, f, start, end).await?;
                 out.extend(raw.iter().filter_map(chat_file_of).filter(|f| f.date >= start && f.date < end));
+            }
+            // A message listed with another size than its kept place has got another file.
+            let peer = match chat.kind {
+                Kind::Saved => self.me.get().map(|me| me.id),
+                _ => Some(chat_peer(chat).id),
+            };
+            if let Some(peer) = peer {
+                for f in &out {
+                    self.places.keep_if(&(peer, f.msg), |place| place.size == f.size);
+                }
             }
             Ok(out)
         })
@@ -1309,26 +1358,38 @@ impl Real {
         Ok(out)
     }
 
-    /// The place of the file of message `id` of `peer`, asked of Telegram. In a channel the
-    /// page of its history around the message is what's asked, and the places of the files
-    /// there are kept (see `places`); one download asks at a time, so the others find theirs
-    /// came with its answer.
-    async fn find(&self, peer: PeerRef, id: i32) -> Result<Place> {
+    /// The place of the file of message `id` of `peer`, asked of Telegram; `cancel` ends a wait
+    /// Telegram asks for. In a channel where pages pay (see `places`), the page of history
+    /// around the message is asked for and the places of the files there are kept: one download
+    /// of the channel asks at a time, so the others find theirs came with its answer. Anywhere
+    /// else the message alone is asked for, each download on its own.
+    async fn find(&self, peer: PeerRef, id: i32, cancel: &AtomicBool) -> Result<Place> {
         let s = &self.shared;
-        let _turn = self.finding.lock().await;
-        if let Some(place) = self.places.get(&(peer.id, id)) {
-            return Ok(place);
+        if peer.id.kind() == PeerKind::Channel {
+            let turn = self.finding.lock().unwrap_or_else(|e| e.into_inner()).entry(peer.id).or_default().clone();
+            let _turn = turn.lock().await;
+            if let Some(place) = self.places.get(&(peer.id, id)) {
+                self.paging.served(peer.id);
+                return Ok(place);
+            }
+            if self.paging.asks_page(peer.id) {
+                PLACE_ASKS.fetch_add(1, Ordering::Relaxed);
+                let request = tl::functions::messages::GetHistory { peer: peer.into(), offset_id: places::page_from(id), offset_date: 0, add_offset: 0, limit: places::PAGE, max_id: 0, min_id: 0, hash: 0 };
+                let page = messages_of(s.patient(cancel, || s.client.invoke(&request)).await?);
+                // Kept before the turn passes on: the next download looks there first.
+                return self.keep(peer, id, &page);
+            }
         }
         PLACE_ASKS.fetch_add(1, Ordering::Relaxed);
-        let page: Vec<tl::enums::Message> = if peer.id.kind() == PeerKind::Channel {
-            let request = tl::functions::messages::GetHistory { peer: peer.into(), offset_id: places::page_from(id), offset_date: 0, add_offset: 0, limit: places::PAGE, max_id: 0, min_id: 0, hash: 0 };
-            messages_of(s.patient(&NEVER, || s.client.invoke(&request)).await?)
-        } else {
-            let ids = [id];
-            s.patient(&NEVER, || s.client.get_messages_by_id(peer, &ids)).await?.into_iter().flatten().map(|m| m.raw).collect()
-        };
+        let ids = [id];
+        let alone: Vec<tl::enums::Message> = s.patient(cancel, || s.client.get_messages_by_id(peer, &ids)).await?.into_iter().flatten().map(|m| m.raw).collect();
+        self.keep(peer, id, &alone)
+    }
+
+    /// Keeps the places of the files of `messages`, of `peer`; that of message `id` among them.
+    fn keep(&self, peer: PeerRef, id: i32, messages: &[tl::enums::Message]) -> Result<Place> {
         let mut found = None;
-        for m in &page {
+        for m in messages {
             let tl::enums::Message::Message(m) = m else { continue };
             let place = m.media.clone().and_then(Media::from_raw).and_then(|media| Some(Place { location: media.to_raw_input_location()?, dc: media.dc_id()?, size: media.size().unwrap_or(0) as u64 }));
             if m.id == id {
@@ -1341,6 +1402,24 @@ impl Real {
         found.unwrap_or_else(|| Err(t("O arquivo não existe mais no Telegram.", "The file doesn't exist on Telegram anymore.").into()))
     }
 
+    /// [`Real::find`], with `progress` asked meanwhile whether to go on: Cancelar works while a
+    /// download waits its turn to ask, or waits out a wait Telegram asked for.
+    async fn find_watched(&self, peer: PeerRef, id: i32, progress: Progress<'_>) -> Result<Place> {
+        let cancel = AtomicBool::new(false);
+        let find = self.find(peer, id, &cancel);
+        tokio::pin!(find);
+        loop {
+            tokio::select! {
+                found = &mut find => return found,
+                () = tokio::time::sleep(Duration::from_millis(250)) => {
+                    if !progress(0) {
+                        return Err(CANCELLED.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     /// Writes the file of message `id` of `peer` to `out`: from the place kept for it, or asked
     /// now; a kept one that Telegram no longer takes is asked anew, once.
     fn download_in(&self, peer: PeerRef, id: i32, out: &mut dyn Write, progress: Progress) -> Result<()> {
@@ -1348,14 +1427,17 @@ impl Real {
             let key = (peer.id, id);
             let kept = self.places.get(&key);
             let place = match &kept {
-                Some(place) => place.clone(),
-                None => self.find(peer, id).await?,
+                Some(place) => {
+                    self.paging.served(peer.id);
+                    place.clone()
+                }
+                None => self.find_watched(peer, id, &mut *progress).await?,
             };
             let mut written = 0;
             let mut result = self.bring(&place, &mut *out, &mut *progress, &mut written).await;
             if places::asks_again(kept.is_some(), result.as_ref().is_err_and(|e| e == STALE), written) {
                 self.places.forget(&key);
-                let place = self.find(peer, id).await?;
+                let place = self.find_watched(peer, id, &mut *progress).await?;
                 result = self.bring(&place, out, progress, &mut written).await;
             }
             result.map_err(|e| if e == STALE { t("O Telegram deixou de aceitar o endereço deste arquivo no meio do download. Tente de novo.", "Telegram stopped taking this file's address halfway through the download. Try again.").into() } else { e })
@@ -1471,12 +1553,9 @@ mod tests {
     }
 
     #[test]
-    fn an_extra_connection_is_no_use_once_it_ended_or_when_it_never_got_through() {
-        let cut = || InvocationError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
-        // It answered before: the connection is made again and the request asked again.
-        assert!(!broken(&cut(), true));
-        // It never did: the address can't be reached from here, so the DC's own carries on.
-        assert!(broken(&cut(), false));
-        assert!(broken(&InvocationError::Dropped("gone"), true) && broken(&InvocationError::Dropped("gone"), false));
+    fn an_extra_connection_that_ended_is_dropped_and_one_only_cut_is_not() {
+        // Cut: it leaves the round and is probed (`lanes`), for it may answer again.
+        assert!(!broken(&InvocationError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset))));
+        assert!(broken(&InvocationError::Dropped("gone")));
     }
 }

@@ -11,8 +11,14 @@
 //! from four downloads at once, made Telegram ask for waits of half a minute (FLOOD_WAIT), and
 //! one request of a hundred at a time still drew one of 4 s in three folders.
 //!
+//! A page pays only where files sit together. In a busy chat each file may be a page of its
+//! own, a hundred messages with their senders where one message would do: after pages in a row
+//! that served no other download, a chat's files are asked about one by one, and a page is
+//! tried again now and then ([`Paging`]).
+//!
 //! A place kept may have expired when used: Telegram says so, and the download asks again
-//! ([`asks_again`]).
+//! ([`asks_again`]). And the message may have got another file meanwhile: a place is forgotten
+//! when its message is seen changed ([`Places::keep_if`]).
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -69,6 +75,81 @@ impl<K: Hash + Eq, P: Clone> Places<K, P> {
     pub fn forget(&self, key: &K) {
         self.kept().remove(key);
     }
+
+    /// Forgets the place kept for `key` unless it's `same` as what the message has now: a
+    /// message whose file was replaced would else download the old one.
+    pub fn keep_if(&self, key: &K, same: impl FnOnce(&P) -> bool) {
+        let mut kept = self.kept();
+        if kept.get(key).is_some_and(|(place, _)| !same(place)) {
+            kept.remove(key);
+        }
+    }
+
+    /// Forgets every place: what the messages hold now isn't known anymore.
+    pub fn clear(&self) {
+        self.kept().clear();
+    }
+}
+
+/// After this many pages in a row that served no other download, a chat's files are asked
+/// about one by one.
+pub const LONE_PAGES: u32 = 2;
+/// After this many files asked about one by one, a page is tried again.
+pub const ONE_BY_ONE: u32 = 30;
+
+#[derive(Default)]
+struct Run {
+    /// A page was asked for in this chat before.
+    paged: bool,
+    /// Downloads that found their place kept since the last request.
+    served: u32,
+    /// Pages in a row that served no other download.
+    lone: u32,
+    /// Files asked about one by one since the last page.
+    singly: u32,
+}
+
+/// Whether a page of history pays in each chat, from what the last ones brought.
+pub struct Paging<C> {
+    chats: Mutex<HashMap<C, Run>>,
+}
+
+impl<C: Hash + Eq> Default for Paging<C> {
+    fn default() -> Paging<C> {
+        Paging { chats: Mutex::new(HashMap::new()) }
+    }
+}
+
+impl<C: Hash + Eq> Paging<C> {
+    /// A download in `chat` found its file's place kept: the last page paid.
+    pub fn served(&self, chat: C) {
+        self.chats.lock().unwrap_or_else(|e| e.into_inner()).entry(chat).or_default().served += 1;
+    }
+
+    /// Whether the request about to be made in `chat` asks for the page around the file; else
+    /// for the file's message alone.
+    pub fn asks_page(&self, chat: C) -> bool {
+        let mut chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+        let run = chats.entry(chat).or_default();
+        if run.lone >= LONE_PAGES {
+            run.singly += 1;
+            if run.singly <= ONE_BY_ONE {
+                return false;
+            }
+            // A page again: one more that serves nobody goes straight back to one by one.
+            (run.singly, run.lone, run.served) = (0, LONE_PAGES - 1, 0);
+            return true;
+        }
+        if run.paged {
+            run.lone = if run.served == 0 { run.lone + 1 } else { 0 };
+        }
+        (run.paged, run.served) = (true, 0);
+        if run.lone >= LONE_PAGES {
+            run.singly = 1;
+            return false;
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -111,6 +192,57 @@ mod tests {
         places.put(7, 7);
         assert_eq!(places.get(&7), Some(7), "the stale ones made room");
         assert_eq!(places.kept().len(), 1);
+    }
+
+    #[test]
+    fn a_place_is_forgotten_when_its_message_has_another_file_now() {
+        let places: Places<i32, u64> = Places::new(Duration::from_secs(60), 10);
+        places.put(1, 4096);
+        places.put(2, 4096);
+        // Message 1 still has a file of 4096 bytes, message 2 one of 5000 now; 3 was never kept.
+        places.keep_if(&1, |size| *size == 4096);
+        places.keep_if(&2, |size| *size == 5000);
+        places.keep_if(&3, |_| false);
+        assert_eq!((places.get(&1), places.get(&2), places.get(&3)), (Some(4096), None, None));
+        places.clear();
+        assert_eq!(places.get(&1), None);
+    }
+
+    #[test]
+    fn pages_that_serve_no_other_download_give_way_to_one_file_at_a_time() {
+        let paging: Paging<&str> = Paging::default();
+        // Files side by side: each page serves the downloads after it, so pages go on.
+        for _ in 0..5 {
+            assert!(paging.asks_page("folder"));
+            for _ in 0..99 {
+                paging.served("folder");
+            }
+        }
+        // Files far apart: two pages that served nobody else, then one by one.
+        assert!(paging.asks_page("busy group"));
+        assert!(paging.asks_page("busy group"), "one lone page may be chance");
+        for _ in 0..ONE_BY_ONE {
+            assert!(!paging.asks_page("busy group"));
+        }
+        // A page is tried again after a while; serving nobody, it goes straight back.
+        assert!(paging.asks_page("busy group"));
+        assert!(!paging.asks_page("busy group"));
+        // Each chat on its own.
+        assert!(paging.asks_page("folder"));
+    }
+
+    #[test]
+    fn a_page_that_serves_again_brings_the_pages_back() {
+        let paging: Paging<i32> = Paging::default();
+        assert!(paging.asks_page(7) && paging.asks_page(7) && !paging.asks_page(7));
+        for _ in 1..ONE_BY_ONE {
+            assert!(!paging.asks_page(7));
+        }
+        // The page tried again serves the next downloads: this part of the chat is dense.
+        assert!(paging.asks_page(7));
+        paging.served(7);
+        assert!(paging.asks_page(7));
+        assert!(paging.asks_page(7), "and one lone page after it is forgiven");
     }
 
     #[test]
