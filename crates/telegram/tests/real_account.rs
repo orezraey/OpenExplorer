@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use grammers_session::types::{PeerAuth, PeerId, PeerRef};
+use openexplorer_telegram::lanes::Tuning;
 use openexplorer_telegram::real::{Conn, Real};
 use openexplorer_telegram::session::KeyringSession;
 use openexplorer_telegram::{Account, Found};
@@ -484,11 +485,8 @@ fn speed_by_connections() {
     use std::sync::atomic::Ordering;
     let Some((api_id, session, peer)) = poc() else { return };
     let rounds: usize = std::env::var("TELEGRAM_ROUNDS").ok().and_then(|r| r.parse().ok()).unwrap_or(3);
-    // `TELEGRAM_VARIANTS=4x16,8x16`: connections × parts in flight.
-    let variants: Vec<(usize, usize)> = std::env::var("TELEGRAM_VARIANTS")
-        .ok()
-        .map(|v| v.split(',').filter_map(|p| p.split_once('x')).map(|(c, n)| (c.parse().unwrap(), n.parse().unwrap())).collect())
-        .unwrap_or(vec![(1, 12), (2, 12), (4, 16), (8, 32)]);
+    // `TELEGRAM_VARIANTS=4x16,8x16m0`: connections × parts in flight (see `Tuning`).
+    let variants: Vec<Tuning> = std::env::var("TELEGRAM_VARIANTS").ok().map(|v| v.split(',').map(|p| p.parse().unwrap()).collect()).unwrap_or(vec!["1x16m0".parse().unwrap(), "4x16m0".parse().unwrap(), "4x16".parse().unwrap()]);
     let a = account(api_id, &session, peer);
     let path = format!("/OE velocidade {}.bin", std::process::id());
     let big = random(100 * 1024 * 1024);
@@ -499,22 +497,22 @@ fn speed_by_connections() {
     let (waits, premium) = (WAITS.load(Ordering::Relaxed), PREMIUM_WAITS.load(Ordering::Relaxed));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         for round in 1..=rounds {
-            for (i, &(connections, parts)) in variants.iter().enumerate() {
-                a.tune(connections, parts);
+            for (i, &tuning) in variants.iter().enumerate() {
+                a.tune(tuning);
                 let t = Instant::now();
                 let mut out = Vec::with_capacity(big.len());
                 a.download(&path, &mut out, &mut |_| true).unwrap();
                 let speed = big.len() as f64 / 1048576.0 / t.elapsed().as_secs_f64();
                 assert!(out == big);
                 down[i].push(speed);
-                let target = format!("/OE envio {} {connections}.bin", std::process::id());
+                let target = format!("/OE envio {} {i}.bin", std::process::id());
                 let t = Instant::now();
                 a.upload(&target, &mut &up[..], up.len() as u64, None, &mut |_| true).unwrap();
                 let speed_up = up.len() as f64 / 1048576.0 / t.elapsed().as_secs_f64();
                 a.remove(&target, false).unwrap();
                 sent[i].push(speed_up);
                 let dropped = openexplorer_telegram::real::DROPPED_CALLS.load(Ordering::Relaxed);
-                println!("rodada {round}, {connections} conexões / {parts} partes: baixar {speed:.1} MiB/s, enviar {speed_up:.1} MiB/s; abertas por DC: {:?}; esperas até aqui {}, pedidos refeitos {dropped}", a.connections_open(), WAITS.load(Ordering::Relaxed) - waits);
+                println!("rodada {round}, {tuning}: baixar {speed:.1} MiB/s, enviar {speed_up:.1} MiB/s; abertas por DC: {:?}; esperas até aqui {}, pedidos refeitos {dropped}", a.connections_open(), WAITS.load(Ordering::Relaxed) - waits);
             }
         }
     }));
@@ -524,13 +522,13 @@ fn speed_by_connections() {
         (v[v.len() / 2], v[0], v[v.len() - 1])
     };
     println!("\nmediana (mín–máx) em MiB/s, {rounds} rodadas:");
-    for (i, &(connections, parts)) in variants.iter().enumerate() {
+    for (i, &tuning) in variants.iter().enumerate() {
         if down[i].is_empty() {
             continue;
         }
         let (d, dmin, dmax) = median(&mut down[i]);
         let (u, umin, umax) = median(&mut sent[i]);
-        println!("  {connections} conexões / {parts} partes: baixar {d:.1} ({dmin:.1}–{dmax:.1}), enviar {u:.1} ({umin:.1}–{umax:.1})");
+        println!("  {tuning}: baixar {d:.1} ({dmin:.1}–{dmax:.1}), enviar {u:.1} ({umin:.1}–{umax:.1})");
     }
     println!("esperas pedidas: {} (FLOOD_PREMIUM_WAIT: {})", WAITS.load(Ordering::Relaxed) - waits, PREMIUM_WAITS.load(Ordering::Relaxed) - premium);
     println!("conexões extras descartadas: {:?}", openexplorer_telegram::real::DROPPED_LANES.lock().unwrap());
@@ -866,9 +864,9 @@ fn speed_of_the_big_chat_file_again() {
     a.list(&top).unwrap();
     let home = KeyringSession::from_bytes(&bytes).unwrap().home();
     println!("DC da conta: {home}");
-    // `TELEGRAM_TUNE=8x32`: connections per DC and parts in flight.
-    if let Some((c, p)) = std::env::var("TELEGRAM_TUNE").ok().and_then(|v| v.split_once('x').map(|(c, p)| (c.parse().unwrap(), p.parse().unwrap()))) {
-        a.tune(c, p);
+    // `TELEGRAM_TUNE=4x16m0`: connections per DC and parts in flight (see `Tuning`).
+    if let Ok(v) = std::env::var("TELEGRAM_TUNE") {
+        a.tune(v.parse().unwrap());
     }
     big_file_rounds(&a, path, size.parse().unwrap());
 }
@@ -882,25 +880,25 @@ fn speed_of_the_big_chat_file_by_connections() {
     let Ok(kept) = std::fs::read_to_string(std::env::temp_dir().join("oe-telegram-big-file.txt")) else { return };
     let (size, path) = kept.split_once('\n').unwrap();
     let size: u64 = size.parse().unwrap();
-    let variants: Vec<(usize, usize)> = std::env::var("TELEGRAM_VARIANTS").ok().map_or_else(|| vec![(1, 16), (4, 16), (8, 32)], |v| v.split(',').map(|p| { let (c, n) = p.split_once('x').unwrap(); (c.parse().unwrap(), n.parse().unwrap()) }).collect());
+    let variants: Vec<Tuning> = std::env::var("TELEGRAM_VARIANTS").ok().map_or_else(|| vec!["1x16m0".parse().unwrap(), "4x16m0".parse().unwrap(), "4x16".parse().unwrap()], |v| v.split(',').map(|p| p.parse().unwrap()).collect());
     let mut speeds: Vec<Vec<f64>> = vec![Vec::new(); variants.len()];
     for round in 0..3 {
-        for (v, &(c, p)) in variants.iter().enumerate() {
+        for (v, &tuning) in variants.iter().enumerate() {
             std::thread::sleep(std::time::Duration::from_secs(15));
             // A fresh account each time: no connection left over from the variant before.
             let a = account(api_id, &bytes, peer);
             a.list(&path.split('/').take(4).collect::<Vec<_>>().join("/")).unwrap();
-            a.tune(c, p);
+            a.tune(tuning);
             let t = Instant::now();
             a.download(path, &mut std::io::sink(), &mut |_| true).unwrap();
             let mibs = size as f64 / 1048576.0 / t.elapsed().as_secs_f64();
             speeds[v].push(mibs);
-            println!("rodada {round}, {c}x{p}: {mibs:.1} MiB/s, conexões {:?}", a.connections_open());
+            println!("rodada {round}, {tuning}: {mibs:.1} MiB/s, conexões {:?}", a.connections_open());
         }
     }
-    for (v, &(c, p)) in variants.iter().enumerate() {
+    for (v, &tuning) in variants.iter().enumerate() {
         let mut s = speeds[v].clone();
         s.sort_by(f64::total_cmp);
-        println!("{c}x{p}: mediana {:.1} MiB/s ({:?})", s[s.len() / 2], s.iter().map(|x| format!("{x:.1}")).collect::<Vec<_>>());
+        println!("{tuning}: mediana {:.1} MiB/s ({:?})", s[s.len() / 2], s.iter().map(|x| format!("{x:.1}")).collect::<Vec<_>>());
     }
 }
