@@ -71,7 +71,7 @@ use std::time::SystemTime;
 use openexplorer_gdrive::store::{self, StoredAccount};
 use openexplorer_gdrive::{ClientConfig, Drive, DriveFile, Quota, oauth};
 use openexplorer_i18n::{t, tr};
-use rune::{AppSpec, DragItem, Key, KeyEvent, LiveRegion, Mods, Tx, Waker};
+use rune::{AppSpec, DragItem, DragOperation, DragOperations, DropDescription, DropDescriptionKind, DropFeedback, DropInfo, Key, KeyEvent, LiveRegion, Mods, Tx, Waker};
 
 use layout::MAX_PANES;
 use model::{Entry, Location, MockDrive, Pane, SortCol, Space};
@@ -406,6 +406,10 @@ fn relaunch() {
 /// How long the window's background takes to fade in over Mica before Mica goes, in seconds:
 /// longer than the colour spring takes to settle.
 const MICA_FADE: f64 = 0.4;
+
+/// The most frames a second the main window draws by itself while another app's window is in
+/// front of it (`App::unfocused_fps`).
+const UNFOCUSED_FPS: f32 = 30.0;
 thread_local! {
     /// When Mica, turned off in Opções, leaves the main window.
     static MICA_OFF_AT: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
@@ -3063,7 +3067,11 @@ fn drag_item(s: &State, p: usize, id: &str) -> Option<DragItem> {
     if paths.is_empty() {
         return None;
     }
-    Some(paths.into_iter().fold(DragItem::new(), DragItem::file).within_app())
+    let item = paths.into_iter().fold(DragItem::new(), DragItem::file).within_app();
+    // Files of the computer may be moved, as Explorer's are: to the other pane on the same disk
+    // or with Shift (see [`drop_operation`]), and by Explorer too. The simulated drive's
+    // placeholders only copy.
+    Some(if matches!(s.panes[p].loc, Location::Local(_) | Location::Found(_)) { item.allow_move() } else { item })
 }
 
 /// Files on disk for the dragged entries, written first when `materialize` is set; without it
@@ -3181,15 +3189,114 @@ fn found_scene(s: &mut State, installed: bool) {
     }
 }
 
-fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
-    if let Some((from, paths)) = &s.last_drag
+// ---------------------------------------------------------------------------------------------
+// Copy or move on a drop
+
+/// The operations a drag from this app's own panes offers ([`drag_item`]): Explorer's offer
+/// adds Link, which tells the two apart when the paths are the same.
+const OWN_DRAG: DragOperations = DragOperations::COPY.with(DragOperation::Move);
+
+/// Whether `files`, dropped with `allowed` offered, are the drag a pane of this app started.
+fn own_drag(s: &State, files: &[PathBuf], allowed: DragOperations) -> bool {
+    allowed == OWN_DRAG && s.last_drag.as_ref().is_some_and(|(_, paths)| paths.as_slice() == files)
+}
+
+/// What a drop of `files` on a pane at `to` does, as Explorer decides it: in a folder of the
+/// computer, files from the same disk move and others copy; to Google Drive or a server they
+/// copy (upload). Shift moves and Ctrl copies, as in Explorer; links aren't made, so Alt
+/// doesn't change the choice. `None` refuses the drop: where `dropped` takes no files, and in
+/// the folder the files already are in.
+///
+/// Only a drag of this app's own panes (`own`) moves. Rune tells the source the drop was a move
+/// and sets nothing more on its data object, while the app moves the files later, in the
+/// background and maybe after asking about a name taken: a source that deletes its originals
+/// on a move reply (an unoptimized move, as Microsoft's "Handling Shell Data Transfer
+/// Scenarios" puts it) could delete them before they're read. Until a drag from Explorer is
+/// seen to keep its files on a move reply, drags from other apps copy.
+pub(crate) fn drop_operation(to: &Location, files: &[PathBuf], own: bool, temp: &std::path::Path, mods: Mods, allowed: DragOperations) -> Option<DragOperation> {
+    let local_dir = match to {
+        Location::Found(_) | Location::DriveSearch(_) | Location::Server { find: Some(_), .. } | Location::Computer => return None,
+        Location::Local(dir) if network::is_server(dir) => return None,
+        Location::Local(dir) => Some(dir.as_path()),
+        Location::Drive { .. } | Location::Server { .. } | Location::Mock(_) => None,
+    };
+    if let Some(dir) = local_dir
+        && files.iter().all(|f| f.parent() == Some(dir))
+    {
+        return None;
+    }
+    // The simulated drive's placeholders and copies of cloud files wait in the temp folder:
+    // they're copied, never taken from it.
+    let movable = own && !matches!(to, Location::Mock(_)) && !files.iter().any(|f| f.starts_with(temp));
+    let allowed = if movable { allowed } else { allowed.intersection(DragOperations::COPY) };
+    let same_disk = local_dir.is_some_and(|dir| !files.is_empty() && files.iter().all(|f| ops::same_volume(f, dir)));
+    let wanted = if mods.shift && !mods.ctrl {
+        DragOperation::Move
+    } else if mods.ctrl && !mods.shift {
+        DragOperation::Copy
+    } else if same_disk {
+        DragOperation::Move
+    } else {
+        DragOperation::Copy
+    };
+    let other = if wanted == DragOperation::Move { DragOperation::Copy } else { DragOperation::Move };
+    [wanted, other].into_iter().find(|op| allowed.contains(*op))
+}
+
+/// The name a drop's label gives the place the files go: the folder's own name.
+fn drop_place(s: &State, p: usize) -> String {
+    match &s.panes[p].loc {
+        Location::Local(dir) => dir.file_name().map_or_else(|| dir.display().to_string(), |n| n.to_string_lossy().into_owned()),
+        _ => {
+            let title = s.panes[p].title();
+            title.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or(&title).to_string()
+        }
+    }
+}
+
+/// What a file drag over pane `p` answers, and the label Windows draws under the drag's image
+/// ("Mover para Fotos").
+pub(crate) fn drop_feedback(s: &State, p: usize, info: &DropInfo<'_>) -> DropFeedback {
+    let own = own_drag(s, info.paths(), info.allowed());
+    // A drag of a pane let go on that same pane does nothing.
+    if own && s.last_drag.as_ref().is_some_and(|(from, _)| *from == p) {
+        return DropFeedback::none();
+    }
+    let Some(op) = drop_operation(&s.panes[p].loc, info.paths(), own, &s.temp, info.mods(), info.allowed()) else {
+        return DropFeedback::none();
+    };
+    let (kind, message) = match op {
+        DragOperation::Move => (DropDescriptionKind::Move, t("Mover para %1", "Move to %1")),
+        _ => (DropDescriptionKind::Copy, t("Copiar para %1", "Copy to %1")),
+    };
+    DropFeedback::from(op).description(DropDescription::new(kind, message).insert(drop_place(s, p)))
+}
+
+fn dropped(s: &mut State, p: usize, files: &[PathBuf], operation: Option<DragOperation>, allowed: DragOperations) {
+    let own = own_drag(s, files, allowed);
+    if own
+        && let Some((from, _)) = &s.last_drag
         && *from == p
-        && paths.as_slice() == files
     {
         s.last_drag = None;
         return;
     }
     s.last_drag = None;
+    // A move only as `drop_operation` allows one, whatever the platform reported.
+    let moving = operation == Some(DragOperation::Move) && own && !files.iter().any(|f| f.starts_with(&s.temp));
+    // A move empties the folders the files came from: they're listed again too.
+    let reload_with_sources = |loc: &Location| {
+        let mut reload = vec![loc.clone()];
+        if moving {
+            for parent in files.iter().filter_map(|f| f.parent()) {
+                let from = Location::Local(parent.to_path_buf());
+                if !reload.contains(&from) {
+                    reload.push(from);
+                }
+            }
+        }
+        reload
+    };
     s.active = p;
     let loc = s.panes[p].loc.clone();
     let (mut done, mut skipped) = (0, 0);
@@ -3212,7 +3319,8 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
                 s.status = nothing_to_upload();
                 return;
             }
-            servers::upload(s, real, &loc, false, vec![loc.clone()]);
+            let reload = reload_with_sources(&loc);
+            servers::upload(s, real, &loc, moving, reload);
             return;
         }
         Location::Drive { .. } => {
@@ -3224,7 +3332,8 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
                 return;
             }
             let left_out = files.len() - real.len();
-            actions::upload(s, real, &loc, false, vec![loc.clone()]);
+            let reload = reload_with_sources(&loc);
+            actions::upload(s, real, &loc, moving, reload);
             if left_out > 0 {
                 s.status = tr!("Itens do drive simulado não são enviados ({left_out}).", "Items of the simulated drive aren't uploaded ({left_out}).");
             }
@@ -3235,7 +3344,9 @@ fn dropped(s: &mut State, p: usize, files: &[PathBuf]) {
             // bar; collisions prompt the user just like Copiar + Colar.
             let sources: Vec<PathBuf> = files.iter().filter(|f| f.parent() != Some(dir.as_path())).cloned().collect();
             if !sources.is_empty() {
-                actions::local_transfer(s, transfers::Op::Copy, sources, dir.clone(), vec![loc.clone()]);
+                let op = if moving { transfers::Op::Move } else { transfers::Op::Copy };
+                let reload = reload_with_sources(&loc);
+                actions::local_transfer(s, op, sources, dir.clone(), reload);
             }
             return;
         }
@@ -3447,6 +3558,10 @@ fn main() {
     if let Some(notice) = cli.notice {
         *STARTUP_UPDATE_NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(notice);
     }
+    // Linux: the system's fallback fonts (emoji, Chinese or Japanese in a file name) are read on
+    // a thread of their own from now on, so the first such name doesn't hold the window up
+    // (240 to 400 ms, Rune measured). Nothing on Windows and macOS, which need no such build.
+    rune::text::prewarm_system_fonts();
     let initial = settings::Settings::load();
     // Rune's own words (a text field's menu, the window buttons' names for screen readers) in
     // the app's language.
@@ -4054,6 +4169,10 @@ fn main() {
     if initial.resize_sync && cfg!(windows) {
         main_app = main_app.resize_sync(rune::ResizeSync::On);
     }
+    // Behind another app's window but still in sight, what moves by itself (the transfers'
+    // bars, the spinners) draws at most 30 times a second; input over the window lifts it.
+    // Rune applies it on macOS only, so far.
+    main_app = main_app.unfocused_fps(UNFOCUSED_FPS);
 
     let batch_rename_app = rune::App::new(AppSpec::<State> {
         min_size: Some((600.0, 440.0)),
@@ -4416,6 +4535,90 @@ mod tests {
         runs.sort_by(f64::total_cmp);
         println!("queue tick: {:.0} µs best, {:.0} µs median of 9 runs of 200", runs[0], runs[4]);
         drop(batch);
+    }
+
+    /// Drops copy or move as Explorer decides them, but only a drag of the app's own panes moves.
+    #[test]
+    fn drops_copy_or_move_as_explorer_does() {
+        let temp = std::path::Path::new(r"C:\Temp\OpenExplorer");
+        let (shift, ctrl, alt) = (Mods { shift: true, ..Mods::default() }, Mods { ctrl: true, cmd: true, ..Mods::default() }, Mods { alt: true, ..Mods::default() });
+        let op = |to: &Location, files: &[&str], own: bool, mods: Mods| {
+            let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+            drop_operation(to, &files, own, temp, mods, if own { OWN_DRAG } else { DragOperations::ALL })
+        };
+        let (copy, moving) = (Some(DragOperation::Copy), Some(DragOperation::Move));
+        let photos = Location::Local(PathBuf::from(r"C:\Users\you\Photos"));
+        let on_c = [r"C:\Users\you\Desktop\a.jpg", r"c:\Data\b.jpg"];
+        let on_d = [r"D:\Camera\a.jpg"];
+        #[cfg(windows)]
+        {
+            // The app's own drag: the same disk moves, another copies; Shift and Ctrl choose.
+            assert_eq!(op(&photos, &on_c, true, Mods::default()), moving);
+            assert_eq!(op(&photos, &on_d, true, Mods::default()), copy);
+            assert_eq!(op(&photos, &[on_c[0], on_d[0]], true, Mods::default()), copy);
+            assert_eq!(op(&photos, &on_c, true, ctrl), copy);
+            assert_eq!(op(&photos, &on_d, true, shift), moving);
+            // No links: Alt keeps Explorer's choice.
+            assert_eq!(op(&photos, &on_c, true, alt), moving);
+        }
+        // Another app's drag copies, even with Shift.
+        assert_eq!(op(&photos, &on_c, false, Mods::default()), copy);
+        assert_eq!(op(&photos, &on_c, false, shift), copy);
+        // To Google Drive or a server: an upload, which moves only with Shift.
+        let drive = Location::Drive { email: "you@gmail.com".into(), space: Space::MyDrive, path: Vec::new() };
+        assert_eq!(op(&drive, &on_c, true, Mods::default()), copy);
+        assert_eq!(op(&drive, &on_c, true, shift), moving);
+        // Copies of cloud files in the temp folder, and the simulated drive, never move.
+        assert_eq!(op(&photos, &[r"C:\Temp\OpenExplorer\x.jpg"], true, shift), copy);
+        assert_eq!(op(&Location::Mock(Vec::new()), &on_c, true, shift), copy);
+        // Where nothing can be dropped, and onto the folder the files are in.
+        assert_eq!(op(&Location::Computer, &on_c, true, Mods::default()), None);
+        assert_eq!(op(&Location::Local(PathBuf::from(r"C:\Users\you\Desktop")), &on_c[..1], true, Mods::default()), None);
+    }
+
+    /// The pane under a file drag answers the operation and the label under the drag's image,
+    /// and the drop does what it answered.
+    #[test]
+    fn a_drag_over_a_pane_shows_what_the_drop_will_do() {
+        let root = std::env::temp_dir().join(format!("oe-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (from, to) = (root.join("Desktop"), root.join("Photos"));
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        let file = from.join("a.jpg");
+        std::fs::write(&file, "jpg").unwrap();
+        let files = vec![file.clone()];
+
+        let mut s = init();
+        switch(&mut s, 0, Location::Local(from.clone()));
+        switch(&mut s, 1, Location::Local(to.clone()));
+        let mut rt = rune::Runtime::new(s, ui::view, (1600.0, 1000.0), rune::Env::new(false, 1.0));
+        rt.frame(1.0 / 60.0);
+        let (x, y) = rt.find(&pane_key(1)).expect("the second pane");
+        let label = |rt: &rune::Runtime<State>| rt.drop_feedback().map(|f| (f.operation(), f.drop_description().map(|d| (d.kind(), d.message().to_string(), d.insert_text().to_string()))));
+        let place = |kind, message: &str| Some((Some(if kind == DropDescriptionKind::Move { DragOperation::Move } else { DragOperation::Copy }), Some((kind, message.to_string(), "Photos".to_string()))));
+
+        // From Explorer: a copy, Shift or not.
+        rt.drag_files_with(files.clone(), Some((x, y)), Mods { shift: true, ..Mods::default() }, DragOperations::ALL);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(label(&rt), place(DropDescriptionKind::Copy, t("Copiar para %1", "Copy to %1")));
+        rt.drag_files_leave();
+        rt.frame(1.0 / 60.0);
+
+        // From the first pane, on the same disk: a move, and the file goes.
+        rt.update(|s, _| s.last_drag = Some((0, files.clone())));
+        rt.drag_files_with(files.clone(), Some((x, y)), Mods::default(), OWN_DRAG);
+        rt.frame(1.0 / 60.0);
+        // A second headless drag over the point the first left is only judged once it moves.
+        assert!(rt.drag_files_to_with(Some((x + 1.0, y)), Mods::default(), OWN_DRAG));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(label(&rt), place(DropDescriptionKind::Move, t("Mover para %1", "Move to %1")));
+        rt.drop_files_with(files.clone(), Some((x, y)), Mods::default(), OWN_DRAG, Some(DragOperation::Move));
+        rt.frame(1.0 / 60.0);
+        let mut queued = Vec::new();
+        rt.update(|s, _| queued = s.transfers.iter().map(|t| t.op).collect());
+        assert_eq!(queued, [transfers::Op::Move]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The mouse's side buttons step through a pane's history as Voltar and Avançar do; the

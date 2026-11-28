@@ -287,6 +287,33 @@ pub fn windows_name(name: &str) -> String {
     if out.is_empty() { "_".into() } else { out }
 }
 
+/// Whether `a` and the folder `dir` are on the same disk, where a move only renames: Explorer
+/// moves files dragged there and copies files from another disk.
+pub fn same_volume(a: &Path, dir: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        // The drive (`C:`) or share (`\\server\share`) each path starts with.
+        let volume = |p: &Path| match p.components().next() {
+            Some(std::path::Component::Prefix(prefix)) => Some(prefix.as_os_str().to_string_lossy().to_lowercase()),
+            _ => None,
+        };
+        volume(a).is_some_and(|v| Some(v) == volume(dir))
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::symlink_metadata(a), std::fs::metadata(dir)) {
+            (Ok(a), Ok(dir)) => a.dev() == dir.dev(),
+            _ => false,
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (a, dir);
+        false
+    }
+}
+
 pub fn rename(from: &Path, name: &str) -> Result<PathBuf, String> {
     if let Some(why) = invalid_name(name) {
         return Err(why);
