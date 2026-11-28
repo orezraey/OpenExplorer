@@ -145,7 +145,15 @@ fn median(v: &[f64]) -> String {
     }
     let mut s = v.to_vec();
     s.sort_by(f64::total_cmp);
-    format!("{:.1} ({:.1}-{:.1})", s[s.len() / 2], s[0], s[s.len() - 1])
+    // Of an even number, halfway between the two in the middle: not the better of them.
+    let middle = if s.len() % 2 == 1 { s[s.len() / 2] } else { (s[s.len() / 2 - 1] + s[s.len() / 2]) / 2.0 };
+    format!("{middle:.1} ({:.1}-{:.1})", s[0], s[s.len() - 1])
+}
+
+/// An error about `path` with the path taken out: a chat's or a file's name is never printed.
+fn nameless(error: &str, path: &str) -> String {
+    let path = path.trim_matches('/');
+    if path.is_empty() { error.to_string() } else { error.replace(&format!("/{path}"), "<path>").replace(path, "<path>") }
 }
 
 /// Runs `job` over `items`, `at_once` threads taking them in turn; the first error, if any.
@@ -387,7 +395,7 @@ fn get_small(args: &[String]) -> Result<(), String> {
         if files.len() >= n {
             break;
         }
-        for i in a.list(&dir)? {
+        for i in a.list(&dir).map_err(|e| nameless(&e, &dir))? {
             let path = format!("{}/{}", dir.trim_end_matches('/'), i.name);
             if i.is_dir() {
                 if !a.passed_over(&path) && (start != "/" || !i.name.starts_with("OE bench")) {
@@ -405,7 +413,7 @@ fn get_small(args: &[String]) -> Result<(), String> {
     let (t, before) = (Instant::now(), Counts::now());
     each(files, at_once, |(path, size)| {
         let mut got = Count(0);
-        a.download(&path, &mut got, &mut |_| true)?;
+        a.download(&path, &mut got, &mut |_| true).map_err(|e| nameless(&e, &path))?;
         if got.0 == size { Ok(()) } else { Err(format!("a file of {size} bytes came as {}", got.0)) }
     })?;
     let secs = t.elapsed().as_secs_f64();
@@ -432,7 +440,7 @@ fn chats(args: &[String]) -> Result<(), String> {
         match a.download(&path, &mut got, &mut |_| true) {
             Ok(()) if got.0 == file.size => println!("chat {i}: {:.1} MiB in {:.1} s = {:.1} MiB/s; connections per DC {:?}{}", file.size as f64 / 1048576.0, t.elapsed().as_secs_f64(), file.size as f64 / 1048576.0 / t.elapsed().as_secs_f64(), a.connections_open(), before.since()),
             Ok(()) => return Err(format!("chat {i}: a file of {} bytes came as {}", file.size, got.0)),
-            Err(e) => return Err(format!("chat {i}: {e}")),
+            Err(e) => return Err(format!("chat {i}: {}", nameless(&e, &path))),
         }
         done += 1;
         if done == n {

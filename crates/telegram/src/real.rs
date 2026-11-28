@@ -488,6 +488,7 @@ impl Shared {
                 Err(e) if !lane.main && broken(e) => {
                     if too_many(e) {
                         REFUSALS.fetch_add(1, Ordering::Relaxed);
+                        self.lanes.refused(dc);
                     }
                     self.dropped(dc, &lane, &e.to_string());
                 }

@@ -67,7 +67,8 @@ impl<K: Hash + Eq, P: Clone> Places<K, P> {
         if kept.len() >= self.most {
             kept.retain(|_, (_, at)| at.elapsed() < self.fresh_for);
         }
-        if kept.len() < self.most {
+        // A key kept already is renewed even when full: its place is the newer one.
+        if kept.len() < self.most || kept.contains_key(&key) {
             kept.insert(key, (place, Instant::now()));
         }
     }
@@ -192,6 +193,17 @@ mod tests {
         places.put(7, 7);
         assert_eq!(places.get(&7), Some(7), "the stale ones made room");
         assert_eq!(places.kept().len(), 1);
+    }
+
+    #[test]
+    fn a_place_kept_already_is_renewed_even_when_no_more_fit() {
+        let places: Places<i32, &str> = Places::new(Duration::from_secs(60), 2);
+        places.put(1, "old");
+        places.put(2, "b");
+        // Full, all fresh: a new key waits, but a newer place for a key that's there goes in.
+        places.put(3, "c");
+        places.put(1, "new");
+        assert_eq!((places.get(&1), places.get(&2), places.get(&3)), (Some("new"), Some("b"), None));
     }
 
     #[test]

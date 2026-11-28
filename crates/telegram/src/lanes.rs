@@ -103,6 +103,8 @@ struct State<L> {
     ceiling: HashMap<(i32, Kind), (usize, Instant)>,
     /// Per DC and address, how many connections in a row were dropped without ever answering.
     unanswered: HashMap<(i32, Kind), u32>,
+    /// Per DC, until when no connection opens to it: Telegram refused one for being too many.
+    refused: HashMap<i32, Instant>,
 }
 
 /// The longest a DC goes without a connection that keeps failing to answer, in rests: each one
@@ -127,7 +129,7 @@ impl<L: Link + Clone> Lanes<L> {
     pub fn new(main: L, tuning: Tuning, rest: Duration) -> Lanes<L> {
         Lanes {
             main,
-            state: Mutex::new(State { lanes: HashMap::new(), ceiling: HashMap::new(), unanswered: HashMap::new() }),
+            state: Mutex::new(State { lanes: HashMap::new(), ceiling: HashMap::new(), unanswered: HashMap::new(), refused: HashMap::new() }),
             general: AtomicUsize::new(tuning.general.max(1)),
             media: AtomicUsize::new(tuning.media),
             rest,
@@ -167,10 +169,23 @@ impl<L: Link + Clone> Lanes<L> {
     /// download (`down`) from a DC with a media address (`has_media`) gets the connection there
     /// and no other: until that one answers its parts go over the account's own. The others to
     /// the DC's own address open for an upload, for a DC with no media address, or when the
-    /// media one broke.
+    /// media one broke. None at all for a rest after Telegram [refused](Lanes::refused) one.
     pub fn to_open(&self, dc: i32, down: bool, has_media: bool) -> Option<Kind> {
+        if self.state().refused.get(&dc).is_some_and(|until| Instant::now() < *until) {
+            return None;
+        }
         let kind = if down && has_media && self.takes_media(dc) { Kind::Media } else { Kind::General };
         (self.count(dc, kind) < self.wanted(dc, kind)).then_some(kind)
+    }
+
+    /// Telegram refused a connection to `dc` for being one too many (`-429`): for a rest, no
+    /// other opens in its place. Opening more is what it refused, and after a refusal it kept
+    /// an account slow for minutes; the parts go over the connections that are left.
+    pub fn refused(&self, dc: i32) {
+        let until = Instant::now() + self.rest;
+        let mut st = self.state();
+        let until = st.refused.get(&dc).map_or(until, |set| until.max(*set));
+        st.refused.insert(dc, until);
     }
 
     /// Opens connections to `dc`'s `kind` of address up to the number wanted, each made by
@@ -263,6 +278,7 @@ impl<L: Link + Clone> Lanes<L> {
         }
         st.ceiling.clear();
         st.unanswered.clear();
+        st.refused.clear();
     }
 
     /// The connections to the DC's own address the account wants: what an upload shares its
@@ -469,6 +485,23 @@ mod tests {
         let none = lanes(4, 0);
         assert!(!none.takes_media(1) && l.takes_media(2));
         assert_eq!(none.to_open(1, true, true), Some(Kind::General));
+    }
+
+    #[test]
+    fn after_a_refusal_no_connection_opens_in_its_place_for_a_while() {
+        let l = Lanes::new(Fake::default(), Tuning { general: 4, media: 1, parts: 16 }, Duration::from_millis(60));
+        let media = open(&l, 1, Kind::Media).remove(0);
+        // Telegram refuses the media connection as one too many: it goes, and the download
+        // doesn't get the three to the DC's own address instead, as it does when one just broke.
+        l.refused(1);
+        assert!(l.drop_lane(1, &media));
+        assert_eq!((l.to_open(1, true, true), l.to_open(1, false, true)), (None, None));
+        assert!(l.pick(1, true).main);
+        // Another DC is as it was.
+        assert_eq!(l.to_open(2, true, true), Some(Kind::Media));
+        // After the rest, the media connection again.
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(l.to_open(1, true, true), Some(Kind::Media));
     }
 
     #[test]
