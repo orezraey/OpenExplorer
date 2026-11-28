@@ -5575,10 +5575,12 @@ fn pane(s: &State, k: &Kit, p: usize, backdrop: bool, layer: &mut Vec<El>) -> El
         card = card.child(solid(new_tab_picker(s, k, p, layer)));
     } else {
         card = card
-            .on_drop_files(move |s: &mut State, files: &[PathBuf], _| {
+            .on_drop_files(move |s: &mut State, files: &[PathBuf], tx: &mut Tx| {
                 crate::autoscroll::left(&mut s.autoscroll, p);
-                dropped(s, p, files)
+                dropped(s, p, files, tx.drop_operation(), tx.drag_operations())
             })
+            // Copy or move, and the label under the drag's image, as Explorer answers them.
+            .drop_feedback(move |s: &State, info| crate::drop_feedback(s, p, info))
             .on_drop_hover(move |s: &mut State, over, _| {
                 s.panes[p].drop_over = over;
                 if !over {
@@ -6658,6 +6660,11 @@ fn wire_entry_interactions(el: El, p: usize, id: &str) -> El {
         s.last_drag = Some((p, paths));
     })
     .on_drag_end(move |s: &mut State, outcome: DragOutcome, _| {
+        // Explorer may have moved the files away (they may be moved now): the folder is read
+        // again, as nothing else tells the pane.
+        if outcome != DragOutcome::Cancelled && matches!(s.panes[p].loc, Location::Local(_)) {
+            crate::refresh(s, p);
+        }
         s.status = match outcome {
             DragOutcome::Cancelled => t("Arrastar cancelado.", "Drag canceled.").into(),
             o => tr!("Arrastar terminou: {o:?}", "Drag ended: {o:?}"),
