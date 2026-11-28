@@ -40,6 +40,7 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc};
 
 use crate::account::now;
 use crate::backend::{Backend, Changes, Paged, Progress, Small};
+use crate::budget::Budget;
 use crate::chats::{self, ChatFile, ChatRef, Cursor, Kind, Month, Page};
 use crate::lanes::{self, Lanes, Link, Tuning};
 use crate::places::{self, Paging, Places};
@@ -192,9 +193,9 @@ struct Shared {
     channel: PeerRef,
     /// Until when (seconds since 1970) each request waiting now waits.
     waits: std::sync::Mutex<Vec<i64>>,
-    /// The budget of file parts in flight; replaced whole when tuned.
-    parts: std::sync::Mutex<Arc<Semaphore>>,
-    parts_at_once: AtomicUsize,
+    /// The file parts in flight, both ways together: one budget for the account's life, made
+    /// bigger or smaller in place when tuned.
+    budget: Budget,
     sends: Semaphore,
     /// The DCs this session was authorized in, besides its own.
     authorized: AsyncMutex<Vec<i32>>,
@@ -389,11 +390,6 @@ impl Shared {
         Ok(())
     }
 
-    /// The budget of file parts in flight, as tuned now.
-    fn budget(&self) -> Arc<Semaphore> {
-        self.parts.lock().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-
     /// The media address of `dc`, if it has one: Telegram's list is asked once, and again a
     /// while after asking failed (the downloads meanwhile go the DC's own way).
     async fn media_of(&self, dc: i32) -> Option<SocketAddrV4> {
@@ -505,9 +501,8 @@ impl Shared {
 
     /// One part of a file, from wherever Telegram keeps it.
     async fn part(self: &Arc<Self>, location: &tl::enums::InputFileLocation, dc: &mut i32, offset: i64, cancel: &AtomicBool) -> Result<Vec<u8>> {
-        let budget = self.budget();
         loop {
-            let _slot = budget.acquire().await.map_err(|e| e.to_string())?;
+            let _slot = self.budget.take().await;
             let request = tl::functions::upload::GetFile { precise: true, cdn_supported: false, location: location.clone(), offset, limit: PART as i32 };
             let here = *dc;
             self.grow(here, true).await;
@@ -737,13 +732,11 @@ impl Real {
     /// The account behind `conn`, storing in `channel`.
     pub fn new(conn: Conn, channel: PeerRef, premium: bool) -> Real {
         let tuning = if premium { PREMIUM } else { FREE };
-        let parts = tuning.parts;
         let shared = Arc::new(Shared {
             client: conn.client.clone(),
             channel,
             waits: std::sync::Mutex::new(Vec::new()),
-            parts: std::sync::Mutex::new(Arc::new(Semaphore::new(parts))),
-            parts_at_once: AtomicUsize::new(parts),
+            budget: Budget::new(tuning.parts),
             sends: Semaphore::new(1),
             authorized: AsyncMutex::new(Vec::new()),
             session: conn.session.clone(),
@@ -761,7 +754,7 @@ impl Real {
     /// Parts of one upload in flight: [`UPLOAD_AT_ONCE`] a connection, within the budget.
     fn upload_at_once(&self) -> usize {
         let s = &self.shared;
-        (UPLOAD_AT_ONCE * s.lanes.general()).min(s.parts_at_once.load(Ordering::SeqCst)).max(1)
+        (UPLOAD_AT_ONCE * s.lanes.general()).min(s.budget.size()).max(1)
     }
 
     fn block<F: Future>(&self, f: F) -> F::Output {
@@ -821,9 +814,9 @@ impl Real {
                     return stop(&mut set, &cancel);
                 }
             }
-            let (s, cancel, budget) = (self.shared.clone(), cancel.clone(), self.shared.budget());
+            let (s, cancel) = (self.shared.clone(), cancel.clone());
             set.spawn(async move {
-                let _slot = budget.acquire().await.map_err(|e| e.to_string())?;
+                let _slot = s.budget.take().await;
                 let home = s.session.home();
                 s.grow(home, false).await;
                 let ok = s
@@ -1154,8 +1147,7 @@ impl Backend for Real {
 
     fn tune(&self, tuning: Tuning) {
         let s = &self.shared;
-        s.parts_at_once.store(tuning.parts.max(1), Ordering::SeqCst);
-        *s.parts.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(Semaphore::new(tuning.parts.max(1)));
+        s.budget.resize(tuning.parts);
         s.lanes.tune(tuning.general, tuning.media);
     }
 }
@@ -1452,7 +1444,7 @@ impl Real {
         let count = size.div_ceil(PART as u64) as usize;
         // Each part waits its turn in the account's budget; no more than twice that many
         // parts wait in memory to be written in order.
-        let at_once = self.shared.parts_at_once.load(Ordering::SeqCst);
+        let at_once = self.shared.budget.size();
         let window = Arc::new(Semaphore::new(at_once * 2));
         let next = Arc::new(AtomicUsize::new(0));
         let cancel = Arc::new(AtomicBool::new(false));

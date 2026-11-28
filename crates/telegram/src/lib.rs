@@ -24,6 +24,7 @@
 
 pub mod account;
 pub mod backend;
+pub mod budget;
 pub mod cache;
 pub mod chats;
 pub mod lanes;
