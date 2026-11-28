@@ -15,16 +15,21 @@
 //!   some seconds. More at once doesn't help; small files go ten to a message group instead.
 //! - A message's file is at most 4000 parts of 512 KiB (about 2000 MiB), 8000 with Premium; a
 //!   bigger file goes in several messages (`records`, `account`).
-//! - Parts go 512 KiB a request. One connection to a DC carries only so much: like Telegram's own
-//!   apps, an account spreads its parts over several (8 with Premium), which took a Premium
-//!   account from ~17 to ~40 MiB/s down and from ~9 to ~33 up (see `real`).
+//! - Parts go 512 KiB a request, over connections of their own. A download goes over one to
+//!   the DC's media address, as in Telegram's own apps: 42 to 50 MiB/s on a Premium account,
+//!   against 24 to 29 over four to the DC's own address. An upload is shared out among those
+//!   four, each good for some 7 MiB/s (see `lanes` and `real`).
+//! - A file's place is asked with the page of history around it, so a folder of small files
+//!   comes down with one request a file, not two (see `places`).
 
 pub mod account;
 pub mod backend;
 pub mod cache;
 pub mod chats;
+pub mod lanes;
 pub mod login;
 pub mod open;
+pub mod places;
 pub mod real;
 pub mod records;
 pub mod session;

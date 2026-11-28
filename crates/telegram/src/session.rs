@@ -121,6 +121,14 @@ impl KeyringSession {
         KeyringSession { data: Mutex::new(copy), name: Mutex::new(None) }
     }
 
+    /// Connects to DC `dc` at `address` from now on: the DC's media address, for a copy that
+    /// carries downloads (see `real`).
+    pub fn set_address(&self, dc: i32, address: SocketAddrV4) {
+        if let Some(o) = self.data.lock().unwrap_or_else(|e| e.into_inner()).dc_options.get_mut(&dc) {
+            o.ipv4 = address;
+        }
+    }
+
     /// This session's own DC.
     pub fn home(&self) -> i32 {
         self.data.lock().unwrap_or_else(|e| e.into_inner()).home_dc

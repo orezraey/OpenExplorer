@@ -10,10 +10,11 @@
 //!
 //! # How much at once
 //!
-//! Requests that carry file parts (both ways) share one budget per account, and go over several
-//! connections to the DC, as Telegram's own apps do (TDLib, Android, Desktop: up to 8 per DC):
-//! each connection is a session of its own over the account's key, and a part goes to the one
-//! with the fewest in flight. The extra connections run on copies of the session that save
+//! Requests that carry file parts (both ways) share one budget per account, and go over
+//! connections of their own to the DC, as in Telegram's own apps (TDLib, Android, Desktop): each
+//! is a session of its own over the account's key. A download goes over one to the DC's media
+//! address, an upload is shared out among several to the DC's own (`lanes` has which, and what
+//! each was measured to bring). The extra connections run on copies of the session that save
 //! nothing, made once the account's own connection holds an authorized key for that DC. One that
 //! breaks is dropped, and that DC gets one fewer for a while. Messages are sent one at a time per account:
 //! Telegram paces them anyway, and several at once only collect several waits.
@@ -21,6 +22,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::{Read, Write};
+use std::net::SocketAddrV4;
 use std::num::NonZeroU32;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -31,7 +33,7 @@ use grammers_client::media::{Downloadable, InputMedia, Media, Uploaded};
 use grammers_client::message::InputMessage;
 use grammers_client::{Client, InvocationError};
 use grammers_mtsender::{ConnectionParams, RetryContext, RetryPolicy, SenderPool, SenderPoolHandle};
-use grammers_session::types::{PeerAuth, PeerId, PeerRef};
+use grammers_session::types::{PeerAuth, PeerId, PeerKind, PeerRef};
 use grammers_tl_types as tl;
 use openexplorer_i18n::{t, tr};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc};
@@ -39,6 +41,8 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc};
 use crate::account::now;
 use crate::backend::{Backend, Changes, Paged, Progress, Small};
 use crate::chats::{self, ChatFile, ChatRef, Cursor, Kind, Month, Page};
+use crate::lanes::{self, Lanes, Link, Tuning};
+use crate::places::{self, Places};
 use crate::session::KeyringSession;
 use crate::tree::{Doc, Msg};
 use crate::{CANCELLED, Result};
@@ -48,25 +52,31 @@ pub const PART: usize = 512 * 1024;
 
 /// Above this a file goes in "big file" parts.
 const BIG: u64 = 10 * 1024 * 1024;
-/// Connections per DC that carry file parts, and file-part requests in flight per account, for a
-/// Premium account and a free one. Telegram's own apps open 8 per DC for Premium (TDLib, Android).
-/// On a real Premium account (`tests/real_account.rs`, `speed_by_connections`: 100 MiB down and
-/// 40 MiB up, variants interleaved, median of 4 rounds) one connection with 12 parts in flight did
-/// 16.7 MiB/s down and 8.6 up; 8 with 32 did 40.7 and 33.4, against 24.9 and 25.8 for 4 with 16
-/// and 19.8 and 20.2 for 8 with 16: 8 connections need enough parts in flight. Measured again on
-/// 2026-11-23, 8 with 32 lost: a 374.5 MiB file of a chat (`speed_of_the_big_chat_file_by_connections`,
-/// interleaved, median of 3) came down at 12.9 MiB/s against 28.2 for 4 with 16 and 16.9 for one
-/// connection, Telegram dropping some of the 8; on the storage channel 4 with 16 did 16.9 and 30.7
-/// down and 27.0 and 27.2 up, against 33.6 and 29.5 down and 20.2 and 18.5 up for 8 with 32. Hence
-/// 4 with 16. A free account gets fewer: Telegram caps its speed anyway (FLOOD_PREMIUM_WAIT), and
-/// TDLib uses 2 to 4 there.
-pub const PREMIUM: (usize, usize) = (4, 16);
-pub const FREE: (usize, usize) = (4, 16);
+/// The connections and the file parts in flight of a Premium account and of a free one (`lanes`
+/// has what each was measured to bring). Four connections to the DC's own address fill a
+/// 31 MiB/s line with an upload, one to its media address brings a download faster than any
+/// other number that lasted, and 32 parts in flight bought nothing over 16 on it. Telegram's
+/// own apps open more (8 each way with Premium): here 8 to the media address were fast for one
+/// run and closed by Telegram in every run after, and 32 parts in flight over 4 or 8 to the
+/// DC's own address were refused (`-429`). Why isn't known; those runs came after others that
+/// had asked for more still. A free account wasn't measured: it gets the same, and Telegram
+/// caps its speed anyway (FLOOD_PREMIUM_WAIT).
+pub const PREMIUM: Tuning = Tuning { general: 4, media: 1, parts: 16 };
+pub const FREE: Tuning = Tuning { general: 4, media: 1, parts: 16 };
 /// Parts of one upload in flight.
 const UPLOAD_AT_ONCE: usize = 4;
 /// How long a DC keeps the fewer connections it was left with when one broke: a short network
 /// drop breaks them all, and the speed should come back after it.
 const CEILING_FOR: Duration = Duration::from_secs(60);
+/// How long a file's place counts as known (see `places`), and how many are kept. Telegram's
+/// references to a file last hours; a download that starts on one this old still ends in time.
+const PLACE_FRESH: Duration = Duration::from_secs(10 * 60);
+const PLACES: usize = 20_000;
+/// What a part answers when Telegram no longer takes the file's place: never shown as it is.
+const STALE: &str = "FILE_REFERENCE";
+/// How long a connection being made has to answer the first request sent over it: connecting
+/// and that answer take half a second from far away, a part of 512 KiB on a slow line more.
+const FIRST_ANSWER: Duration = Duration::from_secs(15);
 /// Waits longer than this fail rather than hold a transfer for so long.
 const LONGEST_WAIT: u64 = 15 * 60;
 /// FLOOD_WAITs this short grammers waits out by itself.
@@ -188,24 +198,37 @@ struct Shared {
     authorized: AsyncMutex<Vec<i32>>,
     session: Arc<KeyringSession>,
     api_id: i32,
-    main: SenderPoolHandle,
-    /// Per DC, the connections file parts go over: the account's own first.
-    lanes: std::sync::Mutex<HashMap<i32, Vec<Arc<Lane>>>>,
-    /// Connections per DC wanted, and per DC the most it takes (one fewer each time one broke)
-    /// and since when: it lasts [`CEILING_FOR`].
-    connections: AtomicUsize,
-    ceiling: std::sync::Mutex<HashMap<i32, (usize, Instant)>>,
+    /// The connections file parts go over.
+    lanes: Lanes<SenderPoolHandle>,
+    media: AsyncMutex<MediaList>,
 }
 
-/// One connection to a DC that file parts go over.
-struct Lane {
-    handle: SenderPoolHandle,
-    busy: AtomicUsize,
-    /// The account's own connection: never dropped.
-    main: bool,
-    /// It answered once: connected. Until then it takes one request at a time (which connects
-    /// it), so parts don't wait behind a connection still being made.
-    ready: AtomicBool,
+/// Each DC's media address, once Telegram's list of them was asked; and when asking failed
+/// last, not to ask with every part.
+#[derive(Default)]
+struct MediaList {
+    known: Option<HashMap<i32, SocketAddrV4>>,
+    failed: Option<Instant>,
+}
+
+impl Link for SenderPoolHandle {
+    fn quit(&self) {
+        SenderPoolHandle::quit(self);
+    }
+}
+
+/// Each DC's address kept for files, from Telegram's list of its DCs' addresses: an IPv4 one
+/// that takes a plain connection, and not a CDN's (those hold other files, under other keys).
+pub fn media_addresses(options: &[tl::enums::DcOption]) -> HashMap<i32, SocketAddrV4> {
+    let mut out = HashMap::new();
+    for tl::enums::DcOption::Option(o) in options {
+        if o.media_only && !o.cdn && !o.ipv6 && !o.tcpo_only
+            && let (Ok(ip), Ok(port)) = (o.ip_address.parse(), u16::try_from(o.port))
+        {
+            out.entry(o.id).or_insert(SocketAddrV4::new(ip, port));
+        }
+    }
+    out
 }
 
 /// Counts a request as in flight on a lane until dropped, also when its task is aborted.
@@ -225,9 +248,12 @@ impl Drop for Busy<'_> {
 }
 
 /// An error after which an extra connection is no use: it ended, or its key isn't known there.
-fn broken(e: &InvocationError) -> bool {
+/// One that never answered (`answered`: it did) is no use either when it can't be reached: the
+/// media address may be closed to a network that reaches the DC's own.
+fn broken(e: &InvocationError, answered: bool) -> bool {
     matches!(e, InvocationError::Dropped(_) | InvocationError::Transport(_) | InvocationError::Authentication(_) | InvocationError::Deserialize(_))
         || matches!(e, InvocationError::Rpc(r) if r.name == "AUTH_KEY_UNREGISTERED")
+        || (!answered && matches!(e, InvocationError::Io(_)))
 }
 
 /// How many waits Telegram asked for in this process, and their seconds: for logs and tests.
@@ -239,6 +265,22 @@ pub static PREMIUM_WAITS: AtomicUsize = AtomicUsize::new(0);
 pub static DROPPED_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// The extra connections dropped in this process, and why: for logs and tests.
 pub static DROPPED_LANES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// The transport-level refusals (`-429`) in this process, on any connection: for logs and tests.
+pub static REFUSALS: AtomicUsize = AtomicUsize::new(0);
+/// What happened lately to the connections that carry file parts, and when: for the benchmark.
+pub static EVENTS: std::sync::Mutex<Vec<(Instant, String)>> = std::sync::Mutex::new(Vec::new());
+
+fn note(event: String) {
+    let mut events = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+    // An app open for days keeps the last few hundred, not all.
+    if events.len() >= 400 {
+        events.drain(..200);
+    }
+    events.push((Instant::now(), event));
+}
+
+/// The requests made to ask where files are kept (see `places`): for the benchmark.
+pub static PLACE_ASKS: AtomicUsize = AtomicUsize::new(0);
 
 /// A flag nothing sets: for requests no one cancels.
 static NEVER: AtomicBool = AtomicBool::new(false);
@@ -285,11 +327,14 @@ impl Shared {
                     self.wait(secs, cancel).await?;
                 }
                 Err(e) if too_many(&e) && busy < 6 => {
+                    REFUSALS.fetch_add(1, Ordering::Relaxed);
+                    note("the account's own connection was refused (-429)".to_string());
                     busy += 1;
                     self.wait(1 << busy.min(4), cancel).await?;
                 }
                 Err(e) if dropped(&e) && ended < drops => {
                     DROPPED_CALLS.fetch_add(1, Ordering::Relaxed);
+                    note(format!("a request's connection ended: {e}"));
                     // A pause of ours, not a wait Telegram asked for: the queue doesn't show it.
                     let end = Instant::now() + Duration::from_secs(1 << ended.min(2));
                     while Instant::now() < end {
@@ -349,69 +394,66 @@ impl Shared {
         self.parts.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// The connections to `dc` file parts go over: at least the account's own.
-    fn lanes(&self, dc: i32) -> Vec<Arc<Lane>> {
-        let mut all = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
-        all.entry(dc).or_insert_with(|| vec![self.main_lane()]).clone()
-    }
-
-    fn main_lane(&self) -> Arc<Lane> {
-        Arc::new(Lane { handle: self.main.clone(), busy: AtomicUsize::new(0), main: true, ready: AtomicBool::new(true) })
-    }
-
-    /// How many connections `dc` should have now.
-    fn wanted(&self, dc: i32) -> usize {
-        let ceiling = self.ceiling.lock().unwrap_or_else(|e| e.into_inner()).get(&dc).filter(|(_, at)| at.elapsed() < CEILING_FOR).map_or(usize::MAX, |(n, _)| *n);
-        self.connections.load(Ordering::SeqCst).min(ceiling).max(1)
-    }
-
-    /// Opens extra connections to `dc` up to the number wanted, once the account's own holds a
-    /// key there that's authorized (its own DC, or one it imported its authorization into): the
-    /// copies then carry that key and need nothing of their own.
-    async fn grow(&self, dc: i32) {
-        if self.lanes(dc).len() >= self.wanted(dc) || !self.session.has_key(dc) || (dc != self.session.home() && !self.authorized.lock().await.contains(&dc)) {
-            return;
-        }
-        // Counted again under the lock: the parts of a transfer all get here at once.
-        let want = self.wanted(dc);
-        let mut all = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
-        let lanes = all.entry(dc).or_insert_with(|| vec![self.main_lane()]);
-        while lanes.len() < want {
-            let SenderPool { runner, handle, .. } = SenderPool::with_configuration(Arc::new(self.session.unsaved_copy()), self.api_id, params());
-            tokio::spawn(runner.run());
-            lanes.push(Arc::new(Lane { handle: handle.thin.clone(), busy: AtomicUsize::new(0), main: false, ready: AtomicBool::new(false) }));
-        }
-    }
-
-    /// Drops an extra connection that broke; `dc` takes one fewer from now on.
-    fn drop_lane(&self, dc: i32, lane: &Arc<Lane>) {
-        let mut all = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(lanes) = all.get_mut(&dc) {
-            let before = lanes.len();
-            lanes.retain(|l| !Arc::ptr_eq(l, lane));
-            if lanes.len() < before {
-                lane.handle.quit();
-                self.ceiling.lock().unwrap_or_else(|e| e.into_inner()).insert(dc, (lanes.len().max(1), Instant::now()));
+    /// The media address of `dc`, if it has one: Telegram's list is asked once, and again a
+    /// while after asking failed (the downloads meanwhile go the DC's own way).
+    async fn media_of(&self, dc: i32) -> Option<SocketAddrV4> {
+        let mut list = self.media.lock().await;
+        if list.known.is_none() && list.failed.is_none_or(|at| at.elapsed() >= CEILING_FOR) {
+            // The parts of a transfer all wait here for the one that asks.
+            match self.client.invoke(&tl::functions::help::GetConfig {}).await {
+                Ok(tl::enums::Config::Config(c)) => list.known = Some(media_addresses(&c.dc_options)),
+                Err(_) => list.failed = Some(Instant::now()),
             }
         }
+        list.known.as_ref()?.get(&dc).copied()
     }
 
-    /// Sends a file-part request to `dc` over its least busy connection; an extra connection
-    /// that broke is dropped and the request goes over another.
-    async fn call_in<R: tl::RemoteCall>(&self, dc: i32, request: &R) -> std::result::Result<R::Return, InvocationError> {
+    /// A connection of its own to `dc`, at `address` rather than where the account's goes.
+    fn open(&self, dc: i32, address: Option<SocketAddrV4>) -> SenderPoolHandle {
+        let copy = self.session.unsaved_copy();
+        if let Some(address) = address {
+            copy.set_address(dc, address);
+        }
+        let SenderPool { runner, handle, .. } = SenderPool::with_configuration(Arc::new(copy), self.api_id, params());
+        tokio::spawn(runner.run());
+        note(format!("DC {dc}: a connection opened to {}", if address.is_some() { "its media address" } else { "its own address" }));
+        handle.thin.clone()
+    }
+
+    /// Opens the connections a file part to `dc` goes over (a download's when `down`), the ones
+    /// `lanes` says are missing, once the account's own holds a key there that's authorized (its
+    /// own DC, or one it imported its authorization into): the copies then carry that key and
+    /// need nothing of their own.
+    async fn grow(&self, dc: i32, down: bool) {
+        let media = if down && self.lanes.takes_media(dc) { self.media_of(dc).await } else { None };
+        let Some(kind) = self.lanes.to_open(dc, down, media.is_some()) else { return };
+        if !self.session.has_key(dc) || (dc != self.session.home() && !self.authorized.lock().await.contains(&dc)) {
+            return;
+        }
+        let address = media.filter(|_| kind == lanes::Kind::Media);
+        self.lanes.grow(dc, kind, || self.open(dc, address));
+    }
+
+    /// Sends a file-part request to `dc` (a download's when `down`) over the connection `lanes`
+    /// picks; an extra connection that broke is dropped and the request goes over another.
+    async fn call_in<R: tl::RemoteCall>(&self, dc: i32, down: bool, request: &R) -> std::result::Result<R::Return, InvocationError> {
         loop {
-            let lane = self
-                .lanes(dc)
-                .into_iter()
-                .filter(|l| l.ready.load(Ordering::SeqCst) || l.busy.load(Ordering::SeqCst) == 0)
-                .min_by_key(|l| l.busy.load(Ordering::SeqCst))
-                .expect("the account's own connection is always ready");
+            let lane = self.lanes.pick(dc, down);
+            let answered = lane.is_ready();
             let answer = {
                 let _busy = Busy::on(&lane.busy);
-                lane.handle.invoke_in_dc(dc, request).await
+                let asked = lane.link.invoke_in_dc(dc, request);
+                // A connection being made gets so long to answer its first request, and no
+                // longer: an address that swallows the connection would hold this part, and the
+                // download behind it, for minutes.
+                if answered || lane.main {
+                    asked.await
+                } else {
+                    tokio::time::timeout(FIRST_ANSWER, asked).await.unwrap_or(Err(InvocationError::Dropped("no answer from a new connection")))
+                }
             };
             if answer.is_ok() {
-                lane.ready.store(true, Ordering::SeqCst);
+                lane.answered();
                 // The account's key answered there: it's authorized, also when that was done in
                 // an earlier run, so the extra connections may go there too.
                 if lane.main && dc != self.session.home() {
@@ -422,9 +464,15 @@ impl Shared {
                 }
             }
             match &answer {
-                Err(e) if !lane.main && broken(e) => {
-                    DROPPED_LANES.lock().unwrap_or_else(|e| e.into_inner()).push(format!("DC {dc}: {e}"));
-                    self.drop_lane(dc, &lane)
+                Err(e) if !lane.main && broken(e, answered) => {
+                    if too_many(e) {
+                        REFUSALS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let busy = lane.busy.load(Ordering::SeqCst) + 1;
+                    if self.lanes.drop_lane(dc, &lane) {
+                        DROPPED_LANES.lock().unwrap_or_else(|e| e.into_inner()).push(format!("DC {dc}: {e}"));
+                        note(format!("DC {dc}: connection dropped {:.1} s after it opened, {busy} requests on it: {e}", lane.age().as_secs_f64()));
+                    }
                 }
                 _ => return answer,
             }
@@ -438,12 +486,13 @@ impl Shared {
             let _slot = budget.acquire().await.map_err(|e| e.to_string())?;
             let request = tl::functions::upload::GetFile { precise: true, cdn_supported: false, location: location.clone(), offset, limit: PART as i32 };
             let here = *dc;
-            self.grow(here).await;
+            self.grow(here, true).await;
             let got = self
                 .patient(cancel, || async {
-                    match self.call_in(here, &request).await {
-                        // Moves and missing authorizations come back to be handled below.
-                        Err(InvocationError::Rpc(e)) if e.code == 303 || e.name == "AUTH_KEY_UNREGISTERED" => Ok(Err(e)),
+                    match self.call_in(here, true, &request).await {
+                        // Moves, missing authorizations and a place gone stale come back to be
+                        // handled below.
+                        Err(InvocationError::Rpc(e)) if e.code == 303 || e.name == "AUTH_KEY_UNREGISTERED" || e.name.starts_with("FILE_REFERENCE_") => Ok(Err(e)),
                         other => other.map(Ok),
                     }
                 })
@@ -452,16 +501,29 @@ impl Shared {
                 Ok(tl::enums::upload::File::File(f)) => return Ok(f.bytes),
                 Ok(tl::enums::upload::File::CdnRedirect(_)) => return Err(t("O Telegram mandou baixar de uma CDN, o que o Open Explorer ainda não faz.", "Telegram sent the download to a CDN, which Open Explorer doesn't do yet.").into()),
                 Err(e) if e.code == 303 => *dc = e.value.ok_or("FILE_MIGRATE")? as i32,
+                Err(e) if e.name.starts_with("FILE_REFERENCE_") => return Err(STALE.into()),
                 Err(_) => self.authorize_in(here).await?,
             }
         }
     }
 }
 
+/// Where Telegram keeps a message's file, as a download asks for it.
+#[derive(Clone)]
+struct Place {
+    location: tl::enums::InputFileLocation,
+    dc: i32,
+    size: u64,
+}
+
 pub struct Real {
     conn: Conn,
     shared: Arc<Shared>,
     premium: bool,
+    /// The places of the files asked about lately, by chat and message.
+    places: Places<(PeerId, i32), Place>,
+    /// One download asks about places at a time: those waiting find theirs came with its answer.
+    finding: AsyncMutex<()>,
     /// The account's own user, as Saved Messages' files are fetched by: asked once.
     me: std::sync::OnceLock<PeerRef>,
 }
@@ -647,7 +709,8 @@ fn read_full(src: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<usize> {
 impl Real {
     /// The account behind `conn`, storing in `channel`.
     pub fn new(conn: Conn, channel: PeerRef, premium: bool) -> Real {
-        let (connections, parts) = if premium { PREMIUM } else { FREE };
+        let tuning = if premium { PREMIUM } else { FREE };
+        let parts = tuning.parts;
         let shared = Arc::new(Shared {
             client: conn.client.clone(),
             channel,
@@ -658,12 +721,10 @@ impl Real {
             authorized: AsyncMutex::new(Vec::new()),
             session: conn.session.clone(),
             api_id: conn.api_id,
-            main: conn.main.clone(),
-            lanes: std::sync::Mutex::new(HashMap::new()),
-            connections: AtomicUsize::new(connections),
-            ceiling: std::sync::Mutex::new(HashMap::new()),
+            lanes: Lanes::new(conn.main.clone(), tuning, CEILING_FOR),
+            media: AsyncMutex::default(),
         });
-        Real { conn, shared, premium, me: std::sync::OnceLock::new() }
+        Real { conn, shared, premium, places: Places::new(PLACE_FRESH, PLACES), finding: AsyncMutex::new(()), me: std::sync::OnceLock::new() }
     }
 
     pub fn session(&self) -> &Arc<KeyringSession> {
@@ -673,7 +734,7 @@ impl Real {
     /// Parts of one upload in flight: [`UPLOAD_AT_ONCE`] a connection, within the budget.
     fn upload_at_once(&self) -> usize {
         let s = &self.shared;
-        (UPLOAD_AT_ONCE * s.connections.load(Ordering::SeqCst).max(1)).min(s.parts_at_once.load(Ordering::SeqCst)).max(1)
+        (UPLOAD_AT_ONCE * s.lanes.general()).min(s.parts_at_once.load(Ordering::SeqCst)).max(1)
     }
 
     fn block<F: Future>(&self, f: F) -> F::Output {
@@ -737,13 +798,13 @@ impl Real {
             set.spawn(async move {
                 let _slot = budget.acquire().await.map_err(|e| e.to_string())?;
                 let home = s.session.home();
-                s.grow(home).await;
+                s.grow(home, false).await;
                 let ok = s
                     .patient(&cancel, || async {
                         if big {
-                            s.call_in(home, &tl::functions::upload::SaveBigFilePart { file_id, file_part: part, file_total_parts: parts, bytes: buf.clone() }).await
+                            s.call_in(home, false, &tl::functions::upload::SaveBigFilePart { file_id, file_part: part, file_total_parts: parts, bytes: buf.clone() }).await
                         } else {
-                            s.call_in(home, &tl::functions::upload::SaveFilePart { file_id, file_part: part, bytes: buf.clone() }).await
+                            s.call_in(home, false, &tl::functions::upload::SaveFilePart { file_id, file_part: part, bytes: buf.clone() }).await
                         }
                     })
                     .await?;
@@ -1038,26 +1099,14 @@ impl Backend for Real {
     }
 
     fn connections_open(&self) -> Vec<(i32, usize)> {
-        let mut open: Vec<(i32, usize)> = self.shared.lanes.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(dc, l)| (*dc, l.len())).collect();
-        open.sort();
-        open
+        self.shared.lanes.open()
     }
 
-    fn tune(&self, connections: usize, parts: usize) {
+    fn tune(&self, tuning: Tuning) {
         let s = &self.shared;
-        s.connections.store(connections.max(1), Ordering::SeqCst);
-        s.parts_at_once.store(parts.max(1), Ordering::SeqCst);
-        *s.parts.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(Semaphore::new(parts.max(1)));
-        // Fewer connections: the extra ones beyond go now.
-        let mut all = s.lanes.lock().unwrap_or_else(|e| e.into_inner());
-        for lanes in all.values_mut() {
-            while lanes.len() > connections.max(1) {
-                if let Some(lane) = lanes.pop() {
-                    lane.handle.quit();
-                }
-            }
-        }
-        s.ceiling.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        s.parts_at_once.store(tuning.parts.max(1), Ordering::SeqCst);
+        *s.parts.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(Semaphore::new(tuning.parts.max(1)));
+        s.lanes.tune(tuning.general, tuning.media);
     }
 }
 
@@ -1260,82 +1309,174 @@ impl Real {
         Ok(out)
     }
 
-    /// Writes the file of message `id` of `peer` to `out`.
+    /// The place of the file of message `id` of `peer`, asked of Telegram. In a channel the
+    /// page of its history around the message is what's asked, and the places of the files
+    /// there are kept (see `places`); one download asks at a time, so the others find theirs
+    /// came with its answer.
+    async fn find(&self, peer: PeerRef, id: i32) -> Result<Place> {
+        let s = &self.shared;
+        let _turn = self.finding.lock().await;
+        if let Some(place) = self.places.get(&(peer.id, id)) {
+            return Ok(place);
+        }
+        PLACE_ASKS.fetch_add(1, Ordering::Relaxed);
+        let page: Vec<tl::enums::Message> = if peer.id.kind() == PeerKind::Channel {
+            let request = tl::functions::messages::GetHistory { peer: peer.into(), offset_id: places::page_from(id), offset_date: 0, add_offset: 0, limit: places::PAGE, max_id: 0, min_id: 0, hash: 0 };
+            messages_of(s.patient(&NEVER, || s.client.invoke(&request)).await?)
+        } else {
+            let ids = [id];
+            s.patient(&NEVER, || s.client.get_messages_by_id(peer, &ids)).await?.into_iter().flatten().map(|m| m.raw).collect()
+        };
+        let mut found = None;
+        for m in &page {
+            let tl::enums::Message::Message(m) = m else { continue };
+            let place = m.media.clone().and_then(Media::from_raw).and_then(|media| Some(Place { location: media.to_raw_input_location()?, dc: media.dc_id()?, size: media.size().unwrap_or(0) as u64 }));
+            if m.id == id {
+                found = Some(place.clone().ok_or_else(|| t("A mensagem não tem arquivo, ou o Telegram não disse onde ele está.", "The message has no file, or Telegram didn't say where it is.").to_string()));
+            }
+            if let Some(place) = place {
+                self.places.put((peer.id, m.id), place);
+            }
+        }
+        found.unwrap_or_else(|| Err(t("O arquivo não existe mais no Telegram.", "The file doesn't exist on Telegram anymore.").into()))
+    }
+
+    /// Writes the file of message `id` of `peer` to `out`: from the place kept for it, or asked
+    /// now; a kept one that Telegram no longer takes is asked anew, once.
     fn download_in(&self, peer: PeerRef, id: i32, out: &mut dyn Write, progress: Progress) -> Result<()> {
         self.block(async {
-            let m = self.fetch(peer, id).await?;
-            let media: Media = m.media().ok_or_else(|| t("A mensagem não tem arquivo.", "The message has no file.").to_string())?;
-            let location = media.to_raw_input_location().ok_or_else(|| t("O Telegram não deu o local do arquivo.", "Telegram didn't give the file's location.").to_string())?;
-            let size = media.size().unwrap_or(0) as u64;
-            let dc = media.dc_id().ok_or_else(|| t("O Telegram não disse onde o arquivo está.", "Telegram didn't say where the file is.").to_string())?;
-            let count = size.div_ceil(PART as u64) as usize;
-            // Each part waits its turn in the account's budget; no more than twice that many
-            // parts wait in memory to be written in order.
-            let at_once = self.shared.parts_at_once.load(Ordering::SeqCst);
-            let window = Arc::new(Semaphore::new(at_once * 2));
-            let next = Arc::new(AtomicUsize::new(0));
-            let cancel = Arc::new(AtomicBool::new(false));
-            let (tx, mut rx) = mpsc::unbounded_channel();
-            let mut tasks = tokio::task::JoinSet::new();
-            for _ in 0..at_once.min(count.max(1)) {
-                let (s, location, window, next, cancel, tx) = (self.shared.clone(), location.clone(), window.clone(), next.clone(), cancel.clone(), tx.clone());
-                tasks.spawn(async move {
-                    let mut dc = dc;
-                    loop {
-                        let held = window.clone().acquire_owned().await.map_err(|e| e.to_string())?;
-                        let i = next.fetch_add(1, Ordering::SeqCst);
-                        if i >= count {
-                            return Ok(());
-                        }
-                        let bytes = s.part(&location, &mut dc, (i * PART) as i64, &cancel).await?;
-                        if tx.send((i, bytes, held)).is_err() {
-                            return Ok(());
-                        }
-                    }
-                });
-            }
-            drop(tx);
-            let mut waiting = std::collections::BTreeMap::new();
-            let (mut at, mut written) = (0usize, 0u64);
-            let failed = 'run: loop {
-                match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
-                    Ok(Some((i, bytes, held))) => {
-                        waiting.insert(i, (bytes, held));
-                        while let Some((bytes, _held)) = waiting.remove(&at) {
-                            if let Err(e) = out.write_all(&bytes) {
-                                break 'run Some(tr!("Não consegui gravar o arquivo: {e}", "Couldn't write the file: {e}"));
-                            }
-                            written += bytes.len() as u64;
-                            at += 1;
-                        }
-                    }
-                    Ok(None) => break None,
-                    Err(_) => {}
-                }
-                // A part that failed never arrives: its error ends the download.
-                while let Some(r) = tasks.try_join_next() {
-                    match r {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => break 'run Some(e),
-                        Err(e) => break 'run Some(e.to_string()),
-                    }
-                }
-                if !progress(written) {
-                    break Some(CANCELLED.to_string());
-                }
+            let key = (peer.id, id);
+            let kept = self.places.get(&key);
+            let place = match &kept {
+                Some(place) => place.clone(),
+                None => self.find(peer, id).await?,
             };
-            if let Some(e) = failed {
-                cancel.store(true, Ordering::SeqCst);
-                tasks.abort_all();
-                return Err(e);
+            let mut written = 0;
+            let mut result = self.bring(&place, &mut *out, &mut *progress, &mut written).await;
+            if places::asks_again(kept.is_some(), result.as_ref().is_err_and(|e| e == STALE), written) {
+                self.places.forget(&key);
+                let place = self.find(peer, id).await?;
+                result = self.bring(&place, out, progress, &mut written).await;
             }
-            while let Some(r) = tasks.join_next().await {
-                r.map_err(|e| e.to_string())??;
-            }
-            if written != size {
-                return Err(tr!("O download parou em {written} de {size} bytes.", "The download stopped at {written} of {size} bytes."));
-            }
-            Ok(())
+            result.map_err(|e| if e == STALE { t("O Telegram deixou de aceitar o endereço deste arquivo no meio do download. Tente de novo.", "Telegram stopped taking this file's address halfway through the download. Try again.").into() } else { e })
         })
+    }
+
+    /// Writes the file at `place` to `out`, its parts fetched several at a time and written in
+    /// order; `written` counts the bytes that reached `out`.
+    async fn bring(&self, place: &Place, out: &mut dyn Write, progress: Progress<'_>, written: &mut u64) -> Result<()> {
+        let (location, size, dc) = (place.location.clone(), place.size, place.dc);
+        let count = size.div_ceil(PART as u64) as usize;
+        // Each part waits its turn in the account's budget; no more than twice that many
+        // parts wait in memory to be written in order.
+        let at_once = self.shared.parts_at_once.load(Ordering::SeqCst);
+        let window = Arc::new(Semaphore::new(at_once * 2));
+        let next = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..at_once.min(count.max(1)) {
+            let (s, location, window, next, cancel, tx) = (self.shared.clone(), location.clone(), window.clone(), next.clone(), cancel.clone(), tx.clone());
+            tasks.spawn(async move {
+                let mut dc = dc;
+                loop {
+                    let held = window.clone().acquire_owned().await.map_err(|e| e.to_string())?;
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    if i >= count {
+                        return Ok(());
+                    }
+                    let bytes = s.part(&location, &mut dc, (i * PART) as i64, &cancel).await?;
+                    if tx.send((i, bytes, held)).is_err() {
+                        return Ok(());
+                    }
+                }
+            });
+        }
+        drop(tx);
+        let mut waiting = std::collections::BTreeMap::new();
+        let mut at = 0usize;
+        let failed = 'run: loop {
+            match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
+                Ok(Some((i, bytes, held))) => {
+                    waiting.insert(i, (bytes, held));
+                    while let Some((bytes, _held)) = waiting.remove(&at) {
+                        if let Err(e) = out.write_all(&bytes) {
+                            break 'run Some(tr!("Não consegui gravar o arquivo: {e}", "Couldn't write the file: {e}"));
+                        }
+                        *written += bytes.len() as u64;
+                        at += 1;
+                    }
+                }
+                Ok(None) => break None,
+                Err(_) => {}
+            }
+            // A part that failed never arrives: its error ends the download.
+            while let Some(r) = tasks.try_join_next() {
+                match r {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => break 'run Some(e),
+                    Err(e) => break 'run Some(e.to_string()),
+                }
+            }
+            if !progress(*written) {
+                break Some(CANCELLED.to_string());
+            }
+        };
+        if let Some(e) = failed {
+            cancel.store(true, Ordering::SeqCst);
+            tasks.abort_all();
+            return Err(e);
+        }
+        while let Some(r) = tasks.join_next().await {
+            r.map_err(|e| e.to_string())??;
+        }
+        if *written != size {
+            let written = *written;
+            return Err(tr!("O download parou em {written} de {size} bytes.", "The download stopped at {written} of {size} bytes."));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn option(id: i32, ip: &str, flags: &[&str]) -> tl::enums::DcOption {
+        let has = |f: &str| flags.contains(&f);
+        tl::types::DcOption { ipv6: has("ipv6"), media_only: has("media_only"), tcpo_only: has("tcpo_only"), cdn: has("cdn"), r#static: has("static"), this_port_only: false, id, ip_address: ip.into(), port: 443, secret: None }.into()
+    }
+
+    #[test]
+    fn a_dcs_media_address_is_the_plain_ipv4_one_kept_for_files() {
+        // As Telegram lists them: each DC's own address, the one for proxies, the IPv6 ones and
+        // the media ones; a CDN's and one that takes only obfuscated connections among them.
+        let options = [
+            option(1, "149.154.175.51", &[]),
+            option(1, "149.154.175.55", &["static"]),
+            option(1, "2001:b28:f23d:f001::a", &["ipv6"]),
+            option(1, "2001:b28:f23d:f001::7", &["ipv6", "media_only"]),
+            option(1, "149.154.175.211", &["media_only"]),
+            option(2, "149.154.162.1", &["media_only", "tcpo_only"]),
+            option(2, "149.154.162.123", &["media_only"]),
+            option(3, "149.154.175.100", &[]),
+            option(4, "149.154.167.9", &["media_only", "cdn"]),
+            option(5, "not an address", &["media_only"]),
+        ];
+        let media = media_addresses(&options);
+        assert_eq!(media.get(&1), Some(&"149.154.175.211:443".parse().unwrap()));
+        assert_eq!(media.get(&2), Some(&"149.154.162.123:443".parse().unwrap()));
+        // No media address: its downloads go over the connections to its own.
+        assert_eq!((media.get(&3), media.get(&4), media.get(&5)), (None, None, None));
+    }
+
+    #[test]
+    fn an_extra_connection_is_no_use_once_it_ended_or_when_it_never_got_through() {
+        let cut = || InvocationError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        // It answered before: the connection is made again and the request asked again.
+        assert!(!broken(&cut(), true));
+        // It never did: the address can't be reached from here, so the DC's own carries on.
+        assert!(broken(&cut(), false));
+        assert!(broken(&InvocationError::Dropped("gone"), true) && broken(&InvocationError::Dropped("gone"), false));
     }
 }

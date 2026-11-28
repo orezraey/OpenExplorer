@@ -762,8 +762,8 @@ impl Account {
 
     /// Sets how many connections per DC carry file parts and how many parts may be in flight:
     /// the benchmarks, to compare.
-    pub fn tune(&self, connections: usize, parts: usize) {
-        self.backend.tune(connections, parts);
+    pub fn tune(&self, tuning: crate::lanes::Tuning) {
+        self.backend.tune(tuning);
     }
 
     /// Per DC, how many connections carry file parts now.
