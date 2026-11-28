@@ -4,7 +4,7 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use openexplorer_i18n::{t, tr};
 use russh::client::{self, Handle, KeyboardInteractiveAuthResponse};
@@ -295,6 +295,21 @@ impl Conn for Sftp {
             let _ = rt.block_on(sftp.remove_file(path));
         }
         result
+    }
+
+    fn sets_dates(&self) -> bool {
+        true
+    }
+
+    /// SETSTAT with the two times (the protocol sets them together), to the second.
+    fn set_modified(&mut self, path: &str, at: SystemTime) -> Result<bool> {
+        let secs = at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()).min(u64::from(u32::MAX)) as u32;
+        let times = russh_sftp::protocol::FileAttributes { atime: Some(secs), mtime: Some(secs), ..Default::default() };
+        match self.rt.block_on(self.sftp.set_metadata(path, times)) {
+            Ok(()) => Ok(true),
+            Err(e) if matches!(status(&e), Some(StatusCode::OpUnsupported | StatusCode::PermissionDenied)) => Ok(false),
+            Err(e) => Err(said(e)),
+        }
     }
 
     fn home(&mut self) -> Result<String> {

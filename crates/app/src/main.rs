@@ -47,6 +47,8 @@ mod rules_ui;
 mod scrollbars;
 mod servers;
 mod services;
+mod sync;
+mod sync_ui;
 mod sysicons;
 mod tabs;
 mod telegram;
@@ -134,6 +136,8 @@ enum Msg {
     Telegram(telegram::Answer),
     /// What the caches take, measured or cleared for Opções › Cache.
     Caches(caches::Answer),
+    /// Background progress or result from folder synchronization.
+    Sync(sync::Answer),
     /// Background TMDB / TVDB search, episode list or poster cover for batch rename.
     Media(media_rename::Answer),
     /// Installing the search service ended: search again in the panes `reload` shows.
@@ -168,6 +172,7 @@ pub enum MainTab {
     #[default]
     Explore,
     Accounts,
+    Sync,
 }
 
 struct State {
@@ -189,6 +194,7 @@ struct State {
     list_rows: [usize; MAX_PANES],
     accounts_filter: Option<servers::Provider>,
     accounts_search: rune::TextEdit,
+    sync: sync::SyncState,
     panes: [Pane; MAX_PANES],
     tabs: [tabs::PaneTabs; MAX_PANES],
     /// Whether each pane's left folder tree is shown.
@@ -467,6 +473,7 @@ impl State {
             list_rows: [1; MAX_PANES],
             accounts_filter: None,
             accounts_search: rune::TextEdit::new(""),
+            sync: sync::SyncState::load(),
             panes: std::array::from_fn(|_| Pane::new(loc.clone())),
             tabs: std::array::from_fn(|_| tabs::PaneTabs::initial()),
             show_tree: [true; MAX_PANES],
@@ -826,6 +833,7 @@ fn init() -> State {
         list_rows: [1; MAX_PANES],
         accounts_filter: None,
         accounts_search: rune::TextEdit::new(""),
+        sync: sync::SyncState::load(),
         panes,
         tabs: std::array::from_fn(|_| tabs::PaneTabs::initial()),
         show_tree: [true; MAX_PANES],
@@ -1591,6 +1599,9 @@ fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             Msg::OneDrive(answer) => onedrive::arrived(s, answer, tx, now),
             Msg::Telegram(answer) => telegram::arrived(s, answer),
             Msg::Caches(answer) => caches::arrived(s, answer),
+            Msg::Sync(answer) => {
+                changed |= sync::arrived(s, answer);
+            }
             Msg::Media(answer) => media_rename::arrived(s, answer),
             Msg::Changes { email, result } => watch::arrived(s, email, result, now),
             Msg::Quota { email, result } => {

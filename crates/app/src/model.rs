@@ -626,11 +626,21 @@ pub fn is_hidden(name: &str, meta: Option<&std::fs::Metadata>) -> bool {
 /// What a folder on the computer holds; a computer on the network (`\\servidor`) holds its
 /// shared folders.
 pub fn read_local(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>> {
+    let mut out = Vec::new();
+    read_local_each(dir, show_hidden, |entry, _| out.push(entry))?;
+    Ok(out)
+}
+
+/// [`read_local`], each entry with whether it is a link to a folder: a symbolic link or, on
+/// Windows, a junction. Such an entry reads as no folder (its own size and date, not those of
+/// what it points to), so a walk that takes folders by `is_dir` doesn't go through it; this
+/// says which of those entries are such links, at no cost for the ones that are not.
+pub fn read_local_each(dir: &Path, show_hidden: bool, mut each: impl FnMut(Entry, bool)) -> std::io::Result<()> {
     if let Some((server, _)) = crate::network::unc(dir).filter(|(_, share)| share.is_empty()) {
         let folder = |name: String| Entry { id: name.clone(), name, is_dir: true, size: None, modified: None, target: None, mime: None, md5: None, starred: false, drive_origin: None };
-        return Ok(crate::network::shares(&server)?.into_iter().map(folder).collect());
+        crate::network::shares(&server)?.into_iter().map(folder).for_each(|entry| each(entry, false));
+        return Ok(());
     }
-    let mut out = Vec::new();
     for item in std::fs::read_dir(dir)? {
         let Ok(item) = item else { continue };
         let name = item.file_name().to_string_lossy().into_owned();
@@ -639,7 +649,9 @@ pub fn read_local(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>> 
             continue;
         }
         let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
-        out.push(Entry {
+        // The entry's own type is the link's; what it points to is asked only of a link.
+        let folder_link = meta.as_ref().is_some_and(|m| m.file_type().is_symlink()) && std::fs::metadata(item.path()).is_ok_and(|m| m.is_dir());
+        let entry = Entry {
             id: name.clone(),
             name,
             is_dir,
@@ -650,9 +662,10 @@ pub fn read_local(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>> 
             md5: None,
             starred: false,
             drive_origin: None,
-        });
+        };
+        each(entry, folder_link);
     }
-    Ok(out)
+    Ok(())
 }
 
 /// A Google Drive stand-in held in memory, to try the panes without an account.

@@ -129,6 +129,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let main_content = match s.main_tab {
         MainTab::Explore => panes(s, &k, see_through, &mut layer),
         MainTab::Accounts => accounts_hub(s, &k),
+        MainTab::Sync => crate::sync_ui::sync_view(s, &k, backdrop, &mut layer),
     };
     let toolbar_el = toolbar(s, &k, &mut layer);
     let body = col()
@@ -164,6 +165,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                         }
                     }
                     MainTab::Accounts => crate::refresh_all_quotas(s),
+                    MainTab::Sync => crate::sync::start_compare(s),
                 }
                 return true;
             }
@@ -2024,6 +2026,10 @@ fn dialog(s: &State, k: &Kit, window_h: Option<f32>, backdrop: bool, layer: &mut
         Dialog::DropboxDeleted(v) => crate::dropbox::deleted_dialog(k, v, layer),
         Dialog::OneDriveLink(m) => crate::onedrive::link_dialog(k, m, layer),
         Dialog::B2Unfinished(d) => crate::b2::unfinished_dialog(k, d, layer),
+        Dialog::SyncOptions(o) => crate::sync_ui::options_dialog(s, k, o, layer),
+        Dialog::SyncFilter(f) => crate::sync_ui::filter_dialog(s, k, f, layer),
+        Dialog::SyncBrowse(b) => crate::sync_ui::browse_dialog(s, k, b, layer),
+        Dialog::SyncSave(d) => crate::sync_ui::save_dialog(s, k, d, layer),
         Dialog::Update => update_dialog(s, k, layer),
     }
 }
@@ -3999,6 +4005,7 @@ fn toolbar(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     let refresh_help = match s.main_tab {
         MainTab::Explore => t("Recarregar a pasta atual (F5)", "Reload the current folder (F5)"),
         MainTab::Accounts => t("Atualizar o espaço utilizado nas contas (F5)", "Refresh storage usage across accounts (F5)"),
+        MainTab::Sync => t("Comparar pastas configuradas (F5)", "Compare configured folders (F5)"),
     };
 
     let view_label = t("Visualizar", "View");
@@ -4076,6 +4083,7 @@ fn toolbar(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
         .child(nav_tab("tab-explore", MainTab::Explore, &icons::TAB_EXPLORE, t("Explorar", "Explore"), None, false))
         .child(nav_tab("tab-accounts", MainTab::Accounts, &icons::TAB_ACCOUNTS, t("Contas", "Accounts"), Some(total_accounts), waiting_oauth))
+        .child(nav_tab("tab-sync", MainTab::Sync, &icons::TAB_SYNC, t("Sincronizar", "Sync"), None, s.sync.is_busy()))
         .child(sep())
         .child(
             tool(k, "reload-all", &icons::REFRESH, t("Atualizar", "Refresh"), true, |s: &mut State, _| match s.main_tab {
@@ -4085,6 +4093,7 @@ fn toolbar(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
                     }
                 }
                 MainTab::Accounts => crate::refresh_all_quotas(s),
+                MainTab::Sync => crate::sync::start_compare(s),
             })
             .help(refresh_help),
         )
@@ -5005,8 +5014,34 @@ fn gutter(s: &State, k: &Kit, left: usize, right: usize, centered: bool) -> El {
     } else {
         (format!("gutter-{left}-{right}"), format!("copy-right-{left}-{right}"), format!("copy-left-{left}-{right}"))
     };
+    // Sincronizar takes the folders of the first two panes: its button is in the strip
+    // between them, above the triangles, which stay where they are without it.
+    let with_sync = (left, right) == (0, 1);
     let mut g = col().key(gutter_key).w(40.0).h_full().items_center().gap(6.0);
-    g = if centered { g.justify_center() } else { g.pt(126.0) };
+    g = if centered { g.justify_center() } else { g.pt(if with_sync { 82.0 } else { 126.0 }) };
+    if with_sync {
+        let syncable = |p: usize| !s.tabs[p].is_picker() && crate::sync::SyncLocation::from_location(&s.panes[p].loc).is_some();
+        let sync_ink = if syncable(0) && syncable(1) { k.c.text_base } else { k.alpha(k.c.icon_faint, 0.65) };
+        let sync_help = t(
+            "Sincronizar a pasta do painel esquerdo com a do painel direito",
+            "Synchronize the left pane folder with the right pane folder",
+        );
+        g = g.child(
+            el().key("gutter-sync")
+                .role("button")
+                .label(sync_help)
+                .help(sync_help)
+                .size(28.0, 28.0)
+                .mb(10.0)
+                .center()
+                .radius(k.radius.sm)
+                .hover(k.c.hover)
+                .press(k.c.pressed)
+                .cursor(Cursor::Pointer)
+                .on_press(crate::sync::open_from_panes)
+                .child(icon(&icons::TAB_SYNC, 16.0).color(sync_ink)),
+        );
+    }
     g.child(arrow(right_key, &icons::COPY_RIGHT, t("Copiar a seleção do painel esquerdo para o direito", "Copy the selection from the left pane to the right"), left, right))
         .child(arrow(left_key, &icons::COPY_LEFT, t("Copiar a seleção do painel direito para o esquerdo", "Copy the selection from the right pane to the left"), right, left))
 }
@@ -6535,7 +6570,7 @@ fn col_grip(k: &Kit, p: usize, i: usize, edge: f32) -> El {
 }
 
 /// A column grip at `edge` over a header `height` tall, changing the width `size` picks.
-fn grip(k: &Kit, key: &str, edge: f32, height: f32, size: impl Fn(&mut State) -> &mut f32 + 'static, default: f32, clamp: impl Fn(f32) -> f32 + 'static) -> El {
+pub(crate) fn grip(k: &Kit, key: &str, edge: f32, height: f32, size: impl Fn(&mut State) -> &mut f32 + 'static, default: f32, clamp: impl Fn(f32) -> f32 + 'static) -> El {
     el().key(key.to_string())
         .role("separator")
         .label(t("Arraste para mudar a largura da coluna; clique duas vezes para voltar ao padrão", "Drag to change the column's width; double-click to restore the default"))

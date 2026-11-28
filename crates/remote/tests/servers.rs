@@ -139,6 +139,70 @@ fn webdav() {
     round_trip(Protocol::Dav, "webdav", 28080);
 }
 
+/// A file sent with its date is listed by the server with that date, which is what a
+/// synchronization compares; `kept` says whether this protocol and this server have a way to
+/// keep one. Where they have none, the file still arrives and the connection goes on working.
+fn a_file_sent_keeps_its_date(protocol: Protocol, kind: &str, port: u16, kept: bool) {
+    use std::time::UNIX_EPOCH;
+    let served = serve(kind, port);
+    let mut s = server(protocol, port);
+    let secret = Some("s3nh@ forte");
+    probe(&mut s, secret).unwrap_or_else(|e| panic!("{kind}: {e}"));
+    let pool = Pool::default();
+    let mut c = pool.take(&s, || secret.map(str::to_string)).unwrap();
+    let local = served.dir.join("local.bin");
+    std::fs::write(&local, vec![9u8; 300_000]).unwrap();
+    // 2020-01-02 03:04:05 UTC.
+    let old = UNIX_EPOCH + Duration::from_secs(1_577_934_245);
+    let apart = |a: std::time::SystemTime, b: std::time::SystemTime| a.duration_since(b).or_else(|_| b.duration_since(a)).unwrap();
+    c.mkdir("/Datas").unwrap();
+    // Twice: WebDAV learns from the first whether the server keeps dates.
+    for name in ["um.bin", "dois.bin"] {
+        let said = c.upload_file_dated(&format!("/Datas/{name}"), &local, old, &mut |_| true).unwrap_or_else(|e| panic!("{kind}: {e}"));
+        assert_eq!(said, Some(kept), "{kind}: {name}");
+        let listed = c.list("/Datas").unwrap().into_iter().find(|i| i.name == name).unwrap_or_else(|| panic!("{kind}: {name} isn't listed"));
+        assert_eq!(listed.size, Some(300_000), "{kind}: {name}");
+        let on_disk = std::fs::metadata(served.dir.join("raiz/Datas").join(name)).unwrap().modified().unwrap();
+        let listed = listed.modified.unwrap_or_else(|| panic!("{kind}: {name} is listed with no date"));
+        if kept {
+            assert!(apart(listed, old) < Duration::from_secs(2) && apart(on_disk, old) < Duration::from_secs(2), "{kind}: {name} listed {listed:?}, on disk {on_disk:?}");
+        } else {
+            assert!(apart(listed, old) > Duration::from_secs(86_400), "{kind}: {name} listed {listed:?}");
+        }
+    }
+    // A date by itself, for a file already there: SFTP has a request for it.
+    let later = old + Duration::from_secs(86_400);
+    let set = c.set_modified("/Datas/um.bin", later).unwrap_or_else(|e| panic!("{kind}: {e}"));
+    assert_eq!(set, protocol == Protocol::Sftp, "{kind}");
+    if set {
+        let listed = c.stat("/Datas/um.bin").unwrap().and_then(|i| i.modified).unwrap();
+        assert!(apart(listed, later) < Duration::from_secs(2), "{kind}: {listed:?}");
+    }
+    // After a date the server wouldn't take, the same connection still answers.
+    assert_eq!(c.list("/Datas").unwrap().len(), 2, "{kind}");
+    c.done();
+}
+
+/// `rclone serve ftp` has no MFMT: the date isn't kept, and nothing is asked of the server.
+#[test]
+#[ignore]
+fn ftp_without_mfmt_keeps_no_date() {
+    a_file_sent_keeps_its_date(Protocol::Ftp, "ftp", 21290, false);
+}
+
+#[test]
+#[ignore]
+fn sftp_keeps_a_sent_files_date() {
+    a_file_sent_keeps_its_date(Protocol::Sftp, "sftp", 22290, true);
+}
+
+/// `rclone serve webdav` takes `X-OC-Mtime`, as ownCloud and Nextcloud do.
+#[test]
+#[ignore]
+fn webdav_keeps_a_sent_files_date() {
+    a_file_sent_keeps_its_date(Protocol::Dav, "webdav", 28090, true);
+}
+
 #[test]
 #[ignore]
 fn sftp_refuses_a_changed_host_key() {
